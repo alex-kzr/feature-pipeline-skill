@@ -1,8 +1,8 @@
 ---
-name: feature-pipeline-skill
+name: feature-pipeline
 description: Portable core for feature-pipeline orchestration.
 ---
 
-# Feature Pipeline Skill
+# Feature Pipeline
 
 This repository is the independently versioned home of the portable feature-pipeline core.
