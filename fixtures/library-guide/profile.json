@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "name": "library-guide",
+  "logical_paths": {
+    "project": ".",
+    "agents": "shared/skills",
+    "core": "automation/core"
+  },
+  "role_grants": {
+    "executor": ["read", "write"],
+    "task_verifier": ["read"],
+    "test_verifier": ["read", "run_checks"]
+  },
+  "stages": [
+    {"name": "implement", "subagents": ["executor"], "argv": ["unit", "apply"]},
+    {"name": "verification", "subagents": ["task_verifier", "test_verifier"], "argv": ["unit", "check"]}
+  ]
+}

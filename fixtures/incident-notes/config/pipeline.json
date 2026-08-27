@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "name": "incident-notes",
+  "logical_paths": {
+    "project": "workspace",
+    "agents": ".agents/skills",
+    "core": "vendor/feature-core"
+  },
+  "role_grants": {
+    "executor": ["read", "write", "run_checks"],
+    "task_verifier": ["read"],
+    "test_verifier": ["read"]
+  },
+  "stages": [
+    {"name": "implement", "subagents": ["executor"], "argv": ["notes", "update"]},
+    {"name": "verification", "subagents": ["task_verifier", "test_verifier"], "argv": ["notes", "validate"]}
+  ]
+}
