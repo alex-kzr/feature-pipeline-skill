@@ -3,9 +3,11 @@
 from .contracts import (
     LogicalPaths,
     Profile,
+    ProfileRegistry,
     RunState,
     SchemaError,
     TaskMetadata,
+    TaskRoute,
     ToolStage,
     Verdict,
     ensure_no_role_escalation,
@@ -14,6 +16,6 @@ from .contracts import (
 )
 
 __all__ = [
-    "LogicalPaths", "Profile", "RunState", "SchemaError", "TaskMetadata", "ToolStage",
+    "LogicalPaths", "Profile", "ProfileRegistry", "RunState", "SchemaError", "TaskMetadata", "TaskRoute", "ToolStage",
     "Verdict", "ensure_no_role_escalation", "load_profile", "validate_relative_path",
 ]

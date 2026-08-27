@@ -18,6 +18,7 @@ SUBAGENTS = frozenset({"executor", "task_verifier", "test_verifier"})
 VERDICTS = frozenset({"PASS", "FAIL", "BLOCKED"})
 RUN_STATUSES = frozenset({"planned", "running", "implemented", "verified", "blocked"})
 SHELL_TOKENS = frozenset({"|", "&&", ";", ">", "<"})
+WRITE_CAPABILITIES = frozenset({"write", "create", "delete", "modify", "filesystem_write"})
 
 
 class SchemaError(ValueError):
@@ -139,6 +140,7 @@ class Profile:
     logical_paths: LogicalPaths
     role_grants: Mapping[str, frozenset[str]]
     stages: tuple[ToolStage, ...]
+    registry: "ProfileRegistry | None" = None
 
     @classmethod
     def from_data(cls, data: object) -> "Profile":
@@ -146,6 +148,9 @@ class Profile:
         _version(value)
         paths = LogicalPaths.from_data(value.get("logical_paths"))
         grants = _role_grants(value.get("role_grants"))
+        for verifier in ("task_verifier", "test_verifier"):
+            if WRITE_CAPABILITIES & grants.get(verifier, frozenset()):
+                raise SchemaError(f"verifier role '{verifier}' must be read-only")
         stages = tuple(ToolStage.from_data(item) for item in _sequence(value.get("stages"), "stages"))
         if not stages:
             raise SchemaError("stages must not be empty")
@@ -153,7 +158,70 @@ class Profile:
             for stage in stages:
                 if stage.name == "verification":
                     _verifier_pair(stage.subagents, "verification.subagents")
-        return cls(SCHEMA_VERSION, _string(value.get("name"), "name"), paths, grants, stages)
+        registry_data = value.get("registry")
+        registry = None if registry_data is None else ProfileRegistry.from_data(registry_data)
+        return cls(SCHEMA_VERSION, _string(value.get("name"), "name"), paths, grants, stages, registry)
+
+
+@dataclass(frozen=True)
+class TaskRoute:
+    """One project-declared route for a supported task type."""
+
+    stack: str
+    subagents: tuple[str, ...]
+    root: str
+    checks: tuple[str, ...]
+    storage: str
+
+    @classmethod
+    def from_data(cls, data: object, task_type: str, registries: Mapping[str, object]) -> "TaskRoute":
+        value = _mapping(data, f"registry.task_types.{task_type}")
+        stack = _registry_name(value.get("stack"), "stack", registries["stacks"])
+        root = _registry_name(value.get("root"), "root", registries["roots"])
+        storage = _registry_name(value.get("storage"), "storage", registries["storage"])
+        subagents = tuple(_registry_name(item, "subagent", registries["subagents"])
+                          for item in _sequence(value.get("subagents"), "route.subagents"))
+        checks = tuple(_registry_name(item, "check", registries["checks"])
+                       for item in _sequence(value.get("checks"), "route.checks"))
+        if not subagents:
+            raise SchemaError(f"registry.task_types.{task_type}.subagents must not be empty")
+        return cls(stack, subagents, root, checks, storage)
+
+
+@dataclass(frozen=True)
+class ProfileRegistry:
+    """Closed project registry used to resolve task routing data."""
+
+    task_types: Mapping[str, TaskRoute]
+    stacks: Mapping[str, Mapping[str, Any]]
+    subagents: Mapping[str, Mapping[str, Any]]
+    roots: Mapping[str, str]
+    checks: Mapping[str, tuple[str, ...]]
+    storage: Mapping[str, str]
+
+    @classmethod
+    def from_data(cls, data: object) -> "ProfileRegistry":
+        value = _mapping(data, "registry")
+        required = ("task_types", "stacks", "subagents", "roots", "checks", "storage")
+        if set(value) != set(required):
+            raise SchemaError("registry must contain only task_types, stacks, subagents, roots, checks, and storage")
+        stacks = _named_objects(value["stacks"], "registry.stacks")
+        subagents = _named_objects(value["subagents"], "registry.subagents")
+        roots = _named_paths(value["roots"], "registry.roots")
+        checks = _named_argv(value["checks"], "registry.checks")
+        storage = _named_paths(value["storage"], "registry.storage")
+        registries: Mapping[str, object] = {"stacks": stacks, "subagents": subagents,
+                                             "roots": roots, "checks": checks, "storage": storage}
+        task_types_data = _mapping(value["task_types"], "registry.task_types")
+        if not task_types_data:
+            raise SchemaError("registry.task_types must not be empty")
+        task_types: dict[str, TaskRoute] = {}
+        for task_type, route in task_types_data.items():
+            name = _string(task_type, "task type")
+            if name not in TASK_TYPES:
+                raise SchemaError(f"unknown task type: {name}")
+            task_types[name] = TaskRoute.from_data(route, name, registries)
+        return cls(task_types, stacks, subagents, roots, checks, storage)
 
 
 def load_profile(path: Path) -> Profile:
@@ -168,6 +236,41 @@ def ensure_no_role_escalation(parent: Sequence[str], requested: Sequence[str]) -
     if not requested_set <= parent_set:
         raise SchemaError("role escalation is not allowed")
     return tuple(sorted(requested_set))
+
+
+def _registry_name(value: object, field: str, registry: object) -> str:
+    name = _string(value, f"route.{field}")
+    if name not in registry:
+        raise SchemaError(f"unknown {field}: {name}")
+    return name
+
+
+def _named_objects(value: object, field: str) -> Mapping[str, Mapping[str, Any]]:
+    entries = _mapping(value, field)
+    if not entries:
+        raise SchemaError(f"{field} must not be empty")
+    return {_string(name, field): _mapping(entry, f"{field}.{name}") for name, entry in entries.items()}
+
+
+def _named_paths(value: object, field: str) -> Mapping[str, str]:
+    entries = _mapping(value, field)
+    if not entries:
+        raise SchemaError(f"{field} must not be empty")
+    return {_string(name, field): validate_relative_path(path, f"{field}.{name}")
+            for name, path in entries.items()}
+
+
+def _named_argv(value: object, field: str) -> Mapping[str, tuple[str, ...]]:
+    entries = _mapping(value, field)
+    if not entries:
+        raise SchemaError(f"{field} must not be empty")
+    result: dict[str, tuple[str, ...]] = {}
+    for name, argv_value in entries.items():
+        argv = tuple(_string(item, f"{field}.{name}") for item in _sequence(argv_value, f"{field}.{name}"))
+        if not argv or any(any(symbol in token for symbol in SHELL_TOKENS) for token in argv):
+            raise SchemaError(f"{field}.{name} must be a non-empty shell-free argv")
+        result[_string(name, field)] = argv
+    return result
 
 
 def _version(value: Mapping[str, Any]) -> None:
