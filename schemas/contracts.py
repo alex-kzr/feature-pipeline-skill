@@ -19,6 +19,7 @@ VERDICTS = frozenset({"PASS", "FAIL", "BLOCKED"})
 RUN_STATUSES = frozenset({"planned", "running", "implemented", "verified", "blocked"})
 SHELL_TOKENS = frozenset({"|", "&&", ";", ">", "<"})
 WRITE_CAPABILITIES = frozenset({"write", "create", "delete", "modify", "filesystem_write"})
+DIFF_POLICIES = frozenset({"ignore", "tracked-empty"})
 
 
 class SchemaError(ValueError):
@@ -115,9 +116,20 @@ class RunState:
 
 @dataclass(frozen=True)
 class ToolStage:
+    """A project-declared deterministic stage: what to run, what it needs, what it must produce.
+
+    ``prerequisites`` and ``outputs`` are anchor-relative logical paths; ``diff_policy`` says
+    whether the stage is allowed to leave tracked changes behind (``ignore``) or must not
+    (``tracked-empty``). The project supplies every value; the core never infers one.
+    """
+
     name: str
     subagents: tuple[str, ...]
     argv: tuple[str, ...]
+    prerequisites: tuple[str, ...] = ()
+    outputs: tuple[str, ...] = ()
+    timeout: float | None = None
+    diff_policy: str = "ignore"
 
     @classmethod
     def from_data(cls, data: object) -> "ToolStage":
@@ -130,7 +142,13 @@ class ToolStage:
         argv = tuple(_string(item, "stage.argv") for item in _sequence(value.get("argv"), "stage.argv"))
         if not argv or any(any(symbol in token for symbol in SHELL_TOKENS) for token in argv):
             raise SchemaError("stage.argv must be a non-empty shell-free argv")
-        return cls(name, subagents, argv)
+        prerequisites = _relative_paths(value.get("prerequisites", []), "stage.prerequisites")
+        outputs = _relative_paths(value.get("outputs", []), "stage.outputs")
+        timeout = _optional_timeout(value.get("timeout"), "stage.timeout")
+        diff_policy = value.get("diff_policy", "ignore")
+        if diff_policy not in DIFF_POLICIES:
+            raise SchemaError(f"stage.diff_policy must be one of {sorted(DIFF_POLICIES)}")
+        return cls(name, subagents, argv, prerequisites, outputs, timeout, diff_policy)
 
 
 @dataclass(frozen=True)
@@ -271,6 +289,18 @@ def _named_argv(value: object, field: str) -> Mapping[str, tuple[str, ...]]:
             raise SchemaError(f"{field}.{name} must be a non-empty shell-free argv")
         result[_string(name, field)] = argv
     return result
+
+
+def _relative_paths(value: object, field: str) -> tuple[str, ...]:
+    return tuple(validate_relative_path(item, field) for item in _sequence(value, field))
+
+
+def _optional_timeout(value: object, field: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        raise SchemaError(f"{field} must be a positive number of seconds")
+    return float(value)
 
 
 def _version(value: Mapping[str, Any]) -> None:
