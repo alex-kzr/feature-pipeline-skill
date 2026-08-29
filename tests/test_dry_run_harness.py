@@ -48,7 +48,9 @@ class DeterminismTests(unittest.TestCase):
         capture = harness.capture_scenario("S1")
         for marker in ("C1.", "C2.", "C3.", "C4.", "C5.", "C6.", "C7.", "C8."):
             self.assertIn(marker, capture)
-        self.assertIn("exit: 0", capture)
+        # DR-5: a non-blocked --dry-run reports a pending delivery gate, exit 10.
+        self.assertIn("exit: 10", capture)
+        self.assertIn("C5. Exit code: 10", capture)
 
 
 class RedactionTests(unittest.TestCase):

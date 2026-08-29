@@ -13,8 +13,13 @@ What it does:
   the fixed delivery-gate order (``plan``, ``final-diff``, ``commit``, verification verdict);
 * with ``--dry-run`` prints a deterministic, redacted plan (sections ``C1``–``C8`` of the
   parallel-acceptance comparison matrix) and writes nothing outside a temporary run directory;
+  a non-blocked ``--dry-run`` exits ``10`` (a delivery gate is pending), matching the legacy
+  runner and the MI-01 exit-code table;
 * refuses ``--push`` before any run artifact exists, with the recorded baseline message and
-  exit code, and never lets ``--commit`` bypass the plan gate;
+  exit code, and never lets ``--commit`` / ``--commit-approved-manifest`` bypass the plan gate;
+* accepts the legacy ``run`` operational surface the compatibility launcher forwards -
+  implementing ``--approve-final-diff`` / ``--commit-approved-manifest`` / ``--status`` /
+  ``--unattended`` and accepting the rest as documented no-ops (see ``scripts/README.md``);
 * fails closed on ``design`` and unknown task types.
 
 Standard library only.
@@ -52,6 +57,14 @@ PUSH_DENIED_MESSAGE = "push is denied at this stage and the runner has no push c
 UNROUTED_TASK_TYPES = frozenset({"design"})
 
 DELIVERY_GATES = ("plan", "final-diff", "commit", "verification-verdict")
+
+# One-line meaning of each exit code, for the C5 line of the dry-run plan.
+EXIT_MEANINGS = {
+    EXIT_OK: "ok",
+    EXIT_GATE_PENDING: "a delivery gate is pending",
+    EXIT_BLOCKED: "blocked",
+    EXIT_ERROR: "error",
+}
 
 _FEATURE_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
@@ -102,14 +115,43 @@ def build_parser() -> argparse.ArgumentParser:
 
     gates = parser.add_argument_group("delivery gates (all closed by default)")
     gates.add_argument("--approve-plan", action="store_true", help="satisfy the plan gate")
+    gates.add_argument("--approve-final-diff", action="store_true",
+                       help="satisfy the final-diff gate; never bypasses an earlier gate")
     gates.add_argument("--commit", action="store_true",
                        help="request the commit gate; it never bypasses the plan gate and this "
                             "runner has no commit code path")
+    gates.add_argument("--commit-approved-manifest", action="store_true",
+                       help="request the commit gate for an approved manifest; never bypasses "
+                            "an earlier gate and this runner has no commit code path")
     gates.add_argument("--dry-run", action="store_true",
                        help="print the deterministic, redacted plan and write nothing outside a "
                             "temporary run directory")
     gates.add_argument("--push", action="store_true",
                        help="denied before any run artifact is created")
+
+    # MI-01 core-classified operational flags the compatibility launcher forwards verbatim.
+    # Each is either given a faithful minimal behaviour here or accepted as a documented
+    # no-op ("not wired in the portable core; the project launcher owns this"). The bar:
+    # a forwarded legacy invocation never dies with an argparse error inside the core.
+    # scripts/README.md carries the per-flag decision table.
+    compat = parser.add_argument_group(
+        "compatibility surface (forwarded from the legacy CLI; see scripts/README.md)")
+    compat.add_argument("--status", action="store_true",
+                        help="print the resolved run state and exit")
+    compat.add_argument("--unattended", action="store_true",
+                        help="alias of --mode unattended")
+    compat.add_argument("--adapter", metavar="NAME", choices=["claude", "codex", "auto"],
+                        help="accepted; adapter routing is not wired in the portable core")
+    compat.add_argument("--max-repair-attempts", metavar="N", type=int,
+                        help="accepted; the repair-loop bound is not wired in the portable core")
+    compat.add_argument("--routine-output-byte-budget", metavar="N", type=int,
+                        help="accepted; output budgeting is not wired in the portable core")
+    compat.add_argument("--diagnostic-output-byte-budget", metavar="N", type=int,
+                        help="accepted; output budgeting is not wired in the portable core")
+    compat.add_argument("--verbose", action="store_true",
+                        help="accepted; reporter verbosity is owned by the project launcher")
+    compat.add_argument("--quiet", action="store_true",
+                        help="accepted; reporter verbosity is owned by the project launcher")
     return parser
 
 
@@ -216,6 +258,8 @@ def _plan_text(
     dep_blocked: dict[str, list[str]],
     lease_blocked: bool,
     approve_plan: bool,
+    approve_final_diff: bool,
+    commit_approved_manifest: bool,
     commit_requested: bool,
     exit_code: int,
 ) -> str:
@@ -266,14 +310,24 @@ def _plan_text(
     lines.append("")
 
     lines.append("C4. Pending delivery gates (in order):")
+    # A gate is satisfied only when it is approved AND every earlier gate already is:
+    # an approval flag never bypasses an earlier, still-pending gate.
+    approved = {
+        "plan": approve_plan,
+        "final-diff": approve_final_diff,
+        "commit": commit_approved_manifest,
+        "verification-verdict": False,
+    }
+    earlier_satisfied = True
     for position, gate in enumerate(DELIVERY_GATES, start=1):
-        satisfied = gate == "plan" and approve_plan
+        satisfied = earlier_satisfied and approved.get(gate, False)
+        earlier_satisfied = satisfied
         state = "satisfied" if satisfied else "pending"
         note = " (requested)" if gate == "commit" and commit_requested else ""
         lines.append(f"  {position}. {gate} - {state}{note}")
     lines.append("")
 
-    lines.append(f"C5. Exit code: {exit_code}")
+    lines.append(f"C5. Exit code: {exit_code} ({EXIT_MEANINGS.get(exit_code, 'see safety posture')})")
     lines.append("")
 
     lines.append("C6. Planned state transitions:")
@@ -367,6 +421,11 @@ def _build(args: argparse.Namespace) -> tuple[str, int]:
             storage_dir = resolved.storage
             break
     lease_dir = (storage_dir or project_dir / ".pipeline" / "runs") / feature
+
+    if args.status:
+        # A read-only state inspector: resolve, report the recorded run, and exit.
+        return _status_text(lease_dir, project_dir, feature), EXIT_OK
+
     lease_path = lease_dir / "pipeline.lock"
     held = read_lease(lease_path)
     lease_blocked = bool(held) and (held.get("unreadable") or pid_alive(held.get("pid")))
@@ -381,24 +440,41 @@ def _build(args: argparse.Namespace) -> tuple[str, int]:
         exit_code = _resume_exit(lease_dir, project_dir, feature)
     elif unresolved:
         exit_code = EXIT_ERROR
-    elif args.dry_run:
-        exit_code = EXIT_OK
     else:
+        # A non-blocked run - dry or real - stops with a delivery gate still pending.
+        # The legacy runner and the MI-01 exit-code table ("10 ... preserve") return
+        # EXIT_GATE_PENDING for every non-blocked --dry-run; the core preserves that.
         exit_code = EXIT_GATE_PENDING
+
+    mode = "unattended" if args.unattended else args.mode
 
     if args.dry_run:
         text = _plan_text(
-            profile=profile, profile_name=profile.name, mode=args.mode, anchors=anchors,
+            profile=profile, profile_name=profile.name, mode=mode, anchors=anchors,
             project_dir=project_dir, profile_rel=profile_rel,
             project_skill_rel=project_skill_rel, selected=selected, all_ids=all_ids,
             routes=routes, dep_blocked=dep_blocked, lease_blocked=lease_blocked,
-            approve_plan=args.approve_plan, commit_requested=args.commit, exit_code=exit_code,
+            approve_plan=args.approve_plan, approve_final_diff=args.approve_final_diff,
+            commit_approved_manifest=args.commit_approved_manifest,
+            commit_requested=args.commit or args.commit_approved_manifest, exit_code=exit_code,
         )
         # A dry run persists nothing: the temporary directory is created and discarded.
         tempfile.mkdtemp(prefix="pipeline-dry-run-")
         return text, exit_code
 
     return _non_dry_run_text(args, exit_code, dep_blocked, lease_blocked, unresolved), exit_code
+
+
+def _status_text(run_dir: Path, project_dir: Path, feature: str) -> str:
+    """Render the recorded run state for ``--status``; redacted, host-path-free."""
+    try:
+        run = Run.load(run_dir, project_dir)
+    except StateError:
+        return redact_text(f"feature: {feature}\nno recorded run\n", build_rules())
+    lines = [f"feature: {run.feature}", f"status: {run.status}", "tasks:"]
+    for record in run.tasks.values():
+        lines.append(f"  {record.id}: {record.status}")
+    return redact_text("\n".join(lines) + "\n", build_rules())
 
 
 def _resume_exit(lease_dir: Path, project_dir: Path, feature: str) -> int:

@@ -186,7 +186,7 @@ class DryRunPlanShapeTests(unittest.TestCase):
                     "--profile", seed["profile_rel"], "--project-skill", "skills",
                     "--plan", "plan.json", "--dry-run",
                 ])
-                self.assertEqual(code, 0, err)
+                self.assertEqual(code, 10, err)
                 self.assertNotIn(str(dest), out)
                 self.assertNotIn(directory, out)
                 outputs.append(out)
@@ -204,7 +204,7 @@ class DryRunPlanShapeTests(unittest.TestCase):
             code, out, err = _run(seed["anchors"] + [
                 "--profile", seed["profile_rel"], "--plan", "plan.json", "--dry-run",
             ])
-        self.assertEqual(code, 0, err)
+        self.assertEqual(code, 10, err)
         for marker in C1_TO_C8:
             self.assertIn(marker, out)
         self.assertIn("notes update", out)  # a stage argv from the incident-notes profile
@@ -218,7 +218,7 @@ class DryRunPlanShapeTests(unittest.TestCase):
                 "--profile", seed["profile_rel"], "--plan", "plan.json", "--dry-run",
             ])
             after = {p for p in dest.rglob("*")}
-        self.assertEqual(code, 0, err)
+        self.assertEqual(code, 10, err)
         self.assertEqual(before, after)
 
 
@@ -253,6 +253,199 @@ class FailClosedRoutingTests(unittest.TestCase):
             ])
         self.assertEqual(code, 30, err)
         self.assertIn("unresolved-executor", out)
+
+
+class DryRunExitCodeTests(unittest.TestCase):
+    """DR-5: a non-blocked dry run reports a pending delivery gate, exit 10."""
+
+    def _dry_run(self, tasks: list[dict], extra: list[str] | None = None,
+                 *, with_registry: bool = True) -> tuple[int, str, str]:
+        with TemporaryDirectory() as directory:
+            dest = Path(directory) / "project"
+            seed = _seed("library-guide", dest, tasks=tasks, with_registry=with_registry)
+            return _run(seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.json", "--dry-run",
+            ] + (extra or []))
+
+    def test_non_blocked_dry_run_returns_gate_pending(self) -> None:
+        code, out, err = self._dry_run([{"id": "T-01", "type": "docs"}])
+        self.assertEqual(code, 10, err)
+        self.assertIn("C5. Exit code: 10", out)
+
+    def test_unmet_dependency_dry_run_still_returns_blocked(self) -> None:
+        tasks = [
+            {"id": "T-01", "type": "docs"},
+            {"id": "T-02", "type": "docs", "depends_on": ["T-01"]},
+        ]
+        code, out, err = self._dry_run(tasks, ["--task", "T-02"])
+        self.assertEqual(code, 20, err)
+
+    def test_absolute_path_dry_run_still_returns_error(self) -> None:
+        code, _, _ = self._dry_run(
+            [{"id": "T-01", "type": "docs"}], ["--prompt", "/etc/pipeline/prompt.md"]
+        )
+        self.assertEqual(code, 30)
+
+    def test_unknown_type_dry_run_still_returns_error(self) -> None:
+        code, out, _ = self._dry_run([{"id": "X-01", "type": "sculpture"}])
+        self.assertEqual(code, 30)
+        self.assertIn("unknown-task-type", out)
+
+
+class DeliveryGateFlagTests(unittest.TestCase):
+    """DR-6: --approve-final-diff and --commit-approved-manifest advance the C4 plan."""
+
+    def _seeded(self, directory: str):
+        dest = Path(directory) / "project"
+        return _seed("library-guide", dest, tasks=[{"id": "T-01", "type": "docs"}])
+
+    def test_approve_final_diff_advances_the_final_diff_gate_in_the_dry_run_plan(self) -> None:
+        with TemporaryDirectory() as directory:
+            seed = self._seeded(directory)
+            code, out, err = _run(seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.json", "--dry-run",
+                "--approve-plan", "--approve-final-diff",
+            ])
+        self.assertEqual(code, 10, err)
+        self.assertIn("plan - satisfied", out)
+        self.assertIn("final-diff - satisfied", out)
+        self.assertIn("commit - pending", out)
+
+    def test_final_diff_gate_never_bypasses_an_unapproved_plan_gate(self) -> None:
+        with TemporaryDirectory() as directory:
+            seed = self._seeded(directory)
+            code, out, err = _run(seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.json", "--dry-run",
+                "--approve-final-diff",
+            ])
+        self.assertEqual(code, 10, err)
+        self.assertIn("plan - pending", out)
+        self.assertIn("final-diff - pending", out)
+
+    def test_commit_approved_manifest_advances_the_commit_gate_when_earlier_gates_pass(self) -> None:
+        with TemporaryDirectory() as directory:
+            seed = self._seeded(directory)
+            code, out, err = _run(seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.json", "--dry-run",
+                "--approve-plan", "--approve-final-diff", "--commit-approved-manifest",
+            ])
+        self.assertEqual(code, 10, err)
+        self.assertIn("commit - satisfied (requested)", out)
+
+    def test_commit_approved_manifest_never_bypasses_earlier_gates(self) -> None:
+        with TemporaryDirectory() as directory:
+            seed = self._seeded(directory)
+            code, out, err = _run(seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.json", "--dry-run",
+                "--commit-approved-manifest",
+            ])
+        self.assertEqual(code, 10, err)
+        self.assertIn("plan - pending", out)
+        self.assertIn("commit - pending", out)
+
+    def test_new_gate_flags_never_advance_a_real_run_past_the_plan_gate(self) -> None:
+        with TemporaryDirectory() as directory:
+            seed = self._seeded(directory)
+            code, out, err = _run(seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.json",
+                "--approve-final-diff", "--commit-approved-manifest",
+            ])
+        self.assertEqual(code, 10, err)
+        self.assertIn("plan gate pending", out)
+
+    def test_new_gate_flags_create_no_run_artifact(self) -> None:
+        with TemporaryDirectory() as directory:
+            seed = self._seeded(directory)
+            code, _, err = _run(seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.json", "--dry-run",
+                "--approve-plan", "--approve-final-diff", "--commit-approved-manifest",
+            ])
+            self.assertEqual(code, 10, err)
+            self.assertFalse(list(seed["project_dir"].glob("**/run.json")))
+
+
+class ForwardedLegacyFlagTests(unittest.TestCase):
+    """DR-6: every MI-01 core-classified flag the launcher forwards is accepted -
+    implemented or a documented no-op - never an argparse exit 2 from inside the core."""
+
+    ACCEPTED_NO_OP = [
+        ["--adapter", "auto"],
+        ["--max-repair-attempts", "3"],
+        ["--routine-output-byte-budget", "4096"],
+        ["--diagnostic-output-byte-budget", "4096"],
+        ["--verbose"],
+        ["--quiet"],
+    ]
+
+    def _dry_run(self, extra: list[str], tasks=None):
+        with TemporaryDirectory() as directory:
+            dest = Path(directory) / "project"
+            seed = _seed("library-guide", dest,
+                         tasks=tasks or [{"id": "T-01", "type": "docs"}])
+            return _run(seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.json", "--dry-run",
+            ] + extra)
+
+    def test_each_accepted_no_op_flag_parses_and_does_not_change_the_exit_code(self) -> None:
+        for extra in self.ACCEPTED_NO_OP:
+            with self.subTest(flag=extra[0]):
+                code, out, err = self._dry_run(extra)
+                self.assertEqual(code, 10, f"{extra} -> {err}")
+                self.assertIn("C1.", out)
+
+    def test_unattended_is_an_alias_of_mode_unattended(self) -> None:
+        code, out, err = self._dry_run(["--unattended"])
+        self.assertEqual(code, 10, err)
+        self.assertIn("mode: unattended", out)
+
+    def test_status_prints_the_recorded_run_state_and_exits_zero(self) -> None:
+        with TemporaryDirectory() as directory:
+            dest = Path(directory) / "project"
+            seed = _seed("library-guide", dest, tasks=[{"id": "T-01", "type": "docs"}])
+            run_dir = seed["project_dir"] / ".pipeline" / "runs" / "sample-feature"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / "run.json").write_text(json.dumps({
+                "schema_version": 1, "feature": "sample-feature",
+                "prompt_path": "plan.json", "plan_path": "plan.json",
+                "run_id": "fixed-run-id", "status": "running",
+                "tasks": [{"id": "T-01", "status": "implemented", "depends_on": [],
+                           "attempts": 1, "blocker": None}],
+                "history": [], "commands": [],
+            }, indent=2) + "\n", encoding="utf-8")
+            code, out, err = _run(seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.json", "--status",
+            ])
+        self.assertEqual(code, 0, err)
+        self.assertIn("status: running", out)
+        self.assertIn("T-01", out)
+        self.assertNotIn(str(dest), out)
+
+    def test_status_reports_no_recorded_run_and_exits_zero(self) -> None:
+        with TemporaryDirectory() as directory:
+            dest = Path(directory) / "project"
+            seed = _seed("library-guide", dest, tasks=[{"id": "T-01", "type": "docs"}])
+            code, out, err = _run(seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.json", "--status",
+            ])
+        self.assertEqual(code, 0, err)
+        self.assertIn("no recorded run", out)
+
+    def test_help_lists_every_forwarded_flag_and_no_project_literal(self) -> None:
+        out = io.StringIO()
+        with redirect_stdout(out), self.assertRaises(SystemExit):
+            runner_cli.main(["--help"])
+        help_text = out.getvalue().lower()
+        for flag in (
+            "--approve-final-diff", "--commit-approved-manifest", "--status",
+            "--unattended", "--adapter", "--max-repair-attempts",
+            "--routine-output-byte-budget", "--diagnostic-output-byte-budget",
+            "--verbose", "--quiet",
+        ):
+            self.assertIn(flag, help_text)
+        for literal in PROJECT_IDENTITY_LITERALS:
+            self.assertNotIn(literal, help_text)
+        for banned in ("archive", "purge", "retry", "maintenance", "recovery", "unblock"):
+            self.assertNotIn(banned, help_text)
 
 
 class DependencyAndCommitGateTests(unittest.TestCase):
@@ -290,7 +483,7 @@ class DependencyAndCommitGateTests(unittest.TestCase):
                 "--profile", seed["profile_rel"], "--plan", "plan.json",
                 "--dry-run", "--commit",
             ])
-        self.assertEqual(code, 0, err)
+        self.assertEqual(code, 10, err)
         self.assertIn("commit - pending", out)
 
 
