@@ -69,3 +69,29 @@ python scripts/run_pipeline.py \
   --project-root <dir> --agents-root <dir> --core-root <dir> \
   --profile <rel> --plan <rel> --dry-run --mode plan-only
 ```
+
+## `dry_run_harness.py`
+
+The core-side dry-run acceptance harness. It produces the deterministic, redacted S1–S7
+dry-run captures that the parallel-acceptance gate (CA-02 / CX-01) compares against the
+legacy baseline. Per scenario it copies a portable fixture to a fresh temp directory, runs
+the runner CLI with the scenario's arguments, and captures the generated argv, stdout,
+stderr, and exit code with every host path normalized to `<project_root>` / `<agents_root>`
+/ `<core_root>` and no user name, machine name, credential, or token left behind. The
+capture is byte-identical across runs from independent clean fixture copies.
+
+The scenario argument table lives in `SCENARIOS` inside the module — the single source of
+truth so the legacy baseline and CX-01 drive both runners with identical arguments. The
+harness writes only under a temp directory (never under `docs/acceptance/` — that is
+CX-01's scope), never passes `--commit`, and passes `--push` only in the S4 denial
+scenario.
+
+Regenerate the captures (prints to stdout; inspect for host leakage):
+
+```
+python scripts/dry_run_harness.py            # every S1–S7 capture
+python scripts/dry_run_harness.py --scenario S3 --scenario S5
+```
+
+The same captures back the determinism and redaction assertions in
+`tests/test_dry_run_harness.py`.
