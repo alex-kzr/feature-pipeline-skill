@@ -8,6 +8,8 @@ What it does:
 
 * resolves the profile through :mod:`pipeline_core.profiles` explicit-anchor resolution,
   rejecting absolute paths, ``~``, ``..`` and ``\\`` separators in the logical arguments;
+* reads the plan as JSON, or - for a ``.md`` path - as a Markdown task table via
+  :mod:`pipeline_core.plan_md`, so the core can be pointed at a real project's native plan;
 * builds a run from profile data — task selection with dependency and lease gates, per-task
   routing through the profile's closed registry, generic non-executing stage construction, and
   the fixed delivery-gate order (``plan``, ``final-diff``, ``commit``, verification verdict);
@@ -38,6 +40,7 @@ from typing import Sequence
 from schemas import SchemaError, load_profile, validate_relative_path
 from schemas.contracts import TASK_TYPES
 
+from .plan_md import MarkdownPlanError, load_markdown_plan
 from .profiles import Anchors, resolve_route
 from .redaction import build_rules, redact_text
 from .stages import plan_release_dry_run
@@ -100,7 +103,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = parser.add_argument_group("run selection and scope")
     run.add_argument("--plan", metavar="REL",
-                     help="plan file (JSON), relative to the resolved project directory")
+                     help="plan file, relative to the resolved project directory: JSON, or "
+                          "Markdown (a '| ID | Type | Depends on |' task table) for a '.md' path")
     run.add_argument("--task", metavar="ID", help="run only this task, if its dependencies pass")
     run.add_argument("--through", metavar="ID",
                      help="select tasks from the first up to and including this one")
@@ -182,6 +186,14 @@ def _resolve_under(anchor: Path, relative: str, field: str) -> Path:
 
 
 def _load_plan(path: Path) -> tuple[str | None, list[dict]]:
+    # A Markdown plan (a common task-board plan format) is read by the compatibility
+    # reader; everything else is parsed as JSON. Downstream construction (selection,
+    # routing, gates, exit codes) is identical for both.
+    if path.suffix.lower() == ".md":
+        try:
+            return load_markdown_plan(path)
+        except MarkdownPlanError as exc:
+            raise CliError(EXIT_ERROR, str(exc)) from None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:

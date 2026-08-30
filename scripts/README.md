@@ -46,7 +46,7 @@ for the read-only `--status` inspector.
 
 ### Plan file
 
-`--plan` points at a JSON file in the project:
+`--plan` points at a **JSON** file:
 
 ```json
 {
@@ -57,6 +57,23 @@ for the read-only `--status` inspector.
   ]
 }
 ```
+
+…or, for a `.md` path, a **Markdown** plan (`pipeline_core/plan_md.py`, CR-05). Two shapes
+are accepted, tried in order:
+
+1. a pipe table whose header names an `ID`, a `Type`, and a `Depends on` column
+   (`depends_on` / `dependencies` / `dependency` / `depends` also accepted; column order
+   free; other columns ignored);
+2. failing a table, every `### <ID>` heading under a `## Phase` section, with `Type` /
+   `Depends on` read from the `## Execution Metadata` block of
+   `<plan-dir>/tasks/<ID>_*.md`.
+
+In both: `(none)` / `-` / empty in a Depends-on value means no dependency; the feature name
+is the filename stem minus a leading `YYYY-MM-DD-`, else a slug of `# Feature: <name>`;
+`--feature` overrides it. The reader fails closed (`EXIT_ERROR`) on no tasks, a task with
+no ID or Type, a missing task file (shape 2), a duplicate ID, or an unknown / self
+dependency. Downstream construction — selection, routing, gates, exit codes, `--dry-run`
+output — is identical to the JSON path.
 
 Each task `type` must be a core task type and must have a route in the profile's registry.
 `design` and any unknown type fail closed (`unresolved-executor` / `unknown-task-type`).
@@ -108,17 +125,27 @@ python scripts/run_pipeline.py \
 
 The core-side dry-run acceptance harness. It produces the deterministic, redacted S1–S7
 dry-run captures that the parallel-acceptance gate (CA-02 / CX-01) compares against the
-legacy baseline. Per scenario it copies a portable fixture to a fresh temp directory, runs
-the runner CLI with the scenario's arguments, and captures the generated argv, stdout,
-stderr, and exit code with every host path normalized to `<project_root>` / `<agents_root>`
-/ `<core_root>` and no user name, machine name, credential, or token left behind. The
-capture is byte-identical across runs from independent clean fixture copies.
+legacy baseline. Per scenario it copies the **shared-project fixture** to a fresh temp
+directory, runs the runner CLI with the scenario's arguments, and captures the generated
+argv, stdout, stderr, and exit code with every host path normalized to `<project_root>` /
+`<agents_root>` / `<core_root>` and no user name, machine name, credential, or token left
+behind. The capture is byte-identical across runs from independent clean fixture copies.
 
-The scenario argument table lives in `SCENARIOS` inside the module — the single source of
-truth so the legacy baseline and CX-01 drive both runners with identical arguments. The
-harness writes only under a temp directory (never under `docs/acceptance/` — that is
-CX-01's scope), never passes `--commit`, and passes `--push` only in the S4 denial
-scenario.
+**Fixture (CR-04).** `fixtures/shared-project/` holds the **core inputs** —
+`profile.json`, `plan.json` (SF-01, SF-02), `plan-s5.json` (SF-03, SF-04) — of the shared
+fixture the parallel-acceptance gate drives both runners from. It is a deliberate vendored
+copy of the canonical fixture in the parent repo
+(`docs/acceptance/fixtures/shared-project/`, owned by CA-04), which also carries the
+Markdown board the legacy runner consumes. `tests/test_dry_run_harness.py` asserts the two
+copies stay byte-identical whenever the parent path is resolvable (it skips in a standalone
+child checkout). Keep them in sync: any change to the canonical fixture's core inputs must
+be mirrored here.
+
+The scenario argument table lives in `SCENARIOS` inside the module. Exit codes: S1/S3/S6/S7
+→ `10` (a delivery gate is pending), S2 → `20` (unmet dependency), S4 → `1` (`--push`
+denied), S5a/S5b → `30` (absolute logical path / unknown task type). The harness writes
+only under a temp directory (never under `docs/acceptance/` — that is CX-01's scope), never
+passes `--commit`, and passes `--push` only in the S4 denial scenario.
 
 Regenerate the captures (prints to stdout; inspect for host leakage):
 
