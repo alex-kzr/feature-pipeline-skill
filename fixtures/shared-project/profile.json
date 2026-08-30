@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "name": "shared-project",
+  "logical_paths": {
+    "project": ".",
+    "agents": "shared/agents",
+    "core": "vendor/core"
+  },
+  "role_grants": {
+    "executor": ["read", "write"],
+    "task_verifier": ["read"],
+    "test_verifier": ["read", "run_checks"]
+  },
+  "stages": [
+    {"name": "implement", "subagents": ["executor"], "argv": ["content", "apply"]},
+    {"name": "verification", "subagents": ["task_verifier", "test_verifier"], "argv": ["content", "check"]}
+  ],
+  "registry": {
+    "task_types": {
+      "docs": {
+        "stack": "text",
+        "subagents": ["executor"],
+        "root": "content",
+        "checks": ["lint"],
+        "storage": "runs"
+      }
+    },
+    "stacks": {"text": {"runtime": "text"}},
+    "subagents": {"executor": {"grant": "executor"}},
+    "roots": {"content": "content"},
+    "checks": {"lint": ["lint", "run"]},
+    "storage": {"runs": ".pipeline/runs"}
+  }
+}

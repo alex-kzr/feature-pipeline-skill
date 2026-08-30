@@ -1,0 +1,7 @@
+{
+  "feature": "shared-project-acceptance",
+  "tasks": [
+    {"id": "SF-01", "type": "docs"},
+    {"id": "SF-02", "type": "docs", "depends_on": ["SF-01"]}
+  ]
+}

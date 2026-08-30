@@ -3,7 +3,7 @@
 
 For each scenario this module:
 
-1. copies a portable fixture into a fresh temporary directory,
+1. copies the shared-project fixture core inputs into a fresh temporary directory,
 2. runs the core runner CLI (:mod:`pipeline_core.runner_cli`, the logic behind
    ``scripts/run_pipeline.py``) with the scenario's arguments,
 3. captures the generated argv, stdout, stderr, and exit code,
@@ -13,11 +13,18 @@ For each scenario this module:
 5. returns the capture as deterministic text — byte-identical across two runs from
    independent clean fixture copies.
 
-The scenario argument table (:data:`SCENARIOS`) is the single source of truth so CX-01 and
-the legacy baseline drive both runners with identical arguments. The harness writes only
-under a temporary directory; it never writes under ``docs/acceptance/`` (that is CX-01's
-scope) and never passes ``--commit``. ``--push`` appears only in the S4 denial scenario,
-which asserts the refusal and that no artifact is created.
+The fixture is [`fixtures/shared-project/`](../fixtures/shared-project/) — the same task
+graph the legacy runner consumes through its Markdown encoding under
+``docs/acceptance/fixtures/shared-project/`` in the parent repository. These three JSON
+files (``profile.json``, ``plan.json`` = SF-01/SF-02, ``plan-s5.json`` = SF-03/SF-04) are a
+**vendored copy** of the canonical fixture's core inputs, kept here so the harness stays
+self-contained; ``tests/test_dry_run_harness.py`` asserts they stay byte-identical to the
+canonical copies whenever the parent path is resolvable.
+
+The harness writes only under a temporary directory; it never writes under
+``docs/acceptance/`` (that is CX-01's scope) and never passes ``--commit``. ``--push``
+appears only in the S4 denial scenario, which asserts the refusal and that no artifact is
+created.
 
 Usage::
 
@@ -48,45 +55,18 @@ from pipeline_core.redaction import build_rules, redact_text
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 
+#: The one shared fixture both runners drive from. Only the core encoding lives here; the
+#: legacy Markdown encoding of the same graph is the canonical fixture in the parent repo.
+SHARED_FIXTURE = "shared-project"
+
 #: One dedicated temp root for the whole process; per-run copies live below it and are
 #: removed as soon as their capture is taken.
 WORKDIR_ROOT = Path(tempfile.mkdtemp(prefix="core-dry-run-harness-"))
 atexit.register(lambda: shutil.rmtree(WORKDIR_ROOT, ignore_errors=True))
 
-#: Feature name every seeded plan carries. A single ``[A-Za-z0-9._-]`` token.
-FEATURE = "acceptance-feature"
-
-#: Closed project registry added to every seeded profile so routing resolves the same way
-#: the legacy baseline expects. Kept here, beside the scenario table, so the comparison
-#: inputs stay identical for both runners.
-REGISTRY = {
-    "task_types": {
-        "docs": {
-            "stack": "text",
-            "subagents": ["executor"],
-            "root": "content",
-            "checks": ["lint"],
-            "storage": "runs",
-        }
-    },
-    "stacks": {"text": {"runtime": "text"}},
-    "subagents": {"executor": {"grant": "executor"}},
-    "roots": {"content": "content"},
-    "checks": {"lint": ["lint", "run"]},
-    "storage": {"runs": ".pipeline/runs"},
-}
-
-# Per-fixture layout: where the profile lives and which subdirectory the profile's
-# ``logical_paths.project`` points at.
-_FIXTURE_LAYOUT = {
-    "library-guide": ("profile.json", "."),
-    "incident-notes": ("config/pipeline.json", "workspace"),
-}
-
-_TWO_TASKS = (
-    {"id": "T-01", "type": "docs"},
-    {"id": "T-02", "type": "docs", "depends_on": ["T-01"]},
-)
+#: Where the profile lives inside the fixture and which subdirectory the profile's
+#: ``logical_paths.project`` points at.
+_FIXTURE_LAYOUT = {SHARED_FIXTURE: ("profile.json", ".")}
 
 
 @dataclass(frozen=True)
@@ -97,7 +77,8 @@ class RunSpec:
     #: ``None`` means "do not seed a fixture" — ``raw_argv`` is passed to the CLI verbatim.
     fixture: str | None = None
     raw_argv: tuple[str, ...] = ()
-    tasks: tuple[dict, ...] = _TWO_TASKS
+    #: Which vendored plan file the scenario runs over. May also be an intentionally
+    #: unsafe literal (the S5a absolute-path probe) that the CLI must reject.
     plan_arg: str = "plan.json"
     prompt_arg: str | None = None
     #: Arguments appended after the anchors, ``--profile``, ``--plan`` and ``--dry-run``.
@@ -125,16 +106,16 @@ class Scenario:
 
 SCENARIOS: dict[str, Scenario] = {
     "S1": Scenario(
-        "plan-only dry run over a multi-task plan",
-        (RunSpec("S1", fixture="library-guide", extra_args=("--mode", "plan-only")),),
+        "plan-only dry run over the routable sub-graph (SF-01, SF-02)",
+        (RunSpec("S1", fixture=SHARED_FIXTURE, extra_args=("--mode", "plan-only")),),
     ),
     "S2": Scenario(
-        "dependency not yet done -> fail closed",
-        (RunSpec("S2", fixture="library-guide", extra_args=("--task", "T-02")),),
+        "SF-02 selected while its dependency SF-01 is not done -> fail closed",
+        (RunSpec("S2", fixture=SHARED_FIXTURE, extra_args=("--task", "SF-02")),),
     ),
     "S3": Scenario(
-        "--through selects the plan up to the last task",
-        (RunSpec("S3", fixture="library-guide", extra_args=("--through", "T-02")),),
+        "--through selects the main plan up to the last routable task",
+        (RunSpec("S3", fixture=SHARED_FIXTURE, extra_args=("--through", "SF-02")),),
     ),
     "S4": Scenario(
         "--push is refused before any run artifact exists",
@@ -145,39 +126,31 @@ SCENARIOS: dict[str, Scenario] = {
         (
             RunSpec(
                 "S5a-absolute-path",
-                fixture="library-guide",
-                tasks=({"id": "T-01", "type": "docs"},),
-                prompt_arg="/etc/pipeline/prompt.md",
+                fixture=SHARED_FIXTURE,
+                plan_arg="/srv/shared-project/content/SF-03.md",
             ),
             RunSpec(
                 "S5b-unknown-type",
-                fixture="library-guide",
-                tasks=({"id": "X-01", "type": "sculpture"},),
+                fixture=SHARED_FIXTURE,
+                plan_arg="plan-s5.json",
+                extra_args=("--task", "SF-04"),
             ),
         ),
     ),
     "S6": Scenario(
-        "--resume from a partially recorded run state",
+        "--resume from a partially recorded run state (base task SF-01)",
         (
             RunSpec(
                 "S6",
-                fixture="library-guide",
-                tasks=({"id": "T-01", "type": "docs"},),
-                extra_args=("--resume",),
+                fixture=SHARED_FIXTURE,
+                extra_args=("--task", "SF-01", "--resume"),
                 partial_state=True,
             ),
         ),
     ),
     "S7": Scenario(
-        "profile-routed dry run on the second portable fixture",
-        (
-            RunSpec(
-                "S7",
-                fixture="incident-notes",
-                tasks=({"id": "N-01", "type": "docs"},),
-                extra_args=("--mode", "plan-only"),
-            ),
-        ),
+        "profile-routed dry run of SF-01 (registry route resolution)",
+        (RunSpec("S7", fixture=SHARED_FIXTURE, extra_args=("--task", "SF-01")),),
     ),
 }
 
@@ -213,8 +186,21 @@ def _redact(text: str, extra_rules: list[tuple[re.Pattern[str], str]]) -> str:
     return redact_text(text, list(extra_rules) + build_rules())
 
 
+def _plan_feature(plan_path: Path) -> str:
+    """The ``feature`` field of a vendored plan file (the run-directory name the CLI uses)."""
+    return str(json.loads(plan_path.read_text(encoding="utf-8"))["feature"])
+
+
+def _plan_tasks(plan_path: Path) -> list[dict]:
+    return list(json.loads(plan_path.read_text(encoding="utf-8"))["tasks"])
+
+
 def _seed(fixture: str, run_dir: Path, spec: RunSpec) -> tuple[list[str], str, Path]:
-    """Copy ``fixture`` into ``run_dir`` and return ``(anchor_argv, profile_rel, project_dir)``."""
+    """Copy ``fixture`` into ``run_dir`` and return ``(anchor_argv, profile_rel, project_dir)``.
+
+    The fixture already carries ``profile.json`` (with its own closed registry) and the
+    ``plan*.json`` files verbatim — nothing is synthesised or overwritten here.
+    """
     profile_rel, project_subdir = _FIXTURE_LAYOUT[fixture]
     project_root = run_dir / "project"
     agents_root = run_dir / "agents"
@@ -223,17 +209,7 @@ def _seed(fixture: str, run_dir: Path, spec: RunSpec) -> tuple[list[str], str, P
     (agents_root / "skills").mkdir(parents=True, exist_ok=True)
     core_root.mkdir(parents=True, exist_ok=True)
 
-    profile_path = project_root / profile_rel
-    profile = json.loads(profile_path.read_text(encoding="utf-8"))
-    profile["registry"] = json.loads(json.dumps(REGISTRY))
-    profile_path.write_text(json.dumps(profile, indent=2) + "\n", encoding="utf-8")
-
     project_dir = project_root if project_subdir == "." else project_root / project_subdir
-    project_dir.mkdir(parents=True, exist_ok=True)
-    (project_dir / spec.plan_arg).write_text(
-        json.dumps({"feature": FEATURE, "tasks": list(spec.tasks)}, indent=2) + "\n",
-        encoding="utf-8",
-    )
 
     if spec.partial_state:
         _write_partial_state(project_dir, spec)
@@ -247,19 +223,25 @@ def _seed(fixture: str, run_dir: Path, spec: RunSpec) -> tuple[list[str], str, P
 
 
 def _write_partial_state(project_dir: Path, spec: RunSpec) -> None:
-    """Record a minimal, loadable run so ``--resume`` has something to resume."""
-    storage = REGISTRY["storage"]["runs"]  # ".pipeline/runs"
-    run_dir = project_dir.joinpath(*storage.split("/"), FEATURE)
+    """Record a minimal, loadable run so ``--resume`` has something to resume.
+
+    Keyed off the real vendored plan the scenario resumes, so the run directory name and
+    the task set match what the CLI derives from that plan.
+    """
+    plan_path = project_dir / spec.plan_arg
+    feature = _plan_feature(plan_path)
+    storage = "runs"  # profile registry storage key; see fixtures/shared-project/profile.json
+    run_dir = project_dir / ".pipeline" / storage / feature
     run_dir.mkdir(parents=True, exist_ok=True)
     tasks = [
-        {"id": task["id"], "status": "implemented", "depends_on": list(task.get("depends_on", [])),
-         "attempts": 1, "blocker": None}
-        for task in spec.tasks
+        {"id": task["id"], "status": "implemented",
+         "depends_on": list(task.get("depends_on", [])), "attempts": 1, "blocker": None}
+        for task in _plan_tasks(plan_path)
     ]
     run_dir.joinpath("run.json").write_text(
         json.dumps({
             "schema_version": 1,
-            "feature": FEATURE,
+            "feature": feature,
             "prompt_path": spec.plan_arg,
             "plan_path": spec.plan_arg,
             "run_id": "harness-fixed-run-id",

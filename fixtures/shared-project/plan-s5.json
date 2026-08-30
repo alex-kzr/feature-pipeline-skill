@@ -1,0 +1,14 @@
+{
+  "feature": "shared-project-acceptance-s5",
+  "tasks": [
+    {
+      "id": "SF-03",
+      "type": "docs",
+      "metadata": {
+        "note": "S5a probe input: this absolute path is the denial trigger; it is not a schema field the core reads.",
+        "absolute_scope_probe": "/srv/shared-project/content/SF-03.md"
+      }
+    },
+    {"id": "SF-04", "type": "mystery"}
+  ]
+}

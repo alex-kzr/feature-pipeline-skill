@@ -1,15 +1,18 @@
 """Acceptance tests for the core-side dry-run harness (`scripts/dry_run_harness.py`).
 
 The harness produces the deterministic, redacted core-side S1-S7 dry-run captures that
-CA-02 / CX-01 compare against the legacy baseline. These tests assert the two properties
-that matter for that comparison — determinism (byte-identical from independent clean
-fixture copies) and redaction (no host path, user, credential, token, or machine name) —
-and the safety constraint that the harness never drives a delivery gate.
+CA-02 / CX-01 compare against the legacy baseline. These tests assert the properties that
+matter for that comparison — determinism (byte-identical from independent clean fixture
+copies), redaction (no host path, user, credential, token, or machine name), the safety
+constraint that the harness never drives a delivery gate, and (CR-04) that the harness runs
+over the shared-project fixture whose core inputs stay in sync with the canonical copy in
+the parent repo.
 """
 
 from __future__ import annotations
 
 import getpass
+import json
 import socket
 import sys
 import unittest
@@ -21,6 +24,16 @@ import dry_run_harness as harness  # noqa: E402
 
 
 ALL_SCENARIOS = ("S1", "S2", "S3", "S4", "S5", "S6", "S7")
+
+#: The vendored core inputs the harness seeds from.
+VENDORED_FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "shared-project"
+#: The canonical fixture in the parent repo (present in the umbrella checkout, absent in a
+#: standalone child checkout).
+CANONICAL_FIXTURE = (
+    Path(__file__).resolve().parents[2]
+    / "docs" / "acceptance" / "fixtures" / "shared-project"
+)
+CORE_INPUT_FILES = ("profile.json", "plan.json", "plan-s5.json")
 
 
 class ScenarioTableTests(unittest.TestCase):
@@ -35,6 +48,51 @@ class ScenarioTableTests(unittest.TestCase):
                 self.assertIn("--push", argv, "S4 is the push-denial scenario")
             else:
                 self.assertNotIn("--push", argv, f"{name} must not pass --push")
+
+
+class SharedFixtureTests(unittest.TestCase):
+    """CR-04: the harness seeds from `fixtures/shared-project/` and its core inputs mirror
+    the canonical fixture the legacy runner consumes."""
+
+    def test_harness_targets_only_the_shared_project_fixture(self) -> None:
+        self.assertEqual(harness.SHARED_FIXTURE, "shared-project")
+        self.assertEqual(list(harness._FIXTURE_LAYOUT), ["shared-project"])
+        for name in ALL_SCENARIOS:
+            for run in harness.SCENARIOS[name].runs:
+                self.assertIn(run.fixture, (None, "shared-project"))
+
+    def test_no_retired_portable_fixture_identifier_remains_in_the_harness(self) -> None:
+        text = Path(harness.__file__).read_text(encoding="utf-8")
+        # Needles assembled at runtime so this test file is not a false self-match.
+        retired = ["-".join(("library", "guide")), "-".join(("incident", "notes")),
+                   "sculpture", "-".join(("T", "01")), "-".join(("N", "01"))]
+        for needle in retired:
+            self.assertNotIn(needle, text, f"retired identifier {needle!r} still in the harness")
+
+    def test_vendored_core_inputs_parse_and_carry_the_expected_task_graph(self) -> None:
+        for fname in CORE_INPUT_FILES:
+            path = VENDORED_FIXTURE / fname
+            self.assertTrue(path.is_file(), f"missing vendored {fname}")
+            json.loads(path.read_text(encoding="utf-8"))
+
+        def graph(name: str) -> list[tuple[str, str, tuple[str, ...]]]:
+            data = json.loads((VENDORED_FIXTURE / name).read_text(encoding="utf-8"))
+            return [(t["id"], t["type"], tuple(t.get("depends_on", []))) for t in data["tasks"]]
+
+        self.assertEqual(graph("plan.json"),
+                         [("SF-01", "docs", ()), ("SF-02", "docs", ("SF-01",))])
+        self.assertEqual(graph("plan-s5.json"),
+                         [("SF-03", "docs", ()), ("SF-04", "mystery", ())])
+
+    def test_vendored_core_inputs_are_byte_identical_to_the_canonical_fixture(self) -> None:
+        if not CANONICAL_FIXTURE.is_dir():
+            self.skipTest("canonical fixture not present (standalone child checkout)")
+        for fname in CORE_INPUT_FILES:
+            self.assertEqual(
+                (VENDORED_FIXTURE / fname).read_bytes(),
+                (CANONICAL_FIXTURE / fname).read_bytes(),
+                f"vendored {fname} has drifted from docs/acceptance/fixtures/shared-project/",
+            )
 
 
 class DeterminismTests(unittest.TestCase):
