@@ -168,7 +168,14 @@ class TaskRecord:
     unblocks: list[str] = field(default_factory=list)
     maintenance_audit: list[dict[str, Any]] = field(default_factory=list)
     external_launch_failures: list[dict[str, Any]] = field(default_factory=list)
-    attested_dependencies: list[str] = field(default_factory=list)
+    #: Read-only evidence that a declared dependency was attested from another, already-closed
+    #: run instead of being dispatched in this one (``--attest-dependency``). Each entry:
+    #: ``dep_id``, ``source_feature``, ``source_run_id``, ``source_digest`` (a
+    #: ``sha256:<hex>`` of the source ``run.json`` at attestation time — tamper-evident, not
+    #: tamper-proof), the source's recorded ``task_verdict``/``test_verdict``/``verified_at``,
+    #: and this run's ``attested_at``. Populated only by
+    #: :meth:`Run.record_attestation`; nothing here is ever written back to the source run.
+    attested_dependencies: list[dict[str, Any]] = field(default_factory=list)
     next_executor_launch_generation: int = 1
     next_task_verifier_launch_generation: int = 1
     next_test_verifier_launch_generation: int = 1
@@ -465,6 +472,26 @@ class Run:
             f"verdicts:{task_id}", to=target,
             note=f"task_verdict={task_verdict} test_verdict={test_verdict}")
         return target
+
+    def record_attestation(
+        self, task_id: str, dep_id: str, evidence: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Record ``dep_id`` as attested on ``task_id`` from ``evidence`` (see
+        :attr:`TaskRecord.attested_dependencies`). Read-only with respect to the source run —
+        only its ``run.json`` was ever read to build ``evidence``; nothing is written to it,
+        reported against it, or has its status changed. Replaces a same-``dep_id`` entry
+        rather than duplicating it.
+        """
+        record = self.task(task_id)
+        entry = dict(evidence)
+        record.attested_dependencies = [
+            existing for existing in record.attested_dependencies
+            if existing.get("dep_id") != dep_id
+        ] + [entry]
+        self.record_event(
+            f"attestation:{task_id}:{dep_id}", to="attested",
+            note=f"{dep_id} attested via {entry.get('source_feature')}")
+        return entry
 
     def begin_repair(self, task_id: str, *, maximum: int) -> bool:
         """Spend one repair attempt on a ``verification_failed`` task.

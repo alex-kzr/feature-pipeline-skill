@@ -109,6 +109,23 @@ or archive/purge code is reachable from `execute`.
   `claude`. `--max-repair-attempts N` overrides every selected task's declared bound.
   `--routine-output-byte-budget` / `--diagnostic-output-byte-budget`, `--resume`, `--task`,
   and `--through` are recorded on `run.json` with their source (`explicit` / `default`).
+- **`--attest-dependency DEP_ID=SOURCE_FEATURE`.** `--task`-only, repeatable: treats `DEP_ID`
+  (one of the tracked task's own declared dependencies) as satisfied because the
+  already-closed run `SOURCE_FEATURE` (a bare directory name under the run-storage root)
+  verified it, without ever dispatching `DEP_ID` in this run. Read-only — only the source
+  run's `run.json` is read, and nothing is written to it. Resolved and validated once, at run
+  creation (source exists and is readable, its `prompt_path`/`plan_path` match this run's
+  exactly, it tracks `DEP_ID` at status `verified`); a resume keeps the recorded attestations,
+  and a resume that also passes `--attest-dependency` must name exactly that set (any order).
+  Invalid with `--through` or an unfiltered run, with a `DEP_ID` outside the tracked task's
+  own dependencies, or with a `DEP_ID` repeated across flags — each denial is a distinct,
+  stable `30`-exit reason (`attestation-requires-task-scope`,
+  `attestation-not-a-dependency`, `duplicate-attestation-dependency`,
+  `attestation-unsafe-source`, `attestation-source-missing`,
+  `attestation-source-identity-mismatch`, `attestation-source-dependency-absent`,
+  `attestation-source-not-verified`, `attestation-mismatch` on a mismatched resume) and
+  writes no partial state. An attested dependency never satisfies an unattested sibling
+  dependency.
 - **Exit codes.** `0` every selected task `verified`; `10` plan gate pending; `20` a task
   ended `blocked` (repair limit reached, external `BLOCKED` verdict, malformed verifier
   evidence, out-of-scope change, live foreign lease, dependency suppression); `30` runner

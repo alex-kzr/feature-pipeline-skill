@@ -594,6 +594,33 @@ class ExecuteModeTests(unittest.TestCase):
             self.assertEqual(code, 30)
             self.assertIn("adapter-unavailable", err)
 
+    def test_attest_dependency_needs_an_equals_separator(self) -> None:
+        with TemporaryDirectory() as directory:
+            seed = self._seed_rich(directory, [RICH_EXECUTE_TASK])
+            with patch.object(runner_cli, "make_execute_adapters", _fake_execute_adapters):
+                code, _out, err = _run(seed["anchors"] + [
+                    "--profile", seed["profile_rel"], "--plan", "plan.json",
+                    "--mode", "execute", "--approve-plan", "--task", "TSK-01",
+                    "--attest-dependency", "TSK-00",
+                ])
+            self.assertEqual(code, 30, err)
+            self.assertIn("DEP_ID=SOURCE_FEATURE", err)
+
+    def test_attest_dependency_rejects_an_unsafe_source_feature(self) -> None:
+        with TemporaryDirectory() as directory:
+            seed = self._seed_rich(directory, [RICH_EXECUTE_TASK])
+            with patch.object(runner_cli, "make_execute_adapters", _fake_execute_adapters):
+                code, _out, err = _run(seed["anchors"] + [
+                    "--profile", seed["profile_rel"], "--plan", "plan.json",
+                    "--mode", "execute", "--approve-plan", "--task", "TSK-01",
+                    "--attest-dependency", "TSK-00=../escape",
+                ])
+            self.assertEqual(code, 30, err)
+            self.assertIn("bare directory name", err)
+            self.assertFalse(
+                (seed["project_dir"] / ".pipeline" / "runs" / "sample-feature"
+                 / "run.json").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

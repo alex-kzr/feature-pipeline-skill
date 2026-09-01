@@ -126,7 +126,10 @@ class RoundTripTests(unittest.TestCase):
             record.unblocks = ["EX-2"]
             record.maintenance_audit = [{"kind": "maintenance-task-evidence", "ref": "m-1"}]
             record.external_launch_failures = [{"generation": 1, "reason": "adapter-timeout"}]
-            record.attested_dependencies = ["EX-0"]
+            record.attested_dependencies = [
+                {"dep_id": "EX-0", "source_feature": "elsewhere", "source_run_id": "prior-run-id",
+                 "source_digest": "sha256:abc", "task_verdict": "PASS", "test_verdict": "PASS",
+                 "verified_at": "2026-09-01T09:00:00Z", "attested_at": "2026-09-01T10:00:00Z"}]
             record.next_executor_launch_generation = 4
             record.next_task_verifier_launch_generation = 2
             record.next_test_verifier_launch_generation = 3
@@ -245,6 +248,37 @@ class ActorAuthorizationTests(unittest.TestCase):
             with self.assertRaises(StateError) as caught:
                 run.transition_task("LT-1", "implemented", ACTOR_RUNNER)
             self.assertEqual(caught.exception.code, "illegal-transition")
+
+
+class AttestationTests(unittest.TestCase):
+    def test_record_attestation_appends_evidence_and_a_history_event(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = _run(root)
+            run.add_task("EX-1")
+            run.add_task("EX-2", depends_on=["EX-1"])
+            evidence = {
+                "dep_id": "EX-1", "source_feature": "elsewhere", "source_run_id": "src-run",
+                "source_digest": "sha256:abc", "task_verdict": "PASS", "test_verdict": "PASS",
+                "verified_at": "2026-09-01T09:00:00Z", "attested_at": "2026-09-01T10:00:00Z",
+            }
+            recorded = run.record_attestation("EX-2", "EX-1", evidence)
+            self.assertEqual(recorded, evidence)
+            self.assertEqual(run.task("EX-2").attested_dependencies, [evidence])
+            self.assertTrue(
+                any(e["scope"] == "attestation:EX-2:EX-1" for e in run.history))
+
+    def test_record_attestation_replaces_a_same_dep_id_entry_rather_than_duplicating(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = _run(root)
+            run.add_task("EX-1")
+            run.add_task("EX-2", depends_on=["EX-1"])
+            run.record_attestation("EX-2", "EX-1", {"dep_id": "EX-1", "source_feature": "a"})
+            run.record_attestation("EX-2", "EX-1", {"dep_id": "EX-1", "source_feature": "b"})
+            attested = run.task("EX-2").attested_dependencies
+            self.assertEqual(len(attested), 1)
+            self.assertEqual(attested[0]["source_feature"], "b")
 
 
 if __name__ == "__main__":

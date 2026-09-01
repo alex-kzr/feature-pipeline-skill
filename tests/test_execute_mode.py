@@ -5,7 +5,7 @@ Every scenario runs :func:`pipeline_core.execution.execute_run` over the
 byte-reproducible. The table in ``fixtures/execution/scenario_adapters.py`` covers the
 single-invocation terminal shapes (AC-1, AC-2, AC-4, AC-5); the bespoke methods below cover
 resume (AC-3), the pinned-adapter switch guard (AC-4), a live foreign lease (AC-4), and the
-stage-9 stop (AC-5).
+stage-9 stop (AC-5). ``AttestDependencyTests`` covers RDS-08's ``--attest-dependency`` bridge.
 """
 
 from __future__ import annotations
@@ -25,8 +25,9 @@ from pipeline_core.execution import (
     ExecuteRequest,
     execute_run,
 )
+from pipeline_core.lifecycle import RunLifecycle
 from pipeline_core.prompt_envelope import EnvelopeAnchors
-from pipeline_core.state import Run, pid_alive
+from pipeline_core.state import ACTOR_RUNNER, Run, pid_alive
 from pipeline_core.verification import VerifierAnchors, VerifierLaunchers
 from schemas.contracts import TaskSpec
 
@@ -263,6 +264,277 @@ class ResumeAndSafetyTests(unittest.TestCase):
                 task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",)),
                 controls=ExecuteControls(unattended=True))
             self.assertTrue(result.ok)
+
+
+class AttestDependencyTests(unittest.TestCase):
+    """RDS-08: ``--attest-dependency`` lets a ``--task``-scoped run trust an already-closed
+    run's verified dependency instead of redispatching it."""
+
+    def _seed(self, directory: str) -> tuple[Path, Path, Path]:
+        root = Path(directory)
+        prompt = root / "prompt.md"
+        prompt.write_text("feature prompt", encoding="utf-8")
+        plan = root / "plan.json"
+        plan.write_text(json.dumps(PLAN, indent=2) + "\n", encoding="utf-8")
+        return root, prompt, plan
+
+    def _request(
+        self, root: Path, prompt: Path, plan: Path, *, feature: str = FEATURE,
+        task_ids: tuple[str, ...], controls: ExecuteControls,
+        executor=None,
+    ) -> ExecuteRequest:
+        return ExecuteRequest(
+            feature=feature,
+            repo_root=root,
+            run_dir=root / "runs" / feature,
+            prompt_path=prompt,
+            plan_path=plan,
+            specs=_specs(task_ids),
+            adapter=executor or sa.ScriptedExecutor(("implemented",)),
+            launchers=VerifierLaunchers(
+                task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))),
+            envelope_anchors=EnvelopeAnchors(project_root=".", agents_root=".agents"),
+            verifier_anchors=VerifierAnchors(
+                project_root=str(root), agents_root=str(root / ".agents")),
+            environment={"claude": True},
+            controls=controls,
+            plan_prompt_path="fixtures/execution/plan.json",
+        )
+
+    def _force_verified(self, life: RunLifecycle, task_id: str) -> None:
+        life.transition(task_id, "running", actor=ACTOR_RUNNER)
+        life.transition(task_id, "implemented", actor=ACTOR_RUNNER)
+        life.run.record_verdicts(task_id, "PASS", "PASS")
+        life.run.save()
+
+    def _make_source_run(
+        self, root: Path, feature: str, prompt: Path, plan: Path, *,
+        tasks: tuple[tuple[str, list[str]], ...], verified_ids: tuple[str, ...],
+    ) -> Path:
+        """A hand-built, closed source run: fine-grained control over exactly which tasks it
+        tracks and which of those reach 'verified', without driving the full dispatch loop."""
+        run = Run.create(feature, prompt, plan, root / "runs" / feature, root)
+        life = RunLifecycle.initialize(run, tasks=tasks)
+        for task_id in verified_ids:
+            self._force_verified(life, task_id)
+        return run.run_dir
+
+    def test_success_reaches_verified_without_dispatching_the_attested_dependency(self) -> None:
+        with TemporaryDirectory() as directory:
+            root, prompt, plan = self._seed(directory)
+            self._make_source_run(
+                root, "source-feature", prompt, plan,
+                tasks=(("EX-01", []),), verified_ids=("EX-01",))
+
+            executor = sa.ScriptedExecutor(("implemented",))
+            result = execute_run(self._request(
+                root, prompt, plan, task_ids=("EX-01", "EX-02"), executor=executor,
+                controls=ExecuteControls(
+                    plan_approved=True, task="EX-02",
+                    attested_dependencies=(("EX-01", "source-feature"),))))
+
+            self.assertTrue(result.ok, result.message)
+            self.assertEqual(result.exit_code, EXIT_OK)
+            self.assertEqual({call["task_id"] for call in executor.calls}, {"EX-02"})
+
+            run = Run.load(result.run_dir, root)
+            self.assertEqual(run.task("EX-02").status, "verified")
+            # EX-01 has no dependency of its own so it is naturally 'ready'; the point is it
+            # was never dispatched to reach that (or any later) state.
+            self.assertEqual(run.task("EX-01").status, "ready")
+            attested = run.task("EX-02").attested_dependencies
+            self.assertEqual(len(attested), 1)
+            self.assertEqual(attested[0]["dep_id"], "EX-01")
+            self.assertEqual(attested[0]["source_feature"], "source-feature")
+            self.assertEqual(attested[0]["task_verdict"], "PASS")
+            self.assertTrue(attested[0]["source_digest"].startswith("sha256:"))
+
+    def test_attesting_never_writes_to_the_source_run(self) -> None:
+        with TemporaryDirectory() as directory:
+            root, prompt, plan = self._seed(directory)
+            source_dir = self._make_source_run(
+                root, "source-feature", prompt, plan,
+                tasks=(("EX-01", []),), verified_ids=("EX-01",))
+            before = (source_dir / "run.json").read_text(encoding="utf-8")
+
+            result = execute_run(self._request(
+                root, prompt, plan, task_ids=("EX-01", "EX-02"),
+                controls=ExecuteControls(
+                    plan_approved=True, task="EX-02",
+                    attested_dependencies=(("EX-01", "source-feature"),))))
+
+            self.assertTrue(result.ok, result.message)
+            after = (source_dir / "run.json").read_text(encoding="utf-8")
+            self.assertEqual(before, after)
+
+    def test_through_scope_is_refused_before_any_state_is_written(self) -> None:
+        with TemporaryDirectory() as directory:
+            root, prompt, plan = self._seed(directory)
+            result = execute_run(self._request(
+                root, prompt, plan, task_ids=("EX-01", "EX-02"),
+                controls=ExecuteControls(
+                    plan_approved=True, through="EX-02",
+                    attested_dependencies=(("EX-01", "source-feature"),))))
+            self.assertEqual(result.status, "error")
+            self.assertIn("attestation-requires-task-scope", result.message)
+            self.assertFalse((root / "runs" / FEATURE / "run.json").exists())
+
+    def test_unfiltered_run_scope_is_refused(self) -> None:
+        with TemporaryDirectory() as directory:
+            root, prompt, plan = self._seed(directory)
+            result = execute_run(self._request(
+                root, prompt, plan, task_ids=("EX-01", "EX-02"),
+                controls=ExecuteControls(
+                    plan_approved=True,
+                    attested_dependencies=(("EX-01", "source-feature"),))))
+            self.assertEqual(result.status, "error")
+            self.assertIn("attestation-requires-task-scope", result.message)
+
+    def test_dep_id_not_a_declared_dependency_is_refused(self) -> None:
+        with TemporaryDirectory() as directory:
+            root, prompt, plan = self._seed(directory)
+            result = execute_run(self._request(
+                root, prompt, plan, task_ids=("EX-01", "EX-02", "EX-03"),
+                controls=ExecuteControls(
+                    plan_approved=True, task="EX-02",
+                    attested_dependencies=(("EX-03", "source-feature"),))))
+            self.assertEqual(result.status, "error")
+            self.assertIn("attestation-not-a-dependency", result.message)
+            self.assertFalse((root / "runs" / FEATURE / "run.json").exists())
+
+    def test_duplicate_dep_id_across_flags_is_refused(self) -> None:
+        with TemporaryDirectory() as directory:
+            root, prompt, plan = self._seed(directory)
+            result = execute_run(self._request(
+                root, prompt, plan, task_ids=("EX-01", "EX-02"),
+                controls=ExecuteControls(
+                    plan_approved=True, task="EX-02",
+                    attested_dependencies=(("EX-01", "one"), ("EX-01", "two")))))
+            self.assertEqual(result.status, "error")
+            self.assertIn("duplicate-attestation-dependency", result.message)
+            self.assertFalse((root / "runs" / FEATURE / "run.json").exists())
+
+    def test_unsafe_source_feature_is_refused_independent_of_the_cli(self) -> None:
+        with TemporaryDirectory() as directory:
+            root, prompt, plan = self._seed(directory)
+            for unsafe in ("../evil", "/etc/passwd", "a/b", "a.b", ".."):
+                with self.subTest(source=unsafe):
+                    result = execute_run(self._request(
+                        root, prompt, plan, task_ids=("EX-01", "EX-02"),
+                        controls=ExecuteControls(
+                            plan_approved=True, task="EX-02",
+                            attested_dependencies=(("EX-01", unsafe),))))
+                    self.assertEqual(result.status, "error")
+                    self.assertIn("attestation-unsafe-source", result.message)
+
+    def test_missing_source_run_is_refused(self) -> None:
+        with TemporaryDirectory() as directory:
+            root, prompt, plan = self._seed(directory)
+            result = execute_run(self._request(
+                root, prompt, plan, task_ids=("EX-01", "EX-02"),
+                controls=ExecuteControls(
+                    plan_approved=True, task="EX-02",
+                    attested_dependencies=(("EX-01", "does-not-exist"),))))
+            self.assertEqual(result.status, "error")
+            self.assertIn("attestation-source-missing", result.message)
+            self.assertFalse((root / "runs" / FEATURE / "run.json").exists())
+
+    def test_prompt_plan_identity_mismatch_is_refused(self) -> None:
+        with TemporaryDirectory() as directory:
+            root, prompt, plan = self._seed(directory)
+            other_plan = root / "plan-2.json"
+            other_plan.write_text(json.dumps(PLAN, indent=2) + "\n", encoding="utf-8")
+            self._make_source_run(
+                root, "source-feature", prompt, other_plan,
+                tasks=(("EX-01", []),), verified_ids=("EX-01",))
+
+            result = execute_run(self._request(
+                root, prompt, plan, task_ids=("EX-01", "EX-02"),
+                controls=ExecuteControls(
+                    plan_approved=True, task="EX-02",
+                    attested_dependencies=(("EX-01", "source-feature"),))))
+            self.assertEqual(result.status, "error")
+            self.assertIn("attestation-source-identity-mismatch", result.message)
+            self.assertFalse((root / "runs" / FEATURE / "run.json").exists())
+
+    def test_source_not_tracking_the_dependency_is_refused(self) -> None:
+        with TemporaryDirectory() as directory:
+            root, prompt, plan = self._seed(directory)
+            self._make_source_run(
+                root, "source-feature", prompt, plan,
+                tasks=(("EX-02", []),), verified_ids=("EX-02",))  # no EX-01 tracked at all
+
+            result = execute_run(self._request(
+                root, prompt, plan, task_ids=("EX-01", "EX-02"),
+                controls=ExecuteControls(
+                    plan_approved=True, task="EX-02",
+                    attested_dependencies=(("EX-01", "source-feature"),))))
+            self.assertEqual(result.status, "error")
+            self.assertIn("attestation-source-dependency-absent", result.message)
+            self.assertFalse((root / "runs" / FEATURE / "run.json").exists())
+
+    def test_source_dependency_not_verified_is_refused(self) -> None:
+        with TemporaryDirectory() as directory:
+            root, prompt, plan = self._seed(directory)
+            self._make_source_run(
+                root, "source-feature", prompt, plan,
+                tasks=(("EX-01", []),), verified_ids=())  # EX-01 stays 'ready', never verified
+
+            result = execute_run(self._request(
+                root, prompt, plan, task_ids=("EX-01", "EX-02"),
+                controls=ExecuteControls(
+                    plan_approved=True, task="EX-02",
+                    attested_dependencies=(("EX-01", "source-feature"),))))
+            self.assertEqual(result.status, "error")
+            self.assertIn("attestation-source-not-verified", result.message)
+            self.assertFalse((root / "runs" / FEATURE / "run.json").exists())
+
+    def test_resume_without_attest_dependency_keeps_the_recorded_set(self) -> None:
+        with TemporaryDirectory() as directory:
+            root, prompt, plan = self._seed(directory)
+            self._make_source_run(
+                root, "source-feature", prompt, plan,
+                tasks=(("EX-01", []),), verified_ids=("EX-01",))
+
+            first = execute_run(self._request(
+                root, prompt, plan, task_ids=("EX-01", "EX-02"),
+                executor=sa.ScriptedExecutor(("implemented",)),
+                controls=ExecuteControls(
+                    plan_approved=True, task="EX-02",
+                    attested_dependencies=(("EX-01", "source-feature"),))))
+            self.assertTrue(first.ok, first.message)
+
+            resumed = execute_run(self._request(
+                root, prompt, plan, task_ids=("EX-01", "EX-02"),
+                executor=sa.ScriptedExecutor(("implemented",)),
+                controls=ExecuteControls(plan_approved=True, task="EX-02", resume=True)))
+            self.assertTrue(resumed.ok, resumed.message)
+
+    def test_resume_repeating_attest_dependency_must_match_exactly(self) -> None:
+        with TemporaryDirectory() as directory:
+            root, prompt, plan = self._seed(directory)
+            self._make_source_run(
+                root, "source-feature", prompt, plan,
+                tasks=(("EX-01", []),), verified_ids=("EX-01",))
+            self._make_source_run(
+                root, "other-feature", prompt, plan,
+                tasks=(("EX-01", []),), verified_ids=("EX-01",))
+
+            first = execute_run(self._request(
+                root, prompt, plan, task_ids=("EX-01", "EX-02"),
+                executor=sa.ScriptedExecutor(("implemented",)),
+                controls=ExecuteControls(
+                    plan_approved=True, task="EX-02",
+                    attested_dependencies=(("EX-01", "source-feature"),))))
+            self.assertTrue(first.ok, first.message)
+
+            resumed = execute_run(self._request(
+                root, prompt, plan, task_ids=("EX-01", "EX-02"),
+                controls=ExecuteControls(
+                    plan_approved=True, task="EX-02", resume=True,
+                    attested_dependencies=(("EX-01", "other-feature"),))))
+            self.assertEqual(resumed.status, "error")
+            self.assertIn("attestation-mismatch", resumed.message)
 
 
 if __name__ == "__main__":

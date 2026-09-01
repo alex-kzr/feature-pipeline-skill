@@ -76,6 +76,11 @@ EXIT_MEANINGS = {
 
 _FEATURE_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
+#: A safe ``--attest-dependency`` ``SOURCE_FEATURE`` token: a bare directory name under the
+#: profile's run-storage root — no path separator, ``.``, ``..``, or absolute/drive path.
+#: ``execution._resolve_source_run_dir`` re-checks containment independently of this check.
+_SOURCE_FEATURE_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
 
 class CliError(Exception):
     """A fail-closed CLI failure carrying a stable exit code and a leak-free message."""
@@ -113,6 +118,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--task", metavar="ID", help="run only this task, if its dependencies pass")
     run.add_argument("--through", metavar="ID",
                      help="select tasks from the first up to and including this one")
+    run.add_argument("--attest-dependency", metavar="DEP_ID=SOURCE_FEATURE", action="append",
+                     dest="attest_dependency",
+                     help="--task only: treat DEP_ID (one of the task's own dependencies) as "
+                          "satisfied because the already-closed run SOURCE_FEATURE verified it, "
+                          "without dispatching it in this run. Repeatable; real control only "
+                          "for --mode execute, accepted as a no-op otherwise")
     run.add_argument("--resume", action="store_true",
                      help="resume a previously recorded run instead of starting one")
     run.add_argument("--mode", default="plan-only",
@@ -587,6 +598,31 @@ def _load_execute_specs(
     return (feature_override or feature), specs
 
 
+def _parse_attestations(raw: list[str] | None) -> tuple[tuple[str, str], ...]:
+    """Parse repeated ``--attest-dependency DEP_ID=SOURCE_FEATURE`` flags, failing closed on
+    unsafe syntax before any source-run path is built. ``execution._validate_attestation_scope``
+    and ``_resolve_attestation`` own every other denial reason (scope, duplicate,
+    not-a-dependency, source resolution)."""
+    if not raw:
+        return ()
+    parsed: list[tuple[str, str]] = []
+    for item in raw:
+        if "=" not in item:
+            raise CliError(
+                EXIT_ERROR, f"--attest-dependency must be DEP_ID=SOURCE_FEATURE: '{item}'")
+        dep_id, source_feature = item.split("=", 1)
+        if not dep_id:
+            raise CliError(EXIT_ERROR, f"--attest-dependency has an empty DEP_ID: '{item}'")
+        if not _SOURCE_FEATURE_RE.match(source_feature):
+            raise CliError(
+                EXIT_ERROR,
+                "--attest-dependency source feature must be a bare directory name (letters, "
+                f"digits, '-', '_' only; no path separator, '.', '..', or absolute/drive path): "
+                f"'{source_feature}'")
+        parsed.append((dep_id, source_feature))
+    return tuple(parsed)
+
+
 def make_execute_adapters(project_dir: Path):
     """Build the production executor adapter and the (identical) read-only verifier pair.
 
@@ -631,6 +667,7 @@ def _execute(
         diagnostic_output_byte_budget=args.diagnostic_output_byte_budget,
         task=args.task,
         through=args.through,
+        attested_dependencies=_parse_attestations(args.attest_dependency),
     )
     request = ExecuteRequest(
         feature=feature,

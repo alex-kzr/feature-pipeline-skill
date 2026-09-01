@@ -257,7 +257,13 @@ class RunLifecycle:
                     note="dependent-unsuppressed")
                 task.blocker = None
                 changed = True
-            deps_verified = all(dep.status == "verified" for dep in deps)
+            # A dependency the task itself has attested (--attest-dependency) counts as
+            # satisfied without ever being dispatched here; an unattested sibling dependency
+            # still needs a real 'verified' status — attestation never widens beyond its own
+            # named dep_id.
+            attested = {entry.get("dep_id") for entry in task.attested_dependencies}
+            deps_verified = all(
+                dep.status == "verified" or dep.id in attested for dep in deps)
             if task.status == "pending" and deps_verified:
                 self.run.transition_task(
                     task.id, "ready", actor=ACTOR_RUNNER, note="readiness-rederived")

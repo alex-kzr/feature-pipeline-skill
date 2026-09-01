@@ -28,11 +28,14 @@ Standard library only.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import re
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 from schemas.contracts import TaskSpec
 
@@ -78,6 +81,11 @@ EXIT_ERROR = 30
 #: The executor capability grant an ``execute`` run composes when a caller does not override
 #: it. A read-only role can never keep ``write`` (:func:`pipeline_core.adapters.effective_grant`).
 DEFAULT_ROLE_GRANT = ("read", "run_checks", "write")
+
+#: A safe ``--attest-dependency`` ``SOURCE_FEATURE`` token: a bare directory name under the
+#: run-storage root — no path separator, ``.``, ``..``, or absolute/drive-qualified path.
+#: Enforced here independently of the CLI's own syntax check (defense in depth).
+_SOURCE_FEATURE_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 __all__ = [
     "EXIT_BLOCKED",
@@ -479,6 +487,10 @@ class ExecuteControls:
     diagnostic_output_byte_budget: int | None = None
     task: str | None = None
     through: str | None = None
+    #: ``(dep_id, source_feature)`` pairs from repeated ``--attest-dependency`` flags. Valid
+    #: only alongside ``task`` — ``--through`` resolves its own dependency closure and must
+    #: never trust an external attestation instead.
+    attested_dependencies: tuple[tuple[str, str], ...] = ()
 
     @property
     def gate_opened(self) -> bool:
@@ -553,6 +565,132 @@ def _select_ids(order: Sequence[str], task: str | None, through: str | None) -> 
     return ids
 
 
+# --- --attest-dependency: a read-only bridge from an already-closed run's verified task --------
+
+
+def _validate_attestation_scope(
+    controls: ExecuteControls, by_id: Mapping[str, TaskSpec]
+) -> None:
+    """Shape/scope checks that need no filesystem access — enforced before anything else runs."""
+    attestations = controls.attested_dependencies
+    if not attestations:
+        return
+    if controls.task is None:
+        raise ExecutionError(
+            "--attest-dependency is only valid with --task; --through resolves its own "
+            "dependency closure and must not trust an external attestation instead",
+            "attestation-requires-task-scope")
+    declared = set(by_id[controls.task].depends_on)
+    seen: set[str] = set()
+    for dep_id, source_feature in attestations:
+        if dep_id in seen:
+            raise ExecutionError(
+                f"--attest-dependency names {dep_id} more than once",
+                "duplicate-attestation-dependency")
+        seen.add(dep_id)
+        if dep_id not in declared:
+            raise ExecutionError(
+                f"{dep_id} is not a declared dependency of {controls.task}",
+                "attestation-not-a-dependency")
+        _validate_source_feature(source_feature)
+
+
+def _validate_source_feature(source_feature: str) -> None:
+    if not _SOURCE_FEATURE_RE.match(source_feature):
+        raise ExecutionError(
+            f"--attest-dependency source feature '{source_feature}' is not a bare directory "
+            "name (letters, digits, '-', '_' only; no path separator, '.', '..', or "
+            "absolute/drive-qualified path)",
+            "attestation-unsafe-source")
+
+
+def _resolve_source_run_dir(run_dir: Path, source_feature: str) -> Path:
+    """Resolve ``source_feature`` under the same run-storage root as ``run_dir`` and re-check
+    containment after resolution — an independent path safe-guard even when the CLI-level
+    syntax check already ran (defense in depth against a planted symlink)."""
+    _validate_source_feature(source_feature)
+    storage_root = run_dir.parent.resolve()
+    candidate = (storage_root / source_feature).resolve()
+    try:
+        candidate.relative_to(storage_root)
+    except ValueError:
+        raise ExecutionError(
+            f"--attest-dependency source feature '{source_feature}' escapes the run-storage "
+            "root",
+            "attestation-unsafe-source") from None
+    return candidate
+
+
+def _resolve_attestation(
+    *, dep_id: str, source_feature: str, run_dir: Path, repo_root: Path,
+    prompt_path: Path | str, plan_path: Path | str | None,
+) -> dict[str, Any]:
+    """Read-only: resolve and validate one attestation's source run. Never writes to it."""
+    source_dir = _resolve_source_run_dir(run_dir, source_feature)
+    run_json = source_dir / "run.json"
+    if not run_json.is_file():
+        raise ExecutionError(
+            f"attestation source run '{source_feature}' is missing or unreadable",
+            "attestation-source-missing")
+    try:
+        source_run = Run.load(source_dir, repo_root)
+    except StateError:
+        raise ExecutionError(
+            f"attestation source run '{source_feature}' is missing or unreadable",
+            "attestation-source-missing") from None
+
+    this_prompt = repo_relative(prompt_path, repo_root)
+    this_plan = repo_relative(plan_path, repo_root) if plan_path else None
+    if source_run.prompt_path != this_prompt or source_run.plan_path != this_plan:
+        raise ExecutionError(
+            f"attestation source run '{source_feature}' tracks a different prompt/plan than "
+            "this run — evidence for a different feature is not evidence for this one",
+            "attestation-source-identity-mismatch")
+
+    try:
+        source_task = source_run.task(dep_id)
+    except StateError:
+        raise ExecutionError(
+            f"attestation source run '{source_feature}' does not track {dep_id}",
+            "attestation-source-dependency-absent") from None
+
+    if source_task.status != "verified":
+        raise ExecutionError(
+            f"attestation source run '{source_feature}' has {dep_id} at status "
+            f"'{source_task.status}', not 'verified'",
+            "attestation-source-not-verified")
+
+    digest = hashlib.sha256(run_json.read_bytes()).hexdigest()
+    return {
+        "dep_id": dep_id,
+        "source_feature": source_feature,
+        "source_run_id": source_run.run_id,
+        "source_digest": f"sha256:{digest}",
+        "task_verdict": source_task.verification.get("task_verdict"),
+        "test_verdict": source_task.verification.get("test_verdict"),
+        "verified_at": source_task.verification.get("verified_at"),
+        "attested_at": _utcnow(),
+    }
+
+
+def _attestation_control_value(controls: ExecuteControls) -> list[str]:
+    return [f"{dep_id}={source}" for dep_id, source in controls.attested_dependencies]
+
+
+def _ensure_attestations_match(run: Run, requested: tuple[tuple[str, str], ...]) -> None:
+    """A resume that also passes ``--attest-dependency`` must name exactly the recorded set
+    (any order); a bare resume keeps whatever was recorded. There is no code path to add or
+    replace an attestation on an existing run."""
+    if not requested:
+        return
+    persisted = set(run.controls.get("attest_dependency", {}).get("value") or [])
+    requested_set = {f"{dep_id}={source}" for dep_id, source in requested}
+    if requested_set != persisted:
+        raise ExecutionError(
+            "resume --attest-dependency does not name exactly the recorded attestation set",
+            "attestation-mismatch")
+
+
 def _controls_map(
     controls: ExecuteControls, resolution: AdapterResolution
 ) -> dict[str, tuple[object, str]]:
@@ -579,6 +717,9 @@ def _controls_map(
                  else (None, "default")),
         "through": ((controls.through, "explicit") if controls.through is not None
                     else (None, "default")),
+        "attest_dependency": (
+            (_attestation_control_value(controls), "explicit")
+            if controls.attested_dependencies else ([], "default")),
         "plan_approval": (
             "approve-plan" if controls.plan_approved
             else "unattended" if controls.unattended else "none", "explicit"),
@@ -662,11 +803,13 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
     if not specs:
         return _error("execute mode needs at least one task in the plan", request)
     order = [spec.id for spec in specs]
+    spec_by_id = {spec.id: spec for spec in specs}
 
     try:
         selected = _select_ids(order, request.controls.task, request.controls.through)
+        _validate_attestation_scope(request.controls, spec_by_id)
     except ExecutionError as exc:
-        return _error(str(exc), request)
+        return _error(f"{exc.code}: {exc}", request)
 
     # 1. The plan gate — no executor is dispatched in execute mode until it is satisfied.
     if not request.controls.gate_opened:
@@ -686,7 +829,9 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
     by_id = _apply_repair_bound(specs, request.controls.max_repair_attempts)
     specs = [by_id[tid] for tid in order]
 
-    # 3. Durable lifecycle: initialize a fresh run, or resume the persisted one.
+    # 3. Durable lifecycle: initialize a fresh run, or resume the persisted one. A fresh run's
+    #    attestations are resolved against their source runs before any run.json exists
+    #    (AC-2's "no partial state" on a denial); a resume trusts whatever was recorded.
     try:
         if request.controls.resume:
             life = RunLifecycle.resume(
@@ -696,10 +841,18 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
                 expected_tasks={spec.id: list(spec.depends_on) for spec in specs},
             )
             ensure_pinned_adapter(life.run, resolution)
+            _ensure_attestations_match(life.run, request.controls.attested_dependencies)
             for name, (value, sourced) in _controls_map(request.controls, resolution).items():
                 if sourced == "explicit":
                     life.run.set_control(name, value, sourced=sourced)
         else:
+            attestations = [
+                _resolve_attestation(
+                    dep_id=dep_id, source_feature=source_feature,
+                    run_dir=request.run_dir, repo_root=request.repo_root,
+                    prompt_path=request.prompt_path, plan_path=request.plan_path)
+                for dep_id, source_feature in request.controls.attested_dependencies
+            ]
             run = Run.create(
                 request.feature, request.prompt_path, request.plan_path,
                 request.run_dir, request.repo_root)
@@ -710,7 +863,12 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
                 adapter_requested=resolution.requested,
                 adapter_resolved=resolution.resolved,
             )
-    except (StateError, ResumeError, AdapterResolutionError) as exc:
+            if attestations:
+                for evidence in attestations:
+                    life.run.record_attestation(
+                        request.controls.task, evidence["dep_id"], evidence)
+                life.recompute_readiness()
+    except (StateError, ResumeError, AdapterResolutionError, ExecutionError) as exc:
         return _error(f"{getattr(exc, 'code', 'state-error')}: {exc}", request)
 
     pin_adapter(life.run, resolution)

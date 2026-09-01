@@ -224,6 +224,32 @@ class ReadinessAndSuppressionTests(unittest.TestCase):
             self.assertIn("A-3", life.run.tasks)
             self.assertNotIn("A-2", life.eligible_tasks())
 
+    def test_an_attested_dependency_satisfies_readiness_without_being_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = _run(root)
+            life = RunLifecycle.initialize(run, tasks=[("A-1", []), ("A-2", ["A-1"])])
+            life.run.record_attestation(
+                "A-2", "A-1",
+                {"dep_id": "A-1", "source_feature": "elsewhere", "task_verdict": "PASS"})
+            life.recompute_readiness()
+            self.assertEqual(life.run.task("A-2").status, "ready")
+            # A-1 itself is untouched by the attestation on its dependent.
+            self.assertEqual(life.run.task("A-1").status, "ready")
+
+    def test_an_attested_dependency_never_satisfies_an_unattested_sibling(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = _run(root)
+            life = RunLifecycle.initialize(
+                run, tasks=[("A-1", []), ("A-2", []), ("A-3", ["A-1", "A-2"])])
+            life.run.record_attestation(
+                "A-3", "A-1",
+                {"dep_id": "A-1", "source_feature": "elsewhere", "task_verdict": "PASS"})
+            life.recompute_readiness()
+            # A-2 was never attested and never verified: A-3 must stay pending.
+            self.assertEqual(life.run.task("A-3").status, "pending")
+
     def test_eligible_tasks_are_ready_and_unblocked(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
