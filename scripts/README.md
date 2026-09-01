@@ -89,6 +89,13 @@ gates in order, `C5` exit code (`Exit code: 10 (a delivery gate is pending)`), `
 state transitions, `C7` redacted evidence manifest, `C8` safety posture. Host paths appear
 only as `<project_root>`, `<agents_root>`, and `<core_root>`.
 
+`--attest-dependency DEP_ID=SOURCE_FEATURE` is a real control here too, not a no-op: `--dry-run`
+parses and validates it with the same syntax/scope/duplicate rules as `execute` mode and
+resolves the source run read-only (see `execute` mode below), so `C6` reflects the attested
+`DEP_ID` as satisfied (no `dependency-not-satisfied`) instead of a hardcoded "verified nothing".
+An invalid or unverifiable attestation fails the dry run closed with the same stable `30`-exit
+reason a real run would use, before any plan is printed.
+
 ### `execute` mode (stages 5–9)
 
 `--mode execute` runs the minimum execution engine end to end and **stops after stage 9**.

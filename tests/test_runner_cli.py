@@ -17,6 +17,8 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from pipeline_core import runner_cli
+from pipeline_core.lifecycle import RunLifecycle
+from pipeline_core.state import ACTOR_RUNNER, Run
 from pipeline_core.verification import VerifierLaunchers
 
 from tests.test_repair import ScriptedExecutor, StubVerifier
@@ -489,6 +491,132 @@ class DependencyAndCommitGateTests(unittest.TestCase):
             ])
         self.assertEqual(code, 10, err)
         self.assertIn("commit - pending", out)
+
+
+class DryRunAttestationTests(unittest.TestCase):
+    """RDS-09: `--dry-run` resolves `--attest-dependency` the same read-only way `--mode
+    execute` does, instead of a separate code path that never consults it."""
+
+    TASKS = [
+        {"id": "T-01", "type": "docs"},
+        {"id": "T-02", "type": "docs", "depends_on": ["T-01"]},
+    ]
+
+    def _seeded(self, directory: str):
+        dest = Path(directory) / "project"
+        return _seed("library-guide", dest, tasks=self.TASKS)
+
+    def _force_verified(self, life: RunLifecycle, task_id: str) -> None:
+        life.transition(task_id, "running", actor=ACTOR_RUNNER)
+        life.transition(task_id, "implemented", actor=ACTOR_RUNNER)
+        life.run.record_verdicts(task_id, "PASS", "PASS")
+        life.run.save()
+
+    def _make_source_run(
+        self, project_dir: Path, source_feature: str, *,
+        verified: bool, dep_id: str = "T-01",
+    ) -> None:
+        """A hand-built source run under the same `.pipeline/runs` storage root the dry-run's
+        own would-be run directory resolves to, tracking `dep_id` in a chosen status."""
+        prompt = plan = project_dir / "plan.json"
+        run = Run.create(
+            source_feature, prompt, plan,
+            project_dir / ".pipeline" / "runs" / source_feature, project_dir)
+        life = RunLifecycle.initialize(run, tasks=[(dep_id, [])])
+        if verified:
+            self._force_verified(life, dep_id)
+
+    def test_valid_attestation_stops_reporting_dependency_not_satisfied(self) -> None:
+        with TemporaryDirectory() as directory:
+            seed = self._seeded(directory)
+            self._make_source_run(seed["project_dir"], "source-feature", verified=True)
+            code, out, err = _run(seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.json",
+                "--task", "T-02", "--attest-dependency", "T-01=source-feature", "--dry-run",
+            ])
+        self.assertEqual(code, 10, err)
+        self.assertNotIn("T-02: pending -> blocked", out)
+        self.assertIn("T-02: pending -> ready -> running -> implemented -> verified", out)
+
+    def test_valid_attestation_dispatches_no_adapter_and_writes_nothing(self) -> None:
+        with TemporaryDirectory() as directory:
+            seed = self._seeded(directory)
+            self._make_source_run(seed["project_dir"], "source-feature", verified=True)
+            source_run_json = (
+                seed["project_dir"] / ".pipeline" / "runs" / "source-feature" / "run.json")
+            before = source_run_json.read_text(encoding="utf-8")
+            code, _out, err = _run(seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.json",
+                "--task", "T-02", "--attest-dependency", "T-01=source-feature", "--dry-run",
+            ])
+            self.assertEqual(code, 10, err)
+            self.assertFalse(
+                (seed["project_dir"] / ".pipeline" / "runs" / "sample-feature"
+                 / "run.json").exists())
+            self.assertEqual(source_run_json.read_text(encoding="utf-8"), before)
+
+    def test_bad_syntax_fails_the_dry_run_the_same_way_a_real_run_would(self) -> None:
+        with TemporaryDirectory() as directory:
+            seed = self._seeded(directory)
+            code, _out, err = _run(seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.json",
+                "--task", "T-02", "--attest-dependency", "T-01", "--dry-run",
+            ])
+        self.assertEqual(code, 30, err)
+        self.assertIn("DEP_ID=SOURCE_FEATURE", err)
+
+    def test_through_scope_is_refused_before_printing_a_plan(self) -> None:
+        with TemporaryDirectory() as directory:
+            seed = self._seeded(directory)
+            code, out, err = _run(seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.json",
+                "--through", "T-02", "--attest-dependency", "T-01=source-feature", "--dry-run",
+            ])
+        self.assertEqual(code, 30, err)
+        self.assertIn("attestation-requires-task-scope", err)
+        self.assertEqual(out, "")
+
+    def test_dep_id_not_a_declared_dependency_is_refused(self) -> None:
+        with TemporaryDirectory() as directory:
+            seed = self._seeded(directory)
+            code, _out, err = _run(seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.json",
+                "--task", "T-01", "--attest-dependency", "T-01=source-feature", "--dry-run",
+            ])
+        self.assertEqual(code, 30, err)
+        self.assertIn("attestation-not-a-dependency", err)
+
+    def test_duplicate_dep_id_is_refused(self) -> None:
+        with TemporaryDirectory() as directory:
+            seed = self._seeded(directory)
+            code, _out, err = _run(seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.json",
+                "--task", "T-02", "--attest-dependency", "T-01=one",
+                "--attest-dependency", "T-01=two", "--dry-run",
+            ])
+        self.assertEqual(code, 30, err)
+        self.assertIn("duplicate-attestation-dependency", err)
+
+    def test_missing_source_run_is_refused(self) -> None:
+        with TemporaryDirectory() as directory:
+            seed = self._seeded(directory)
+            code, _out, err = _run(seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.json",
+                "--task", "T-02", "--attest-dependency", "T-01=does-not-exist", "--dry-run",
+            ])
+        self.assertEqual(code, 30, err)
+        self.assertIn("attestation-source-missing", err)
+
+    def test_unverified_source_dependency_is_refused(self) -> None:
+        with TemporaryDirectory() as directory:
+            seed = self._seeded(directory)
+            self._make_source_run(seed["project_dir"], "source-feature", verified=False)
+            code, _out, err = _run(seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.json",
+                "--task", "T-02", "--attest-dependency", "T-01=source-feature", "--dry-run",
+            ])
+        self.assertEqual(code, 30, err)
+        self.assertIn("attestation-source-not-verified", err)
 
 
 RICH_EXECUTE_TASK = {

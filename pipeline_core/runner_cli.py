@@ -35,13 +35,21 @@ import re
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Sequence
 
 from schemas import SchemaError, load_profile, validate_relative_path
 from schemas.contracts import TASK_TYPES, TaskSpec
 
 from .adapters import ClaudeAdapter
-from .execution import ExecuteControls, ExecuteRequest, execute_run
+from .execution import (
+    ExecuteControls,
+    ExecuteRequest,
+    ExecutionError,
+    execute_run,
+    _resolve_attestation,
+    _validate_attestation_scope,
+)
 from .plan_md import MarkdownPlanError, load_markdown_plan
 from .profiles import Anchors, resolve_route
 from .prompt_envelope import EnvelopeAnchors
@@ -122,8 +130,9 @@ def build_parser() -> argparse.ArgumentParser:
                      dest="attest_dependency",
                      help="--task only: treat DEP_ID (one of the task's own dependencies) as "
                           "satisfied because the already-closed run SOURCE_FEATURE verified it, "
-                          "without dispatching it in this run. Repeatable; real control only "
-                          "for --mode execute, accepted as a no-op otherwise")
+                          "without dispatching it in this run. Repeatable; real control for "
+                          "--mode execute and for --dry-run (both resolve and validate the "
+                          "source run read-only), accepted as a no-op otherwise")
     run.add_argument("--resume", action="store_true",
                      help="resume a previously recorded run instead of starting one")
     run.add_argument("--mode", default="plan-only",
@@ -444,12 +453,6 @@ def _build(args: argparse.Namespace) -> tuple[str, int]:
     all_ids = [t["id"] for t in plan_tasks]
     verified: set[str] = set()  # a fresh run has verified nothing
 
-    dep_blocked: dict[str, list[str]] = {}
-    if args.task is not None:
-        unmet = [d for d in selected[0]["depends_on"] if d not in verified]
-        if unmet:
-            dep_blocked[args.task] = unmet
-
     routes: dict[str, tuple] = {t["id"]: _route(profile, t["type"], anchors) for t in selected}
 
     storage_dir = None
@@ -459,6 +462,34 @@ def _build(args: argparse.Namespace) -> tuple[str, int]:
             storage_dir = resolved.storage
             break
     lease_dir = (storage_dir or project_dir / ".pipeline" / "runs") / feature
+
+    # `--dry-run` mirrors `_execute`'s attestation handling read-only: same syntax/scope
+    # checks, and the same source-run resolution, so a preview never claims success for an
+    # attestation the real run would refuse (or silently ignores a bad one).
+    attested_ids: set[str] = set()
+    if args.dry_run:
+        attestations = _parse_attestations(args.attest_dependency)
+        if attestations:
+            by_id = {t["id"]: SimpleNamespace(depends_on=t["depends_on"]) for t in plan_tasks}
+            attestation_controls = ExecuteControls(
+                task=args.task, attested_dependencies=attestations)
+            try:
+                _validate_attestation_scope(attestation_controls, by_id)
+                for dep_id, source_feature in attestations:
+                    _resolve_attestation(
+                        dep_id=dep_id, source_feature=source_feature, run_dir=lease_dir,
+                        repo_root=project_dir, prompt_path=project_dir / prompt_rel,
+                        plan_path=plan_path)
+                    attested_ids.add(dep_id)
+            except ExecutionError as exc:
+                raise CliError(EXIT_ERROR, f"{exc.code}: {exc}") from None
+
+    dep_blocked: dict[str, list[str]] = {}
+    if args.task is not None:
+        unmet = [d for d in selected[0]["depends_on"]
+                 if d not in verified and d not in attested_ids]
+        if unmet:
+            dep_blocked[args.task] = unmet
 
     if args.status:
         # A read-only state inspector: resolve, report the recorded run, and exit.
