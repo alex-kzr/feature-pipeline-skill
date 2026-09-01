@@ -18,7 +18,14 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from pipeline_core import runner_cli
-from pipeline_core.plan_md import MarkdownPlanError, load_markdown_plan
+from pipeline_core.plan_md import (
+    MarkdownPlanError,
+    load_markdown_plan,
+    load_markdown_plan_specs,
+)
+from pipeline_core.task_files import TaskDefaults
+from schemas import SchemaError
+from schemas.contracts import CommandSpec
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 
@@ -224,6 +231,90 @@ class HeadingsAndTaskFilesTests(unittest.TestCase):
         with TemporaryDirectory() as raw:
             with self.assertRaises(MarkdownPlanError):
                 load_markdown_plan(_write(Path(raw), "plan.md", body))
+
+
+SPEC_PLAN_MD = """\
+# Feature: Spec Thing
+
+## Phase 1 — Contract
+**Execution:** whole-phase: same-session
+
+### SP-01 Provide the base module
+→ [tasks/SP-01_base.md](tasks/SP-01_base.md)
+
+### SP-02 Extend the base module
+→ [tasks/SP-02_extend.md](tasks/SP-02_extend.md)
+"""
+
+
+def _spec_task_file(depends: str) -> str:
+    return (
+        "# SP-0X - x\n\n## Status\n- [ ] To Do\n\n## Execution Metadata\n"
+        "- Type: python\n- Executor: python-executor\n"
+        f"- Depends on: {depends}\n"
+        "- Allowed scope: `pkg/core/**`\n- Out of scope: none\n- Required skills: none\n"
+        "- Documentation impact: none\n- Verification commands:\n"
+        "  - `pkg` -> `python -m unittest discover -s tests -t .`\n\n## Purpose\nx\n"
+    )
+
+
+def _historical_task_file() -> str:
+    return (
+        "# SP-02 - x\n\n## Status\n- [ ] To Do\n\n## Purpose\nx\n\n"
+        "## Affected Files / Components\n- `pkg/core/extend.py`\n\n"
+        "## Definition of Done\n- [ ] It extends\n"
+    )
+
+
+class LoadMarkdownPlanSpecsTests(unittest.TestCase):
+    def _plan(self, root: Path, second_body: str) -> Path:
+        (root / "tasks").mkdir()
+        (root / "2026-09-01-spec-thing.md").write_text(SPEC_PLAN_MD, encoding="utf-8")
+        (root / "tasks" / "SP-01_base.md").write_text(_spec_task_file("none"), encoding="utf-8")
+        (root / "tasks" / "SP-02_extend.md").write_text(second_body, encoding="utf-8")
+        return root / "2026-09-01-spec-thing.md"
+
+    def test_declared_task_files_normalize_to_specs_in_plan_order(self) -> None:
+        with TemporaryDirectory() as raw:
+            plan = self._plan(Path(raw), _spec_task_file("SP-01"))
+            feature, specs = load_markdown_plan_specs(plan)
+            _feature2, graph = load_markdown_plan(plan)
+        self.assertEqual(feature, "spec-thing")
+        self.assertEqual([s.id for s in specs], [t["id"] for t in graph])  # order unchanged
+        self.assertEqual(specs[1].depends_on, ("SP-01",))
+        self.assertEqual(
+            specs[0].verification_commands,
+            (CommandSpec("pkg", ("python", "-m", "unittest", "discover", "-s", "tests", "-t", ".")),),
+        )
+        self.assertEqual(specs[0].metadata_source, "declared")
+
+    def test_a_bare_task_table_plan_has_no_metadata_and_fails_closed(self) -> None:
+        with TemporaryDirectory() as raw:
+            path = _write(Path(raw), "plan.md", MAIN_PLAN_MD)  # a table, no task files
+            with self.assertRaises(MarkdownPlanError):
+                load_markdown_plan_specs(path)
+
+    def test_a_block_less_task_file_uses_caller_defaults(self) -> None:
+        defaults = TaskDefaults(
+            task_type="python",
+            executor="python-executor",
+            verification_commands=(CommandSpec("pkg", ("pytest",)),),
+        )
+        with TemporaryDirectory() as raw:
+            plan = self._plan(Path(raw), _historical_task_file())
+            before = (Path(raw) / "tasks" / "SP-02_extend.md").read_bytes()
+            _feature, specs = load_markdown_plan_specs(plan, defaults=defaults)
+            after = (Path(raw) / "tasks" / "SP-02_extend.md").read_bytes()
+        self.assertEqual(before, after)
+        self.assertEqual(specs[1].metadata_source, "defaults")
+        self.assertEqual(specs[1].allowed_scope, ("pkg/core/extend.py",))
+        self.assertEqual(specs[1].verification_commands, (CommandSpec("pkg", ("pytest",)),))
+
+    def test_a_block_less_task_file_without_defaults_fails_closed(self) -> None:
+        with TemporaryDirectory() as raw:
+            plan = self._plan(Path(raw), _historical_task_file())
+            with self.assertRaises(SchemaError):
+                load_markdown_plan_specs(plan)
 
 
 def _seed(dest: Path) -> dict:

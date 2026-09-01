@@ -5,14 +5,14 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from .artifacts import ArtifactReadError, read_json, write_json_atomic
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 EXIT_TIMEOUT = "timeout"
 EXIT_NOT_FOUND = "not-found"
 EXIT_LAUNCH_FAILED = "error"
@@ -27,6 +27,12 @@ TASK_TRANSITIONS = {
     "repairing": {"implemented", "blocked"}, "verified": set(),
     "blocked": {"ready", "implemented"},
 }
+
+#: Interrupted non-terminal states rolled back on resume. A ``running`` task lost its executor
+#: window and returns to ``ready`` for redispatch; a ``repairing`` task lost its repair window
+#: and returns to ``verification_failed`` for the repair loop. ``implemented`` and ``verified``
+#: are preserved; every other state is already safe to resume from as-is.
+RESUME_ROLLBACKS = {"running": "ready", "repairing": "verification_failed"}
 
 
 class StateError(Exception):
@@ -107,19 +113,108 @@ def pid_alive(pid: int | None) -> bool:
     return True
 
 
+#: Independent launch-generation counters. Each executor or verifier launch attempt consumes
+#: one generation for its role; the count never resets and survives resume (AC-3).
+LAUNCH_ROLES = ("executor", "task_verifier", "test_verifier")
+_GENERATION_FIELD = {role: f"next_{role}_launch_generation" for role in LAUNCH_ROLES}
+
+
+def _empty_verification() -> dict[str, Any]:
+    """An explicit 'not yet verified' state — never an empty/implicit manifest."""
+    return {"task_verdict": None, "test_verdict": None, "verified_at": None}
+
+
+def _empty_execution_evidence() -> dict[str, Any]:
+    """Execution evidence with unavailable attribution stated, not implied by emptiness."""
+    return {
+        "attempt": 0,
+        "executor_report": None,
+        "implementation": {
+            "state": "not-attempted",
+            "changed_files": [],
+            "manifest": None,
+            "diff": None,
+        },
+    }
+
+
 @dataclass
 class TaskRecord:
-    """A portable task's durable identity and state."""
+    """A portable task's durable identity, execution, and verification facts (schema v2)."""
     id: str
     status: str = "pending"
     depends_on: list[str] = field(default_factory=list)
     attempts: int = 0
     blocker: str | None = None
+    # --- schema v2: execution + adapter facts ------------------------------------------
+    type: str | None = None
+    executor: str | None = None
+    adapter: str | None = None
+    session_id: str | None = None
+    verification: dict[str, Any] = field(default_factory=_empty_verification)
+    execution_evidence: dict[str, Any] = field(default_factory=_empty_execution_evidence)
+    changed_files: list[str] = field(default_factory=list)
+    verification_tier: str = "full"
+    accepts_scoped: list[str] = field(default_factory=list)
+    promotion: dict[str, Any] | None = None
+    unblocks: list[str] = field(default_factory=list)
+    maintenance_audit: list[dict[str, Any]] = field(default_factory=list)
+    external_launch_failures: list[dict[str, Any]] = field(default_factory=list)
+    attested_dependencies: list[str] = field(default_factory=list)
+    next_executor_launch_generation: int = 1
+    next_task_verifier_launch_generation: int = 1
+    next_test_verifier_launch_generation: int = 1
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "TaskRecord":
+        """Build a record from a persisted (already schema-v2) task mapping, tolerating
+        absent optional keys by falling back to the field default."""
+        known = {f.name for f in fields(cls)}
+        return cls(**{key: value for key, value in data.items() if key in known})
+
+
+def _migrate_task_v1_to_v2(task: Mapping[str, Any]) -> dict[str, Any]:
+    """Carry a schema v1 task's identity and state forward, adding v2 defaults.
+
+    Order, status (including terminal states), attempts, blockers, and dependencies are
+    preserved verbatim; the new execution/verification/generation fields start empty but
+    explicit (never an implicit blank manifest).
+    """
+    return asdict(TaskRecord.from_dict(dict(task)))
+
+
+def migrate_v1_to_v2(payload: Mapping[str, object]) -> dict[str, object]:
+    """Deterministic, in-memory-only v1 -> v2 run-state migration."""
+    migrated = dict(payload)
+    migrated["schema_version"] = 2
+    migrated["tasks"] = [_migrate_task_v1_to_v2(task) for task in payload.get("tasks", [])]
+    migrated.setdefault("current_task", None)
+    migrated.setdefault("controls", {})
+    migrated.setdefault("environment", {})
+    migrated.setdefault("stages", {})
+    migrated.setdefault("artifacts", {})
+    migrated.setdefault("history", [])
+    migrated.setdefault("commands", [])
+    return migrated
+
+
+def migrate_run_state(payload: Mapping[str, object]) -> dict[str, object]:
+    """Normalize a persisted run-state payload to the current schema, or fail closed.
+
+    A v1 payload is migrated; a payload already at :data:`SCHEMA_VERSION` is returned as a
+    shallow copy; any other version (including an unknown future one) raises without ever
+    rewriting the source file — callers only read here.
+    """
+    if payload.get("schema_version") == 1:
+        return migrate_v1_to_v2(payload)
+    if payload.get("schema_version") != SCHEMA_VERSION:
+        raise StateError("unsupported run-state schema version", "unknown-schema-version")
+    return dict(payload)
 
 
 @dataclass
 class Run:
-    """A JSON-persisted run with explicit repository anchors."""
+    """A JSON-persisted run with explicit repository anchors (schema v2)."""
     feature: str
     prompt_path: str
     plan_path: str | None
@@ -130,11 +225,58 @@ class Run:
     tasks: dict[str, TaskRecord] = field(default_factory=dict)
     history: list[dict[str, str | None]] = field(default_factory=list)
     commands: list[dict[str, Any]] = field(default_factory=list)
+    # --- schema v2: fully sourced controls, environment, and per-stage state ------------
+    controls: dict[str, Any] = field(default_factory=dict)
+    environment: dict[str, Any] = field(default_factory=dict)
+    current_task: str | None = None
+    stages: dict[str, dict[str, Any]] = field(default_factory=dict)
+    artifacts: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def create(cls, feature: str, prompt_path: str | Path, plan_path: str | Path | None, run_dir: str | Path, repo_root: str | Path) -> "Run":
         root = Path(repo_root).resolve()
         return cls(feature, repo_relative(prompt_path, root), repo_relative(plan_path, root) if plan_path else None, Path(run_dir), root, f"{_now().replace(':', '-')}-{feature}")
+
+    def set_control(self, name: str, value: Any, *, sourced: str = "explicit") -> None:
+        """Record an input control and whether it was explicit or a default (gap §3.1)."""
+        self.controls[name] = {"value": value, "sourced": sourced}
+
+    def command(self, command_id: str) -> dict[str, Any]:
+        """Resolve a stable ``command-N`` reference back to its recorded evidence."""
+        for entry in self.commands:
+            if entry["id"] == command_id:
+                return entry
+        raise StateError(f"unknown command '{command_id}'", "unknown-command")
+
+    def stage_command_ids(self, stage: str) -> list[str]:
+        """The ``command-N`` ids recorded under a stage, in execution order."""
+        return list(self.stages.get(stage, {}).get("commands", []))
+
+    def consume_launch_generation(self, task_id: str, role: str = "executor") -> int:
+        """Return the current launch generation for ``role`` and advance it by one.
+
+        The counter is consumed on every launch *attempt* (even a failed one) and never
+        resets, so generations stay monotonic across resume (AC-3).
+        """
+        if role not in _GENERATION_FIELD:
+            raise StateError(f"unknown launch role '{role}'", "unknown-launch-role")
+        record = self.task(task_id)
+        attribute = _GENERATION_FIELD[role]
+        current = getattr(record, attribute)
+        setattr(record, attribute, current + 1)
+        return current
+
+    def record_event(self, scope: str, *, frm: str | None = None, to: str | None = None,
+                     actor: str = ACTOR_RUNNER, note: str | None = None) -> dict[str, str | None]:
+        """Append one durable history event and return it.
+
+        Every lifecycle mutation that is not itself a task transition (a command record, a
+        launch-generation allocation, a blocker update, a resume reconciliation) records its
+        source event here so the persisted history explains each change (AC-4).
+        """
+        entry = {"at": _now(), "scope": scope, "from": frm, "to": to, "actor": actor, "note": note}
+        self.history.append(entry)
+        return entry
 
     def add_task(self, task_id: str, *, depends_on: list[str] | None = None) -> TaskRecord:
         record = TaskRecord(task_id, depends_on=list(depends_on or []))
@@ -168,10 +310,26 @@ class Run:
     def record_command(self, stage: str, cwd: str | Path, argv: list[str], exit_code: Any, duration: float, stdout: str, stderr: str) -> dict[str, Any]:
         entry = {"id": f"command-{len(self.commands) + 1}", "stage": stage, "cwd": repo_relative(cwd, self.repo_root), "argv": list(argv), "exit_code": exit_code, "duration": duration, "stdout": stdout, "stderr": stderr}
         self.commands.append(entry)
+        self.stages.setdefault(stage, {}).setdefault("commands", []).append(entry["id"])
         return entry
 
     def to_dict(self) -> dict[str, Any]:
-        return {"schema_version": SCHEMA_VERSION, "feature": self.feature, "prompt_path": self.prompt_path, "plan_path": self.plan_path, "run_id": self.run_id, "status": self.status, "tasks": [asdict(task) for task in self.tasks.values()], "history": self.history, "commands": self.commands}
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "feature": self.feature,
+            "prompt_path": self.prompt_path,
+            "plan_path": self.plan_path,
+            "run_id": self.run_id,
+            "status": self.status,
+            "current_task": self.current_task,
+            "controls": self.controls,
+            "environment": self.environment,
+            "tasks": [asdict(task) for task in self.tasks.values()],
+            "history": self.history,
+            "commands": self.commands,
+            "stages": self.stages,
+            "artifacts": self.artifacts,
+        }
 
     def save(self) -> Path:
         return write_json_atomic(self.run_dir / "run.json", self.to_dict(), repo_root=self.repo_root)
@@ -180,13 +338,18 @@ class Run:
     def load(cls, run_dir: str | Path, repo_root: str | Path) -> "Run":
         directory = Path(run_dir)
         try:
-            data = read_json(directory / "run.json")
+            raw = read_json(directory / "run.json")
         except ArtifactReadError as exc:
             raise StateError(str(exc), "unreadable-state") from None
-        if data.get("schema_version") != SCHEMA_VERSION:
-            raise StateError("unsupported run-state schema version", "unknown-schema-version")
-        tasks = {entry["id"]: TaskRecord(**entry) for entry in data.get("tasks", [])}
-        return cls(data["feature"], data["prompt_path"], data.get("plan_path"), directory, Path(repo_root).resolve(), data["run_id"], data.get("status", "pending"), tasks, data.get("history", []), data.get("commands", []))
+        data = migrate_run_state(raw)
+        tasks = {entry["id"]: TaskRecord.from_dict(entry) for entry in data.get("tasks", [])}
+        return cls(
+            data["feature"], data["prompt_path"], data.get("plan_path"), directory,
+            Path(repo_root).resolve(), data["run_id"], data.get("status", "pending"),
+            tasks, data.get("history", []), data.get("commands", []),
+            data.get("controls", {}), data.get("environment", {}),
+            data.get("current_task"), data.get("stages", {}), data.get("artifacts", {}),
+        )
 
     def resume(self, *, feature: str, prompt_path: str | Path, plan_path: str | Path | None) -> None:
         if feature != self.feature or repo_relative(prompt_path, self.repo_root) != self.prompt_path or (repo_relative(plan_path, self.repo_root) if plan_path else None) != self.plan_path:

@@ -20,6 +20,12 @@ RUN_STATUSES = frozenset({"planned", "running", "implemented", "verified", "bloc
 SHELL_TOKENS = frozenset({"|", "&&", ";", ">", "<"})
 WRITE_CAPABILITIES = frozenset({"write", "create", "delete", "modify", "filesystem_write"})
 DIFF_POLICIES = frozenset({"ignore", "tracked-empty"})
+VERIFICATION_TIERS = frozenset({"full", "scoped"})
+
+#: A task ID as written on a board or in a plan: two-to-six letters, a hyphen, one-to-four
+#: digits (``EDF-01``, ``LT-9``, ``PCC-05``). Kept deliberately looser than any one project's
+#: convention so the portable core never rejects a legitimate upstream ID.
+TASK_ID_RE = re.compile(r"^[A-Za-z]{2,6}-\d{1,4}$")
 
 
 class SchemaError(ValueError):
@@ -344,3 +350,262 @@ def _role_grants(value: object) -> Mapping[str, frozenset[str]]:
         result[_string(role, "role name")] = frozenset(
             _string(item, f"role_grants.{role}") for item in _sequence(capabilities, f"role_grants.{role}"))
     return result
+
+
+# --- normalized execution task contract (EDF-01) ------------------------------------------
+#
+# One project-neutral task model every later execution stage can trust. A Markdown task file
+# and an equivalent JSON plan entry normalize to the same ``TaskSpec``; construction is
+# fail-closed, so invalid or incomplete execution metadata raises here — before any run
+# artifact is written or any executor process is launched.
+
+
+def _shell_free_argv(value: object, field: str) -> tuple[str, ...]:
+    argv = tuple(_string(item, field) for item in _sequence_like(value, field))
+    if not argv:
+        raise SchemaError(f"{field} must be a non-empty argv")
+    for token in argv:
+        if any(symbol in token for symbol in SHELL_TOKENS):
+            raise SchemaError(
+                f"{field} contains a shell operator ('{token}') — split chained commands into "
+                f"separate entries so each has its own recorded exit code"
+            )
+    return argv
+
+
+def _split_command_string(command: str) -> list[str]:
+    """Split a command line on whitespace, honouring quoted segments. No shell is involved."""
+    parts: list[str] = []
+    current = ""
+    quote: str | None = None
+    for char in command:
+        if quote:
+            if char == quote:
+                quote = None
+            else:
+                current += char
+        elif char in "\"'":
+            quote = char
+        elif char.isspace():
+            if current:
+                parts.append(current)
+                current = ""
+        else:
+            current += char
+    if current:
+        parts.append(current)
+    return parts
+
+
+def _sequence_like(value: object, field: str) -> Sequence[object]:
+    if isinstance(value, (str, bytes)) or isinstance(value, Mapping):
+        raise SchemaError(f"{field} must be a list")
+    if not isinstance(value, (list, tuple)):
+        raise SchemaError(f"{field} must be a list")
+    return value
+
+
+@dataclass(frozen=True)
+class CommandSpec:
+    """One verification command: a working directory and a shell-free argv."""
+
+    cwd: str
+    argv: tuple[str, ...]
+
+    @classmethod
+    def from_data(cls, data: object, *, field: str = "verification_commands") -> "CommandSpec":
+        if isinstance(data, CommandSpec):
+            return data
+        value = _mapping(data, field)
+        cwd = validate_relative_path(value.get("cwd", "."), f"{field}.cwd")
+        if "argv" in value and value.get("argv") is not None:
+            argv = _shell_free_argv(value.get("argv"), f"{field}.argv")
+        elif value.get("command"):
+            argv = _shell_free_argv(_split_command_string(_string(value.get("command"),
+                                                                  f"{field}.command")),
+                                    f"{field}.argv")
+        else:
+            raise SchemaError(f"{field} entry needs an 'argv' list or a 'command' string")
+        return cls(cwd, argv)
+
+
+@dataclass(frozen=True)
+class AcceptanceCriterionSpec:
+    """One ordered acceptance criterion. The checkbox is a verifier's finding, never set here."""
+
+    id: str
+    text: str
+    checked: bool = False
+
+
+def validate_acceptance_criteria(items: Sequence[object]) -> tuple[AcceptanceCriterionSpec, ...]:
+    """Coerce ``items`` to ``AcceptanceCriterionSpec`` values with unique, gap-free ``AC-n`` IDs.
+
+    Each item is an :class:`AcceptanceCriterionSpec`, a ``{"id","text","checked"}`` mapping, or a
+    bare string (unchecked). IDs, when present, must already be ``AC-1 … AC-n`` in order.
+    """
+    criteria: list[AcceptanceCriterionSpec] = []
+    for index, item in enumerate(items, start=1):
+        if isinstance(item, AcceptanceCriterionSpec):
+            text, checked, given_id = item.text, item.checked, item.id
+        elif isinstance(item, Mapping):
+            text = str(item.get("text", "")).strip()
+            checked = bool(item.get("checked", False))
+            given_id = str(item["id"]) if item.get("id") else None
+        else:
+            text, checked, given_id = str(item).strip(), False, None
+        if not text:
+            raise SchemaError(f"acceptance criterion {index} has no text")
+        expected = f"AC-{index}"
+        if given_id is not None and given_id != expected:
+            raise SchemaError(
+                f"acceptance criteria must be AC-1..AC-n without gaps; found '{given_id}' "
+                f"where '{expected}' was expected"
+            )
+        criteria.append(AcceptanceCriterionSpec(expected, text, checked))
+    return tuple(criteria)
+
+
+def _spec_paths(value: object, field: str, *, allow_glob: bool = True,
+                require_skill_md: bool = False) -> tuple[str, ...]:
+    out: list[str] = []
+    for item in _sequence_like(value, field):
+        normalized = validate_relative_path(item, field)
+        if not allow_glob and "*" in normalized:
+            raise SchemaError(f"{field} entry '{item}' must be a concrete path, not a glob")
+        if require_skill_md and not normalized.endswith("SKILL.md"):
+            raise SchemaError(f"{field} entry '{item}' must name an exact SKILL.md")
+        out.append(normalized)
+    return tuple(out)
+
+
+def _spec_task_ids(value: object, field: str) -> tuple[str, ...]:
+    out: list[str] = []
+    for item in _sequence_like(value, field):
+        token = _string(item, field)
+        if not TASK_ID_RE.match(token):
+            raise SchemaError(f"{field} entry '{token}' is not a valid task ID")
+        out.append(token)
+    return tuple(out)
+
+
+@dataclass(frozen=True)
+class TaskSpec:
+    """A validated, project-neutral executable task. Immutable; build via :meth:`build`."""
+
+    id: str
+    title: str
+    path: str
+    task_type: str
+    executor: str
+    depends_on: tuple[str, ...]
+    allowed_scope: tuple[str, ...]
+    out_of_scope: tuple[str, ...]
+    required_skills: tuple[str, ...]
+    max_repair_attempts: int
+    documentation_impact: tuple[str, ...]
+    verification_commands: tuple[CommandSpec, ...]
+    verification_tier: str
+    accepts_scoped: tuple[str, ...]
+    deferred_verification_commands: tuple[CommandSpec, ...]
+    blocking_conditions: str | None
+    acceptance_criteria: tuple[AcceptanceCriterionSpec, ...]
+    metadata_source: str
+    defaults_applied: tuple[str, ...]
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        id: str,
+        task_type: str,
+        executor: str,
+        allowed_scope: Sequence[object],
+        title: str = "",
+        path: str = "",
+        depends_on: Sequence[object] = (),
+        out_of_scope: Sequence[object] = (),
+        required_skills: Sequence[object] = (),
+        max_repair_attempts: int = 2,
+        documentation_impact: Sequence[object] = (),
+        verification_commands: Sequence[object] = (),
+        verification_tier: str = "full",
+        accepts_scoped: Sequence[object] = (),
+        deferred_verification_commands: Sequence[object] = (),
+        blocking_conditions: object = None,
+        acceptance_criteria: Sequence[object] = (),
+        metadata_source: str = "declared",
+        defaults_applied: Sequence[object] = (),
+    ) -> "TaskSpec":
+        task_id = _string(id, "task.id")
+        if not TASK_ID_RE.match(task_id):
+            raise SchemaError(f"invalid task ID '{task_id}'")
+
+        normalized_type = _string(task_type, "task.type").strip().lower().replace("-", "_")
+        if normalized_type not in TASK_TYPES:
+            raise SchemaError(f"unknown task type: {task_type}")
+
+        executor_name = _string(executor, "task.executor")
+
+        scope = _spec_paths(allowed_scope, "allowed_scope")
+        if not scope:
+            raise SchemaError("allowed_scope must not be empty — a task at least writes its own file")
+
+        deps = _spec_task_ids(depends_on, "depends_on")
+        if task_id in deps:
+            raise SchemaError(f"{task_id} depends on itself")
+
+        scoped = _spec_task_ids(accepts_scoped, "accepts_scoped")
+        for dep in scoped:
+            if dep not in deps:
+                raise SchemaError(
+                    f"accepts_scoped entry '{dep}' is not one of this task's dependencies "
+                    f"({', '.join(deps) or 'none'})"
+                )
+
+        tier = _string(verification_tier, "verification_tier").strip().lower()
+        if tier not in VERIFICATION_TIERS:
+            raise SchemaError(f"unknown verification tier: {verification_tier}")
+
+        if isinstance(max_repair_attempts, bool) or not isinstance(max_repair_attempts, int):
+            raise SchemaError("max_repair_attempts must be a non-negative integer")
+        if max_repair_attempts < 0:
+            raise SchemaError("max_repair_attempts must be a non-negative integer")
+
+        commands = tuple(CommandSpec.from_data(item, field="verification_commands")
+                         for item in _sequence_like(verification_commands, "verification_commands"))
+        deferred = tuple(CommandSpec.from_data(item, field="deferred_verification_commands")
+                         for item in _sequence_like(deferred_verification_commands,
+                                                    "deferred_verification_commands"))
+        if deferred and tier != "scoped":
+            raise SchemaError(
+                "deferred_verification_commands require verification_tier 'scoped'"
+            )
+
+        blocking = None if blocking_conditions is None else _string(blocking_conditions,
+                                                                    "blocking_conditions")
+
+        return cls(
+            id=task_id,
+            title=str(title or ""),
+            path=str(path or ""),
+            task_type=normalized_type,
+            executor=executor_name,
+            depends_on=deps,
+            allowed_scope=scope,
+            out_of_scope=_spec_paths(out_of_scope, "out_of_scope"),
+            required_skills=_spec_paths(required_skills, "required_skills", allow_glob=False,
+                                        require_skill_md=True),
+            max_repair_attempts=max_repair_attempts,
+            documentation_impact=_spec_paths(documentation_impact, "documentation_impact",
+                                             allow_glob=False),
+            verification_commands=commands,
+            verification_tier=tier,
+            accepts_scoped=scoped,
+            deferred_verification_commands=deferred,
+            blocking_conditions=blocking,
+            acceptance_criteria=validate_acceptance_criteria(acceptance_criteria),
+            metadata_source=str(metadata_source or "declared"),
+            defaults_applied=tuple(_string(item, "defaults_applied")
+                                   for item in _sequence_like(defaults_applied, "defaults_applied")),
+        )

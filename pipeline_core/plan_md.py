@@ -35,7 +35,11 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-__all__ = ["MarkdownPlanError", "load_markdown_plan"]
+from schemas.contracts import TaskSpec
+
+from .task_files import TaskDefaults, load_task_spec
+
+__all__ = ["MarkdownPlanError", "load_markdown_plan", "load_markdown_plan_specs"]
 
 
 class MarkdownPlanError(Exception):
@@ -238,3 +242,59 @@ def load_markdown_plan(path: Path) -> tuple[str, list[dict]]:
                 )
 
     return _feature_name(path, text), tasks
+
+
+def load_markdown_plan_specs(
+    path: Path, *, defaults: TaskDefaults | None = None
+) -> tuple[str, tuple[TaskSpec, ...]]:
+    """Return ``(feature, task_specs)`` — every task normalized to a validated :class:`TaskSpec`.
+
+    This is the execution-grade counterpart of :func:`load_markdown_plan`: the same feature name
+    and task order, but each task is resolved to its ``tasks/<ID>_*.md`` file and normalized
+    through :func:`pipeline_core.task_files.load_task_spec`. A plan that carries no per-task
+    files (a bare ``| ID | Type | Depends on |`` table) has no execution metadata and fails
+    closed with :class:`MarkdownPlanError`; a block-less task file fails closed too unless
+    ``defaults`` is supplied for it.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raise MarkdownPlanError("plan file not found") from None
+    except OSError:
+        raise MarkdownPlanError("plan file is not readable") from None
+
+    ids: list[str] = []
+    for line in text.splitlines():
+        heading = _TASK_HEADING_RE.match(line.strip())
+        if heading and heading.group("id") not in ids:
+            ids.append(heading.group("id"))
+    if not ids:
+        raise MarkdownPlanError(
+            "no '### <ID>' task headings: a bare task table carries no execution metadata, so "
+            "it cannot drive a real run — use a plan with tasks/<ID>_*.md task files"
+        )
+
+    feature = _feature_name(path, text)
+    tasks_dir = path.parent / "tasks"
+
+    specs: list[TaskSpec] = []
+    for task_id in ids:
+        matches = sorted(tasks_dir.glob(f"{task_id}_*.md"))
+        if not matches:
+            raise MarkdownPlanError(
+                f"{task_id}: no task file '{task_id}_*.md' under {tasks_dir.name}/ to load "
+                f"execution metadata from"
+            )
+        specs.append(load_task_spec(matches[0], defaults=defaults))
+
+    known = {spec.id for spec in specs}
+    for spec in specs:
+        if spec.id in spec.depends_on:
+            raise MarkdownPlanError(f"{spec.id} depends on itself")
+        for dependency in spec.depends_on:
+            if dependency not in known:
+                raise MarkdownPlanError(
+                    f"{spec.id} depends on '{dependency}', which is not a task in the plan"
+                )
+
+    return feature, tuple(specs)

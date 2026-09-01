@@ -18,6 +18,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Mapping, Sequence
 
+from schemas.contracts import (
+    AcceptanceCriterionSpec,
+    CommandSpec,
+    SchemaError,
+    TaskSpec,
+)
+
 
 class LegacyAdapterError(ValueError):
     """A legacy task mapping that cannot be adapted without guessing."""
@@ -164,3 +171,63 @@ def adapt_legacy_task(raw: Mapping[str, object], defaults: LegacyDefaults) -> Ad
         metadata_source="declared" if has_metadata else "defaults",
         defaults_applied=tuple(applied),
     )
+
+
+def adapt_task_spec(
+    raw: Mapping[str, object], defaults: "LegacyDefaults | None" = None
+) -> TaskSpec:
+    """Normalize a parsed JSON plan entry (or any parsed task mapping) into a ``TaskSpec``.
+
+    This is the JSON counterpart of :func:`pipeline_core.task_files.load_task_spec`: a Markdown
+    task file and a JSON plan entry describing the same task land on an equivalent ``TaskSpec``.
+    An entry with ``has_metadata`` false and no ``defaults`` fails closed — real execution never
+    runs a task whose execution metadata is neither declared nor supplied. ``raw`` is read,
+    never modified.
+    """
+    task_id = str(raw.get("id") or "").strip()
+    has_metadata = bool(raw.get("has_metadata"))
+    if not has_metadata and defaults is None:
+        raise SchemaError(
+            f"{task_id or '<task>'}: execution metadata is absent and no defaults were supplied"
+        )
+
+    effective = defaults or LegacyDefaults(task_type="", executor="")
+    try:
+        adapted = adapt_legacy_task(raw, effective)
+    except LegacyAdapterError as exc:
+        raise SchemaError(str(exc)) from None
+
+    def _commands(value: object) -> tuple[CommandSpec, ...]:
+        if not value:
+            return ()
+        return tuple(CommandSpec.from_data(item) for item in value)  # type: ignore[union-attr]
+
+    try:
+        return TaskSpec.build(
+            id=adapted.task_id,
+            title=adapted.title,
+            path=str(raw.get("path") or ""),
+            task_type=adapted.task_type,
+            executor=adapted.executor,
+            depends_on=tuple(adapted.depends_on),
+            allowed_scope=tuple(adapted.allowed_scope),
+            out_of_scope=tuple(adapted.out_of_scope),
+            required_skills=tuple(raw.get("required_skills") or ()),
+            max_repair_attempts=adapted.max_repair_attempts,
+            documentation_impact=tuple(adapted.documentation_impact),
+            verification_commands=_commands(adapted.verification_commands),
+            verification_tier=str(raw.get("verification_tier") or "full"),
+            accepts_scoped=tuple(raw.get("accepts_scoped") or ()),
+            deferred_verification_commands=_commands(raw.get("deferred_verification_commands")),
+            blocking_conditions=adapted.blocking_conditions,
+            acceptance_criteria=tuple(
+                AcceptanceCriterionSpec(item.id, item.text, item.checked)
+                for item in adapted.acceptance_criteria
+            ),
+            metadata_source=adapted.metadata_source,
+            defaults_applied=tuple(adapted.defaults_applied),
+        )
+    except SchemaError:
+        raise
+    except LegacyAdapterError as exc:
+        raise SchemaError(str(exc)) from None
