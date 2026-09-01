@@ -10,7 +10,43 @@ from typing import Any, Iterable
 REPO_TOKEN = "<repo>"
 TMP_TOKEN = "<tmp>"
 HOME_TOKEN = "<home>"
+SECRET_TOKEN = "<redacted>"
 Rule = tuple[re.Pattern[str], str]
+
+#: Secret shapes redacted from any captured output or assembled report before it is
+#: persisted. Each entry is ``(pattern, replacement)`` and the replacement may reference
+#: capture groups, so a ``KEY=value`` assignment keeps ``KEY=`` and loses only the value.
+#: These run *before* the path rules and *before* any byte-budget truncation so a secret can
+#: never be split into an unrecognizable fragment that survives the cut.
+_SECRET_RULES: list[Rule] = [
+    (re.compile(
+        r"(?i)\b([A-Za-z0-9_.\-]*(?:pass(?:word|wd)?|secret|token|api[_-]?key|access[_-]?key"
+        r"|client[_-]?secret|auth(?:oriz(?:ation|ed))?)[A-Za-z0-9_.\-]*)"
+        r"(\s*[:=]\s*|\s+)"
+        r"[\"']?([^\s\"']{3,})[\"']?"),
+     rf"\1\2{SECRET_TOKEN}"),
+    (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._\-]+"), f"Bearer {SECRET_TOKEN}"),
+    (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b"), SECRET_TOKEN),
+    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"), SECRET_TOKEN),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), SECRET_TOKEN),
+    (re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"), SECRET_TOKEN),
+    (re.compile(
+        r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----.*?"
+        r"-----END (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----",
+        re.DOTALL),
+     SECRET_TOKEN),
+]
+
+
+def secret_rules() -> list[Rule]:
+    """Return the secret-redaction rules; applied before path rules and truncation."""
+    return list(_SECRET_RULES)
+
+
+def output_rules(repo_root: str | Path | None = None) -> list[Rule]:
+    """Full rule set for captured process output and assembled reports: secrets first,
+    then the machine-local path spellings."""
+    return secret_rules() + build_rules(repo_root)
 
 
 def build_rules(repo_root: str | Path | None = None) -> list[Rule]:

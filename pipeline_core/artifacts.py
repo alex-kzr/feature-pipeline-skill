@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from typing import Any, Callable
 
-from .redaction import build_rules, redact
+from .redaction import build_rules, output_rules, redact, redact_text
 
 
 class ArtifactError(Exception):
@@ -53,6 +53,26 @@ def write_json_atomic(path: str | Path, payload: Any, *, repo_root: str | Path |
     temporary = target.with_name(f"{target.name}.tmp")
     try:
         temporary.write_text(text, encoding="utf-8")
+        os.replace(temporary, target)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return target
+
+
+def write_text_atomic(path: str | Path, text: str, *, repo_root: str | Path | None = None) -> Path:
+    """Persist a redacted text artifact (command log, diagnostic) atomically.
+
+    Every text artifact the execution engine writes passes through here so redaction of
+    secrets and machine-local paths is automatic for any future caller; the write is
+    serialize-then-replace so a crash never leaves a half-written log behind.
+    """
+    redacted = redact_text(text, output_rules(repo_root))
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f"{target.name}.tmp")
+    try:
+        temporary.write_text(redacted, encoding="utf-8")
         os.replace(temporary, target)
     finally:
         if temporary.exists():
