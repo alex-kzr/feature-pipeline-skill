@@ -313,6 +313,69 @@ class Run:
         self.stages.setdefault(stage, {}).setdefault("commands", []).append(entry["id"])
         return entry
 
+    def record_executor_evidence(
+        self,
+        task_id: str,
+        *,
+        attempt: int,
+        generation: int,
+        report_path: str | Path,
+        session_id: str | None = None,
+        reserved_manifest: str | None = None,
+        reserved_diff: str | None = None,
+    ) -> dict[str, Any]:
+        """Record a trusted executor report as this task's execution evidence.
+
+        The implementation delta itself is RDS-05's to attribute, so ``manifest`` / ``diff``
+        stay ``None`` here; the reserved artifact paths are carried so the diff step has a
+        fixed, non-overwriting home. Never sets any verification field.
+        """
+        record = self.task(task_id)
+        if session_id:
+            record.session_id = session_id
+        evidence = {
+            "attempt": attempt,
+            "launch_generation": generation,
+            "executor_report": repo_relative(report_path, self.repo_root),
+            "implementation": {
+                "state": "pending-attribution",
+                "changed_files": [],
+                "manifest": None,
+                "diff": None,
+                "manifest_reserved": reserved_manifest,
+                "diff_reserved": reserved_diff,
+            },
+        }
+        record.execution_evidence = evidence
+        self.record_event(
+            f"execution-evidence:{task_id}", to=str(generation),
+            actor=ACTOR_EXECUTOR, note="executor report recorded as execution evidence")
+        return evidence
+
+    def record_launch_failure(
+        self,
+        task_id: str,
+        *,
+        stage: str,
+        generation: int,
+        exit_code: Any,
+        detail: str,
+    ) -> dict[str, Any]:
+        """Append durable evidence that one launch attempt failed and consumed its generation."""
+        record = self.task(task_id)
+        entry = {
+            "stage": stage,
+            "generation": generation,
+            "exit_code": exit_code,
+            "detail": detail,
+            "at": _now(),
+        }
+        record.external_launch_failures.append(entry)
+        self.record_event(
+            f"launch-failure:{task_id}:{stage}", frm=str(generation), to=str(generation),
+            note=f"{stage} launch generation {generation} failed: {detail}")
+        return entry
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": SCHEMA_VERSION,
