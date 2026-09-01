@@ -1,0 +1,50 @@
+{
+  "feature": "execute-mode-fixture",
+  "tasks": [
+    {
+      "id": "EX-01",
+      "title": "Direct success task",
+      "path": "fixtures/execution/tasks/EX-01_direct-success.md",
+      "task_type": "python",
+      "executor": "python-executor",
+      "depends_on": [],
+      "allowed_scope": ["fixtures/execution/work/ex-01.txt"],
+      "out_of_scope": ["fixtures/execution/tasks/EX-01_direct-success.md"],
+      "acceptance_criteria": [
+        "The task reaches verified through two independent PASS verdicts."
+      ],
+      "verification_commands": [],
+      "max_repair_attempts": 2
+    },
+    {
+      "id": "EX-02",
+      "title": "Dependent verify task",
+      "path": "fixtures/execution/tasks/EX-02_dependent-verify.md",
+      "task_type": "python",
+      "executor": "python-executor",
+      "depends_on": ["EX-01"],
+      "allowed_scope": ["fixtures/execution/work/ex-02.txt"],
+      "out_of_scope": ["fixtures/execution/tasks/EX-02_dependent-verify.md"],
+      "acceptance_criteria": [
+        "The task only becomes ready once EX-01 is verified."
+      ],
+      "verification_commands": [],
+      "max_repair_attempts": 2
+    },
+    {
+      "id": "EX-03",
+      "title": "Repair then verify task",
+      "path": "fixtures/execution/tasks/EX-03_repair-then-verify.md",
+      "task_type": "python",
+      "executor": "python-executor",
+      "depends_on": ["EX-02"],
+      "allowed_scope": ["fixtures/execution/work/ex-03.txt"],
+      "out_of_scope": ["fixtures/execution/tasks/EX-03_repair-then-verify.md"],
+      "acceptance_criteria": [
+        "A first FAIL spends exactly one bounded repair, then the task verifies."
+      ],
+      "verification_commands": [],
+      "max_repair_attempts": 2
+    }
+  ]
+}

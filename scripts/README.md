@@ -89,6 +89,43 @@ gates in order, `C5` exit code (`Exit code: 10 (a delivery gate is pending)`), `
 state transitions, `C7` redacted evidence manifest, `C8` safety posture. Host paths appear
 only as `<project_root>`, `<agents_root>`, and `<core_root>`.
 
+### `execute` mode (stages 5–9)
+
+`--mode execute` runs the minimum execution engine end to end and **stops after stage 9**.
+For every dependency-ready selected task, in plan order, it: resolves the complete task
+contract, initializes (or `--resume`s) the durable schema-v2 run, acquires the pipeline and
+per-task write leases, dispatches the executor, runs the task-declared verification commands
+as runner-owned evidence, obtains two independent read-only verifier verdicts, and repairs
+within the task's bounded attempt limit — ending each task at `verified` or at a truthful
+non-zero terminal state. No documentation, Graphify, final verification, release, recovery,
+or archive/purge code is reachable from `execute`.
+
+- **Plan gate.** The first executor dispatch is refused until the plan gate is satisfied:
+  pass `--approve-plan`, or opt in explicitly with `--unattended`. Without either, the run
+  exits `10` and writes no run state.
+- **Real controls.** `--adapter {claude,codex,auto}` selects and *pins* the execution
+  adapter (a resume that would switch it fails closed with `adapter-unavailable` /
+  `adapter-switch`); `codex` is recognized but unavailable, so it never falls back to
+  `claude`. `--max-repair-attempts N` overrides every selected task's declared bound.
+  `--routine-output-byte-budget` / `--diagnostic-output-byte-budget`, `--resume`, `--task`,
+  and `--through` are recorded on `run.json` with their source (`explicit` / `default`).
+- **Exit codes.** `0` every selected task `verified`; `10` plan gate pending; `20` a task
+  ended `blocked` (repair limit reached, external `BLOCKED` verdict, malformed verifier
+  evidence, out-of-scope change, live foreign lease, dependency suppression); `30` runner
+  error (unknown/unavailable adapter, resume identity or adapter mismatch, incomplete task
+  metadata). The run never reports `0` while any selected task is non-terminal.
+- **Plan input.** `execute` needs the full execution metadata per task: a Markdown plan
+  whose `tasks/<ID>_*.md` files carry an `## Execution Metadata` block, or a JSON plan whose
+  entries carry `task_type` / `executor` / `allowed_scope` / `acceptance_criteria`. The
+  id+type-only shape the dry run accepts is rejected.
+- **Run directory.** `<profile storage>/<feature>/run.json`, or
+  `<project>/.pipeline/runs/<feature>/run.json` when the first task's type has no registry
+  route.
+
+Deterministic fake-adapter acceptance fixtures live in
+[`fixtures/execution/`](../fixtures/execution/); the accepted slice and every deferred
+mode/stage are enumerated in `docs/acceptance/core-execution-engine.md` (parent repository).
+
 ### Compatibility surface (flags forwarded from the legacy CLI)
 
 The compatibility launcher forwards the legacy `run` operational surface verbatim. Every
@@ -103,9 +140,9 @@ the core.
 | `--status` | implemented | resolves the anchors + profile + plan, prints the recorded run state (`feature`, `status`, per-task status) or `no recorded run`, and exits `0`; read-only |
 | `--unattended` | implemented | alias of `--mode unattended` |
 | `--verbose` / `--quiet` | accepted no-op | the portable core emits only the deterministic plan / advisory text; reporter verbosity is owned by the project launcher |
-| `--adapter {claude,codex,auto}` | accepted no-op | adapter routing is not wired in the portable core; the project launcher owns it (OF-02) |
-| `--max-repair-attempts N` | accepted no-op | the repair-loop bound is not wired in the portable core; the project launcher owns it |
-| `--routine-output-byte-budget N` / `--diagnostic-output-byte-budget N` | accepted no-op | output budgeting is not wired in the portable core (redaction still runs with defaults) |
+| `--adapter {claude,codex,auto}` | real control in `--mode execute` | selects and pins the execution adapter for `execute`; accepted as a no-op in `plan-only` / `unattended` |
+| `--max-repair-attempts N` | real control in `--mode execute` | overrides each selected task's declared repair bound for `execute`; accepted as a no-op in `plan-only` / `unattended` |
+| `--routine-output-byte-budget N` / `--diagnostic-output-byte-budget N` | recorded control in `--mode execute` | persisted on `run.json` with its source; accepted as a no-op in `plan-only` / `unattended` (redaction still runs with defaults) |
 
 Known **unimplemented** surface (not stubbed): the legacy `archive` / `purge` / `retry`
 subcommands have no lifecycle-maintenance counterpart in the portable core yet. Passing one

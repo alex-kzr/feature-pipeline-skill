@@ -28,22 +28,37 @@ Standard library only.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from schemas.contracts import TaskSpec
 
+from .adapter_resolution import (
+    AdapterResolution,
+    AdapterResolutionError,
+    ensure_pinned_adapter,
+    pin_adapter,
+    resolve_adapter,
+)
 from .adapters import Adapter
 from .artifacts import write_json_atomic
-from .commands import run_verification_commands, verification_stage
+from .commands import (
+    DIAGNOSTIC_OUTPUT_BUDGET,
+    ROUTINE_OUTPUT_BUDGET,
+    run_verification_commands,
+    verification_stage,
+)
+from .concurrency import pipeline_lease, task_lease
 from .diagnostics import write_diagnostic_report
-from .dispatch import DispatchRequest, dispatch_executor
+from .dispatch import DispatchError, DispatchRequest, dispatch_executor
+from .lease import LeaseHeldError
 from .lifecycle import RunLifecycle
 from .prompt_envelope import EnvelopeAnchors
 from .reports import RepairReport, newest_repair_report, verifier_artifacts, write_repair_report
-from .state import ACTOR_RUNNER, repo_relative
+from .state import ACTOR_RUNNER, ResumeError, Run, StateError, repo_relative
 from .task_files import upsert_blockers_section
 from .verification import (
     VerificationOutcome,
@@ -53,11 +68,30 @@ from .verification import (
     orchestrate_verification,
 )
 
+#: Process exit codes, byte-identical to :mod:`pipeline_core.runner_cli` — ``execute`` mode
+#: shares the baseline compatibility table so one exit code means one thing across modes.
+EXIT_OK = 0
+EXIT_GATE_PENDING = 10
+EXIT_BLOCKED = 20
+EXIT_ERROR = 30
+
+#: The executor capability grant an ``execute`` run composes when a caller does not override
+#: it. A read-only role can never keep ``write`` (:func:`pipeline_core.adapters.effective_grant`).
+DEFAULT_ROLE_GRANT = ("read", "run_checks", "write")
+
 __all__ = [
+    "EXIT_BLOCKED",
+    "EXIT_ERROR",
+    "EXIT_GATE_PENDING",
+    "EXIT_OK",
+    "ExecuteControls",
+    "ExecuteRequest",
+    "ExecuteResult",
     "ExecutionError",
     "RepairPass",
     "TaskExecution",
     "TaskRunResult",
+    "execute_run",
     "run_task",
 ]
 
@@ -402,3 +436,358 @@ def _block(
     run.save()
     return TaskRunResult(
         task_id, "blocked", record.attempts, gates, blocker, Path(diagnostic), tuple(passes))
+
+
+# ============================================================================================
+# Execute-mode integration (EMI-01): one public entry that drives the whole minimum engine.
+# ============================================================================================
+#
+# :func:`execute_run` composes what the earlier phases built — the normalized task contract,
+# durable schema-v2 lifecycle, deterministic adapter resolution and pinning, cross-process
+# write leases, executor dispatch, independent verification, and the bounded repair loop — into
+# one dependency-ordered orchestration that carries every selected task to ``verified`` or to a
+# truthful non-zero terminal state. It deliberately stops after stage 9: no documentation,
+# Graphify, final verification, release, archive, purge, or recovery code is reachable from
+# here.
+
+
+#: The non-terminal task states :func:`execute_run` will still drive forward. A fresh run only
+#: ever presents ``ready``; the other three appear when a resume lands mid-flight (an executor
+#: that reported ``implemented`` before a crash, an open repair round, a rolled-back window).
+_ACTIONABLE_STATES = frozenset({"ready", "implemented", "verification_failed", "repairing"})
+
+_SUPPRESSED_PREFIX = "blocked_by: "
+
+
+@dataclass(frozen=True)
+class ExecuteControls:
+    """The real ``execute``-mode controls, each carrying whether the caller set it explicitly.
+
+    ``max_repair_attempts`` overrides every selected task's declared bound when set. The two
+    byte budgets and the selection/resume flags are persisted with their source
+    (``explicit`` / ``default``) on ``run.json`` so a resume can be reasoned about against the
+    controls the run was created with.
+    """
+
+    plan_approved: bool = False
+    unattended: bool = False
+    resume: bool = False
+    adapter: str | None = None
+    adapter_explicit: bool = False
+    max_repair_attempts: int | None = None
+    routine_output_byte_budget: int | None = None
+    diagnostic_output_byte_budget: int | None = None
+    task: str | None = None
+    through: str | None = None
+
+    @property
+    def gate_opened(self) -> bool:
+        """The first writer dispatch is allowed only once the plan gate is satisfied."""
+        return bool(self.plan_approved or self.unattended)
+
+
+@dataclass(frozen=True)
+class ExecuteRequest:
+    """Everything one ``execute`` invocation needs. The CLI fills this from resolved anchors;
+    a test fills it directly with deterministic fake adapters."""
+
+    feature: str
+    repo_root: Path
+    run_dir: Path
+    prompt_path: Path | str
+    plan_path: Path | str | None
+    specs: tuple[TaskSpec, ...]
+    adapter: Adapter
+    launchers: VerifierLaunchers
+    envelope_anchors: EnvelopeAnchors
+    verifier_anchors: VerifierAnchors
+    #: Maps an adapter name to a truthy value when it can run here. Passed verbatim to
+    #: :func:`pipeline_core.adapter_resolution.resolve_adapter`; the core never probes a
+    #: developer machine from inside this module.
+    environment: Mapping[str, object] = field(default_factory=dict)
+    controls: ExecuteControls = ExecuteControls()
+    role_grant: tuple[str, ...] = DEFAULT_ROLE_GRANT
+    execution_mode: str = "separate"
+    #: The plan file path as it should appear in executor/verifier prompts (logical, not host).
+    plan_prompt_path: str | None = None
+    working_root: str = "."
+    timeout: float | None = None
+    #: Injected so a test can pin the lease owner; production uses this process.
+    pipeline_pid: int | None = None
+
+
+@dataclass(frozen=True)
+class ExecuteResult:
+    """The terminal outcome of one ``execute`` invocation."""
+
+    status: str  # 'ok' | 'gate-pending' | 'blocked' | 'error'
+    exit_code: int
+    message: str
+    run_dir: Path | None
+    run_id: str | None = None
+    task_results: tuple[TaskRunResult, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "ok"
+
+
+def _error(message: str, request: ExecuteRequest | None = None,
+           results: tuple[TaskRunResult, ...] = (), run_id: str | None = None) -> ExecuteResult:
+    return ExecuteResult(
+        "error", EXIT_ERROR, message,
+        request.run_dir if request is not None else None, run_id, results)
+
+
+def _select_ids(order: Sequence[str], task: str | None, through: str | None) -> list[str]:
+    """Mirror the CLI's ``--task`` / ``--through`` selection against the plan order."""
+    ids = list(order)
+    if task is not None:
+        if task not in ids:
+            raise ExecutionError(f"--task names an unknown task: {task}", "unknown-task")
+        return [task]
+    if through is not None:
+        if through not in ids:
+            raise ExecutionError(f"--through names an unknown task: {through}", "unknown-task")
+        return ids[: ids.index(through) + 1]
+    return ids
+
+
+def _controls_map(
+    controls: ExecuteControls, resolution: AdapterResolution
+) -> dict[str, tuple[object, str]]:
+    """``{name: (value, sourced)}`` for :meth:`RunLifecycle.initialize` — every input control
+    recorded with whether it was explicit or a default."""
+    routine = controls.routine_output_byte_budget
+    diagnostic = controls.diagnostic_output_byte_budget
+    return {
+        "mode": ("execute", "explicit"),
+        "adapter_requested": (resolution.requested, "explicit" if controls.adapter_explicit
+                              else "default"),
+        "adapter_resolved": (resolution.resolved, resolution.sourced),
+        "max_repair_attempts": (
+            (controls.max_repair_attempts, "explicit")
+            if controls.max_repair_attempts is not None else (None, "default")),
+        "routine_output_byte_budget": (
+            (routine, "explicit") if routine is not None
+            else (ROUTINE_OUTPUT_BUDGET, "default")),
+        "diagnostic_output_byte_budget": (
+            (diagnostic, "explicit") if diagnostic is not None
+            else (DIAGNOSTIC_OUTPUT_BUDGET, "default")),
+        "resume": (controls.resume, "explicit" if controls.resume else "default"),
+        "task": ((controls.task, "explicit") if controls.task is not None
+                 else (None, "default")),
+        "through": ((controls.through, "explicit") if controls.through is not None
+                    else (None, "default")),
+        "plan_approval": (
+            "approve-plan" if controls.plan_approved
+            else "unattended" if controls.unattended else "none", "explicit"),
+    }
+
+
+def _next_actionable(
+    life: RunLifecycle, selected: Sequence[str], order: Sequence[str]
+) -> str | None:
+    """The first selected task, in plan order, the loop can still move forward.
+
+    A task carrying a ``blocked_by:`` suppression marker is skipped — its blocked root has
+    already ended the run.
+    """
+    chosen = set(selected)
+    for task_id in order:
+        if task_id not in chosen:
+            continue
+        record = life.run.task(task_id)
+        if record.status not in _ACTIONABLE_STATES:
+            continue
+        if (record.blocker or "").startswith(_SUPPRESSED_PREFIX):
+            continue
+        return task_id
+    return None
+
+
+def _pending_reason(life: RunLifecycle, pending: Sequence[str]) -> str:
+    """Explain why a selected task never reached ``verified`` — a fail-closed, truthful line."""
+    parts: list[str] = []
+    for task_id in pending:
+        record = life.run.task(task_id)
+        if record.status == "blocked":
+            parts.append(f"{task_id} blocked: {record.blocker or 'see diagnostics'}")
+        elif (record.blocker or "").startswith(_SUPPRESSED_PREFIX):
+            parts.append(f"{task_id} suppressed ({record.blocker})")
+        else:
+            unmet = [dep for dep in record.depends_on
+                     if life.run.task(dep).status != "verified"]
+            if unmet:
+                parts.append(
+                    f"{task_id} dependency-not-satisfied: {', '.join(unmet)}")
+            else:
+                parts.append(
+                    f"{task_id} did not reach verified (status '{record.status}')")
+    return "; ".join(parts)
+
+
+def _apply_repair_bound(
+    specs: Sequence[TaskSpec], maximum: int | None
+) -> dict[str, TaskSpec]:
+    by_id = {spec.id: spec for spec in specs}
+    if maximum is None:
+        return by_id
+    return {tid: replace(spec, max_repair_attempts=maximum) for tid, spec in by_id.items()}
+
+
+def execute_run(request: ExecuteRequest) -> ExecuteResult:
+    """Drive every selected task to ``verified`` or to a truthful non-zero terminal state.
+
+    Contract (plan §"Execute Mode Integration"):
+
+    * the first executor dispatch is refused until the plan gate is satisfied
+      (``--approve-plan`` or an explicit ``--unattended`` opt-in) — ``EXIT_GATE_PENDING``;
+    * the adapter is resolved from ``request.environment`` and pinned; an unknown/unavailable
+      adapter, or a resume that would switch it, is ``EXIT_ERROR`` — nothing is substituted;
+    * a fresh run persists a complete schema-v2 ``run.json`` (with every control's source)
+      before any process exists; a resume reconciles the persisted run and continues;
+    * the pipeline write lease is held for the whole loop and a per-task lease for each task;
+      a live foreign lease is ``EXIT_BLOCKED``;
+    * dependency-ready tasks run in plan order through :func:`run_task` (dispatch → the full
+      independent-verification gate → bounded repair). A task that ends ``blocked`` ends the
+      run ``EXIT_BLOCKED`` and its dependents are already suppressed;
+    * success (``EXIT_OK``) requires *every* selected task ``verified`` — the run never reports
+      success while any selected task is non-terminal.
+
+    Stages 10–16 are never reached: no documentation, Graphify, final verification, release,
+    archive, purge, or recovery code is called from here.
+    """
+    specs = list(request.specs)
+    if not specs:
+        return _error("execute mode needs at least one task in the plan", request)
+    order = [spec.id for spec in specs]
+
+    try:
+        selected = _select_ids(order, request.controls.task, request.controls.through)
+    except ExecutionError as exc:
+        return _error(str(exc), request)
+
+    # 1. The plan gate — no executor is dispatched in execute mode until it is satisfied.
+    if not request.controls.gate_opened:
+        return ExecuteResult(
+            "gate-pending", EXIT_GATE_PENDING,
+            "plan gate pending: approve with --approve-plan or opt in with --unattended; "
+            "execute mode dispatches no executor until then.",
+            None)
+
+    # 2. Deterministic adapter resolution — fail closed, never substitute one adapter for
+    #    another.
+    try:
+        resolution = resolve_adapter(request.controls.adapter, request.environment)
+    except AdapterResolutionError as exc:
+        return _error(f"{exc.code}: {exc}", request)
+
+    by_id = _apply_repair_bound(specs, request.controls.max_repair_attempts)
+    specs = [by_id[tid] for tid in order]
+
+    # 3. Durable lifecycle: initialize a fresh run, or resume the persisted one.
+    try:
+        if request.controls.resume:
+            life = RunLifecycle.resume(
+                request.run_dir, request.repo_root,
+                feature=request.feature, prompt_path=request.prompt_path,
+                plan_path=request.plan_path,
+                expected_tasks={spec.id: list(spec.depends_on) for spec in specs},
+            )
+            ensure_pinned_adapter(life.run, resolution)
+            for name, (value, sourced) in _controls_map(request.controls, resolution).items():
+                if sourced == "explicit":
+                    life.run.set_control(name, value, sourced=sourced)
+        else:
+            run = Run.create(
+                request.feature, request.prompt_path, request.plan_path,
+                request.run_dir, request.repo_root)
+            life = RunLifecycle.initialize(
+                run,
+                tasks=[(spec.id, list(spec.depends_on)) for spec in specs],
+                controls=_controls_map(request.controls, resolution),
+                adapter_requested=resolution.requested,
+                adapter_resolved=resolution.resolved,
+            )
+    except (StateError, ResumeError, AdapterResolutionError) as exc:
+        return _error(f"{getattr(exc, 'code', 'state-error')}: {exc}", request)
+
+    pin_adapter(life.run, resolution)
+    life.run.save()
+
+    # 4. Cross-process write lease for the whole run.
+    pid = request.pipeline_pid if request.pipeline_pid is not None else os.getpid()
+    lease = pipeline_lease(request.repo_root, life.run.run_id, pid)
+    try:
+        lease.acquire()
+    except LeaseHeldError as exc:
+        return ExecuteResult(
+            "blocked", EXIT_BLOCKED, f"{exc.code}: {exc}",
+            request.run_dir, life.run.run_id)
+
+    results: list[TaskRunResult] = []
+    try:
+        while True:
+            task_id = _next_actionable(life, selected, order)
+            if task_id is None:
+                break
+            spec = by_id[task_id]
+            t_lease = task_lease(request.repo_root, life.run.run_id, task_id, pid)
+            try:
+                t_lease.acquire(task_id)
+            except LeaseHeldError as exc:
+                return ExecuteResult(
+                    "blocked", EXIT_BLOCKED, f"{exc.code}: {exc}",
+                    request.run_dir, life.run.run_id, tuple(results))
+            try:
+                outcome = run_task(
+                    life,
+                    TaskExecution(
+                        spec=spec,
+                        adapter=request.adapter,
+                        launchers=request.launchers,
+                        verifier_anchors=request.verifier_anchors,
+                        envelope_anchors=request.envelope_anchors,
+                        role_grant=tuple(request.role_grant),
+                        execution_mode=request.execution_mode,
+                        plan_path=request.plan_prompt_path,
+                        working_root=request.working_root,
+                        timeout=request.timeout,
+                    ),
+                )
+            except (ExecutionError, DispatchError) as exc:
+                return _error(
+                    f"{getattr(exc, 'code', 'execution-error')}: {exc}",
+                    request, tuple(results), life.run.run_id)
+            finally:
+                t_lease.release()
+
+            results.append(outcome)
+            if outcome.status != "verified":
+                life.run.status = "blocked"
+                life.run.save()
+                return ExecuteResult(
+                    "blocked", EXIT_BLOCKED,
+                    f"{task_id} ended '{outcome.status}': "
+                    f"{outcome.blocker or 'see the persisted diagnostic'}",
+                    request.run_dir, life.run.run_id, tuple(results))
+            life.recompute_readiness()
+
+        pending = [tid for tid in selected if life.run.task(tid).status != "verified"]
+        if not pending:
+            life.run.status = "verified"
+            life.run.save()
+            return ExecuteResult(
+                "ok", EXIT_OK,
+                f"execute complete: {len(selected)} selected task(s) verified. Stopped after "
+                f"stage 9 — documentation, Graphify, final verification, release, and "
+                f"archive/purge are not run in execute mode.",
+                request.run_dir, life.run.run_id, tuple(results))
+        life.run.status = "blocked"
+        life.run.save()
+        return ExecuteResult(
+            "blocked", EXIT_BLOCKED, _pending_reason(life, pending),
+            request.run_dir, life.run.run_id, tuple(results))
+    finally:
+        lease.release()

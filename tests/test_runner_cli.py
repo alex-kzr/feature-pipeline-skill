@@ -14,8 +14,12 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from pipeline_core import runner_cli
+from pipeline_core.verification import VerifierLaunchers
+
+from tests.test_repair import ScriptedExecutor, StubVerifier
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 
@@ -485,6 +489,110 @@ class DependencyAndCommitGateTests(unittest.TestCase):
             ])
         self.assertEqual(code, 10, err)
         self.assertIn("commit - pending", out)
+
+
+RICH_EXECUTE_TASK = {
+    "id": "TSK-01",
+    "title": "Rich execute task",
+    "path": "tasks/TSK-01.md",
+    "task_type": "docs",
+    "executor": "docs-executor",
+    "depends_on": [],
+    "allowed_scope": ["content/tsk-01.txt"],
+    "acceptance_criteria": ["The task reaches verified."],
+    "verification_commands": [],
+    "max_repair_attempts": 2,
+}
+
+
+def _fake_execute_adapters(_project_dir):
+    executor = ScriptedExecutor(("implemented",))
+    launchers = VerifierLaunchers(task=StubVerifier(("PASS",)), test=StubVerifier(("PASS",)))
+    return executor, launchers, {"claude": True, "codex": False}
+
+
+class ExecuteModeTests(unittest.TestCase):
+    """`--mode execute` wiring: the CLI stays thin and delegates to `execution.execute_run`."""
+
+    def _seed_rich(self, directory: str, tasks: list[dict]):
+        dest = Path(directory) / "project"
+        seed = _seed("library-guide", dest, tasks=[{"id": "TSK-01", "type": "docs"}])
+        (seed["project_dir"] / "plan.json").write_text(
+            json.dumps({"feature": "sample-feature", "tasks": tasks}, indent=2) + "\n",
+            encoding="utf-8")
+        return seed
+
+    def test_help_lists_execute_as_a_mode(self) -> None:
+        out = io.StringIO()
+        with self.assertRaises(SystemExit), redirect_stdout(out):
+            runner_cli.main(["--help"])
+        self.assertIn("execute", out.getvalue())
+
+    def test_execute_without_plan_approval_is_gate_pending(self) -> None:
+        with TemporaryDirectory() as directory:
+            seed = self._seed_rich(directory, [RICH_EXECUTE_TASK])
+            with patch.object(runner_cli, "make_execute_adapters", _fake_execute_adapters):
+                code, out, err = _run(seed["anchors"] + [
+                    "--profile", seed["profile_rel"], "--plan", "plan.json", "--mode", "execute",
+                ])
+            self.assertEqual(code, 10, err)
+            self.assertIn("plan gate pending", out)
+            self.assertFalse(
+                (seed["project_dir"] / ".pipeline" / "runs" / "sample-feature"
+                 / "run.json").exists())
+
+    def test_execute_with_plan_approval_runs_a_task_to_verified(self) -> None:
+        with TemporaryDirectory() as directory:
+            seed = self._seed_rich(directory, [RICH_EXECUTE_TASK])
+            with patch.object(runner_cli, "make_execute_adapters", _fake_execute_adapters):
+                code, out, err = _run(seed["anchors"] + [
+                    "--profile", seed["profile_rel"], "--plan", "plan.json",
+                    "--mode", "execute", "--approve-plan",
+                ])
+            self.assertEqual(code, 0, err)
+            self.assertIn("verified", out)
+            run = json.loads(
+                (seed["project_dir"] / ".pipeline" / "runs" / "sample-feature" / "run.json")
+                .read_text(encoding="utf-8"))
+            self.assertEqual(run["tasks"][0]["status"], "verified")
+
+    def test_execute_rejects_an_id_and_type_only_plan(self) -> None:
+        with TemporaryDirectory() as directory:
+            seed = self._seed_rich(directory, [{"id": "TSK-01", "type": "docs"}])
+            with patch.object(runner_cli, "make_execute_adapters", _fake_execute_adapters):
+                code, out, err = _run(seed["anchors"] + [
+                    "--profile", seed["profile_rel"], "--plan", "plan.json",
+                    "--mode", "execute", "--approve-plan",
+                ])
+            self.assertEqual(code, 30, out)
+            self.assertIn("full task metadata", err)
+
+    def test_execute_unattended_opt_in_satisfies_the_gate(self) -> None:
+        with TemporaryDirectory() as directory:
+            seed = self._seed_rich(directory, [RICH_EXECUTE_TASK])
+            with patch.object(runner_cli, "make_execute_adapters", _fake_execute_adapters):
+                code, out, err = _run(seed["anchors"] + [
+                    "--profile", seed["profile_rel"], "--plan", "plan.json",
+                    "--mode", "execute", "--unattended",
+                ])
+            self.assertEqual(code, 0, err)
+            self.assertIn("verified", out)
+
+    def test_execute_unknown_adapter_fails_closed(self) -> None:
+        with TemporaryDirectory() as directory:
+            seed = self._seed_rich(directory, [RICH_EXECUTE_TASK])
+
+            def _no_adapter(_project_dir):
+                executor, launchers, _env = _fake_execute_adapters(_project_dir)
+                return executor, launchers, {}
+
+            with patch.object(runner_cli, "make_execute_adapters", _no_adapter):
+                code, _out, err = _run(seed["anchors"] + [
+                    "--profile", seed["profile_rel"], "--plan", "plan.json",
+                    "--mode", "execute", "--approve-plan",
+                ])
+            self.assertEqual(code, 30)
+            self.assertIn("adapter-unavailable", err)
 
 
 if __name__ == "__main__":

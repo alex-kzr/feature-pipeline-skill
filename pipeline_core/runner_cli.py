@@ -38,13 +38,18 @@ from pathlib import Path
 from typing import Sequence
 
 from schemas import SchemaError, load_profile, validate_relative_path
-from schemas.contracts import TASK_TYPES
+from schemas.contracts import TASK_TYPES, TaskSpec
 
+from .adapters import ClaudeAdapter
+from .execution import ExecuteControls, ExecuteRequest, execute_run
 from .plan_md import MarkdownPlanError, load_markdown_plan
 from .profiles import Anchors, resolve_route
+from .prompt_envelope import EnvelopeAnchors
 from .redaction import build_rules, redact_text
 from .stages import plan_release_dry_run
 from .state import Run, StateError, read_lease, pid_alive
+from .task_files import load_task_spec
+from .verification import VerifierAnchors, VerifierLaunchers
 
 # Process exit codes preserved from the baseline compatibility promise.
 EXIT_OK = 0
@@ -110,8 +115,11 @@ def build_parser() -> argparse.ArgumentParser:
                      help="select tasks from the first up to and including this one")
     run.add_argument("--resume", action="store_true",
                      help="resume a previously recorded run instead of starting one")
-    run.add_argument("--mode", default="plan-only", choices=["plan-only", "unattended"],
-                     help="run mode (default: plan-only)")
+    run.add_argument("--mode", default="plan-only",
+                     choices=["plan-only", "unattended", "execute"],
+                     help="run mode (default: plan-only). 'execute' runs stages 5-9 — executor "
+                          "dispatch, independent verification, and bounded repair — and stops "
+                          "before documentation/delivery")
     run.add_argument("--feature", metavar="NAME", help="override the plan's feature name")
     run.add_argument("--prompt", metavar="REL",
                      help="prompt file, relative to the resolved project directory "
@@ -145,13 +153,17 @@ def build_parser() -> argparse.ArgumentParser:
     compat.add_argument("--unattended", action="store_true",
                         help="alias of --mode unattended")
     compat.add_argument("--adapter", metavar="NAME", choices=["claude", "codex", "auto"],
-                        help="accepted; adapter routing is not wired in the portable core")
+                        help="execution adapter for --mode execute (real control there); "
+                             "accepted as a no-op in plan-only/unattended")
     compat.add_argument("--max-repair-attempts", metavar="N", type=int,
-                        help="accepted; the repair-loop bound is not wired in the portable core")
+                        help="repair-loop bound for --mode execute (overrides each task's "
+                             "declared bound); accepted as a no-op in plan-only/unattended")
     compat.add_argument("--routine-output-byte-budget", metavar="N", type=int,
-                        help="accepted; output budgeting is not wired in the portable core")
+                        help="recorded control for --mode execute; accepted as a no-op in "
+                             "plan-only/unattended")
     compat.add_argument("--diagnostic-output-byte-budget", metavar="N", type=int,
-                        help="accepted; output budgeting is not wired in the portable core")
+                        help="recorded control for --mode execute; accepted as a no-op in "
+                             "plan-only/unattended")
     compat.add_argument("--verbose", action="store_true",
                         help="accepted; reporter verbosity is owned by the project launcher")
     compat.add_argument("--quiet", action="store_true",
@@ -409,6 +421,9 @@ def _build(args: argparse.Namespace) -> tuple[str, int]:
     prompt_rel = _logical_relative(args.prompt, "--prompt") if args.prompt else plan_rel
     _resolve_under(project_dir, prompt_rel, "--prompt")
 
+    if args.mode == "execute" and not args.dry_run:
+        return _execute(args, anchors, agents_root, project_dir, profile, plan_path, prompt_rel)
+
     plan_feature, plan_tasks = _load_plan(plan_path)
     feature = args.feature or plan_feature
     if not feature or not _FEATURE_RE.match(feature):
@@ -495,6 +510,148 @@ def _resume_exit(lease_dir: Path, project_dir: Path, feature: str) -> int:
     except StateError:
         return EXIT_BLOCKED
     return EXIT_GATE_PENDING
+
+
+# --- execute mode (stages 5-9) -----------------------------------------------------------
+
+
+def _project_relative(path: Path, project_dir: Path) -> str | None:
+    try:
+        return path.resolve().relative_to(project_dir.resolve()).as_posix()
+    except ValueError:
+        return None
+
+
+def _load_execute_specs(
+    plan_path: Path, feature_override: str | None
+) -> tuple[str | None, list[TaskSpec]]:
+    """Resolve the plan to complete :class:`TaskSpec` values for execute mode.
+
+    A ``.md`` plan reads its task table and normalizes each ``tasks/<ID>_*.md`` file through
+    :func:`pipeline_core.task_files.load_task_spec`. A ``.json`` plan must carry the full
+    execution metadata per task (``task_type``/``executor``/``allowed_scope``/…) — the
+    id+type-only shape the dry run accepts is not enough to launch anything.
+    """
+    if plan_path.suffix.lower() == ".md":
+        try:
+            feature, entries = load_markdown_plan(plan_path)
+        except MarkdownPlanError as exc:
+            raise CliError(EXIT_ERROR, str(exc)) from None
+        tasks_dir = plan_path.parent / "tasks"
+        specs: list[TaskSpec] = []
+        for entry in entries:
+            tid = entry["id"]
+            matches = sorted(tasks_dir.glob(f"{tid}_*.md"))
+            if not matches:
+                raise CliError(
+                    EXIT_ERROR,
+                    f"execute mode: no task file 'tasks/{tid}_*.md' beside the plan")
+            try:
+                specs.append(load_task_spec(matches[0]))
+            except SchemaError as exc:
+                raise CliError(EXIT_ERROR, f"{tid}: {exc}") from None
+        return (feature_override or feature), specs
+
+    try:
+        data = json.loads(plan_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise CliError(EXIT_ERROR, "plan file not found") from None
+    except json.JSONDecodeError:
+        raise CliError(EXIT_ERROR, "plan file is not valid JSON") from None
+    tasks = data.get("tasks") if isinstance(data, dict) else None
+    if not isinstance(tasks, list) or not tasks:
+        raise CliError(EXIT_ERROR, "plan must be an object with a non-empty 'tasks' list")
+    specs = []
+    seen: set[str] = set()
+    for entry in tasks:
+        if not isinstance(entry, dict):
+            raise CliError(EXIT_ERROR, "every plan task must be an object")
+        kwargs = dict(entry)
+        if "task_type" not in kwargs and "type" in kwargs:
+            kwargs["task_type"] = kwargs.pop("type")
+        if "allowed_scope" not in kwargs:
+            raise CliError(
+                EXIT_ERROR,
+                "execute mode needs full task metadata: give each JSON task 'task_type', "
+                "'executor', 'allowed_scope', and 'acceptance_criteria', or point --plan at a "
+                "Markdown plan with task files")
+        try:
+            spec = TaskSpec.build(**kwargs)
+        except (SchemaError, TypeError) as exc:
+            raise CliError(EXIT_ERROR, f"{entry.get('id', '?')}: {exc}") from None
+        if spec.id in seen:
+            raise CliError(EXIT_ERROR, f"duplicate task id in plan: {spec.id}")
+        seen.add(spec.id)
+        specs.append(spec)
+    feature = str(data["feature"]) if data.get("feature") else None
+    return (feature_override or feature), specs
+
+
+def make_execute_adapters(project_dir: Path):
+    """Build the production executor adapter and the (identical) read-only verifier pair.
+
+    A module-level seam: a test replaces this with deterministic fake adapters.
+    """
+    executor = ClaudeAdapter(working_root=str(project_dir))
+    launchers = VerifierLaunchers(task=executor, test=executor)
+    environment = {"claude": executor.available(), "codex": False}
+    return executor, launchers, environment
+
+
+def _execute(
+    args: argparse.Namespace,
+    anchors: Anchors,
+    agents_root: Path,
+    project_dir: Path,
+    profile,
+    plan_path: Path,
+    prompt_rel: str,
+) -> tuple[str, int]:
+    feature, specs = _load_execute_specs(plan_path, args.feature)
+    if not feature or not _FEATURE_RE.match(feature):
+        raise CliError(EXIT_ERROR, "feature name must be a single [A-Za-z0-9._-] token")
+
+    storage_dir = None
+    for spec in specs:
+        resolved, reason = _route(profile, spec.task_type, anchors)
+        if reason is None:
+            storage_dir = resolved.storage
+            break
+    run_dir = (storage_dir or project_dir / ".pipeline" / "runs") / feature
+
+    executor, launchers, environment = make_execute_adapters(project_dir)
+    controls = ExecuteControls(
+        plan_approved=args.approve_plan,
+        unattended=args.unattended,
+        resume=args.resume,
+        adapter=args.adapter,
+        adapter_explicit=args.adapter is not None,
+        max_repair_attempts=args.max_repair_attempts,
+        routine_output_byte_budget=args.routine_output_byte_budget,
+        diagnostic_output_byte_budget=args.diagnostic_output_byte_budget,
+        task=args.task,
+        through=args.through,
+    )
+    request = ExecuteRequest(
+        feature=feature,
+        repo_root=project_dir,
+        run_dir=run_dir,
+        prompt_path=project_dir / prompt_rel,
+        plan_path=plan_path,
+        specs=tuple(specs),
+        adapter=executor,
+        launchers=launchers,
+        envelope_anchors=EnvelopeAnchors(project_root=".", agents_root=".agents"),
+        verifier_anchors=VerifierAnchors(
+            project_root=str(project_dir), agents_root=str(agents_root)),
+        environment=environment,
+        controls=controls,
+        plan_prompt_path=_project_relative(plan_path, project_dir),
+    )
+    result = execute_run(request)
+    if result.status == "error":
+        raise CliError(result.exit_code, result.message)
+    return redact_text(result.message.rstrip("\n") + "\n", build_rules()), result.exit_code
 
 
 def _non_dry_run_text(args, exit_code, dep_blocked, lease_blocked, unresolved) -> str:
