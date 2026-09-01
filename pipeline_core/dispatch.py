@@ -129,7 +129,7 @@ def dispatch_executor(
     write_text_atomic(artifacts.prompt_envelope, envelope, repo_root=run.repo_root)
 
     launch_request = LaunchRequest(
-        role=EXECUTOR_ROLE,
+        role=spec.executor,
         task_id=task_id,
         prompt=envelope,
         report_path=artifacts.executor_report,
@@ -174,7 +174,7 @@ def dispatch_executor(
         role=EXECUTOR_ROLE, task_id=task_id, attempt=request.attempt
     )
     envelope_request = LaunchRequest(
-        role=EXECUTOR_ROLE,
+        role=spec.executor,
         task_id=task_id,
         prompt=envelope_prompt,
         report_path=artifacts.status_envelope,

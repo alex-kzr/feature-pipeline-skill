@@ -218,6 +218,29 @@ class ClaudeLaunchTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0)
         self.assertIsNotNone(result.session_id)
 
+    @unittest.skipUnless(
+        os.environ.get("PIPELINE_CORE_CLAUDE_SMOKE"), "opt-in installed-CLI characterization"
+    )
+    def test_installed_cli_accepts_every_shipped_executor_role(self) -> None:  # pragma: no cover
+        """RDS-06: each concrete ``Executor`` a task can declare must be a real ``--agent`` the
+        installed CLI recognizes, so ``dispatch_executor`` handing it ``spec.executor`` verbatim
+        never regresses back into the fixed-literal ``"executor"`` bug this task fixed."""
+        import shutil
+
+        if shutil.which("claude") is None:
+            self.skipTest("claude CLI not on PATH")
+        for role in ("python-executor", "rust-executor", "frontend-executor",
+                     "docs-maintainer", "task-verifier", "test-verifier"):
+            with self.subTest(role=role):
+                with tempfile.TemporaryDirectory() as directory:
+                    adapter = ClaudeAdapter(working_root=directory)
+                    result = adapter.launch(_request(
+                        role, read_only=True, role_grant=("read",), no_tools=True,
+                        prompt="Reply with the single word: ready", timeout=120.0,
+                    ))
+                self.assertEqual(result.exit_code, 0, msg=result.stderr)
+                self.assertNotIn("not found", (result.stderr or "").lower())
+
 
 # --- resolution -----------------------------------------------------------------------------
 

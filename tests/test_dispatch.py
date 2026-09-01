@@ -256,6 +256,30 @@ class GenerationTests(unittest.TestCase):
             self.assertEqual(life.run.task(spec.id).next_executor_launch_generation, 2)
 
 
+# --- adapter-facing role resolution (RDS-06) -----------------------------------------------------
+
+
+class AdapterRoleResolutionTests(unittest.TestCase):
+    """``dispatch_executor`` must launch the task's own concrete ``Executor``, not the generic
+    ``EXECUTOR_ROLE`` stage constant — the Claude CLI has no ``executor`` agent."""
+
+    def test_both_adapter_launches_use_the_spec_executor_role(self) -> None:
+        for executor in ("python-executor", "docs-maintainer"):
+            with self.subTest(executor=executor):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    spec = _spec(executor=executor)
+                    life = _running_life(root, spec)
+                    adapter = ScriptedAdapter()
+                    outcome = dispatch_executor(life, _request(spec), adapter)
+
+                    self.assertEqual(outcome.status, "implemented")
+                    self.assertEqual(len(adapter.calls), 2)
+                    self.assertEqual(adapter.calls[0]["role"], executor)
+                    self.assertEqual(adapter.calls[1]["role"], executor)
+                    self.assertNotEqual(adapter.calls[0]["role"], "executor")
+
+
 # --- prompt envelope ---------------------------------------------------------------------------
 
 
