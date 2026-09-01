@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -16,6 +17,7 @@ from pipeline_core.adapters import (
     LaunchRequest,
     build_claude_argv,
     effective_grant,
+    parse_result_text,
     parse_session_id,
 )
 from pipeline_core.adapter_resolution import (
@@ -43,6 +45,26 @@ print(json.dumps({
 """
 
 _SLOW_CLAUDE = "import time\ntime.sleep(30)\n"
+
+#: The literal oxidium-forge PCC-02 reproduction evidence (RDS-07): the raw
+#: ``--output-format json`` wrapper the CLI actually returned, its own ``result`` field
+#: carrying the clean, correctly-shaped status envelope the agent sent.
+_OXIDIUM_FORGE_WRAPPER = json.dumps({
+    "type": "result", "subtype": "success", "is_error": False,
+    "result": '{"role": "executor", "status": "blocked", "task_id": "PCC-01", "attempt": 1}',
+    "session_id": "sess-pcc01", "uuid": "u-1", "duration_ms": 100, "duration_api_ms": 90,
+    "total_cost_usd": 0.01, "usage": {"input_tokens": 1}, "modelUsage": {}, "num_turns": 1,
+    "is_error_status": None, "api_error_status": None, "stop_reason": "end_turn",
+    "subtype_reason": None, "permission_denials": [], "queued_turn_count": 0,
+    "fast_mode_state": None, "fast_mode_disabled_reason": None, "subagent_stats": {},
+    "terminal_reason": None, "time_to_request_ms": 0, "ttft_ms": 0, "ttft_stream_ms": 0,
+})
+
+_WRAPPER_CLAUDE = f"""\
+import sys
+sys.stdin.read()
+print({_OXIDIUM_FORGE_WRAPPER!r})
+"""
 
 
 def _fake_executable(directory: Path, body: str, name: str) -> list[str]:
@@ -179,6 +201,24 @@ class ClaudeLaunchTests(unittest.TestCase):
         self.assertEqual(result.session_id, "sess-CLAUDE-1")
         self.assertIn("implemented", result.stdout)
 
+    def test_launch_extracts_result_text_not_the_raw_wrapper(self) -> None:
+        """RDS-07: ``LaunchResult.stdout`` must be the wrapper's own ``result`` text — the
+        oxidium-forge PCC-02 reproduction evidence, literally, as the regression fixture — not
+        the raw ``--output-format json`` wrapper it travelled inside."""
+        with tempfile.TemporaryDirectory() as directory:
+            executable = _fake_executable(Path(directory), _WRAPPER_CLAUDE, "wrapper_claude.py")
+            adapter = ClaudeAdapter(executable=executable)
+            result = adapter.launch(_request("task_verifier", read_only=True))
+
+        self.assertEqual(
+            result.stdout,
+            '{"role": "executor", "status": "blocked", "task_id": "PCC-01", "attempt": 1}',
+        )
+        self.assertEqual(result.session_id, "sess-pcc01")
+        # The raw wrapper is preserved separately, for a human debugging a failed launch.
+        self.assertIn("total_cost_usd", result.raw_stdout)
+        self.assertNotIn("total_cost_usd", result.stdout)
+
     def test_timeout_terminates_the_process_and_reports_the_sentinel(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             executable = _fake_executable(Path(directory), _SLOW_CLAUDE, "slow_claude.py")
@@ -200,6 +240,20 @@ class ClaudeLaunchTests(unittest.TestCase):
         self.assertIsNone(parse_session_id(""))
         self.assertIsNone(parse_session_id('{"type": "result", "result": "x"}'))
         self.assertEqual(parse_session_id('{"session_id": "abc"}'), "abc")
+
+    def test_parse_result_text_never_invents_a_value(self) -> None:
+        self.assertIsNone(parse_result_text(""))
+        self.assertIsNone(parse_result_text("not json at all"))
+        self.assertIsNone(parse_result_text('{"session_id": "abc"}'))
+        self.assertEqual(parse_result_text('{"result": "hello"}'), "hello")
+        self.assertEqual(parse_result_text(_OXIDIUM_FORGE_WRAPPER), (
+            '{"role": "executor", "status": "blocked", "task_id": "PCC-01", "attempt": 1}'
+        ))
+
+    def test_parse_result_text_takes_the_last_object_on_a_resumed_continuation(self) -> None:
+        first = json.dumps({"result": "first turn"})
+        second = json.dumps({"result": "second turn"})
+        self.assertEqual(parse_result_text(f"{first}\n{second}"), "second turn")
 
     @unittest.skipUnless(
         os.environ.get("PIPELINE_CORE_CLAUDE_SMOKE"), "opt-in installed-CLI characterization"

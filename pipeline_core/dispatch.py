@@ -287,7 +287,9 @@ def _block_for_failure(
             "reason": reason,
             "exit_code": result.exit_code,
             "session_id": result.session_id,
-            "stdout": result.stdout,
+            # Raw CLI wrapper (unextracted), preserved for a human debugging a failed launch —
+            # `result.stdout` itself is the extracted assistant text (RDS-07).
+            "stdout": result.raw_stdout or result.stdout,
             "stderr": result.stderr,
         },
         repo_root=run.repo_root,

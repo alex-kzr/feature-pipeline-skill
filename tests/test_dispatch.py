@@ -5,11 +5,12 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from pipeline_core.adapters import AdapterError, LaunchResult
+from pipeline_core.adapters import AdapterError, ClaudeAdapter, LaunchResult
 from pipeline_core.dispatch import DispatchRequest, dispatch_executor
 from pipeline_core.lifecycle import RunLifecycle
 from pipeline_core.prompt_envelope import EnvelopeAnchors
@@ -278,6 +279,55 @@ class AdapterRoleResolutionTests(unittest.TestCase):
                     self.assertEqual(adapter.calls[0]["role"], executor)
                     self.assertEqual(adapter.calls[1]["role"], executor)
                     self.assertNotEqual(adapter.calls[0]["role"], "executor")
+
+
+# --- result-text extraction through a real ClaudeAdapter (RDS-07) --------------------------------
+
+
+_WRAPPED_CLAUDE_FAKE = """\
+import json, sys
+sys.stdin.read()
+argv = sys.argv[1:]
+if "--resume" in argv:
+    result_text = json.dumps(
+        {"role": "executor", "status": "implemented", "task_id": "RDS-04", "attempt": 1}
+    )
+else:
+    result_text = "- Status: implemented\\n\\n## Files changed\\n- dispatch.py\\n"
+print(json.dumps({
+    "type": "result", "subtype": "success", "is_error": False,
+    "result": result_text, "session_id": "sess-wrapped-1",
+    "usage": {"input_tokens": 1}, "modelUsage": {}, "total_cost_usd": 0.01,
+}))
+"""
+
+
+class ResultTextExtractionTests(unittest.TestCase):
+    """Regression for the oxidium-forge PCC-02 failure: a real ``--output-format json`` launch
+    wraps the executor's actual prose/envelope text inside a ``result`` field alongside 20+
+    telemetry keys. Before RDS-07, ``dispatch_executor`` fed that whole wrapper to
+    ``settle_executor_status``, and the strict status envelope failed to parse
+    (``unparseable-status-envelope``) even though the agent sent a perfectly well-shaped one."""
+
+    def test_wrapped_cli_output_settles_to_implemented_not_unparseable_envelope(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = root / "wrapped_claude.py"
+            script.write_text(_WRAPPED_CLAUDE_FAKE, encoding="utf-8")
+            adapter = ClaudeAdapter(executable=[sys.executable, str(script)])
+
+            spec = _spec()
+            life = _running_life(root, spec)
+            outcome = dispatch_executor(life, _request(spec), adapter)
+
+            self.assertEqual(outcome.status, "implemented")
+            self.assertEqual(outcome.settled_status, "implemented")
+            # The persisted report is the extracted prose, not the raw CLI wrapper.
+            report_text = outcome.artifacts.executor_report.read_text(encoding="utf-8")
+            self.assertIn("Status: implemented", report_text)
+            self.assertNotIn("total_cost_usd", report_text)
+            envelope_text = outcome.artifacts.status_envelope.read_text(encoding="utf-8")
+            self.assertNotIn("total_cost_usd", envelope_text)
 
 
 # --- prompt envelope ---------------------------------------------------------------------------

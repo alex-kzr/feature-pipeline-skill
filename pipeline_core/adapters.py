@@ -112,12 +112,20 @@ class LaunchRequest:
 
 @dataclass(frozen=True)
 class LaunchResult:
-    """The evidence returned by one adapter launch. Facts only — no interpretation."""
+    """The evidence returned by one adapter launch. Facts only — no interpretation.
+
+    ``stdout`` is the assistant's actual text: for a ``--output-format json`` launch (every
+    launch this adapter makes) that is the wrapper's own ``result`` field, extracted by
+    :func:`parse_result_text` — never the raw CLI wrapper object those 20+ telemetry keys live
+    in. ``raw_stdout`` keeps that untouched wrapper text for a human debugging a failed launch;
+    nothing that parses a report/envelope/verdict should ever read it.
+    """
 
     exit_code: int
     stdout: str = ""
     stderr: str = ""
     session_id: str | None = None
+    raw_stdout: str = ""
 
 
 class Adapter(Protocol):
@@ -299,6 +307,27 @@ def parse_session_id(stdout: str) -> str | None:
     return None
 
 
+def parse_result_text(stdout: str) -> str | None:
+    """The assistant's actual text — the wrapper's own ``result`` field — never invented.
+
+    ``--output-format json`` wraps the real report/envelope text the agent wrote inside a
+    ``result`` key alongside 20+ unrelated telemetry keys (``session_id``, ``usage``,
+    ``modelUsage``, ``total_cost_usd``, …). Every downstream consumer that treats stdout as "the
+    agent's report/envelope text" needs this inner string, not the wrapper. Mirrors
+    :func:`parse_session_id`'s parse of the same objects; when more than one object carries a
+    ``result`` string (a resumed continuation can emit more than one), the last one wins, since
+    that is the most recent turn. Returns ``None`` — never an invented empty string — when no
+    object carries a ``result`` string, e.g. stdout that is empty, plain prose, or a
+    truncated/killed partial write; callers fail closed on that the same way
+    :func:`_result_objects` already does for a non-JSON stream.
+    """
+    text_result: str | None = None
+    for event in _result_objects(stdout):
+        if isinstance(event, dict) and isinstance(event.get("result"), str):
+            text_result = event["result"]
+    return text_result
+
+
 # --- process lifetime ------------------------------------------------------------------------
 
 
@@ -445,11 +474,16 @@ class ClaudeAdapter:
             timeout=request.timeout or self._timeout,
             env=self._env,
         )
+        extracted_text = parse_result_text(completed.stdout)
         return LaunchResult(
             exit_code=completed.exit_code,
-            stdout=completed.stdout,
+            # Fail closed the same way the wrapper parse already does: a stream that never
+            # yielded a `result` string (empty, plain text, a truncated/killed partial write)
+            # is passed through unchanged rather than invented as empty.
+            stdout=extracted_text if extracted_text is not None else completed.stdout,
             stderr=completed.stderr,
             session_id=parse_session_id(completed.stdout) or request.resume_session_id,
+            raw_stdout=completed.stdout,
         )
 
     def _cwd_for(self, request: LaunchRequest) -> Path | None:

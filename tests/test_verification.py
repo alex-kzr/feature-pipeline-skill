@@ -16,11 +16,12 @@ The tests cover the four properties the contract names:
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from pipeline_core.adapters import AdapterError, LaunchResult
+from pipeline_core.adapters import AdapterError, ClaudeAdapter, LaunchResult
 from pipeline_core.reports import verifier_artifacts
 from pipeline_core.state import Run, StateError
 from pipeline_core.verification import (
@@ -224,6 +225,50 @@ class VerdictMatrixOrchestrationTests(unittest.TestCase):
             outcome = _orchestrate(run, _spec(), FakeVerifier(), FakeVerifier())
             self.assertEqual(outcome.status, "verified")
             self.assertIsNotNone(outcome.verdict_record)
+
+
+_WRAPPED_VERIFIER_CLAUDE_FAKE = """\
+import json, sys
+sys.stdin.read()
+argv = sys.argv[1:]
+role = argv[argv.index("--agent") + 1]
+if "--resume" in argv:
+    result_text = json.dumps(
+        {"role": role, "verdict": "PASS", "task_id": "VR-02", "attempt": 1}
+    )
+else:
+    result_text = f"# {role}\\n\\n- Verdict: PASS\\n\\n- Findings: none\\n"
+print(json.dumps({
+    "type": "result", "subtype": "success", "is_error": False,
+    "result": result_text, "session_id": "sess-verifier-wrapped",
+    "usage": {}, "modelUsage": {}, "total_cost_usd": 0.02,
+}))
+"""
+
+
+class VerifierResultTextExtractionTests(unittest.TestCase):
+    """Regression for the same oxidium-forge failure shape on the verifier side (RDS-07):
+    both verifier roles hit the identical strict-envelope-fed-the-raw-wrapper bug the moment a
+    task gets past executor dispatch, per this task's evidence."""
+
+    def test_wrapped_cli_output_settles_to_verified_not_unparseable_envelope(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = root / "wrapped_verifier_claude.py"
+            script.write_text(_WRAPPED_VERIFIER_CLAUDE_FAKE, encoding="utf-8")
+            executable = [sys.executable, str(script)]
+
+            run = _implemented_run(root)
+            outcome = _orchestrate(
+                run, _spec(),
+                ClaudeAdapter(executable=executable),
+                ClaudeAdapter(executable=executable),
+            )
+
+            self.assertEqual(outcome.status, "verified")
+            self.assertEqual(outcome.task_verdict, "PASS")
+            self.assertEqual(outcome.test_verdict, "PASS")
+            self.assertIsNone(outcome.failure)
 
 
 class FreshReadOnlyToollessTests(unittest.TestCase):
