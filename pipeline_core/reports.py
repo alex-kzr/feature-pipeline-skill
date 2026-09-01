@@ -1,4 +1,4 @@
-"""Executor launch artifact layout and strict executor-status settlement.
+"""Executor and verifier launch artifact layout and strict token settlement.
 
 Every executor launch *attempt* owns a generation directory
 ``reports/<TASK-ID>/launch-<generation>/``. Beneath it live the executor's prose report
@@ -207,3 +207,212 @@ def settle_executor_status(
             f"{envelope_token!r} stands"
         )
     return StatusResolution(envelope_token, prose_token, envelope_token, drift)
+
+
+# --- independent verifier artifacts and verdict settlement (VR-02) --------------------------
+
+#: The only verdict tokens a verifier launch may report.
+VERDICT_TOKENS = ("PASS", "FAIL", "BLOCKED")
+
+#: The strict JSON verdict-envelope shape — exactly these keys, nothing missing, nothing extra.
+VERDICT_ENVELOPE_KEYS = frozenset({"role", "verdict", "task_id", "attempt"})
+
+#: The two independent verifier roles. ``verify-<attempt>/`` is their per-attempt home so a
+#: repair pass never overwrites the previous attempt's reports (AC-3).
+VERIFIER_ROLES = ("task_verifier", "test_verifier")
+
+_VERIFIER_ROLE_KEY = {"task_verifier": "task", "test_verifier": "test"}
+
+#: A ``Verdict:`` line: an optional leading ``- ``, optional ``*``/``_`` emphasis around the
+#: field name and/or the token, then one of the known tokens. Nothing else parses.
+_VERDICT_RE = re.compile(
+    r"(?im)^\s*-?\s*[*_]*\s*Verdict\s*[*_]*\s*:\s*[*_]*\s*(PASS|FAIL|BLOCKED)\b"
+)
+
+
+def _verifier_role_key(role: str) -> str:
+    key = _VERIFIER_ROLE_KEY.get(str(role).strip().lower().replace("-", "_"))
+    if key is None:
+        raise ReportError(
+            f"unknown verifier role {role!r}; expected one of {list(VERIFIER_ROLES)}",
+            "unknown-verifier-role",
+        )
+    return key
+
+
+@dataclass(frozen=True)
+class VerifierArtifacts:
+    """Every path one independent-verification attempt owns.
+
+    Each of the two roles gets a prose report, a strict JSON verdict envelope, and the prompt
+    envelope it was handed. ``verdict_record`` is the runner's combined, persisted verdict
+    (both tokens plus the timestamp); ``verifier_failure`` holds a launch/settlement failure.
+    """
+
+    task_id: str
+    attempt: int
+    directory: Path
+    task_report: Path
+    task_envelope: Path
+    task_prompt: Path
+    test_report: Path
+    test_envelope: Path
+    test_prompt: Path
+    verdict_record: Path
+    verifier_failure: Path
+
+    def report(self, role: str) -> Path:
+        return getattr(self, f"{_verifier_role_key(role)}_report")
+
+    def envelope(self, role: str) -> Path:
+        return getattr(self, f"{_verifier_role_key(role)}_envelope")
+
+    def prompt(self, role: str) -> Path:
+        return getattr(self, f"{_verifier_role_key(role)}_prompt")
+
+
+def verifier_artifacts(
+    run_dir: str | Path, task_id: str, attempt: int
+) -> VerifierArtifacts:
+    """Resolve every artifact path for ``task_id``'s ``attempt``-th independent verification."""
+    if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
+        raise ReportError(
+            f"verification attempt must be a positive integer, got {attempt!r}",
+            "invalid-verification-attempt",
+        )
+    directory = Path(run_dir) / REPORTS_DIRNAME / str(task_id) / f"verify-{attempt}"
+    return VerifierArtifacts(
+        task_id=str(task_id),
+        attempt=attempt,
+        directory=directory,
+        task_report=directory / f"task-verifier-{attempt}.md",
+        task_envelope=directory / f"task-verifier-envelope-{attempt}.json",
+        task_prompt=directory / f"task-verifier-prompt-{attempt}.md",
+        test_report=directory / f"test-verifier-{attempt}.md",
+        test_envelope=directory / f"test-verifier-envelope-{attempt}.json",
+        test_prompt=directory / f"test-verifier-prompt-{attempt}.md",
+        verdict_record=directory / f"verdict-{attempt}.json",
+        verifier_failure=directory / f"verifier-failure-{attempt}.json",
+    )
+
+
+def build_verdict_envelope_prompt(*, role: str, task_id: str, attempt: int) -> str:
+    """The same-session, tool-free continuation that asks only for the JSON verdict envelope."""
+    shape = (
+        f'{{"role": "{role}", "verdict": <one of {list(VERDICT_TOKENS)}>, '
+        f'"task_id": "{task_id}", "attempt": {attempt}}}'
+    )
+    return "\n".join(
+        [
+            "Reply with only the following JSON object and nothing else — no other text, no "
+            "code fence, no explanation, no markdown:",
+            shape,
+            "",
+            "Use the real verdict from the report you just wrote; do not copy the placeholder "
+            "token.",
+        ]
+    )
+
+
+def parse_verifier_verdict(text: str) -> str:
+    """The upper-cased token from the prose ``- Verdict:`` line, or ``unparseable-report``."""
+    match = _VERDICT_RE.search(text or "")
+    if not match:
+        raise ReportError(
+            "verifier report has no parseable '- Verdict: PASS | FAIL | BLOCKED' line — a "
+            "claim without the required field is not evidence",
+            "unparseable-report",
+        )
+    return match.group(1).upper()
+
+
+def parse_verdict_envelope(text: str, *, role: str, task_id: str, attempt: int) -> str:
+    """Strictly parse one JSON verdict envelope. Never infers, never falls back to the prose."""
+    stripped = (text or "").strip()
+    try:
+        data = json.loads(stripped)
+    except (json.JSONDecodeError, ValueError):
+        raise ReportError(
+            f"verdict envelope is not valid JSON: {stripped[:200]!r}",
+            "unparseable-verdict-envelope",
+        ) from None
+    if not isinstance(data, dict):
+        raise ReportError(
+            "verdict envelope is not a JSON object", "unparseable-verdict-envelope")
+    if set(data.keys()) != set(VERDICT_ENVELOPE_KEYS):
+        raise ReportError(
+            f"verdict envelope has keys {sorted(data.keys())}, expected exactly "
+            f"{sorted(VERDICT_ENVELOPE_KEYS)} — none missing, none extra",
+            "unparseable-verdict-envelope",
+        )
+    verdict = data.get("verdict")
+    if verdict not in VERDICT_TOKENS:
+        raise ReportError(
+            f"verdict envelope 'verdict' is {verdict!r}, expected one of "
+            f"{list(VERDICT_TOKENS)}",
+            "unparseable-verdict-envelope",
+        )
+    if data.get("role") != role:
+        raise ReportError(
+            f"verdict envelope declares role {data.get('role')!r}, expected {role!r}",
+            "unparseable-verdict-envelope",
+        )
+    if data.get("task_id") != task_id:
+        raise ReportError(
+            f"verdict envelope declares task_id {data.get('task_id')!r}, expected {task_id!r}",
+            "unparseable-verdict-envelope",
+        )
+    if data.get("attempt") != attempt or isinstance(data.get("attempt"), bool):
+        raise ReportError(
+            f"verdict envelope declares attempt {data.get('attempt')!r}, expected {attempt!r}",
+            "unparseable-verdict-envelope",
+        )
+    return verdict
+
+
+@dataclass(frozen=True)
+class VerdictResolution:
+    """The settled verifier verdict plus how it was reached."""
+
+    token: str  # 'PASS' | 'FAIL' | 'BLOCKED'
+    prose_token: str | None
+    envelope_token: str
+    drift: str | None  # set when the prose line was absent or malformed
+
+
+def settle_verifier_verdict(
+    *, prose_text: str, envelope_text: str, role: str, task_id: str, attempt: int
+) -> VerdictResolution:
+    """Reconcile the strict prose verdict parser and the authoritative JSON envelope.
+
+    * envelope invalid → ``unparseable-verdict-envelope`` (whatever the prose says);
+    * envelope valid, prose valid, they agree → that token;
+    * envelope valid, prose valid, they disagree → ``verdict-envelope-mismatch`` (fail closed);
+    * envelope valid, prose absent/malformed → the envelope token, with ``drift`` set.
+    """
+    envelope_token = parse_verdict_envelope(
+        envelope_text, role=role, task_id=task_id, attempt=attempt
+    )
+
+    prose_token: str | None = None
+    prose_error: str | None = None
+    try:
+        prose_token = parse_verifier_verdict(prose_text)
+    except ReportError as exc:
+        prose_error = str(exc)
+
+    if prose_token is not None and prose_token != envelope_token:
+        raise ReportError(
+            f"verifier verdict disagreement for {task_id} attempt {attempt}: prose reported "
+            f"{prose_token!r}, envelope reported {envelope_token!r} — not resolved "
+            f"automatically",
+            "verdict-envelope-mismatch",
+        )
+
+    drift = None
+    if prose_token is None:
+        drift = (
+            f"prose verdict line unusable ({prose_error}); envelope verdict "
+            f"{envelope_token!r} stands"
+        )
+    return VerdictResolution(envelope_token, prose_token, envelope_token, drift)

@@ -34,6 +34,11 @@ TASK_TRANSITIONS = {
 #: are preserved; every other state is already safe to resume from as-is.
 RESUME_ROLLBACKS = {"running": "ready", "repairing": "verification_failed"}
 
+#: The only verdict tokens an independent verifier may return. ``BLOCKED`` is an external
+#: condition, never a defect, so it takes precedence over ``FAIL`` when the two verifiers
+#: disagree and it never consumes a repair attempt.
+VERDICT_TOKENS = ("PASS", "FAIL", "BLOCKED")
+
 
 class StateError(Exception):
     """A state failure with a stable code."""
@@ -416,6 +421,47 @@ class Run:
             f"launch-failure:{task_id}:{stage}", frm=str(generation), to=str(generation),
             note=f"{stage} launch generation {generation} failed: {detail}")
         return entry
+
+    def record_verdicts(self, task_id: str, task_verdict: str, test_verdict: str) -> str:
+        """Record two independent verifier verdicts and derive the task's next state.
+
+        The sole producer of ``verified``: it takes ``PASS`` from *both* the task verifier
+        and the test verifier. When the two verdicts differ, precedence is fail-closed — any
+        ``BLOCKED`` blocks the task (an external cause; no repair attempt is consumed) and,
+        failing that, any ``FAIL`` sends it to ``verification_failed`` for the repair loop.
+        Both verdicts and a UTC timestamp are persisted whatever the outcome, so a resume can
+        see exactly what the verifiers said (AC-3).
+        """
+        for verdict in (task_verdict, test_verdict):
+            if verdict not in VERDICT_TOKENS:
+                raise StateError(
+                    f"'{verdict}' is not a verdict token; expected one of "
+                    f"{', '.join(VERDICT_TOKENS)}",
+                    "unknown-verdict",
+                )
+        record = self.task(task_id)
+        record.verification = {
+            "task_verdict": task_verdict,
+            "test_verdict": test_verdict,
+            "verified_at": _now(),
+        }
+        if "BLOCKED" in (task_verdict, test_verdict):
+            reason = "a verifier returned BLOCKED — external cause"
+            if record.status != "blocked":
+                self.transition_task(task_id, "blocked", actor=ACTOR_RUNNER, note=reason)
+            record.blocker = reason
+            self.record_event(
+                f"verdicts:{task_id}", to="blocked",
+                note=f"task_verdict={task_verdict} test_verdict={test_verdict}")
+            return record.status
+        target = "verified" if task_verdict == test_verdict == "PASS" else "verification_failed"
+        self.transition_task(
+            task_id, target, actor=ACTOR_RUNNER,
+            note=f"independent verdicts task={task_verdict} test={test_verdict}")
+        self.record_event(
+            f"verdicts:{task_id}", to=target,
+            note=f"task_verdict={task_verdict} test_verdict={test_verdict}")
+        return target
 
     def to_dict(self) -> dict[str, Any]:
         return {
