@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import shutil
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -17,6 +18,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from pipeline_core import runner_cli
+from pipeline_core.adapters import LaunchRequest
 from pipeline_core.lifecycle import RunLifecycle
 from pipeline_core.state import ACTOR_RUNNER, Run
 from pipeline_core.verification import VerifierLaunchers
@@ -633,7 +635,7 @@ RICH_EXECUTE_TASK = {
 }
 
 
-def _fake_execute_adapters(_project_dir):
+def _fake_execute_adapters(_project_dir, _agents_root):
     executor = ScriptedExecutor(("implemented",))
     launchers = VerifierLaunchers(task=StubVerifier(("PASS",)), test=StubVerifier(("PASS",)))
     return executor, launchers, {"claude": True, "codex": False}
@@ -710,8 +712,8 @@ class ExecuteModeTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             seed = self._seed_rich(directory, [RICH_EXECUTE_TASK])
 
-            def _no_adapter(_project_dir):
-                executor, launchers, _env = _fake_execute_adapters(_project_dir)
+            def _no_adapter(_project_dir, _agents_root):
+                executor, launchers, _env = _fake_execute_adapters(_project_dir, _agents_root)
                 return executor, launchers, {}
 
             with patch.object(runner_cli, "make_execute_adapters", _no_adapter):
@@ -748,6 +750,87 @@ class ExecuteModeTests(unittest.TestCase):
             self.assertFalse(
                 (seed["project_dir"] / ".pipeline" / "runs" / "sample-feature"
                  / "run.json").exists())
+
+
+def _plan_request() -> LaunchRequest:
+    """A minimal read-only request, just enough to render an argv via ``adapter.plan``."""
+    return LaunchRequest(
+        role="task_verifier", task_id="T-1", prompt="", report_path=Path("report.md"),
+        read_only=True, no_tools=True,
+    )
+
+
+class MakeExecuteAdaptersTests(unittest.TestCase):
+    """RDS-10: the production ``ClaudeAdapter`` (shared by executor, task-verifier, and
+    test-verifier — one instance, `VerifierLaunchers(task=executor, test=executor)`) must reach
+    the resolved, symlink-following real path of ``agents_root``. The Claude CLI's own sandbox
+    resolves the *requested* directory before checking it against the allowed list, so granting
+    the unresolved logical (symlinked) path is not equivalent and is silently denied."""
+
+    def test_symlinked_agents_root_is_granted_by_its_resolved_real_path(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            project_dir = root / "project"
+            project_dir.mkdir()
+            real_agents_root = root / "real-agents"
+            real_agents_root.mkdir()
+            symlinked_agents_root = project_dir / ".agents"
+            try:
+                os.symlink(real_agents_root, symlinked_agents_root, target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f"symlinks unavailable: {exc}")
+
+            executor, _launchers, _environment = runner_cli.make_execute_adapters(
+                project_dir, symlinked_agents_root)
+            argv = executor.plan(_plan_request())
+
+            self.assertIn(str(real_agents_root.resolve()), argv)
+            self.assertNotIn(str(symlinked_agents_root), argv)
+
+    def test_coincident_resolved_roots_add_no_duplicate_dir(self) -> None:
+        with TemporaryDirectory() as directory:
+            project_dir = Path(directory)
+            executor, _launchers, _environment = runner_cli.make_execute_adapters(
+                project_dir, project_dir)
+            argv = executor.plan(_plan_request())
+
+            self.assertNotIn("--add-dir", argv)
+
+    @unittest.skipUnless(
+        os.environ.get("PIPELINE_CORE_CLAUDE_SMOKE"), "opt-in installed-CLI characterization"
+    )
+    def test_installed_cli_reads_a_symlinked_skill_with_zero_permission_denials(
+        self,
+    ) -> None:  # pragma: no cover - opt-in
+        if shutil.which("claude") is None:
+            self.skipTest("claude CLI not on PATH")
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            project_dir = root / "project"
+            project_dir.mkdir()
+            real_agents_root = root / "real-agents" / "skills" / "demo"
+            real_agents_root.mkdir(parents=True)
+            (real_agents_root / "SKILL.md").write_text("demo skill\n", encoding="utf-8")
+            symlinked_agents_root = project_dir / ".agents"
+            try:
+                os.symlink(
+                    real_agents_root.parents[1], symlinked_agents_root, target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f"symlinks unavailable: {exc}")
+
+            executor, _launchers, _environment = runner_cli.make_execute_adapters(
+                project_dir, symlinked_agents_root)
+            result = executor.launch(LaunchRequest(
+                role="task_verifier", task_id="T-1", prompt=(
+                    "Read the file .agents/skills/demo/SKILL.md and reply with its exact "
+                    "contents."),
+                report_path=Path("report.md"), read_only=True, role_grant=("read",),
+                tools=("Read",), timeout=120.0,
+            ))
+
+        self.assertEqual(result.exit_code, 0, result.stderr)
+        wrapper = json.loads(result.raw_stdout)
+        self.assertEqual(wrapper.get("permission_denials"), [])
 
 
 if __name__ == "__main__":

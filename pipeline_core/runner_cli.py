@@ -654,12 +654,29 @@ def _parse_attestations(raw: list[str] | None) -> tuple[tuple[str, str], ...]:
     return tuple(parsed)
 
 
-def make_execute_adapters(project_dir: Path):
+def make_execute_adapters(project_dir: Path, agents_root: Path):
     """Build the production executor adapter and the (identical) read-only verifier pair.
 
     A module-level seam: a test replaces this with deterministic fake adapters.
+
+    ``add_dirs`` carries the fully resolved, symlink/junction-following real path of
+    ``agents_root`` (RDS-10). The Claude CLI's own directory sandbox resolves the *requested*
+    path and compares that resolved form against its allowed-directory list — an unresolved
+    logical path (e.g. a symlinked ``.agents`` that reaches outside ``project_dir``, a shared
+    Syncthing-replicated skills library) is silently denied even though it looks like a
+    legitimate subpath. Resolving here, in Python, before the CLI ever sees the argv, is the
+    only way to
+    grant the directory it will actually check. When the resolved ``agents_root`` coincides
+    with the resolved ``project_dir``, ``working_root`` already covers it, so nothing extra is
+    added — this must add exactly the resolved agents root, never a duplicate of what
+    ``working_root`` already grants.
     """
-    executor = ClaudeAdapter(working_root=str(project_dir))
+    resolved_agents_root = Path(agents_root).resolve()
+    resolved_project_dir = Path(project_dir).resolve()
+    add_dirs = (
+        () if resolved_agents_root == resolved_project_dir else (resolved_agents_root,)
+    )
+    executor = ClaudeAdapter(working_root=str(project_dir), add_dirs=add_dirs)
     launchers = VerifierLaunchers(task=executor, test=executor)
     environment = {"claude": executor.available(), "codex": False}
     return executor, launchers, environment
@@ -686,7 +703,7 @@ def _execute(
             break
     run_dir = (storage_dir or project_dir / ".pipeline" / "runs") / feature
 
-    executor, launchers, environment = make_execute_adapters(project_dir)
+    executor, launchers, environment = make_execute_adapters(project_dir, agents_root)
     controls = ExecuteControls(
         plan_approved=args.approve_plan,
         unattended=args.unattended,
