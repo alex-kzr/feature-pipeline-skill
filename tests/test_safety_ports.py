@@ -11,7 +11,15 @@ from pipeline_core.adapters import LaunchRequest, LaunchResult
 from pipeline_core.archive import ArchiveError, archive_manifest
 from pipeline_core.git_port import GitPort, GitSafetyError
 from pipeline_core.recovery_descriptors import DescriptorError, load_descriptor
-from pipeline_core.verification import VerificationError, VerificationEvidence, parse_verdict, verify_independently
+from pipeline_core.verification import (
+    VerificationError,
+    VerificationEvidence,
+    evidence_forces_fail,
+    missing_command_evidence,
+    parse_verdict,
+    verifier_evidence_payload,
+    verify_independently,
+)
 
 
 class StubAdapter:
@@ -32,6 +40,20 @@ class VerificationPortTests(unittest.TestCase):
         self.assertEqual(verify_independently(StubAdapter(), evidence, task, test).status, "verified")
         with self.assertRaises(VerificationError):
             verify_independently(StubAdapter(), evidence, task, LaunchRequest("test", "NP-02", "", Path("x")))
+
+    def test_evidence_payload_is_deterministic_and_flags_unbacked_claims(self) -> None:
+        backed = VerificationEvidence(
+            "NP-02", 1, commands=({"cwd": "pkg", "argv": ["make", "check"]},))
+        self.assertEqual(
+            verifier_evidence_payload(backed), verifier_evidence_payload(backed))
+        self.assertIsNone(evidence_forces_fail(backed))
+
+        missing = missing_command_evidence(
+            [{"cwd": "pkg", "argv": ["make", "lint"]}],
+            [{"cwd": "pkg", "argv": ["make", "check"]}],
+        )
+        flagged = VerificationEvidence("NP-02", 1, missing_evidence=missing)
+        self.assertIsNotNone(evidence_forces_fail(flagged))
 
 
 class SafetyPortTests(unittest.TestCase):

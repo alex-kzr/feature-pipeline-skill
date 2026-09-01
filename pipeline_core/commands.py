@@ -30,7 +30,7 @@ import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Iterable, Mapping, Sequence
 
 from .artifacts import write_text_atomic
 from .concurrency import cargo_mutex, is_cargo_program
@@ -239,6 +239,88 @@ def _run_relative(path: Path, run_dir: str | Path) -> str:
         return path.resolve().relative_to(Path(run_dir).resolve()).as_posix()
     except ValueError:
         return path.as_posix()
+
+
+def verification_stage(task_id: str, *, attempt: int | None = None) -> str:
+    """The stable stage key under which a task's verification commands are recorded.
+
+    Every attempt owns its own stage so a repair re-run's evidence never overwrites the
+    first pass's records.
+    """
+    return f"task:{task_id}:verify" if attempt is None else f"task:{task_id}:verify:{attempt}"
+
+
+def _declared_cwd_argv(command: object) -> tuple[str, tuple[str, ...]]:
+    """Read ``(cwd, argv)`` from a :class:`~schemas.contracts.CommandSpec` or a plain mapping."""
+    cwd = getattr(command, "cwd", None)
+    argv = getattr(command, "argv", None)
+    if argv is None and isinstance(command, Mapping):
+        cwd = command.get("cwd")
+        argv = command.get("argv")
+        if argv is None and command.get("command"):
+            argv = str(command["command"]).split()
+    if argv is None:
+        raise ValueError(f"verification command {command!r} carries no argv")
+    return (str(cwd) if cwd else "."), tuple(str(part) for part in argv)
+
+
+@dataclass(frozen=True)
+class VerificationRun:
+    """The ordered command evidence one verification pass produced.
+
+    ``stopped_reason`` is set when an *external blocker* — a program or toolchain that is not
+    available, or a command that could not be launched — halted the pass before every declared
+    command ran. ``unrun`` then lists the ``(cwd, argv)`` of the declared checks that were
+    deliberately not executed, so the evidence stays explicit about the gap rather than
+    looking complete. A real command *failure* (a non-zero exit or a timeout) never stops the
+    pass and never appears here.
+    """
+
+    records: tuple[dict, ...]
+    unrun: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    stopped_reason: str | None = None
+
+    @property
+    def complete(self) -> bool:
+        return self.stopped_reason is None and not self.unrun
+
+
+def run_verification_commands(
+    run: Run,
+    commands: Iterable[object],
+    *,
+    stage: str,
+    task_id: str | None = None,
+    attempt: int | None = None,
+    timeout: float | None = None,
+) -> VerificationRun:
+    """Execute every declared verification command in order as runner-owned evidence.
+
+    Each command runs through :func:`run_command` from its own repository-relative working
+    directory with a shell-free argv, producing a stable ``command-N`` record on ``run``. A
+    command that *fails* does not stop the pass — the complete declared set is still
+    exercised. A command that is *blocked* (its program/toolchain is unavailable, or it could
+    not be launched) is an external blocker: the pass stops there, the evidence already
+    gathered is retained, and the remaining declared checks are returned in ``unrun``.
+    """
+    declared = [_declared_cwd_argv(command) for command in commands]
+    records: list[dict] = []
+    for index, (cwd, argv) in enumerate(declared, start=1):
+        record = run_command(run, stage, cwd, list(argv), timeout=timeout)
+        record["command_index"] = index
+        if task_id is not None:
+            record["task_id"] = task_id
+        if attempt is not None:
+            record["attempt"] = attempt
+        records.append(record)
+        if record.get("disposition") == DISPOSITION_BLOCKED:
+            reason = record.get("reason") or "declared verification command could not be run"
+            return VerificationRun(
+                tuple(records),
+                tuple(declared[index:]),
+                f"{' '.join(argv)}: {reason}",
+            )
+    return VerificationRun(tuple(records))
 
 
 def outcome_of(record: dict) -> CommandOutcome:
