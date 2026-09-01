@@ -43,6 +43,7 @@ from .reports import (
     settle_executor_status,
 )
 from .state import ACTOR_EXECUTOR, repo_relative
+from .worktree import AttributionResult, attribute_executor_window, capture_snapshot
 
 EXECUTOR_ROLE = "executor"
 
@@ -91,6 +92,9 @@ class DispatchOutcome:
     report_text: str | None
     drift: str | None = None
     failure: str | None = None
+    #: Runner-owned attribution of the implementation diff to this launch window. Present
+    #: only on a trusted ``implemented``; ``None`` for every blocked outcome.
+    attribution: AttributionResult | None = None
 
 
 def dispatch_executor(
@@ -137,6 +141,12 @@ def dispatch_executor(
         timeout=request.timeout,
         envelope_path=artifacts.status_envelope,
     )
+    # Runner-owned evidence: content snapshot of the whole worktree immediately before the
+    # launch, with the runner's own run/lock/report directory excluded. Subtracting this
+    # after the launch attributes exactly this generation's changes, independent of both
+    # executor claims and pre-existing workspace dirt.
+    before_snapshot = capture_snapshot(run.repo_root, exclude_roots=(run.run_dir,))
+
     try:
         result = adapter.launch(launch_request)
     except AdapterError as exc:
@@ -210,7 +220,19 @@ def dispatch_executor(
             report_text, resolution.drift,
         )
 
-    # Trusted 'implemented': record evidence, then the single legal transition.
+    # Trusted 'implemented': attribute the executor window, record evidence, then the single
+    # legal transition.
+    attribution = attribute_executor_window(
+        before_snapshot,
+        run.repo_root,
+        artifacts=artifacts,
+        task_id=task_id,
+        allowed_scope=spec.allowed_scope,
+        attempt=request.attempt,
+        generation=generation,
+        executor_report=artifacts.executor_report,
+        exclude_roots=(run.run_dir,),
+    )
     run.record_executor_evidence(
         task_id,
         attempt=request.attempt,
@@ -219,6 +241,16 @@ def dispatch_executor(
         session_id=result.session_id,
         reserved_manifest=repo_relative(artifacts.implementation_manifest, run.repo_root),
         reserved_diff=repo_relative(artifacts.implementation_diff, run.repo_root),
+    )
+    run.record_implementation_attribution(
+        task_id,
+        generation=generation,
+        attempt=request.attempt,
+        attribution_state=attribution.state,
+        manifest=attribution.manifest,
+        diff=attribution.diff,
+        changed_files=attribution.changed_files,
+        reason=attribution.reason,
     )
     if resolution.drift:
         run.record_event(
@@ -229,7 +261,7 @@ def dispatch_executor(
     )
     return DispatchOutcome(
         task_id, generation, "implemented", "implemented", artifacts, result, envelope_result,
-        report_text, resolution.drift,
+        report_text, resolution.drift, attribution=attribution,
     )
 
 

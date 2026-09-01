@@ -4,6 +4,7 @@ and the structural rule that an executor launch can end only at ``implemented``.
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -79,6 +80,7 @@ class ScriptedAdapter:
         write_report: bool = True,
         write_envelope: bool = True,
         raise_code: str | None = None,
+        on_launch=None,
     ) -> None:
         self.prose_status = prose_status
         self.prose_text = prose_text
@@ -90,6 +92,9 @@ class ScriptedAdapter:
         self.write_report = write_report
         self.write_envelope = write_envelope
         self.raise_code = raise_code
+        #: Optional callable invoked once, on the executor launch, to simulate the executor
+        #: mutating the workspace inside its window.
+        self.on_launch = on_launch
         self.calls: list[dict] = []
 
     def launch(self, request):  # noqa: ANN001 - test double
@@ -104,6 +109,8 @@ class ScriptedAdapter:
             return self._deliver(request, text, self.envelope_exit, self.write_envelope)
         if self.raise_code:
             raise AdapterError("scripted adapter failure", self.raise_code)
+        if self.on_launch is not None:
+            self.on_launch()
         text = self.prose_text if self.prose_text is not None else _prose(self.prose_status)
         return self._deliver(request, text, self.launch_exit, self.write_report)
 
@@ -381,21 +388,32 @@ class StateAuthorityTests(unittest.TestCase):
             life.run.transition_task(spec.id, "verified", actor=ACTOR_RUNNER)
             self.assertEqual(life.run.task(spec.id).status, "verified")
 
-    def test_reserved_manifest_and_diff_paths_are_not_written_by_dispatch(self) -> None:
+    def test_dispatch_attributes_the_window_and_fails_closed_without_a_repo(self) -> None:
+        # The dispatch fixtures run outside a Git work tree, so attribution has no baseline:
+        # it must persist an explicit 'unavailable' packet, never a silent empty one.
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             spec = _spec()
             life = _running_life(root, spec)
             outcome = dispatch_executor(life, _request(spec), ScriptedAdapter())
 
-            self.assertFalse(outcome.artifacts.implementation_manifest.exists())
-            self.assertFalse(outcome.artifacts.implementation_diff.exists())
+            self.assertEqual(outcome.attribution.state, "unavailable")
+            self.assertTrue(outcome.attribution.reason)
+            self.assertTrue(outcome.artifacts.implementation_manifest.is_file())
+            self.assertTrue(outcome.artifacts.implementation_diff.is_file())
+            manifest = json.loads(
+                outcome.artifacts.implementation_manifest.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["attribution_state"], "unavailable")
+            self.assertEqual(manifest["changed_files"], [])
+            self.assertIsNotNone(manifest["reason"])
+
             implementation = life.run.task(spec.id).execution_evidence["implementation"]
-            self.assertIsNone(implementation["manifest"])
-            self.assertIsNone(implementation["diff"])
+            self.assertEqual(implementation["state"], "unavailable")
             self.assertTrue(
-                implementation["manifest_reserved"].endswith(
+                implementation["manifest"].endswith(
                     "launch-1/implementation-manifest-1.json"))
+            self.assertTrue(
+                implementation["diff"].endswith("launch-1/implementation-diff-1.md"))
 
 
 class ArtifactLayoutTests(unittest.TestCase):
@@ -408,6 +426,103 @@ class ArtifactLayoutTests(unittest.TestCase):
         with self.assertRaises(ReportError) as ctx:
             launch_artifacts("run-dir", "RDS-04", 0)
         self.assertEqual(ctx.exception.code, "invalid-launch-generation")
+
+
+def _git(root: Path, *argv: str) -> None:
+    subprocess.run(["git", *argv], cwd=root, check=True, capture_output=True, text=True)
+
+
+def _init_repo(root: Path) -> None:
+    _git(root, "init", "-q")
+    _git(root, "config", "user.email", "t@example.com")
+    _git(root, "config", "user.name", "Test")
+    (root / ".gitignore").write_text("storage/\nprompts/\n", encoding="utf-8")
+    (root / "src.py").write_text("print('base')\n", encoding="utf-8")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-qm", "base")
+
+
+class DispatchAttributionTests(unittest.TestCase):
+    def test_known_delta_captures_the_executor_edit_and_classifies_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _init_repo(root)
+            spec = _spec(allowed_scope=("src.py",))
+            life = _running_life(root, spec)
+
+            def mutate() -> None:
+                (root / "src.py").write_text("print('changed by executor')\n", encoding="utf-8")
+                (root / "stray.txt").write_text("out of scope\n", encoding="utf-8")
+
+            outcome = dispatch_executor(
+                life, _request(spec), ScriptedAdapter(on_launch=mutate))
+
+            self.assertEqual(outcome.attribution.state, "known")
+            by_path = {row["path"]: row for row in outcome.attribution.changed_files}
+            self.assertEqual(by_path["src.py"]["status"], "modified")
+            self.assertEqual(by_path["src.py"]["classification"], "in_allowed_scope")
+            self.assertTrue(by_path["src.py"]["digest"].startswith("sha256:"))
+            self.assertEqual(by_path["stray.txt"]["classification"], "out_of_scope")
+
+            diff = outcome.artifacts.implementation_diff.read_text(encoding="utf-8")
+            self.assertIn("# attribution: known", diff)
+            self.assertIn("changed by executor", diff)
+            self.assertEqual(
+                life.run.task(spec.id).changed_files, ["src.py", "stray.txt"])
+
+    def test_preexisting_dirt_is_excluded_but_a_further_edit_is_kept(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _init_repo(root)
+            # Pre-existing, un-committed changes present before the launch window opens.
+            (root / "src.py").write_text("print('pre-existing dirt')\n", encoding="utf-8")
+            (root / "untouched.py").write_text("# pre-existing new file\n", encoding="utf-8")
+            spec = _spec(allowed_scope=("src.py", "untouched.py"))
+            life = _running_life(root, spec)
+
+            def mutate() -> None:
+                (root / "src.py").write_text("print('executor went further')\n", encoding="utf-8")
+
+            outcome = dispatch_executor(
+                life, _request(spec), ScriptedAdapter(on_launch=mutate))
+
+            self.assertEqual(outcome.attribution.state, "known")
+            paths = {row["path"] for row in outcome.attribution.changed_files}
+            self.assertEqual(paths, {"src.py"})  # untouched.py drops out entirely
+
+    def test_empty_window_is_known_empty_not_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _init_repo(root)
+            spec = _spec(allowed_scope=("src.py",))
+            life = _running_life(root, spec)
+            outcome = dispatch_executor(life, _request(spec), ScriptedAdapter())
+
+            self.assertEqual(outcome.attribution.state, "known-empty")
+            self.assertEqual(outcome.attribution.changed_files, [])
+            manifest = json.loads(
+                outcome.artifacts.implementation_manifest.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["attribution_state"], "known-empty")
+            self.assertIn(
+                "known-empty",
+                outcome.artifacts.implementation_diff.read_text(encoding="utf-8"))
+
+    def test_runner_owned_run_dir_churn_is_never_attributed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _init_repo(root)
+            # Track the run directory so ls-files would surface it if it were not excluded.
+            (root / ".gitignore").write_text("prompts/\n", encoding="utf-8")
+            spec = _spec(allowed_scope=("src.py",))
+            life = _running_life(root, spec)
+
+            def mutate() -> None:
+                (life.run.run_dir / "runner-note.txt").write_text("churn\n", encoding="utf-8")
+
+            outcome = dispatch_executor(
+                life, _request(spec), ScriptedAdapter(on_launch=mutate))
+
+            self.assertEqual(outcome.attribution.state, "known-empty")
 
 
 if __name__ == "__main__":

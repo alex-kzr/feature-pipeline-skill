@@ -352,6 +352,47 @@ class Run:
             actor=ACTOR_EXECUTOR, note="executor report recorded as execution evidence")
         return evidence
 
+    def record_implementation_attribution(
+        self,
+        task_id: str,
+        *,
+        generation: int,
+        attempt: int,
+        attribution_state: str,
+        manifest: str,
+        diff: str,
+        changed_files: list[dict[str, Any]],
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Fill in the runner-owned executor-window delta on this task's execution evidence.
+
+        Called after :meth:`record_executor_evidence` for a trusted ``implemented`` launch:
+        it replaces the ``pending-attribution`` implementation block with the persisted
+        manifest/diff refs, the attributed change rows, and the distinct attribution state
+        (``known`` / ``known-empty`` / ``unavailable``). Never touches any verification field.
+        """
+        record = self.task(task_id)
+        evidence = dict(record.execution_evidence)
+        implementation = dict(evidence.get("implementation", {}))
+        implementation.update(
+            {
+                "state": attribution_state,
+                "reason": reason,
+                "changed_files": list(changed_files),
+                "manifest": manifest,
+                "diff": diff,
+            }
+        )
+        evidence["implementation"] = implementation
+        record.execution_evidence = evidence
+        record.changed_files = [str(entry["path"]) for entry in changed_files]
+        self.record_event(
+            f"implementation-attribution:{task_id}", to=str(generation),
+            actor=ACTOR_EXECUTOR,
+            note=f"executor launch-{generation} diff attributed ({attribution_state})",
+        )
+        return evidence
+
     def record_launch_failure(
         self,
         task_id: str,
