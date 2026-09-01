@@ -24,7 +24,10 @@ TASK_TRANSITIONS = {
     "running": {"implemented", "blocked"},
     "implemented": {"verified", "verification_failed", "blocked"},
     "verification_failed": {"repairing", "implemented", "blocked"},
-    "repairing": {"implemented", "blocked"}, "verified": set(),
+    # ``repairing -> running`` lets the runner reopen a consumed repair attempt as a fresh
+    # executor window so the one dispatch path — which owns launch generations, status
+    # settlement, and diff attribution — is reused unchanged for a repair redispatch.
+    "repairing": {"implemented", "blocked", "running"}, "verified": set(),
     "blocked": {"ready", "implemented"},
 }
 
@@ -462,6 +465,35 @@ class Run:
             f"verdicts:{task_id}", to=target,
             note=f"task_verdict={task_verdict} test_verdict={test_verdict}")
         return target
+
+    def begin_repair(self, task_id: str, *, maximum: int) -> bool:
+        """Spend one repair attempt on a ``verification_failed`` task.
+
+        When repair budget remains this increments ``attempts`` and moves the task
+        ``verification_failed -> repairing`` in one step, returning ``True``. When ``attempts``
+        has already reached ``maximum`` nothing is mutated and ``False`` is returned, so the
+        caller can block the task at the limit. An external ``BLOCKED`` outcome is settled by
+        :meth:`record_verdicts` before this is ever reached, so an attempt is only spent on a
+        real verification ``FAIL``.
+        """
+        if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 0:
+            raise StateError(
+                "maximum repair attempts must be a non-negative integer", "invalid-max-attempts")
+        record = self.task(task_id)
+        if record.status != "verification_failed":
+            raise TransitionError(
+                f"cannot begin a repair for {task_id} from {record.status}", "illegal-transition")
+        if record.attempts >= maximum:
+            return False
+        previous = record.attempts
+        record.attempts = previous + 1
+        self.transition_task(
+            task_id, "repairing", actor=ACTOR_RUNNER,
+            note=f"repair attempt {record.attempts} of {maximum}")
+        self.record_event(
+            f"repair-attempt:{task_id}", frm=str(previous), to=str(record.attempts),
+            note="repair attempt consumed")
+        return True
 
     def to_dict(self) -> dict[str, Any]:
         return {

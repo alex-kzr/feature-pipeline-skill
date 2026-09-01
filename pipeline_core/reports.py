@@ -23,6 +23,9 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
+
+from .artifacts import write_text_atomic
 
 #: The only two states an executor launch may report. There is deliberately no ``verified``
 #: token: nothing an executor writes can carry a task past ``implemented``.
@@ -416,3 +419,174 @@ def settle_verifier_verdict(
             f"{envelope_token!r} stands"
         )
     return VerdictResolution(envelope_token, prose_token, envelope_token, drift)
+
+
+# --- bounded-repair report consolidation (VR-03) -------------------------------------------
+
+#: A repair report lives beside the launch and verify directories at
+#: ``reports/<TASK-ID>/repair-<attempt>.md`` and is immutable once written — a later attempt
+#: writes a new number, it never rewrites an earlier one.
+REPAIR_REPORT_STEM = "repair"
+
+_REPAIR_NAME_RE = re.compile(rf"^{REPAIR_REPORT_STEM}-([1-9][0-9]*)\.md$")
+
+
+@dataclass(frozen=True)
+class RepairReport:
+    """The consolidated repair report one failed verification gate produced."""
+
+    path: Path
+    attempt: int
+    source_attempt: int
+    findings: tuple[str, ...]
+    product_defects: tuple[str, ...]
+    environment_problems: tuple[str, ...]
+    regression_tests: tuple[str, ...]
+
+
+def repair_report_path(run_dir: str | Path, task_id: str, attempt: int) -> Path:
+    """Resolve the immutable path for ``task_id``'s ``attempt``-numbered repair report."""
+    if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
+        raise ReportError(
+            f"repair attempt must be a positive integer, got {attempt!r}",
+            "invalid-repair-attempt",
+        )
+    return (
+        Path(run_dir) / REPORTS_DIRNAME / str(task_id) / f"{REPAIR_REPORT_STEM}-{attempt}.md"
+    )
+
+
+def newest_repair_report(run_dir: str | Path, task_id: str) -> Path | None:
+    """The highest-numbered persisted repair report for ``task_id``, or ``None``.
+
+    A resume that lands back on ``verification_failed`` uses this to continue the exact repair
+    round already opened rather than deriving a fresh one and double-counting the attempt.
+    """
+    base = Path(run_dir) / REPORTS_DIRNAME / str(task_id)
+    if not base.is_dir():
+        return None
+    best: tuple[int, Path] | None = None
+    for candidate in base.glob(f"{REPAIR_REPORT_STEM}-*.md"):
+        match = _REPAIR_NAME_RE.match(candidate.name)
+        if match and candidate.is_file():
+            number = int(match.group(1))
+            if best is None or number > best[0]:
+                best = (number, candidate)
+    return None if best is None else best[1]
+
+
+def consolidate_findings(*sources: str) -> tuple[str, ...]:
+    """Order-preserving, whitespace-insensitive de-duplication of the verifier finding lines.
+
+    Both verifiers' verbatim reports are still carried in the repair report; this is the
+    single merged, de-duplicated list the repairing executor works from.
+    """
+    seen: set[str] = set()
+    merged: list[str] = []
+    for text in sources:
+        for raw in (text or "").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if not line.strip("-*_ 0123456789."):
+                continue
+            key = " ".join(line.lower().split())
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(line)
+    return tuple(merged)
+
+
+def _bullet_list(items: Sequence[str], empty: str) -> list[str]:
+    rows = [str(item).strip() for item in items if str(item).strip()]
+    return [f"- {row}" for row in rows] if rows else [f"- {empty}"]
+
+
+def write_repair_report(
+    run: object,
+    spec: object,
+    attempt: int,
+    *,
+    task_verifier_text: str,
+    test_verifier_text: str,
+    source_attempt: int | None = None,
+    product_defects: Sequence[str] = (),
+    environment_problems: Sequence[str] = (),
+    regression_tests: Sequence[str] = (),
+) -> RepairReport:
+    """Consolidate both verifier reports into one attempt-numbered repair report.
+
+    The report always cites both source reports, restates the original allowed/out-of-scope
+    verbatim, separates product defects from environment problems, and lists the regression
+    tests the repair must rerun. Deduplication of the *finding lines* is done here;
+    interpretation (which finding is which kind) is the caller's, passed in explicitly. The
+    two source reports are also embedded verbatim so nothing is lost.
+    """
+    if source_attempt is None:
+        source_attempt = max(attempt - 1, 1)
+    path = repair_report_path(run.run_dir, spec.id, attempt)
+    findings = consolidate_findings(task_verifier_text, test_verifier_text)
+    maximum = getattr(spec, "max_repair_attempts", "?")
+    scope = ", ".join(getattr(spec, "allowed_scope", ()) or ()) or "none"
+    out_of_scope = ", ".join(getattr(spec, "out_of_scope", ()) or ()) or "none"
+    verify_dir = f"{REPORTS_DIRNAME}/{spec.id}/verify-{source_attempt}"
+
+    lines: list[str] = [
+        f"# Repair Report — {spec.id} — attempt {attempt} of {maximum}",
+        "",
+        f"- Task: {spec.id} — {getattr(spec, 'title', '') or spec.id}",
+        f"- Consolidated from: {verify_dir}/task-verifier-{source_attempt}.md, "
+        f"{verify_dir}/test-verifier-{source_attempt}.md",
+        f"- Attempt: {attempt} of {maximum}",
+        f"- Source verification gate: {source_attempt}",
+        f"- Original scope (unchanged): {scope}",
+        f"- Out of scope (unchanged): {out_of_scope}",
+        "",
+        "## Consolidated findings (deduplicated)",
+        "",
+        *_bullet_list(findings, "no discrete finding lines parsed — read the verbatim reports"),
+        "",
+        "## Product defects to fix",
+        "",
+        *_bullet_list(product_defects, "none itemised — treat every consolidated finding above as a defect"),
+        "",
+        "## Environment problems (out of this task's control — do not fix here)",
+        "",
+        *_bullet_list(environment_problems, "none"),
+        "",
+        "## Required regression tests",
+        "",
+        *_bullet_list(
+            regression_tests,
+            "rerun every declared verification command and re-check every acceptance criterion",
+        ),
+        "",
+        "## Scope constraints (verbatim, unchanged)",
+        "",
+        f"- Write only inside: {scope}",
+        f"- Never touch: {out_of_scope}",
+        "- Do not widen scope to satisfy a finding; an out-of-scope need is a blocker or a "
+        "discovery, never a change in this task.",
+        "",
+        "## Task-verifier report (verbatim)",
+        "",
+        (task_verifier_text or "").strip() or "_(the task-verifier report was empty)_",
+        "",
+        "## Test-verifier report (verbatim)",
+        "",
+        (test_verifier_text or "").strip() or "_(the test-verifier report was empty)_",
+        "",
+    ]
+    document = "\n".join(line.rstrip() for line in lines).rstrip("\n") + "\n"
+    written = write_text_atomic(path, document, repo_root=getattr(run, "repo_root", None))
+    return RepairReport(
+        path=written,
+        attempt=attempt,
+        source_attempt=source_attempt,
+        findings=findings,
+        product_defects=tuple(str(x).strip() for x in product_defects if str(x).strip()),
+        environment_problems=tuple(
+            str(x).strip() for x in environment_problems if str(x).strip()),
+        regression_tests=tuple(str(x).strip() for x in regression_tests if str(x).strip()),
+    )

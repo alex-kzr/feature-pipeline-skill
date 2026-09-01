@@ -34,8 +34,13 @@ __all__ = [
     "TaskFileError",
     "load_task_spec",
     "parse_execution_metadata",
+    "render_blocker_entry",
     "synthesize_acceptance_criteria",
+    "upsert_blockers_section",
 ]
+
+BLOCKERS_HEADING = "## Blockers"
+_BLOCKER_KEY_RE = re.compile(r"^-\s+\[(?P<key>[^\]]+)\]")
 
 
 class TaskFileError(SchemaError):
@@ -388,3 +393,91 @@ def _spec_from_defaults(
         )
     except SchemaError as exc:
         raise TaskFileError(f"{rel}: {exc}") from None
+
+
+# --- narrow, idempotent '## Blockers' section edits (VR-03) -------------------------------
+
+
+def render_blocker_entry(
+    key: str, reason: str, *, fields: Mapping[str, object] | None = None
+) -> list[str]:
+    """One ``- [key] reason`` bullet plus an indented ``  - name: value`` line per field."""
+    entry = [f"- [{key}] {reason}".rstrip()]
+    for name, value in (fields or {}).items():
+        entry.append(f"  - {name}: {value}")
+    return entry
+
+
+def _blocker_groups(section: Sequence[str]) -> list[list[str]]:
+    """Split a ``## Blockers`` section body into one list of lines per ``- [..]`` entry."""
+    groups: list[list[str]] = []
+    current: list[str] | None = None
+    for line in section:
+        if _BLOCKER_KEY_RE.match(line):
+            current = [line]
+            groups.append(current)
+        elif current is not None and (not line.strip() or line.startswith((" ", "\t"))):
+            current.append(line)
+        elif current is not None:
+            current.append(line)
+    for group in groups:
+        while group and not group[-1].strip():
+            group.pop()
+    return groups
+
+
+def upsert_blockers_section(
+    path: str | Path,
+    key: str,
+    reason: str,
+    *,
+    fields: Mapping[str, object] | None = None,
+) -> bool:
+    """Add or replace exactly one ``[key]`` entry under the task file's ``## Blockers`` section.
+
+    The section is created at end of file when absent. An entry whose key already matches is
+    replaced in place; any other entry is preserved verbatim. Nothing outside the
+    ``## Blockers`` section is touched — the ``## Status`` and ``## Acceptance Criteria``
+    checkboxes are never rewritten. Returns ``True`` when the file content changed.
+    """
+    path = Path(path)
+    original = path.read_text(encoding="utf-8")
+    newline = "\r\n" if "\r\n" in original else "\n"
+    lines = original.splitlines()
+    entry = render_blocker_entry(key, reason, fields=fields)
+
+    start = next(
+        (i for i, line in enumerate(lines) if line.strip().lower() == BLOCKERS_HEADING.lower()),
+        None,
+    )
+    if start is None:
+        prefix = lines[:]
+        if prefix and prefix[-1].strip():
+            prefix.append("")
+        rebuilt = prefix + [BLOCKERS_HEADING, "", *entry, ""]
+    else:
+        end = next(
+            (j for j in range(start + 1, len(lines)) if lines[j].startswith("## ")),
+            len(lines),
+        )
+        groups = _blocker_groups(lines[start + 1:end])
+        replaced = False
+        for group in groups:
+            match = _BLOCKER_KEY_RE.match(group[0])
+            if match and match.group("key") == key:
+                group[:] = entry
+                replaced = True
+        if not replaced:
+            groups.append(entry)
+        body: list[str] = [""]
+        for group in groups:
+            body.extend(group)
+            body.append("")
+        rebuilt = lines[:start + 1] + body + lines[end:]
+
+    document = newline.join(line.rstrip() for line in rebuilt).rstrip(newline).rstrip("\n")
+    document += newline
+    if document == original:
+        return False
+    path.write_text(document, encoding="utf-8")
+    return True
