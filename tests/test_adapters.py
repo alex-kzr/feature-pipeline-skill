@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from pipeline_core.adapters import (
@@ -294,6 +295,54 @@ class ClaudeLaunchTests(unittest.TestCase):
                     ))
                 self.assertEqual(result.exit_code, 0, msg=result.stderr)
                 self.assertNotIn("not found", (result.stderr or "").lower())
+
+
+# --- encoding (RDS-11) ------------------------------------------------------------------------
+
+
+#: Reads the prompt as raw bytes and dumps them back as ASCII hex — a write-side check that
+#: never itself depends on any text encoding, so only the parent's ``Popen`` encoding of the
+#: prompt string can be under test.
+_HEX_ECHO_CLAUDE = """\
+import sys
+sys.stdout.write(sys.stdin.buffer.read().hex())
+"""
+
+#: Writes a real, hardcoded UTF-8-encoded non-ASCII reply — exactly how the installed CLI (a
+#: Node.js process) behaves on a redirected stdout pipe regardless of the host's locale. A
+#: read-side check: only the parent's decoding of these bytes is under test.
+_UTF8_REPLY_CLAUDE = """\
+import sys
+sys.stdin.buffer.read()
+sys.stdout.buffer.write("caf\\u00e9 \\u2014 na\\u00efve".encode("utf-8"))
+"""
+
+
+class SubprocessEncodingTests(unittest.TestCase):
+    """RDS-11: ``run_subprocess`` must not depend on ``locale.getpreferredencoding()`` — Windows
+    non-English locales (verified: ``cp1251``) are not UTF-8, and silently mis-encode/decode
+    every non-ASCII character crossing the pipe in either direction. A patched "wrong" locale
+    is used so this is deterministic across hosts, rather than depending on the CI machine's own
+    locale already happening to be UTF-8 (which would mask the bug)."""
+
+    def test_prompt_is_written_as_utf8_regardless_of_host_locale(self) -> None:
+        from pipeline_core.adapters import run_subprocess
+
+        prompt = "café — naïve"
+        with tempfile.TemporaryDirectory() as directory:
+            argv = _fake_executable(Path(directory), _HEX_ECHO_CLAUDE, "hex_echo.py")
+            with unittest.mock.patch("locale.getpreferredencoding", return_value="cp1251"):
+                completed = run_subprocess(argv, prompt=prompt, timeout=5)
+        self.assertEqual(completed.stdout, prompt.encode("utf-8").hex())
+
+    def test_reply_is_decoded_as_utf8_regardless_of_host_locale(self) -> None:
+        from pipeline_core.adapters import run_subprocess
+
+        with tempfile.TemporaryDirectory() as directory:
+            argv = _fake_executable(Path(directory), _UTF8_REPLY_CLAUDE, "utf8_reply.py")
+            with unittest.mock.patch("locale.getpreferredencoding", return_value="cp1251"):
+                completed = run_subprocess(argv, prompt="hi", timeout=5)
+        self.assertEqual(completed.stdout, "café — naïve")
 
 
 # --- resolution -----------------------------------------------------------------------------

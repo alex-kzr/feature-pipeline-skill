@@ -28,6 +28,13 @@ Used                                         Evidence
 ``-r/--resume <id>``                         continue a healthy session
 ===========================================  =========================================
 
+``run_subprocess()`` pins ``encoding="utf-8"`` (with ``errors="strict"``) on the
+``subprocess.Popen`` call explicitly — the CLI is a Node.js process that always speaks UTF-8 on
+its stdio pipes, but Python's own ``text=True`` mode falls back to
+``locale.getpreferredencoding()`` for both directions when no ``encoding=`` is given, which is
+not UTF-8 on every host locale (RDS-11). Leaving it implicit silently corrupts every non-ASCII
+character crossing the pipe in either direction.
+
 There is no per-directory *write* sandbox on this CLI, so a read-only launch is enforced
 structurally: an effective grant with no write capability, a ``--tools`` set with no editing
 tool, those same editing tools in ``--disallowed-tools``, ``git push`` always denied, and
@@ -379,6 +386,8 @@ def run_subprocess(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="strict",
         env=env,
     )
     if os.name == "nt":
