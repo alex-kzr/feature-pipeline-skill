@@ -21,7 +21,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from pipeline_core.adapters import AdapterError, ClaudeAdapter, LaunchResult
+from pipeline_core.adapters import (
+    AdapterError,
+    ClaudeAdapter,
+    LaunchResult,
+    build_claude_argv,
+)
 from pipeline_core.reports import verifier_artifacts
 from pipeline_core.state import Run, StateError
 from pipeline_core.verification import (
@@ -227,11 +232,66 @@ class VerdictMatrixOrchestrationTests(unittest.TestCase):
             self.assertIsNotNone(outcome.verdict_record)
 
 
+class _AgentNameRecordingVerifier(FakeVerifier):
+    """A :class:`FakeVerifier` that also keeps every :class:`LaunchRequest` it is handed, so a
+    test can rebuild the production argv and inspect the ``--agent`` value that would reach the
+    CLI (RDS-14)."""
+
+    def __init__(self, **kw: object) -> None:
+        super().__init__(**kw)  # type: ignore[arg-type]
+        self.requests: list = []
+
+    def launch(self, request):  # noqa: ANN001 - test double
+        self.requests.append(request)
+        return super().launch(request)
+
+    def initial_request(self):
+        """The fresh verdict launch — not the same-session envelope continuation."""
+        return next(r for r in self.requests if not r.resume_session_id)
+
+
+class VerifierAgentNameRegressionTests(unittest.TestCase):
+    """RDS-14: ``_run_one_verifier`` threads ``normalize_role``'s underscored form into
+    ``LaunchRequest.role``; before the fix ``build_claude_argv`` put that on the wire verbatim as
+    ``--agent task_verifier``, an agent name the CLI does not have (its on-disk agents are
+    hyphenated). These drive the real ``orchestrate_verification`` path and assert the rebuilt
+    argv carries the hyphenated on-disk name."""
+
+    def _initial_requests(self, directory: str):
+        run = _implemented_run(Path(directory))
+        task = _AgentNameRecordingVerifier()
+        test = _AgentNameRecordingVerifier()
+        outcome = _orchestrate(run, _spec(), task, test)
+        self.assertEqual(outcome.status, "verified", outcome.failure)
+        return task.initial_request(), test.initial_request()
+
+    def _agent_arg(self, request) -> str:  # noqa: ANN001 - test helper
+        argv = build_claude_argv(request, executable="claude")
+        return argv[argv.index("--agent") + 1]
+
+    def test_task_verifier_launch_builds_the_hyphenated_on_disk_agent(self) -> None:  # AC-1
+        with tempfile.TemporaryDirectory() as directory:
+            task_request, _test_request = self._initial_requests(directory)
+            self.assertEqual(self._agent_arg(task_request), "task-verifier")
+
+    def test_test_verifier_launch_builds_the_hyphenated_on_disk_agent(self) -> None:  # AC-2
+        with tempfile.TemporaryDirectory() as directory:
+            _task_request, test_request = self._initial_requests(directory)
+            self.assertEqual(self._agent_arg(test_request), "test-verifier")
+
+    def test_the_underscored_normalized_form_never_reaches_the_agent_flag(self) -> None:  # AC-4
+        with tempfile.TemporaryDirectory() as directory:
+            for request in self._initial_requests(directory):
+                self.assertNotIn("_", self._agent_arg(request))
+
+
 _WRAPPED_VERIFIER_CLAUDE_FAKE = """\
 import json, sys
 sys.stdin.read()
 argv = sys.argv[1:]
-role = argv[argv.index("--agent") + 1]
+# The CLI's on-disk agent is hyphenated (task-verifier); a prompt-following model still emits
+# normalize_role()'s underscored form in its envelope, which is what the runner settles against.
+role = argv[argv.index("--agent") + 1].replace("-", "_")
 if "--resume" in argv:
     result_text = json.dumps(
         {"role": role, "verdict": "PASS", "task_id": "VR-02", "attempt": 1}

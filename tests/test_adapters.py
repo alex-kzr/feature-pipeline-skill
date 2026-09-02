@@ -18,6 +18,7 @@ from pipeline_core.adapters import (
     LaunchRequest,
     build_claude_argv,
     effective_grant,
+    on_disk_agent_name,
     parse_result_text,
     parse_session_id,
 )
@@ -126,6 +127,21 @@ class ClaudeArgvTests(unittest.TestCase):
         self.assertIn("Bash(git push:*)", argv[argv.index("--disallowed-tools") + 1])
         for token in argv:
             self.assertFalse(any(ch in token for ch in "|;<>`\n"), token)
+
+    def test_verifier_agent_flag_is_the_hyphenated_on_disk_name(self) -> None:  # RDS-14
+        for normalized, on_disk in (
+            ("task_verifier", "task-verifier"),
+            ("test_verifier", "test-verifier"),
+        ):
+            argv = build_claude_argv(
+                _request(normalized, read_only=True, no_tools=True), executable="claude")
+            self.assertEqual(argv[argv.index("--agent") + 1], on_disk)
+
+    def test_on_disk_agent_name_denormalizes_verifiers_and_passes_executors_through(self) -> None:
+        self.assertEqual(on_disk_agent_name("task_verifier"), "task-verifier")
+        self.assertEqual(on_disk_agent_name("test-verifier"), "test-verifier")
+        self.assertEqual(on_disk_agent_name("python-executor"), "python-executor")
+        self.assertEqual(on_disk_agent_name("rust-executor"), "rust-executor")
 
     def test_resume_appends_the_session_id(self) -> None:
         argv = build_claude_argv(_request("executor", resume_session_id="sess-9"))

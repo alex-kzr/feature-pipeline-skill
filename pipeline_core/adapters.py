@@ -154,6 +154,28 @@ def is_verifier_role(role: str) -> bool:
     return normalize_role(role) in VERIFIER_ROLES
 
 
+#: The exact on-disk Claude CLI agent name for each normalized verifier role. The CLI's
+#: ``--agent`` flag needs the hyphenated on-disk spelling; :func:`normalize_role`'s underscored
+#: output exists only so ``"task-verifier"`` and ``"task_verifier"`` *compare* equal for an
+#: internal table lookup — it must never be the value put on the wire (RDS-14).
+_ON_DISK_VERIFIER_AGENTS: dict[str, str] = {
+    "task_verifier": "task-verifier",
+    "test_verifier": "test-verifier",
+}
+
+
+def on_disk_agent_name(role: str) -> str:
+    """The exact on-disk agent name the CLI's ``--agent`` flag expects for ``role``.
+
+    A verifier role is canonicalized to its hyphenated on-disk spelling no matter which
+    spelling the caller passed; every other role already names itself on disk (executors
+    declare e.g. ``python-executor``) and is returned untouched. This is the single conversion
+    point between :func:`normalize_role`'s internal underscored form and the ``--agent`` value
+    — keep it the only one so an underscored spelling can never reach the CLI again (RDS-14).
+    """
+    return _ON_DISK_VERIFIER_AGENTS.get(normalize_role(role), role)
+
+
 def request_is_read_only(request: LaunchRequest) -> bool:
     """A request is read-only when it says so, or when its role is read-only by definition."""
     return bool(request.read_only) or is_verifier_role(request.role)
@@ -302,7 +324,7 @@ def build_claude_argv(
             disallowed.append(PUSH_DENY_TOOL)
         argv += ["--disallowed-tools", ",".join(disallowed)]
 
-    argv += ["--agent", request.role]
+    argv += ["--agent", on_disk_agent_name(request.role)]
 
     for directory in add_dirs:
         argv += ["--add-dir", str(directory)]
