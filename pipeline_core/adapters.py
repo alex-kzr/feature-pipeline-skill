@@ -168,8 +168,9 @@ def on_disk_agent_name(role: str) -> str:
     """The exact on-disk agent name the CLI's ``--agent`` flag expects for ``role``.
 
     A verifier role is canonicalized to its hyphenated on-disk spelling no matter which
-    spelling the caller passed; every other role already names itself on disk (executors
-    declare e.g. ``python-executor``) and is returned untouched. This is the single conversion
+    spelling the caller passed; every other role already names itself on disk (a
+    ``custom-executor`` role, say, is spelled that way in both places) and is returned
+    untouched. This is the single conversion
     point between :func:`normalize_role`'s internal underscored form and the ``--agent`` value
     — keep it the only one so an underscored spelling can never reach the CLI again (RDS-14).
     """
