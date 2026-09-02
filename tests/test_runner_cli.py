@@ -635,7 +635,7 @@ RICH_EXECUTE_TASK = {
 }
 
 
-def _fake_execute_adapters(_project_dir, _agents_root):
+def _fake_execute_adapters(_project_dir, _agents_root, _core_root=None):
     executor = ScriptedExecutor(("implemented",))
     launchers = VerifierLaunchers(task=StubVerifier(("PASS",)), test=StubVerifier(("PASS",)))
     return executor, launchers, {"claude": True, "codex": False}
@@ -712,8 +712,9 @@ class ExecuteModeTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             seed = self._seed_rich(directory, [RICH_EXECUTE_TASK])
 
-            def _no_adapter(_project_dir, _agents_root):
-                executor, launchers, _env = _fake_execute_adapters(_project_dir, _agents_root)
+            def _no_adapter(_project_dir, _agents_root, _core_root=None):
+                executor, launchers, _env = _fake_execute_adapters(
+                    _project_dir, _agents_root, _core_root)
                 return executor, launchers, {}
 
             with patch.object(runner_cli, "make_execute_adapters", _no_adapter):
@@ -761,11 +762,12 @@ def _plan_request() -> LaunchRequest:
 
 
 class MakeExecuteAdaptersTests(unittest.TestCase):
-    """RDS-10: the production ``ClaudeAdapter`` (shared by executor, task-verifier, and
-    test-verifier — one instance, `VerifierLaunchers(task=executor, test=executor)`) must reach
-    the resolved, symlink-following real path of ``agents_root``. The Claude CLI's own sandbox
-    resolves the *requested* directory before checking it against the allowed list, so granting
-    the unresolved logical (symlinked) path is not equivalent and is silently denied."""
+    """RDS-10 / RDS-17: the production ``ClaudeAdapter`` (shared by executor, task-verifier,
+    and test-verifier — one instance, `VerifierLaunchers(task=executor, test=executor)`) must
+    reach the resolved, symlink-following real paths of ``agents_root`` (RDS-10) *and*
+    ``core_root`` (RDS-17). The Claude CLI's own sandbox resolves the *requested* directory
+    before checking it against the allowed list, so granting the unresolved logical
+    (symlinked) path is not equivalent and is silently denied."""
 
     def test_symlinked_agents_root_is_granted_by_its_resolved_real_path(self) -> None:
         with TemporaryDirectory() as directory:
@@ -781,7 +783,7 @@ class MakeExecuteAdaptersTests(unittest.TestCase):
                 self.skipTest(f"symlinks unavailable: {exc}")
 
             executor, _launchers, _environment = runner_cli.make_execute_adapters(
-                project_dir, symlinked_agents_root)
+                project_dir, symlinked_agents_root, project_dir)
             argv = executor.plan(_plan_request())
 
             self.assertIn(str(real_agents_root.resolve()), argv)
@@ -791,10 +793,79 @@ class MakeExecuteAdaptersTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             project_dir = Path(directory)
             executor, _launchers, _environment = runner_cli.make_execute_adapters(
-                project_dir, project_dir)
+                project_dir, project_dir, project_dir)
             argv = executor.plan(_plan_request())
 
             self.assertNotIn("--add-dir", argv)
+
+    def test_doubly_linked_core_root_is_granted_by_its_resolved_real_path(self) -> None:
+        """The core discovery link sits *inside* ``agents_root`` but its real target is a
+        separate checkout outside the resolved agents root: the adapter must grant the
+        resolved target, not the unresolved logical path (RDS-17 AC-1/AC-2)."""
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            project_dir = root / "project"
+            project_dir.mkdir()
+
+            # agents_root: a link inside the project reaching a real tree outside it.
+            real_agents_root = root / "real-agents"
+            (real_agents_root / "skills" / "software-development").mkdir(parents=True)
+            symlinked_agents_root = project_dir / ".agents"
+
+            # core discovery link: a second link, under agents_root, whose target is a
+            # sibling tree outside agents_root's resolved root.
+            real_core_root = root / "real-core"
+            (real_core_root / "pipeline_core").mkdir(parents=True)
+            (real_core_root / "pipeline_core" / "adapters.py").write_text(
+                "# core SPI\n", encoding="utf-8")
+            core_discovery_link = (
+                real_agents_root / "skills" / "software-development" / "feature-pipeline")
+            try:
+                os.symlink(real_agents_root, symlinked_agents_root, target_is_directory=True)
+                os.symlink(real_core_root, core_discovery_link, target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f"symlinks unavailable: {exc}")
+
+            # The run is anchored on the logical (doubly-linked) discovery-link path.
+            logical_core_root = (
+                symlinked_agents_root / "skills" / "software-development" / "feature-pipeline")
+            executor, _launchers, _environment = runner_cli.make_execute_adapters(
+                project_dir, symlinked_agents_root, logical_core_root)
+            argv = executor.plan(_plan_request())
+
+            self.assertIn(str(real_agents_root.resolve()), argv)
+            self.assertIn(str(real_core_root.resolve()), argv)
+            self.assertNotIn(str(logical_core_root), argv)
+
+            # A read under the resolved core target would be granted.
+            granted = [Path(argv[i + 1]) for i, a in enumerate(argv) if a == "--add-dir"]
+            core_file = (real_core_root / "pipeline_core" / "adapters.py").resolve()
+            self.assertTrue(any(core_file.is_relative_to(d) for d in granted))
+
+    def test_core_root_under_agents_root_adds_no_duplicate_dir(self) -> None:
+        """When ``core_root`` resolves under the already-granted resolved ``agents_root``,
+        no extra/duplicate ``--add-dir`` is emitted for it (RDS-17 AC-3)."""
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            project_dir = root / "project"
+            project_dir.mkdir()
+            real_agents_root = root / "real-agents"
+            nested_core_root = real_agents_root / "skills" / "software-development" / "core"
+            nested_core_root.mkdir(parents=True)
+            symlinked_agents_root = project_dir / ".agents"
+            try:
+                os.symlink(real_agents_root, symlinked_agents_root, target_is_directory=True)
+            except OSError as exc:
+                self.skipTest(f"symlinks unavailable: {exc}")
+
+            logical_core_root = (
+                symlinked_agents_root / "skills" / "software-development" / "core")
+            executor, _launchers, _environment = runner_cli.make_execute_adapters(
+                project_dir, symlinked_agents_root, logical_core_root)
+            argv = executor.plan(_plan_request())
+
+            self.assertEqual(argv.count("--add-dir"), 1)
+            self.assertIn(str(real_agents_root.resolve()), argv)
 
     @unittest.skipUnless(
         os.environ.get("PIPELINE_CORE_CLAUDE_SMOKE"), "opt-in installed-CLI characterization"
@@ -812,18 +883,31 @@ class MakeExecuteAdaptersTests(unittest.TestCase):
             real_agents_root.mkdir(parents=True)
             (real_agents_root / "SKILL.md").write_text("demo skill\n", encoding="utf-8")
             symlinked_agents_root = project_dir / ".agents"
+
+            # A second link, under agents_root, whose target is a separate core checkout.
+            real_core_root = root / "real-core"
+            (real_core_root / "pipeline_core").mkdir(parents=True)
+            (real_core_root / "pipeline_core" / "adapters.py").write_text(
+                "# core SPI\n", encoding="utf-8")
+            core_discovery_link = (
+                real_agents_root.parents[1] / "software-development" / "feature-pipeline")
+            core_discovery_link.parent.mkdir(parents=True, exist_ok=True)
             try:
                 os.symlink(
                     real_agents_root.parents[1], symlinked_agents_root, target_is_directory=True)
+                os.symlink(real_core_root, core_discovery_link, target_is_directory=True)
             except OSError as exc:
                 self.skipTest(f"symlinks unavailable: {exc}")
 
+            logical_core_root = (
+                symlinked_agents_root / "software-development" / "feature-pipeline")
             executor, _launchers, _environment = runner_cli.make_execute_adapters(
-                project_dir, symlinked_agents_root)
+                project_dir, symlinked_agents_root, logical_core_root)
             result = executor.launch(LaunchRequest(
                 role="task_verifier", task_id="T-1", prompt=(
-                    "Read the file .agents/skills/demo/SKILL.md and reply with its exact "
-                    "contents."),
+                    "Read the file .agents/skills/demo/SKILL.md and then the file "
+                    ".agents/software-development/feature-pipeline/pipeline_core/adapters.py, "
+                    "and reply with their exact contents."),
                 report_path=Path("report.md"), read_only=True, role_grant=("read",),
                 tools=("Read",), timeout=120.0,
             ))

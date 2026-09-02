@@ -654,28 +654,49 @@ def _parse_attestations(raw: list[str] | None) -> tuple[tuple[str, str], ...]:
     return tuple(parsed)
 
 
-def make_execute_adapters(project_dir: Path, agents_root: Path):
+def _resolve_add_dirs(project_dir: Path, *anchors: Path) -> tuple[Path, ...]:
+    """Resolve each anchor and keep only those not already reachable from a granted root.
+
+    The adapter's ``working_root`` (the resolved ``project_dir``) is always reachable, so it
+    seeds the covered set without being emitted. Each further anchor is resolved once
+    (symlink/junction-following) and emitted only when it does not sit under ``project_dir``
+    or under an anchor already granted in this call — a core checkout nested under the agents
+    root needs no separate ``--add-dir``; one in an unrelated filesystem tree does. Input
+    order is preserved and no resolved path is emitted twice.
+    """
+    covered: list[Path] = [Path(project_dir).resolve()]
+    granted: list[Path] = []
+    for anchor in anchors:
+        resolved = Path(anchor).resolve()
+        if any(resolved.is_relative_to(root) for root in covered):
+            continue
+        granted.append(resolved)
+        covered.append(resolved)
+    return tuple(granted)
+
+
+def make_execute_adapters(project_dir: Path, agents_root: Path, core_root: Path):
     """Build the production executor adapter and the (identical) read-only verifier pair.
 
     A module-level seam: a test replaces this with deterministic fake adapters.
 
-    ``add_dirs`` carries the fully resolved, symlink/junction-following real path of
-    ``agents_root`` (RDS-10). The Claude CLI's own directory sandbox resolves the *requested*
-    path and compares that resolved form against its allowed-directory list — an unresolved
-    logical path (e.g. a symlinked ``.agents`` that reaches outside ``project_dir``, a shared
-    Syncthing-replicated skills library) is silently denied even though it looks like a
-    legitimate subpath. Resolving here, in Python, before the CLI ever sees the argv, is the
-    only way to
-    grant the directory it will actually check. When the resolved ``agents_root`` coincides
-    with the resolved ``project_dir``, ``working_root`` already covers it, so nothing extra is
-    added — this must add exactly the resolved agents root, never a duplicate of what
-    ``working_root`` already grants.
+    ``add_dirs`` carries the fully resolved, symlink/junction-following real paths of the
+    anchors the run was given — ``agents_root`` (RDS-10) and ``core_root`` (RDS-17) — that
+    are not already reachable from the adapter's ``working_root`` (the resolved
+    ``project_dir``). The Claude CLI's own directory sandbox resolves the *requested* path
+    and compares that resolved form against its allowed-directory list, so an unresolved
+    logical path is silently denied even though it looks like a legitimate subpath: a
+    symlinked ``.agents`` that reaches outside ``project_dir`` (a shared Syncthing-replicated
+    skills library), or — one link deeper — a ``.agents/skills/software-development/
+    feature-pipeline`` discovery link whose real target is a *separate* core checkout, not a
+    subdirectory of the resolved ``agents_root``. Resolving here, in Python, before the CLI
+    ever sees the argv, is the only way to grant the directory it will actually check. A
+    resolved anchor that already sits under ``working_root`` (or under an anchor already
+    granted) adds nothing — this emits exactly the roots genuinely outside every other
+    grant, never a duplicate, whether the core resolves under ``agents_root``, beside it, or
+    in an unrelated tree.
     """
-    resolved_agents_root = Path(agents_root).resolve()
-    resolved_project_dir = Path(project_dir).resolve()
-    add_dirs = (
-        () if resolved_agents_root == resolved_project_dir else (resolved_agents_root,)
-    )
+    add_dirs = _resolve_add_dirs(project_dir, agents_root, core_root)
     executor = ClaudeAdapter(working_root=str(project_dir), add_dirs=add_dirs)
     launchers = VerifierLaunchers(task=executor, test=executor)
     environment = {"claude": executor.available(), "codex": False}
@@ -703,7 +724,8 @@ def _execute(
             break
     run_dir = (storage_dir or project_dir / ".pipeline" / "runs") / feature
 
-    executor, launchers, environment = make_execute_adapters(project_dir, agents_root)
+    executor, launchers, environment = make_execute_adapters(
+        project_dir, agents_root, anchors.core_root)
     controls = ExecuteControls(
         plan_approved=args.approve_plan,
         unattended=args.unattended,

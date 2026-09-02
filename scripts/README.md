@@ -133,17 +133,26 @@ or archive/purge code is reachable from `execute`.
   `attestation-source-not-verified`, `attestation-mismatch` on a mismatched resume) and
   writes no partial state. An attested dependency never satisfies an unattested sibling
   dependency.
-- **`--add-dir` for a shared/synced `agents_root`.** The dispatched executor, task-verifier,
-  and test-verifier (one adapter instance, shared) are always granted the fully resolved,
-  symlink/junction-following real path of `agents_root` as an extra `--add-dir`, alongside
-  `project_dir` as the working root. This matters whenever a project's `agents_root` resolves
-  *outside* `project_dir` — e.g. a symlink to a shared, synced skills library, the layout
-  `--project-skill`'s own docstring already anticipates. Without the resolved real path
-  granted, the Claude CLI's own directory sandbox denies every `Read` (and read `Bash`) under
-  that path, since the CLI checks the *resolved* target against its allowed-directory list, not
-  the logical (symlinked) one requested — which breaks the executor/verifier contract's very
-  first instruction, reading required skills. When `agents_root` resolves to the same real path
-  as `project_dir`, nothing extra is added (`working_root` already covers it).
+- **`--add-dir` for a shared/synced `agents_root` and a split-checkout `core_root`.** The
+  dispatched executor, task-verifier, and test-verifier (one adapter instance, shared) are
+  granted the fully resolved, symlink/junction-following real path of both `agents_root` and
+  `core_root` as extra `--add-dir` entries, alongside `project_dir` as the working root. The
+  `agents_root` grant matters whenever a project's `agents_root` resolves *outside*
+  `project_dir` — e.g. a symlink to a shared, synced skills library, the layout
+  `--project-skill`'s own docstring already anticipates. The `core_root` grant matters one
+  link deeper: on a split-checkout layout the core discovery link
+  (`.agents/skills/software-development/feature-pipeline`) is itself a second
+  symlink/junction whose real target is a *separate* checkout, not a subdirectory of the
+  resolved `agents_root`. A task that must inspect the core itself (adapter/SPI relocation,
+  core-contract characterisation) then needs that resolved real path too. Without it the
+  Claude CLI's own directory sandbox denies every `Read` (and read `Bash`) under that path,
+  since the CLI checks the *resolved* target against its allowed-directory list, not the
+  logical (symlinked) one requested — which breaks the executor/verifier contract. Each
+  resolved anchor is emitted at most once, and only when it is genuinely outside every other
+  grant: a `core_root` that resolves under `project_dir` or under the already-granted
+  `agents_root`, or an `agents_root` that resolves to the same real path as `project_dir`,
+  adds nothing (`working_root` / the wider grant already covers it). Resolution is layout-
+  agnostic — no absolute path or host assumption.
 - **Exit codes.** `0` every selected task `verified`; `10` plan gate pending; `20` a task
   ended `blocked` (repair limit reached, external `BLOCKED` verdict, malformed verifier
   evidence, out-of-scope change, live foreign lease, dependency suppression); `30` runner
