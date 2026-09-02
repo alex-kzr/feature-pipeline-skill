@@ -17,6 +17,11 @@ from a cwd resolved beneath the project root, and the whole process tree is term
 timeout or cancellation so no child survives on Windows or POSIX. Every ``cargo`` invocation
 takes the cross-process Cargo mutex first.
 
+The launcher pins ``encoding="utf-8"`` (with ``errors="strict"``) on the ``subprocess.Popen``
+call explicitly — ``text=True`` alone decodes stdout/stderr via ``locale.getpreferredencoding()``,
+which is not UTF-8 on every host locale (RDS-12), silently corrupting any non-ASCII byte a
+verification command's toolchain writes to its pipes.
+
 Standard library only.
 """
 
@@ -172,6 +177,7 @@ def run_command(
             process = subprocess.Popen(
                 [program, *declared[1:]], cwd=full_cwd, shell=False,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                encoding="utf-8", errors="strict",
                 start_new_session=os.name != "nt", creationflags=creationflags)
             try:
                 stdout, stderr = process.communicate(timeout=timeout)

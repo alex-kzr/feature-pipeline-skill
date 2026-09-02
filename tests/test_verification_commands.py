@@ -20,6 +20,7 @@ import json
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from pipeline_core.commands import (
@@ -27,6 +28,7 @@ from pipeline_core.commands import (
     DISPOSITION_FAIL,
     DISPOSITION_PASS,
     VerificationRun,
+    run_command,
     run_verification_commands,
     verification_stage,
 )
@@ -300,6 +302,43 @@ class EvidenceBindingTests(unittest.TestCase):
             )
             self.assertEqual(evidence.commands[0]["task_id"], "VR-01")
             self.assertEqual(evidence.commands[0]["attempt"], 2)
+
+
+# --- encoding (RDS-12) --------------------------------------------------------------------------
+
+
+#: Writes real, hardcoded UTF-8-encoded non-ASCII bytes straight to the stdout/stderr file
+#: descriptors — exactly how a compiler, linter, or test runner behaves on a redirected pipe
+#: regardless of the host's locale. Kept pure-ASCII (``\uXXXX`` escapes, raw buffer writes) so
+#: only the parent's decoding of these bytes is under test, never the child's own stdout codec.
+_UTF8_STDIO_SCRIPT = (
+    "import sys\n"
+    "sys.stdout.buffer.write('caf\\u00e9 \\u2014 na\\u00efve'.encode('utf-8'))\n"
+    "sys.stderr.buffer.write('na\\u00efve \\u2014 caf\\u00e9'.encode('utf-8'))\n"
+)
+
+
+class SubprocessEncodingTests(unittest.TestCase):
+    """RDS-12: ``run_command``'s launcher must pin UTF-8 rather than fall back to
+    ``locale.getpreferredencoding()`` — a non-UTF-8 host locale (verified: ``cp1251``) silently
+    corrupts every non-ASCII byte a verification command writes to stdout/stderr. The locale is
+    patched to a "wrong" codepage for the call so the check is deterministic across hosts rather
+    than depending on the CI machine's own locale already being UTF-8 (which would mask the bug).
+    """
+
+    def test_command_output_decodes_as_utf8_regardless_of_host_locale(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run = _run(Path(directory))
+            argv = [sys.executable, "-c", _UTF8_STDIO_SCRIPT]
+            with unittest.mock.patch(
+                "locale.getpreferredencoding", return_value="cp1251"
+            ):
+                record = run_command(run, verification_stage("VR-01", attempt=1),
+                                     ".", argv, timeout=10)
+
+        self.assertEqual(record["exit_code"], 0)
+        self.assertEqual(record["stdout"], "café — naïve")
+        self.assertEqual(record["stderr"], "naïve — café")
 
 
 if __name__ == "__main__":
