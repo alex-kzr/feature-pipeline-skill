@@ -1,4 +1,4 @@
-"""Contention, stale-owner, and Cargo-serialization tests for the write leases and mutex.
+"""Contention, stale-owner, and write-serialization tests for the write leases and mutex.
 
 Multiprocess by construction where the requirement is cross-process: child writers are real
 ``python -c`` processes so a passing test proves the lock file — not a thread lock — is what
@@ -18,11 +18,12 @@ from pathlib import Path
 from pipeline_core.concurrency import (
     FileMutex,
     PipelineLease,
-    cargo_lock_path,
-    cargo_mutex,
+    is_serialized_program,
     pipeline_lease,
+    serialized_lock_path,
     task_lease,
     task_lock_path,
+    write_mutex,
 )
 from pipeline_core.lease import LeaseHeldError
 from pipeline_core.state import read_lease, write_lease
@@ -116,12 +117,19 @@ class WriteLeaseTests(unittest.TestCase):
             self.assertFalse(path.exists())
 
 
-class CargoMutexTests(unittest.TestCase):
+class WriteMutexTests(unittest.TestCase):
+    def test_is_serialized_program_matches_only_caller_declared_basenames(self) -> None:
+        self.assertTrue(is_serialized_program("/usr/bin/forge", ["forge"]))
+        self.assertTrue(is_serialized_program("C:\\bin\\Forge.EXE", ["forge.exe"]))
+        self.assertFalse(is_serialized_program("/usr/bin/forge", []))
+        self.assertFalse(is_serialized_program("/usr/bin/forge", ["cargo"]))
+        self.assertFalse(is_serialized_program(None, ["forge"]))
+
     def test_file_mutex_serializes_two_independent_processes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             log = root / "mutex.log"
-            path = root / "cargo.lock"
+            path = root / "serialized-forge.lock"
             code = (
                 "import os, sys, time\n"
                 "from pipeline_core.concurrency import FileMutex\n"
@@ -142,12 +150,13 @@ class CargoMutexTests(unittest.TestCase):
             self.assertFalse(path.exists())
             self._assert_no_overlap(log)
 
-    def test_cargo_command_takes_the_mutex_so_runs_never_overlap(self) -> None:
+    def test_a_declared_serialized_command_takes_the_mutex_so_runs_never_overlap(self) -> None:
+        # AC-3: exercises the write mutex through a caller-declared, non-``cargo`` program.
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "prompt.md").write_text("prompt", encoding="utf-8")
-            log = root / "cargo-runs.log"
-            cargo = self._make_fake_cargo(root, log)
+            log = root / "tool-runs.log"
+            tool = self._make_fake_tool(root, log, name="forge")
 
             code = (
                 "import sys\n"
@@ -156,29 +165,59 @@ class CargoMutexTests(unittest.TestCase):
                 "from pipeline_core.commands import run_command\n"
                 "root = Path(sys.argv[1])\n"
                 "run = Run.create('c', root / 'prompt.md', None, root / 'runs' / sys.argv[3], root)\n"
-                "rec = run_command(run, 'stage:build', '.', [sys.argv[2], str(root / 'cargo-runs.log')])\n"
+                "rec = run_command(run, 'stage:build', '.', [sys.argv[2], str(root / 'tool-runs.log')],\n"
+                "                  serialized_programs=['forge'])\n"
                 "print(rec['exit_code'])\n"
             )
             env = dict(os.environ, PYTHONPATH=str(SKILL_ROOT))
             workers = [
                 subprocess.Popen(
-                    [sys.executable, "-c", code, str(root), str(cargo), f"run-{n}"],
+                    [sys.executable, "-c", code, str(root), str(tool), f"run-{n}"],
                     stdout=subprocess.PIPE, text=True, env=env)
                 for n in range(2)
             ]
             exits = [worker.communicate(timeout=40)[0].strip() for worker in workers]
 
             self.assertEqual(exits, ["0", "0"])
-            self.assertFalse(cargo_lock_path(root).exists())
+            self.assertFalse(serialized_lock_path(root, "forge").exists())
             self._assert_no_overlap(log)
+
+    def test_an_undeclared_command_is_not_serialized(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "prompt.md").write_text("prompt", encoding="utf-8")
+            log = root / "tool-runs.log"
+            tool = self._make_fake_tool(root, log, name="forge")
+
+            code = (
+                "import sys\n"
+                "from pathlib import Path\n"
+                "from pipeline_core.state import Run\n"
+                "from pipeline_core.commands import run_command\n"
+                "root = Path(sys.argv[1])\n"
+                "run = Run.create('c', root / 'prompt.md', None, root / 'runs' / sys.argv[3], root)\n"
+                "rec = run_command(run, 'stage:build', '.', [sys.argv[2], str(root / 'tool-runs.log')])\n"
+                "print(rec['exit_code'])\n"
+            )
+            env = dict(os.environ, PYTHONPATH=str(SKILL_ROOT))
+            workers = [
+                subprocess.Popen(
+                    [sys.executable, "-c", code, str(root), str(tool), f"run-{n}"],
+                    stdout=subprocess.PIPE, text=True, env=env)
+                for n in range(2)
+            ]
+            exits = [worker.communicate(timeout=40)[0].strip() for worker in workers]
+
+            self.assertEqual(exits, ["0", "0"])
+            self.assertFalse(serialized_lock_path(root, "forge").exists())
 
     def test_mutex_reclaims_a_dead_owner_and_times_out_on_a_live_one(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            path = cargo_lock_path(root)
+            path = serialized_lock_path(root, "forge")
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps({"pid": _dead_pid(), "run_id": "old"}), encoding="utf-8")
-            with cargo_mutex(root, run_id="new", timeout=5):
+            with write_mutex(root, "forge", run_id="new", timeout=5):
                 self.assertEqual(read_lease(path)["run_id"], "new")
             self.assertFalse(path.exists())
 
@@ -201,8 +240,8 @@ class CargoMutexTests(unittest.TestCase):
 
     # -- helpers ----------------------------------------------------------------------
 
-    def _make_fake_cargo(self, directory: Path, log: Path) -> Path:
-        worker = directory / "cargo_worker.py"
+    def _make_fake_tool(self, directory: Path, log: Path, *, name: str) -> Path:
+        worker = directory / f"{name}_worker.py"
         worker.write_text(
             "import os, sys, time\n"
             "log = sys.argv[1]\n"
@@ -211,15 +250,15 @@ class CargoMutexTests(unittest.TestCase):
             "open(log, 'a').write(f'exit {os.getpid()} {time.time()}\\n')\n",
             encoding="utf-8")
         if os.name == "nt":
-            cargo = directory / "cargo.bat"
-            cargo.write_text(
+            tool = directory / f"{name}.bat"
+            tool.write_text(
                 f'@echo off\r\n"{sys.executable}" "{worker}" %*\r\n', encoding="utf-8")
         else:
-            cargo = directory / "cargo"
-            cargo.write_text(
+            tool = directory / name
+            tool.write_text(
                 f'#!/bin/sh\nexec "{sys.executable}" "{worker}" "$@"\n', encoding="utf-8")
-            cargo.chmod(0o755)
-        return cargo
+            tool.chmod(0o755)
+        return tool
 
     def _assert_no_overlap(self, log: Path) -> None:
         intervals: dict[str, dict[str, float]] = {}
@@ -227,9 +266,9 @@ class CargoMutexTests(unittest.TestCase):
             event, pid, stamp = line.split()
             intervals.setdefault(pid, {})[event] = float(stamp)
         spans = sorted((v["enter"], v["exit"]) for v in intervals.values())
-        self.assertEqual(len(spans), 2, f"expected two cargo runs, got {intervals}")
+        self.assertEqual(len(spans), 2, f"expected two serialized runs, got {intervals}")
         (a_enter, a_exit), (b_enter, b_exit) = spans
-        self.assertLessEqual(a_exit, b_enter, f"cargo runs overlapped: {spans}")
+        self.assertLessEqual(a_exit, b_enter, f"serialized runs overlapped: {spans}")
 
 
 if __name__ == "__main__":

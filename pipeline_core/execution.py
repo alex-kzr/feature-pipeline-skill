@@ -453,8 +453,8 @@ def _block(
 # write leases, executor dispatch, independent verification, and the bounded repair loop — into
 # one dependency-ordered orchestration that carries every selected task to ``verified`` or to a
 # truthful non-zero terminal state. It deliberately stops after stage 9: no documentation,
-# Graphify, final verification, release, archive, purge, or recovery code is reachable from
-# here.
+# knowledge-graph refresh, final verification, release, archive, purge, or recovery code is
+# reachable from here.
 
 
 #: The non-terminal task states :func:`execute_run` will still drive forward. A fresh run only
@@ -794,8 +794,8 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
     * success (``EXIT_OK``) requires *every* selected task ``verified`` — the run never reports
       success while any selected task is non-terminal.
 
-    Stages 10–16 are never reached: no documentation, Graphify, final verification, release,
-    archive, purge, or recovery code is called from here.
+    Stages 10–16 are never reached: no documentation, knowledge-graph refresh, final
+    verification, release, archive, purge, or recovery code is called from here.
     """
     specs = list(request.specs)
     if not specs:
@@ -937,8 +937,8 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
             return ExecuteResult(
                 "ok", EXIT_OK,
                 f"execute complete: {len(selected)} selected task(s) verified. Stopped after "
-                f"stage 9 — documentation, Graphify, final verification, release, and "
-                f"archive/purge are not run in execute mode.",
+                f"stage 9 — documentation, knowledge-graph refresh, final verification, "
+                f"release, and archive/purge are not run in execute mode.",
                 request.run_dir, life.run.run_id, tuple(results))
         life.run.status = "blocked"
         life.run.save()

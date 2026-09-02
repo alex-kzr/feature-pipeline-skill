@@ -14,8 +14,9 @@ The runner — never an agent — owns this call. Every launched command produce
 Output budgets are selected by *outcome*, not by stage: a success keeps the routine 16 KiB
 budget, anything else keeps the 64 KiB diagnostic budget. Commands run with ``shell=False``
 from a cwd resolved beneath the project root, and the whole process tree is terminated on
-timeout or cancellation so no child survives on Windows or POSIX. Every ``cargo`` invocation
-takes the cross-process Cargo mutex first.
+timeout or cancellation so no child survives on Windows or POSIX. Every invocation of a
+caller-declared serialized program (``serialized_programs``) takes the cross-process write
+mutex for that program first.
 
 The launcher pins ``encoding="utf-8"`` (with ``errors="strict"``) on the ``subprocess.Popen``
 call explicitly — ``text=True`` alone decodes stdout/stderr via ``locale.getpreferredencoding()``,
@@ -38,7 +39,7 @@ from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
 from .artifacts import write_text_atomic
-from .concurrency import cargo_mutex, is_cargo_program
+from .concurrency import is_serialized_program, write_mutex
 from .redaction import output_rules, redact_text
 from .state import EXIT_LAUNCH_FAILED, EXIT_NOT_FOUND, EXIT_TIMEOUT, Run, repo_relative
 
@@ -148,8 +149,15 @@ def run_command(
     argv: Sequence[str],
     timeout: float | None = None,
     output_limit: int | None = None,
+    serialized_programs: Sequence[str] = (),
 ) -> dict:
-    """Run argv without a shell, persist redacted evidence, and record the outcome."""
+    """Run argv without a shell, persist redacted evidence, and record the outcome.
+
+    ``serialized_programs`` is the caller-declared set of program basenames whose invocations
+    must not overlap (a compiled-language build tool, typically). When the resolved program is
+    one of them the launch is wrapped in its cross-process write mutex; otherwise the set has
+    no effect. The core hard-codes no names.
+    """
     declared = list(argv)
     if not declared:
         raise ValueError(f"{stage}: refusing to execute an empty command")
@@ -170,7 +178,11 @@ def run_command(
                        time.monotonic() - start, "", f"{declared[0]}: {where}", output_limit)
 
     creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
-    mutex = cargo_mutex(run.repo_root, run_id=run.run_id) if is_cargo_program(program) else nullcontext()
+    mutex = (
+        write_mutex(run.repo_root, program, run_id=run.run_id)
+        if is_serialized_program(program, serialized_programs)
+        else nullcontext()
+    )
     process: subprocess.Popen | None = None
     try:
         with mutex:
@@ -299,6 +311,7 @@ def run_verification_commands(
     task_id: str | None = None,
     attempt: int | None = None,
     timeout: float | None = None,
+    serialized_programs: Sequence[str] = (),
 ) -> VerificationRun:
     """Execute every declared verification command in order as runner-owned evidence.
 
@@ -308,11 +321,16 @@ def run_verification_commands(
     exercised. A command that is *blocked* (its program/toolchain is unavailable, or it could
     not be launched) is an external blocker: the pass stops there, the evidence already
     gathered is retained, and the remaining declared checks are returned in ``unrun``.
+
+    ``serialized_programs`` is forwarded verbatim to :func:`run_command` — the caller's set of
+    program basenames to hold the write mutex around.
     """
     declared = [_declared_cwd_argv(command) for command in commands]
     records: list[dict] = []
     for index, (cwd, argv) in enumerate(declared, start=1):
-        record = run_command(run, stage, cwd, list(argv), timeout=timeout)
+        record = run_command(
+            run, stage, cwd, list(argv), timeout=timeout,
+            serialized_programs=serialized_programs)
         record["command_index"] = index
         if task_id is not None:
             record["task_id"] = task_id
