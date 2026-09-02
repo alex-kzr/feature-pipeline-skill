@@ -129,7 +129,6 @@ class TaskExecution:
     execution_mode: str = "separate"
     plan_path: str | None = None
     working_root: str = "."
-    tools: tuple[str, ...] = ()
     timeout: float | None = None
     #: Executor-claimed checks, so :func:`build_verification_evidence` can surface a claim with
     #: no runner-recorded command as a fact-only ``FAIL``.
@@ -199,7 +198,6 @@ def run_task(life: RunLifecycle, request: TaskExecution) -> TaskRunResult:
                     anchors=request.envelope_anchors,
                     execution_mode=request.execution_mode,
                     plan_path=request.plan_path,
-                    tools=tuple(request.tools),
                     working_root=request.working_root,
                     timeout=request.timeout,
                     fresh_session=True,

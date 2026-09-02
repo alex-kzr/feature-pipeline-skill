@@ -31,7 +31,13 @@ from pathlib import Path
 
 from schemas.contracts import TaskSpec
 
-from .adapters import Adapter, AdapterError, LaunchRequest, LaunchResult
+from .adapters import (
+    Adapter,
+    AdapterError,
+    LaunchRequest,
+    LaunchResult,
+    grant_tool_names,
+)
 from .artifacts import write_json_atomic, write_text_atomic
 from .lifecycle import RunLifecycle
 from .prompt_envelope import EnvelopeAnchors, build_executor_envelope
@@ -68,7 +74,6 @@ class DispatchRequest:
     anchors: EnvelopeAnchors
     execution_mode: str = "separate"
     plan_path: str | None = None
-    tools: tuple[str, ...] = ()
     working_root: str = "."
     timeout: float | None = None
     #: A repair redispatch is a fresh context by mandate; a healthy first pass is too, until a
@@ -137,7 +142,10 @@ def dispatch_executor(
         role_grant=tuple(request.role_grant),
         allowed_scope=tuple(spec.allowed_scope),
         fresh_session=request.fresh_session,
-        tools=tuple(request.tools),
+        # Concrete CLI tool names derived from the one grant that is actually populated. A
+        # separate `tools=` pass-through here is what let every real launch run `--tools ""`
+        # while the role grant said read/run_checks/write (RDS-13).
+        tools=grant_tool_names(request.role_grant),
         timeout=request.timeout,
         envelope_path=artifacts.status_envelope,
     )

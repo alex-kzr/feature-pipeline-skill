@@ -177,6 +177,39 @@ def effective_grant(request: LaunchRequest) -> tuple[str, ...]:
     return tuple(sorted(grant))
 
 
+#: The concrete Claude CLI built-in tools each abstract read/run capability authorizes. ``write``
+#: is not listed here — it maps to :data:`WRITING_TOOLS` verbatim rather than a second copy of
+#: the editor names.
+_READ_TOOLS: tuple[str, ...] = ("Read", "Glob", "Grep")
+_RUN_CHECKS_TOOLS: tuple[str, ...] = ("Bash",)
+
+
+def grant_tool_names(grant: Sequence[str]) -> tuple[str, ...]:
+    """Turn an abstract capability grant into the concrete ``--tools`` names it needs.
+
+    ``read`` -> ``Read, Glob, Grep``; ``run_checks`` -> ``Bash``; any write capability
+    (:data:`WRITE_CAPABILITIES`) -> :data:`WRITING_TOOLS`. Order is stable and duplicates are
+    dropped. A grant that names none of these yields ``()`` — the caller decides whether that
+    is a deliberate tool-free launch or a wiring bug; it must never be turned into
+    ``--tools ""`` for a role whose prompt promises tools (RDS-13).
+    """
+    caps = set(grant)
+    names: list[str] = []
+    if "read" in caps:
+        names.extend(_READ_TOOLS)
+    if "run_checks" in caps:
+        names.extend(_RUN_CHECKS_TOOLS)
+    if caps & WRITE_CAPABILITIES:
+        names.extend(sorted(WRITING_TOOLS))
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for name in names:
+        if name not in seen:
+            seen.add(name)
+            ordered.append(name)
+    return tuple(ordered)
+
+
 # --- argv ----------------------------------------------------------------------------------------
 
 

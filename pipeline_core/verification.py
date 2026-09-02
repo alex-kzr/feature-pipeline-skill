@@ -25,7 +25,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
-from .adapters import Adapter, AdapterError, LaunchRequest, LaunchResult, normalize_role
+from .adapters import (
+    Adapter,
+    AdapterError,
+    LaunchRequest,
+    LaunchResult,
+    grant_tool_names,
+    normalize_role,
+)
 from .artifacts import write_json_atomic, write_text_atomic
 from .commands import VerificationRun
 from .diagnostics import write_diagnostic_report
@@ -470,6 +477,9 @@ def _run_one_verifier(
 ) -> _SettledVerifier:
     normalized = normalize_role(role)
     tool_less = normalized == "test_verifier"
+    # The task verifier's prompt says "You may read the worktree"; grant exactly that and
+    # nothing that writes. The test verifier stays deliberately tool-free (`no_tools=True`).
+    verifier_grant: tuple[str, ...] = () if tool_less else ("read",)
     prompt = build_verifier_prompt(
         normalized, spec, anchors=anchors, feature_prompt=run.prompt_path,
         evidence_payload=evidence_payload, attempt=attempt, plan_path=plan_path,
@@ -483,9 +493,11 @@ def _run_one_verifier(
         report_path=artifacts.report(normalized),
         read_only=True,
         working_root=".",
+        role_grant=verifier_grant,
         allowed_scope=tuple(getattr(spec, "allowed_scope", ()) or ()),
         fresh_session=True,
         resume_session_id=None,
+        tools=grant_tool_names(verifier_grant),
         no_tools=tool_less,
     )
     try:
