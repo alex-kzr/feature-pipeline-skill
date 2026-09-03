@@ -38,7 +38,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Sequence
 
-from schemas import SchemaError, load_profile, validate_relative_path
+from schemas import SchemaError, validate_relative_path
 from schemas.contracts import TASK_TYPES, TaskSpec
 
 from .adapters import ClaudeAdapter
@@ -52,6 +52,7 @@ from .execution import (
 )
 from .plan_md import MarkdownPlanError, load_markdown_plan
 from .profiles import Anchors, resolve_route
+from .project_profile import load_runnable_profile
 from .prompt_envelope import EnvelopeAnchors
 from .redaction import build_rules, redact_text
 from .stages import plan_release_dry_run
@@ -427,7 +428,7 @@ def _build(args: argparse.Namespace) -> tuple[str, int]:
         _resolve_under(agents_root, project_skill_rel, "--project-skill")
 
     try:
-        profile = load_profile(profile_path)
+        profile = load_runnable_profile(profile_path)
     except FileNotFoundError:
         raise CliError(EXIT_ERROR, "profile file not found") from None
     except SchemaError as exc:
