@@ -8,7 +8,7 @@ import re
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from .artifacts import ArtifactReadError, read_json, write_json_atomic
 
@@ -521,6 +521,34 @@ class Run:
             f"repair-attempt:{task_id}", frm=str(previous), to=str(record.attempts),
             note="repair attempt consumed")
         return True
+
+    def record_stage_outcome(
+        self,
+        stage: str,
+        *,
+        number: int,
+        verdict: str,
+        reasons: Sequence[str] = (),
+        evidence: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Persist one post-task lifecycle stage's verdict under ``stages[<stage>]`` (UPR-03).
+
+        Post-task stages (documentation, its independent audit, Graphify refresh and
+        verification) are run-level, not task-level: each carries a numbered ``verdict`` and
+        the reasons behind it. Every write also records a history event, so a resume can see
+        how far the lifecycle got and re-enter at the first stage without a recorded ``PASS``.
+        """
+        entry = self.stages.setdefault(stage, {})
+        previous = entry.get("verdict")
+        entry["number"] = int(number)
+        entry["verdict"] = str(verdict)
+        entry["reasons"] = [str(reason) for reason in reasons]
+        if evidence is not None:
+            entry["evidence"] = dict(evidence)
+        self.record_event(
+            f"stage:{stage}", frm=previous, to=str(verdict),
+            note=f"post-task stage {number} -> {verdict}")
+        return entry
 
     def to_dict(self) -> dict[str, Any]:
         return {
