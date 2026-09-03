@@ -1,0 +1,181 @@
+# Packaging and quality contract for the portable feature-pipeline core.
+#
+# PKG-01 (docs/plans/tasks/PKG-01_package-quality-configuration.md) declares the build,
+# Python, CLI, and development-tool contract WITHOUT moving any implementation. Source still
+# lives in the flat `pipeline_core/` and `schemas/` packages; docs/adr/002 moves them under
+# `src/feature_pipeline/` in PKG-02 behind a compatibility facade.
+#
+# Runtime import graph: standard library only (docs/adr/003). Everything below `dev` is
+# development/CI tooling and is never imported by `scripts/run_pipeline.py`.
+
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "feature-pipeline"
+version = "0.1.0"
+description = "Portable, standard-library-only orchestration core for the feature pipeline."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [{ name = "feature-pipeline maintainers" }]
+keywords = ["pipeline", "orchestration", "agents"]
+classifiers = [
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+    "Private :: Do Not Upload",
+]
+
+# docs/adr/003: the runtime depends on nothing outside the standard library.
+dependencies = []
+
+[project.optional-dependencies]
+# Development and CI tooling only. Exempt from the standard-library-only rule (docs/adr/003).
+dev = [
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "coverage>=7.6",
+]
+
+[project.scripts]
+feature-pipeline = "pipeline_core.runner_cli:main"
+
+[project.urls]
+Documentation = "https://example.invalid/feature-pipeline/docs/agents/README.md"
+
+[tool.hatch.build.targets.wheel]
+# The two importable runtime packages today. PKG-02 replaces this with `src/feature_pipeline`.
+packages = ["pipeline_core", "schemas"]
+
+[tool.hatch.build.targets.sdist]
+include = ["pipeline_core", "schemas", "scripts", "templates", "roles", "reports", "README.md", "SKILL.md"]
+
+# --------------------------------------------------------------------------------------------
+# Ruff — explicit rule set with a NAMED baseline (AC-2).
+#
+# `select` is the enforced set: a new violation of any of these rules fails the build now.
+# `ignore` is the pre-existing debt in `pipeline_core/` and `schemas/`, which PKG-01 may not
+# touch (Allowed scope; docs/adr/002). Each ignored code is cleared by the Phase task that
+# owns the module — this commit does no reformatting or `--fix` (PKG-01 Risks note).
+# --------------------------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+extend-exclude = [
+    "fixtures",
+    "tests/goldens",
+    "templates",
+    "roles",
+    "reports",
+    "scripts/dry_run_harness.py",
+]
+
+[tool.ruff.lint]
+# Deliberately modest starting set (PKG-01 Risks note: an eager strict config would mix
+# unrelated cleanup into the packaging commit). Broader families — `UP` typing modernization,
+# `SIM`/`C4`/`RUF`/`ISC`/`FLY`/`FURB` style — are adopted by the Phase task that does that
+# module's cleanup (prompt L633), each raising `select` as its diff lands.
+select = ["E", "F", "I", "B"]
+# Pre-existing findings only (`ruff check .` at PKG-01), which PKG-01's Allowed scope forbids
+# reformatting away (Risks note). Everything else in `select` is enforced now. Burn-down owners:
+#   E501  long lines ...................... style debt, no reformat here
+#   F401  unused imports .................. PKG-02 facade cleanup + test tidy
+#   I001  import ordering ................. PKG-02
+#   B023  loop-variable closure (real bug)  IN-01 (plan_md.py); characterized in BL-02
+#   B904  raise ... from in except ........ RS-01 (concurrency.py), RS-02 (lease.py)
+#   B905  zip() without strict= ........... CLI-01 (runner_cli.py render helper)
+ignore = ["E501", "F401", "I001", "B023", "B904", "B905"]
+
+[tool.ruff.lint.per-file-ignores]
+# Test doubles and denial-path assertions use idioms bugbear flags; not this task's cleanup.
+"tests/**" = ["B007", "B011", "B017", "B904", "B905"]
+"scripts/**" = ["B008"]
+
+# --------------------------------------------------------------------------------------------
+# mypy — explicit gradual-typing boundary (AC-2).
+#
+# The runtime packages are checked. The 15 modules carrying the 78 pre-existing errors
+# catalogued in `.prompts/feature-pipeline-refactor.md` (F-20) are parked BY NAME below, so a
+# newly added module is checked immediately rather than silently inheriting the skip. The
+# not-yet-created `feature_pipeline.domain.*` / `feature_pipeline.ports.*` packages are strict
+# from introduction (prompt L482, docs/adr/003 acceptance test 3).
+# --------------------------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.11"
+files = ["pipeline_core", "schemas"]
+namespace_packages = true
+explicit_package_bases = true
+check_untyped_defs = true
+warn_redundant_casts = true
+warn_unreachable = true
+# `warn_unused_configs` is intentionally off: the forward-looking `feature_pipeline.*`
+# overrides below match nothing until PKG-02, and that is expected, not a misconfiguration.
+exclude = ['^(fixtures|tests|templates|scripts)/']
+
+[[tool.mypy.overrides]]
+# Pre-existing typing debt — clear per module in DS-*, VP-*, RS-*, WT-*, DF-*, IN-*, PKG-02.
+module = [
+    "pipeline_core.adapters",
+    "pipeline_core.archive",
+    "pipeline_core.commands",
+    "pipeline_core.dispatch",
+    "pipeline_core.execution",
+    "pipeline_core.legacy_adapter",
+    "pipeline_core.plan_md",
+    "pipeline_core.reports",
+    "pipeline_core.roles",
+    "pipeline_core.runner_cli",
+    "pipeline_core.state",
+    "pipeline_core.task_files",
+    "pipeline_core.verification",
+    "pipeline_core.worktree",
+    "schemas.contracts",
+]
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+# Strict from day one for the packages later phases introduce.
+module = [
+    "feature_pipeline.domain.*",
+    "feature_pipeline.ports.*",
+]
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+disallow_any_generics = true
+warn_return_any = true
+no_implicit_optional = true
+
+# --------------------------------------------------------------------------------------------
+# Test discovery + coverage — a ratcheted floor, not an arbitrary target (prompt L631).
+#
+# unittest itself reads no config file; the canonical invocation is
+#   uv run python -m unittest discover -s tests -t .
+# `coverage run` wraps it via `command_line` below so the discovery arguments live in one
+# place. `fail_under` starts at the value measured for the untouched package and only rises.
+# --------------------------------------------------------------------------------------------
+[tool.coverage.run]
+branch = true
+command_line = "-m unittest discover -s tests -t ."
+source = ["pipeline_core", "schemas"]
+omit = [
+    "fixtures/*",
+    "tests/*",
+    "templates/*",
+    "scripts/*",
+]
+
+[tool.coverage.report]
+# Ratchet, not a target: `coverage report` measured 90% (branch) over pipeline_core/ +
+# schemas/ at PKG-01 with 7 environment-dependent cases skipped. The floor sits 2 points
+# below that and only ever rises.
+fail_under = 88
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+]
