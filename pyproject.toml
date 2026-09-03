@@ -47,11 +47,13 @@ feature-pipeline = "pipeline_core.runner_cli:main"
 Documentation = "https://example.invalid/feature-pipeline/docs/agents/README.md"
 
 [tool.hatch.build.targets.wheel]
-# The two importable runtime packages today. PKG-02 replaces this with `src/feature_pipeline`.
-packages = ["pipeline_core", "schemas"]
+# PKG-02 (docs/adr/002): the migration target `src/feature_pipeline` is the canonical
+# package; `pipeline_core` (implementation, migrating one group at a time) and the `schemas`
+# import shim (one deprecation window, docs/adr/007) ship alongside it until Phase 12.
+packages = ["src/feature_pipeline", "pipeline_core", "schemas"]
 
 [tool.hatch.build.targets.sdist]
-include = ["pipeline_core", "schemas", "scripts", "templates", "roles", "reports", "README.md", "SKILL.md"]
+include = ["src", "pipeline_core", "schemas", "scripts", "templates", "roles", "reports", "README.md", "SKILL.md"]
 
 # --------------------------------------------------------------------------------------------
 # Ruff — explicit rule set with a NAMED baseline (AC-2).
@@ -105,7 +107,8 @@ ignore = ["E501", "F401", "I001", "B023", "B904", "B905"]
 # --------------------------------------------------------------------------------------------
 [tool.mypy]
 python_version = "3.11"
-files = ["pipeline_core", "schemas"]
+files = ["src/feature_pipeline", "pipeline_core", "schemas"]
+mypy_path = "src"
 namespace_packages = true
 explicit_package_bases = true
 check_untyped_defs = true
@@ -132,6 +135,11 @@ module = [
     "pipeline_core.task_files",
     "pipeline_core.verification",
     "pipeline_core.worktree",
+    # Relocated by PKG-02 from the top-level `schemas.contracts`; same code, same debt,
+    # cleared with the rest of the contracts work in DF-01.
+    "feature_pipeline.contracts",
+    # The `schemas.*` deprecation shim (re-exports only); dropped whole in DOC-02.
+    "schemas",
     "schemas.contracts",
 ]
 ignore_errors = true
@@ -159,7 +167,7 @@ no_implicit_optional = true
 [tool.coverage.run]
 branch = true
 command_line = "-m unittest discover -s tests -t ."
-source = ["pipeline_core", "schemas"]
+source = ["feature_pipeline", "pipeline_core", "schemas"]
 omit = [
     "fixtures/*",
     "tests/*",

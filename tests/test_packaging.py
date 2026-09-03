@@ -48,7 +48,8 @@ _KNOWN_TYPING_DEBT = {
     "pipeline_core.task_files",
     "pipeline_core.verification",
     "pipeline_core.worktree",
-    "schemas.contracts",
+    # PKG-02 relocated the top-level `schemas.contracts` under the package namespace.
+    "feature_pipeline.contracts",
 }
 
 
