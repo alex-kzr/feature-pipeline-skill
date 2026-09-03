@@ -27,6 +27,12 @@ Callers supply all anchors. The core does not infer host-specific locations or p
 
 - `plan-only` (default) / `unattended` — resolve the profile, select and route tasks, and
   print the deterministic dry-run plan. No executor is launched.
+- `release-dry-run` — `plan-only` plus the post-task lifecycle: stages 10–16 (documentation
+  and its audit, the Graphify refresh and verification, final verification, the human
+  final-diff gate, and the release dry run) and their gates are laid out in order in the
+  `C4` / `C6` plan, read from the tool-integration and release-policy files beside the
+  profile. It implies `--dry-run`, writes nothing, and stops at the release dry-run boundary
+  with exit `10`; the release stage has no commit or push code path.
 - `execute` — run stages 5–9 for every dependency-ready selected task: executor dispatch,
   runner-owned verification commands, two independent verifier verdicts, and the bounded
   repair loop, ending each task at `verified` or at a truthful non-zero terminal state. It

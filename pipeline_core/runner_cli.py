@@ -50,11 +50,14 @@ from .execution import (
     _resolve_attestation,
     _validate_attestation_scope,
 )
+from .integrations import load_tool_integration
 from .plan_md import MarkdownPlanError, load_markdown_plan
+from .post_task import POST_TASK_STAGES
 from .profiles import Anchors, resolve_route
 from .project_profile import load_runnable_profile
 from .prompt_envelope import EnvelopeAnchors
 from .redaction import build_rules, redact_text
+from .release import ReleasePolicy, load_release_policy
 from .stages import plan_release_dry_run
 from .state import Run, StateError, read_lease, pid_alive
 from .task_files import load_task_spec
@@ -74,6 +77,12 @@ PUSH_DENIED_MESSAGE = "push is denied at this stage and the runner has no push c
 UNROUTED_TASK_TYPES = frozenset({"design"})
 
 DELIVERY_GATES = ("plan", "final-diff", "commit", "verification-verdict")
+
+#: The ``--mode`` value that extends the plan-only dry run with the stage 10-16 post-task
+#: lifecycle (documentation, its audit, the code-graph refresh + verification, final
+#: verification, the human final-diff gate, and the release dry run). It always writes
+#: nothing and always stops at the release dry-run boundary.
+POST_TASK_MODE = "release-dry-run"
 
 # One-line meaning of each exit code, for the C5 line of the dry-run plan.
 EXIT_MEANINGS = {
@@ -137,10 +146,13 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--resume", action="store_true",
                      help="resume a previously recorded run instead of starting one")
     run.add_argument("--mode", default="plan-only",
-                     choices=["plan-only", "unattended", "execute"],
+                     choices=["plan-only", "unattended", "execute", POST_TASK_MODE],
                      help="run mode (default: plan-only). 'execute' runs stages 5-9 — executor "
                           "dispatch, independent verification, and bounded repair — and stops "
-                          "before documentation/delivery")
+                          "before documentation/delivery. 'release-dry-run' extends the "
+                          "plan-only dry run with the post-task lifecycle (stages 10–16) and "
+                          "its gates in the C4/C6 plan, then stops at the final-diff / release "
+                          "dry-run boundary; it still writes nothing")
     run.add_argument("--feature", metavar="NAME", help="override the plan's feature name")
     run.add_argument("--prompt", metavar="REL",
                      help="prompt file, relative to the resolved project directory "
@@ -288,6 +300,63 @@ def _token(path: Path, project_root: Path) -> str:
     return "<project_root>" if rel == "." else f"<project_root>/{rel}"
 
 
+def _post_task_gate_lines(
+    *,
+    release_policy: ReleasePolicy | None,
+    wrapper_dir: str | None,
+    output_count: int,
+    approve_plan: bool,
+    approve_final_diff: bool,
+    commit_requested: bool,
+) -> list[str]:
+    """Render the stage 10-16 post-task lifecycle for the C4 plan.
+
+    Every work stage is ``planned`` (a plan can never run it); the human final-diff gate is
+    ``satisfied`` only when the plan gate is also approved; and the release stage is *always*
+    a dry run here — a plan can never assert a passing final verification, so ``would_commit``
+    can never be true. This mirrors :func:`pipeline_core.release.release_plan_result` without
+    any commit or push code path.
+    """
+    fd_ok = approve_plan and approve_final_diff
+    out: list[str] = ["  post-task lifecycle (stages 10-16, in order):"]
+    for number, name in POST_TASK_STAGES:
+        if number == 12:
+            suffix = (f" (wrapper: bash {wrapper_dir}/build.sh)" if wrapper_dir else "")
+            out.append(f"  {number}. {name} - planned{suffix}")
+        elif number == 13:
+            out.append(
+                f"  {number}. {name} - planned ({output_count} configured output(s) re-checked)")
+        elif number == 14:
+            checks = "; ".join(
+                " ".join(command.argv) for command in
+                (release_policy.final_verification if release_policy else ()))
+            out.append(f"  {number}. {name} - planned (checks: {checks})")
+        elif number == 15:
+            out.append(f"  {number}. {name} - {'satisfied' if fd_ok else 'pending'}")
+        elif number == 16:
+            blockers: list[str] = []
+            if not commit_requested:
+                blockers.append("no explicit commit control was given")
+            if not fd_ok:
+                blockers.append("the final diff is not approved")
+            blockers.append("final verification has not run in a plan")
+            out.append(f"  {number}. {name} - dry-run")
+            if release_policy is not None:
+                out.append(f"     stage paths: {', '.join(release_policy.stage_paths)}")
+                if release_policy.submodule_pointer:
+                    out.append(f"     submodule pointer: {release_policy.submodule_pointer}")
+                out.append(
+                    f"     proposed commit message: {release_policy.commit_message_template}")
+            out.append(f"     reasons release stays a dry run: {'; '.join(blockers)}")
+            out.append(
+                "     commit: the runner has no commit code path - nothing is executed even "
+                "when authorized")
+            out.append("     push: never - the runner has no push code path")
+        else:
+            out.append(f"  {number}. {name} - planned")
+    return out
+
+
 def _plan_text(
     *,
     profile,
@@ -307,6 +376,10 @@ def _plan_text(
     commit_approved_manifest: bool,
     commit_requested: bool,
     exit_code: int,
+    post_task: bool = False,
+    release_policy: ReleasePolicy | None = None,
+    wrapper_dir: str | None = None,
+    output_count: int = 0,
 ) -> str:
     lines: list[str] = []
     lines.append("feature-pipeline core runner - dry run")
@@ -370,6 +443,11 @@ def _plan_text(
         state = "satisfied" if satisfied else "pending"
         note = " (requested)" if gate == "commit" and commit_requested else ""
         lines.append(f"  {position}. {gate} - {state}{note}")
+    if post_task:
+        lines.extend(_post_task_gate_lines(
+            release_policy=release_policy, wrapper_dir=wrapper_dir, output_count=output_count,
+            approve_plan=approve_plan, approve_final_diff=approve_final_diff,
+            commit_requested=commit_requested))
     lines.append("")
 
     lines.append(f"C5. Exit code: {exit_code} ({EXIT_MEANINGS.get(exit_code, 'see safety posture')})")
@@ -387,6 +465,9 @@ def _plan_text(
             lines.append(f"  {task['id']}: pending -> blocked ({reason})")
         else:
             lines.append(f"  {task['id']}: pending -> ready -> running -> implemented -> verified")
+    if post_task:
+        chain = " -> ".join(name for _, name in POST_TASK_STAGES)
+        lines.append(f"  post-task: verified -> {chain} (release stays a dry run)")
     lines.append("")
 
     lines.append("C7. Redacted evidence manifest:")
@@ -408,6 +489,11 @@ def _plan_text(
     lines.append("  design / no registry route: fail closed (unresolved-executor)")
     lines.append("  verifier roles: read-only, enforced at profile load")
     lines.append("  unmet dependency: fail closed (dependency-not-satisfied)")
+    if post_task:
+        lines.append(
+            "  release stage: dry-run plan only; a commit needs the commit control, an "
+            "approved final diff, and a passing final verification, and even then no commit "
+            "or push subprocess exists")
 
     text = "\n".join(lines) + "\n"
     # Defense in depth: normalize any machine-local path spelling that slipped through.
@@ -419,6 +505,12 @@ def _build(args: argparse.Namespace) -> tuple[str, int]:
     agents_root = Path(_require(args.agents_root, "--agents-root"))
     core_root = Path(_require(args.core_root, "--core-root"))
     anchors = Anchors(project_root, agents_root, core_root)
+
+    # ``release-dry-run`` is a plan-only preview by construction: it never runs an executor
+    # and never writes, so it always implies ``--dry-run``.
+    post_task = args.mode == POST_TASK_MODE
+    if post_task:
+        args.dry_run = True
 
     profile_rel = _logical_relative(_require(args.profile, "--profile"), "--profile")
     profile_path = _resolve_under(project_root, profile_rel, "--profile")
@@ -435,6 +527,28 @@ def _build(args: argparse.Namespace) -> tuple[str, int]:
         raise CliError(EXIT_ERROR, f"profile is invalid: {exc}") from None
     except json.JSONDecodeError:
         raise CliError(EXIT_ERROR, "profile file is not valid JSON") from None
+
+    # ``release-dry-run`` consumes the project's post-task contract as-is: the tool-integration
+    # block and the release policy declared beside the profile. Loading is fail-closed.
+    release_policy: ReleasePolicy | None = None
+    wrapper_dir: str | None = None
+    output_count = 0
+    if post_task:
+        config_dir = profile_path.parent
+        try:
+            integration = load_tool_integration(config_dir / "integrations.json")
+            release_policy = load_release_policy(config_dir / "release.json")
+        except FileNotFoundError:
+            raise CliError(
+                EXIT_ERROR,
+                "release-dry-run needs an integrations.json and a release.json beside the "
+                "profile") from None
+        except SchemaError as exc:
+            raise CliError(EXIT_ERROR, f"post-task config is invalid: {exc}") from None
+        except json.JSONDecodeError:
+            raise CliError(EXIT_ERROR, "post-task config is not valid JSON") from None
+        wrapper_dir = integration.wrapper_dir
+        output_count = len(integration.expected_outputs)
 
     project_dir = _resolve_under(project_root, profile.logical_paths.project, "project path")
     plan_rel = _logical_relative(_require(args.plan, "--plan"), "--plan")
@@ -527,6 +641,8 @@ def _build(args: argparse.Namespace) -> tuple[str, int]:
             approve_plan=args.approve_plan, approve_final_diff=args.approve_final_diff,
             commit_approved_manifest=args.commit_approved_manifest,
             commit_requested=args.commit or args.commit_approved_manifest, exit_code=exit_code,
+            post_task=post_task, release_policy=release_policy, wrapper_dir=wrapper_dir,
+            output_count=output_count,
         )
         # A dry run persists nothing: the temporary directory is created and discarded.
         tempfile.mkdtemp(prefix="pipeline-dry-run-")

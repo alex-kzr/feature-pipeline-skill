@@ -151,6 +151,11 @@ def load_graphify_integration(path: str | Path) -> GraphifyIntegration:
     return GraphifyIntegration.from_data(raw)
 
 
+#: Project-identity-free alias. The portable runner CLI carries no tool name in its own
+#: source, so it loads this contract through the neutral spelling.
+load_tool_integration = load_graphify_integration
+
+
 def _mapping(value: object, field: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise SchemaError(f"{field} must be an object")

@@ -917,5 +917,176 @@ class MakeExecuteAdaptersTests(unittest.TestCase):
         self.assertEqual(wrapper.get("permission_denials"), [])
 
 
+# --- UPR-06: --mode release-dry-run wires the stage 10-16 post-task lifecycle into the CLI ---
+
+_SIBLING_CHECKS = {
+    "checks": [{"name": "lint", "argv": ["lint", "run"], "cwd": "."}],
+}
+_SIBLING_INTEGRATIONS = {
+    "schema_version": 1,
+    "graphify": {
+        "stage": "graphify",
+        "executor": "runner:graphify",
+        "workspace": "tools/graphify",
+        "scan_root": ".",
+        "wrapper_dir": "tools/graphify/scripts",
+        "expected_outputs": [
+            "tools/graphify/graphify-out/graph.json",
+            "tools/graphify/graphify-out/manifest.json",
+        ],
+        "diff_policy": "tracked-empty",
+        "forbidden": ["graphify claude install"],
+    },
+}
+_SIBLING_RELEASE = {
+    "schema_version": 1,
+    "final_verification": ["lint"],
+    "release": {
+        "stage_paths": ["content", "config"],
+        "submodule_pointer": "content",
+        "commit_message_template": "chore(sample): {feature} - {summary}",
+    },
+}
+
+# The seven post-task stage labels, in order, as the CLI must lay them out in C4.
+_POST_TASK_LABELS = (
+    "documentation",
+    "documentation-audit",
+    "graphify-refresh",
+    "graphify-verification",
+    "final-verification",
+    "final-diff-approval",
+    "release",
+)
+
+
+def _seed_release(directory: str, *, tasks=None):
+    """`_seed` the library-guide fixture and add the sibling integrations/release/checks
+    config files the `release-dry-run` mode consumes."""
+    dest = Path(directory) / "project"
+    seed = _seed("library-guide", dest, tasks=tasks or [{"id": "T-01", "type": "docs"}])
+    config_dir = dest  # library-guide keeps profile.json at the project root
+    (config_dir / "checks.json").write_text(
+        json.dumps(_SIBLING_CHECKS, indent=2) + "\n", encoding="utf-8")
+    (config_dir / "integrations.json").write_text(
+        json.dumps(_SIBLING_INTEGRATIONS, indent=2) + "\n", encoding="utf-8")
+    (config_dir / "release.json").write_text(
+        json.dumps(_SIBLING_RELEASE, indent=2) + "\n", encoding="utf-8")
+    return seed
+
+
+class ReleaseDryRunModeTests(unittest.TestCase):
+    """UPR-06: `--mode release-dry-run` extends the plan-only dry run with stages 10-16 and
+    their gates in C4/C6, stops at the dry-run boundary with a non-error exit, and adds no
+    commit or push code path."""
+
+    def _run_mode(self, extra=None, *, tasks=None):
+        with TemporaryDirectory() as directory:
+            seed = _seed_release(directory, tasks=tasks)
+            return _run(seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.json",
+                "--mode", "release-dry-run",
+            ] + (extra or []))
+
+    def test_help_lists_release_dry_run_as_a_mode_without_a_project_literal(self) -> None:
+        out = io.StringIO()
+        with redirect_stdout(out), self.assertRaises(SystemExit):
+            runner_cli.main(["--help"])
+        help_text = out.getvalue().lower()
+        self.assertIn("release-dry-run", help_text)
+        for literal in PROJECT_IDENTITY_LITERALS:
+            self.assertNotIn(literal, help_text)
+
+    def test_mode_surfaces_stages_10_to_16_in_order_and_stops_non_error(self) -> None:
+        code, out, err = self._run_mode()
+        self.assertEqual(code, 10, err)
+        self.assertIn("mode: release-dry-run", out)
+        # C4 lays out every post-task stage, numbered 10..16, in order.
+        c4 = out.split("C4.", 1)[1].split("C5.", 1)[0]
+        positions = [c4.index(f"{n}. {label}")
+                     for n, label in zip(range(10, 17), _POST_TASK_LABELS)]
+        self.assertEqual(positions, sorted(positions), c4)
+        # C6 shows the post-task transition chain.
+        c6 = out.split("C6.", 1)[1].split("C7.", 1)[0]
+        self.assertIn("post-task:", c6)
+        for label in _POST_TASK_LABELS:
+            self.assertIn(label, c6)
+
+    def test_mode_is_byte_identical_across_two_independent_runs(self) -> None:
+        outputs = []
+        for _ in range(2):
+            code, out, _err = self._run_mode()
+            self.assertEqual(code, 10)
+            outputs.append(out)
+        self.assertEqual(outputs[0], outputs[1])
+
+    def test_release_stage_is_a_dry_run_and_names_no_commit_or_push_command(self) -> None:
+        code, out, err = self._run_mode()
+        self.assertEqual(code, 10, err)
+        self.assertIn("16. release - dry-run", out)
+        self.assertIn("no explicit commit control was given", out)
+        self.assertNotIn("git commit", out)
+        self.assertNotIn("git push", out)
+        self.assertIn("no push code path", out)
+
+    def test_full_approvals_still_leave_release_a_dry_run_pending_final_verification(self) -> None:
+        # AC-2: a commit needs a passing final verification too, which a plan can never assert.
+        code, out, err = self._run_mode(
+            ["--approve-plan", "--approve-final-diff", "--commit-approved-manifest"])
+        self.assertEqual(code, 10, err)
+        self.assertIn("15. final-diff-approval - satisfied", out)
+        self.assertIn("16. release - dry-run", out)
+        self.assertIn("final verification", out)
+
+    def test_final_diff_approval_stage_stays_pending_without_the_approvals(self) -> None:
+        code, out, err = self._run_mode()
+        self.assertEqual(code, 10, err)
+        self.assertIn("15. final-diff-approval - pending", out)
+
+    def test_push_is_still_refused_under_release_dry_run_and_writes_nothing(self) -> None:
+        # AC-2
+        with TemporaryDirectory() as directory:
+            seed = _seed_release(directory)
+            code, _out, err = _run(seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.json",
+                "--mode", "release-dry-run", "--push",
+            ])
+            self.assertEqual(code, 1)
+            self.assertEqual(
+                err.strip(),
+                "push is denied at this stage and the runner has no push code path.")
+            self.assertFalse(list(seed["project_dir"].glob("**/run.json")))
+
+    def test_mode_writes_nothing_into_the_project_tree(self) -> None:
+        with TemporaryDirectory() as directory:
+            seed = _seed_release(directory)
+            dest = seed["dest"]
+            before = {p for p in dest.rglob("*")}
+            code, _out, err = _run(seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.json",
+                "--mode", "release-dry-run",
+            ])
+            after = {p for p in dest.rglob("*")}
+        self.assertEqual(code, 10, err)
+        self.assertEqual(before, after)
+
+    def test_missing_sibling_config_fails_closed(self) -> None:
+        with TemporaryDirectory() as directory:
+            seed = _seed_release(directory)
+            (seed["dest"] / "release.json").unlink()
+            code, _out, err = _run(seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.json",
+                "--mode", "release-dry-run",
+            ])
+        self.assertEqual(code, 30)
+        self.assertNotIn(str(seed["dest"]), err)
+
+    def test_stage_16_reflects_the_release_json_staging_policy(self) -> None:
+        code, out, err = self._run_mode()
+        self.assertEqual(code, 10, err)
+        self.assertIn("chore(sample): {feature} - {summary}", out)
+        self.assertIn("stage paths: content, config", out)
+
+
 if __name__ == "__main__":
     unittest.main()

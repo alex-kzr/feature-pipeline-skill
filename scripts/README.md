@@ -28,9 +28,10 @@ below its declared anchor; a value that escapes its anchor is rejected.
 
 ### Run selection and gates
 
-`--task ID`, `--through ID`, `--resume`, and `--mode {plan-only,unattended}` select scope.
-Delivery gates are closed by default and ordered `plan`, `final-diff`, `commit`, verification
-verdict. `--approve-plan`, `--approve-final-diff`, and `--commit-approved-manifest` each
+`--task ID`, `--through ID`, `--resume`, and `--mode {plan-only,unattended,release-dry-run}`
+select scope. Delivery gates are closed by default and ordered `plan`, `final-diff`, `commit`,
+verification verdict; `release-dry-run` additionally lays out the post-task lifecycle gates
+(stages 10–16) after them (see `--mode release-dry-run` below). `--approve-plan`, `--approve-final-diff`, and `--commit-approved-manifest` each
 advance the matching gate in the dry-run plan and **never bypass an earlier, still-pending
 gate**. `--commit`, `--commit-approved-manifest` never bypass the plan gate and this runner
 has no commit code path. `--push` is refused before any run artifact exists, with exit code
@@ -95,6 +96,32 @@ resolves the source run read-only (see `execute` mode below), so `C6` reflects t
 `DEP_ID` as satisfied (no `dependency-not-satisfied`) instead of a hardcoded "verified nothing".
 An invalid or unverifiable attestation fails the dry run closed with the same stable `30`-exit
 reason a real run would use, before any plan is printed.
+
+### `--mode release-dry-run` (stages 10–16 in the plan)
+
+`--mode release-dry-run` is a plan-only preview that reaches further than the default dry run:
+after the four stage-9 delivery gates it also lays out the **post-task lifecycle** — stages
+10–16 (`documentation`, `documentation-audit`, `graphify-refresh`, `graphify-verification`,
+`final-verification`, `final-diff-approval`, `release`) — and their gates, in order, in `C4`,
+with a matching post-task transition chain in `C6` and an extra `C8` safety line. It implies
+`--dry-run`: no executor is dispatched, nothing is written, and every non-blocked run exits
+`10`.
+
+It consumes the project's post-task contract **as declared**, from the two files beside the
+profile: the tool-integration block (`integrations.json`) supplies the Graphify wrapper and the
+count of configured outputs; the release policy (`release.json`, with its sibling `checks.json`
+resolving the `final_verification` check names) supplies the final-verification argv, the files
+to stage, the submodule pointer, and the proposed commit message. A missing or invalid file
+fails closed with exit `30`.
+
+Every work stage (10–14) is shown as `planned` — a plan can never run it. The human
+`final-diff-approval` gate (15) is `satisfied` only when `--approve-plan` **and**
+`--approve-final-diff` are both set. Stage 16 (`release`) is **always** a dry run here: a plan
+can never assert a passing final verification, so `would_commit` is never true. The rendered
+release plan mirrors `pipeline_core.release.release_plan_result` but has no commit or push code
+path — a real commit still needs the commit control, an approved final diff, and a passing
+final verification, and even then nothing is committed or pushed. `--push` is refused exactly as
+in every other mode (exit `1`).
 
 ### `execute` mode (stages 5–9)
 
