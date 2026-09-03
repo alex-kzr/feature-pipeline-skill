@@ -2,13 +2,19 @@
 
 Historical task files predate the ``## Execution Metadata`` block. The contract for them is
 "extend, do not convert": they stay executable through documented defaults and are never
-rewritten just to look uniform. This adapter is the portable form of that rule — it takes an
-already-parsed task mapping and returns a normalized :class:`AdaptedTask`, applying
-caller-supplied defaults only when the file declared no metadata block.
+rewritten just to look uniform.
 
-It performs no file I/O and mutates nothing it is given: the "without rewriting" guarantee is
-structural, not a convention. The default *values* (type, executor, checks) are supplied by the
-project through :class:`LegacyDefaults`; this module has no per-project inference table.
+Since **IN-01** the resolution rules live in one place —
+:meth:`feature_pipeline.inputs.TaskDefinitionBuilder.resolve_mapping` — and this module is a
+delegating facade:
+
+* :func:`adapt_legacy_task` projects the shared resolution onto the loose in-memory
+  :class:`AdaptedTask` view (raw command objects preserved, ``LegacyAdapterError`` raised);
+* :func:`adapt_task_spec` is the JSON counterpart of
+  :func:`pipeline_core.task_files.load_task_spec` — a Markdown task file and a JSON plan
+  entry describing the same task land on an equivalent, fully validated ``TaskSpec``.
+
+Neither performs file I/O and neither mutates its input: ``raw`` is read, never modified.
 
 Standard library only.
 """
@@ -18,12 +24,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Mapping, Sequence
 
-from schemas.contracts import (
-    AcceptanceCriterionSpec,
-    CommandSpec,
-    SchemaError,
-    TaskSpec,
-)
+from feature_pipeline.contracts import SchemaError, TaskSpec
+from feature_pipeline.inputs import SourceDefaults, TaskDefinitionBuilder
 
 
 class LegacyAdapterError(ValueError):
@@ -92,84 +94,49 @@ def synthesize_acceptance_criteria(items: Sequence[object]) -> tuple[AcceptanceC
     return tuple(criteria)
 
 
-def _tuple(value: object) -> tuple:
-    if value is None:
-        return ()
-    if isinstance(value, (str, bytes)) or isinstance(value, Mapping):
-        raise LegacyAdapterError(f"expected a list, got {type(value).__name__}")
-    return tuple(value)
+def _source_defaults(defaults: "LegacyDefaults | SourceDefaults | None") -> SourceDefaults | None:
+    if defaults is None or isinstance(defaults, SourceDefaults):
+        return defaults
+    return SourceDefaults(
+        task_type=defaults.task_type,
+        executor=defaults.executor,
+        max_repair_attempts=defaults.max_repair_attempts,
+        out_of_scope=tuple(defaults.out_of_scope),
+        documentation_impact=tuple(defaults.documentation_impact),
+        verification_commands=tuple(defaults.verification_commands),
+    )
 
 
 def adapt_legacy_task(raw: Mapping[str, object], defaults: LegacyDefaults) -> AdaptedTask:
     """Normalize one parsed task mapping, applying ``defaults`` only for a block-less file.
 
-    ``raw`` is read, never modified. A file that declared an ``## Execution Metadata`` block
+    Delegates the declared/defaulted resolution to the shared builder and projects the
+    result onto :class:`AdaptedTask`. A file that declared an ``## Execution Metadata`` block
     (``raw["has_metadata"]`` truthy) keeps every declared value and may only default
-    ``max_repair_attempts`` / ``blocking_conditions``; a historical file takes the full default
-    set and reports each key it used in ``defaults_applied``.
+    ``max_repair_attempts`` / ``blocking_conditions``; a historical file takes the full
+    default set and reports each key it used in ``defaults_applied``.
     """
-    task_id = str(raw.get("id") or "").strip()
-    if not task_id:
-        raise LegacyAdapterError("legacy task mapping has no 'id'")
-
-    has_metadata = bool(raw.get("has_metadata"))
-    applied: list[str] = []
-
-    def resolve(key: str, declared: object, default: object) -> object:
-        if declared is not None:
-            return declared
-        if has_metadata and key not in DECLARED_DEFAULTABLE:
-            raise LegacyAdapterError(
-                f"{task_id}: declared metadata is missing required field '{key}'"
-            )
-        applied.append(key)
-        return default
-
-    task_type = str(resolve("type", raw.get("type"), defaults.task_type))
-    executor = str(resolve("executor", raw.get("executor"), defaults.executor))
-    allowed_scope = _tuple(resolve("allowed_scope", raw.get("allowed_scope"),
-                                   raw.get("affected_files")))
-    if not allowed_scope:
-        raise LegacyAdapterError(f"{task_id}: no allowed scope could be resolved")
-    out_of_scope = _tuple(resolve("out_of_scope", raw.get("out_of_scope"), defaults.out_of_scope))
-    documentation_impact = _tuple(resolve("documentation_impact", raw.get("documentation_impact"),
-                                          defaults.documentation_impact))
-    verification_commands = _tuple(resolve("verification_commands", raw.get("verification_commands"),
-                                           defaults.verification_commands))
-    max_repair_attempts = int(resolve("max_repair_attempts", raw.get("max_repair_attempts"),
-                                      defaults.max_repair_attempts))
-
-    depends_on = _tuple(raw.get("depends_on"))
-    blocking_conditions = raw.get("blocking_conditions")
-    if blocking_conditions is not None:
-        blocking_conditions = str(blocking_conditions)
-
-    criteria_source = raw.get("acceptance_criteria")
-    if criteria_source is not None:
-        acceptance_criteria = tuple(
-            AcceptanceCriterion(str(c["id"]), str(c["text"]).strip(), bool(c.get("checked", False)))
-            for c in criteria_source
-        )
-    else:
-        acceptance_criteria = synthesize_acceptance_criteria(_tuple(raw.get("definition_of_done")))
-        if not has_metadata:
-            applied.append("acceptance_criteria")
-
+    resolved = TaskDefinitionBuilder.resolve_mapping(
+        raw, defaults=_source_defaults(defaults), error=LegacyAdapterError
+    )
     return AdaptedTask(
-        task_id=task_id,
-        title=str(raw.get("title") or "").strip(),
-        task_type=task_type,
-        executor=executor,
-        depends_on=depends_on,
-        allowed_scope=allowed_scope,
-        out_of_scope=out_of_scope,
-        max_repair_attempts=max_repair_attempts,
-        documentation_impact=documentation_impact,
-        verification_commands=verification_commands,
-        acceptance_criteria=acceptance_criteria,
-        blocking_conditions=blocking_conditions,
-        metadata_source="declared" if has_metadata else "defaults",
-        defaults_applied=tuple(applied),
+        task_id=resolved.task_id,
+        title=resolved.title,
+        task_type=resolved.task_type,
+        executor=resolved.executor,
+        depends_on=tuple(resolved.depends_on),
+        allowed_scope=tuple(resolved.allowed_scope),
+        out_of_scope=tuple(resolved.out_of_scope),
+        max_repair_attempts=resolved.max_repair_attempts,
+        documentation_impact=tuple(resolved.documentation_impact),
+        verification_commands=tuple(resolved.verification_commands),
+        acceptance_criteria=tuple(
+            AcceptanceCriterion(item.id, item.text, item.checked)
+            for item in resolved.acceptance_criteria
+        ),
+        blocking_conditions=resolved.blocking_conditions,
+        metadata_source=resolved.metadata_source,
+        defaults_applied=tuple(resolved.defaults_applied),
     )
 
 
@@ -178,56 +145,10 @@ def adapt_task_spec(
 ) -> TaskSpec:
     """Normalize a parsed JSON plan entry (or any parsed task mapping) into a ``TaskSpec``.
 
-    This is the JSON counterpart of :func:`pipeline_core.task_files.load_task_spec`: a Markdown
-    task file and a JSON plan entry describing the same task land on an equivalent ``TaskSpec``.
-    An entry with ``has_metadata`` false and no ``defaults`` fails closed — real execution never
-    runs a task whose execution metadata is neither declared nor supplied. ``raw`` is read,
-    never modified.
+    The JSON counterpart of :func:`pipeline_core.task_files.load_task_spec`, sharing the one
+    metadata/command parser and the one validation pass. An entry with ``has_metadata`` false
+    and no ``defaults`` fails closed. ``raw`` is read, never modified.
     """
-    task_id = str(raw.get("id") or "").strip()
-    has_metadata = bool(raw.get("has_metadata"))
-    if not has_metadata and defaults is None:
-        raise SchemaError(
-            f"{task_id or '<task>'}: execution metadata is absent and no defaults were supplied"
-        )
-
-    effective = defaults or LegacyDefaults(task_type="", executor="")
-    try:
-        adapted = adapt_legacy_task(raw, effective)
-    except LegacyAdapterError as exc:
-        raise SchemaError(str(exc)) from None
-
-    def _commands(value: object) -> tuple[CommandSpec, ...]:
-        if not value:
-            return ()
-        return tuple(CommandSpec.from_data(item) for item in value)  # type: ignore[union-attr]
-
-    try:
-        return TaskSpec.build(
-            id=adapted.task_id,
-            title=adapted.title,
-            path=str(raw.get("path") or ""),
-            task_type=adapted.task_type,
-            executor=adapted.executor,
-            depends_on=tuple(adapted.depends_on),
-            allowed_scope=tuple(adapted.allowed_scope),
-            out_of_scope=tuple(adapted.out_of_scope),
-            required_skills=tuple(raw.get("required_skills") or ()),
-            max_repair_attempts=adapted.max_repair_attempts,
-            documentation_impact=tuple(adapted.documentation_impact),
-            verification_commands=_commands(adapted.verification_commands),
-            verification_tier=str(raw.get("verification_tier") or "full"),
-            accepts_scoped=tuple(raw.get("accepts_scoped") or ()),
-            deferred_verification_commands=_commands(raw.get("deferred_verification_commands")),
-            blocking_conditions=adapted.blocking_conditions,
-            acceptance_criteria=tuple(
-                AcceptanceCriterionSpec(item.id, item.text, item.checked)
-                for item in adapted.acceptance_criteria
-            ),
-            metadata_source=adapted.metadata_source,
-            defaults_applied=tuple(adapted.defaults_applied),
-        )
-    except SchemaError:
-        raise
-    except LegacyAdapterError as exc:
-        raise SchemaError(str(exc)) from None
+    return TaskDefinitionBuilder.from_json_plan_entry(
+        raw, defaults=_source_defaults(defaults), error=SchemaError
+    ).to_task_spec()
