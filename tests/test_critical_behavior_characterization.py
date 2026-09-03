@@ -1,0 +1,532 @@
+"""BL-02 — executable characterization of the eight critical ambiguous behaviors.
+
+Plan: ``docs/plans/2026-09-03-feature-pipeline-refactor.md`` (Phase 0). Prompt findings
+``F-01`` .. ``F-08`` (``.prompts/feature-pipeline-refactor.md`` §4.1).
+
+Each test below turns one finding from an observation into reproducible evidence: it asserts
+the behavior **as it is today**, not the behavior a fix would produce. Every finding is a
+correction target — the disposition table in
+``docs/validation/refactor-compatibility-baseline.md`` records, per finding, that it is
+corrected through an approved ADR (BL-03) and names the later task that does the correction.
+When that task lands, the paired test here is expected to fail; that failure is the signal
+the contract moved deliberately, and the test is then updated alongside the change.
+
+This module changes **no production module** (BL-02 AC-2): it only reads public APIs, the
+persisted ``run.json``, and — where the finding is a missing wiring rather than an observable
+output — module source through :mod:`inspect`.
+
+Standard library only.
+"""
+
+from __future__ import annotations
+
+import inspect
+import json
+import subprocess
+import sys
+import tempfile
+import unittest
+from dataclasses import fields, replace
+from pathlib import Path
+
+from schemas import SchemaError
+from schemas.contracts import TaskSpec
+
+from pipeline_core import dispatch as dispatch_mod
+from pipeline_core import execution as execution_mod
+from pipeline_core import runner_cli
+from pipeline_core.adapters import LaunchResult
+from pipeline_core.commands import (
+    DIAGNOSTIC_OUTPUT_BUDGET,
+    run_command,
+)
+from pipeline_core.diagnostics import write_diagnostic_report
+from pipeline_core.dispatch import DispatchRequest, dispatch_executor
+from pipeline_core.execution import ExecuteControls, ExecuteRequest, TaskExecution, _apply_repair_bound
+from pipeline_core.git_port import GitPort, GitResult, GitSafetyError
+from pipeline_core.lifecycle import RunLifecycle
+from pipeline_core.prompt_envelope import EnvelopeAnchors
+from pipeline_core.state import ACTOR_RUNNER, Run
+from pipeline_core.worktree import IN_SCOPE, OUT_OF_SCOPE, STATE_KNOWN, attribute_window
+from pipeline_core import state as state_mod
+from pipeline_core import worktree as worktree_mod
+
+
+# --- shared fixtures -----------------------------------------------------------------------
+
+
+def _spec(**overrides: object) -> TaskSpec:
+    base: dict[str, object] = dict(
+        id="BL-02",
+        title="Characterize critical ambiguous behavior",
+        path="docs/plans/tasks/BL-02_critical-behavior-characterization.md",
+        task_type="python",
+        executor="python-executor",
+        allowed_scope=("in_scope.py",),
+        out_of_scope=("secret.py",),
+        required_skills=(
+            ".agents/skills/software-development/test-driven-development/SKILL.md",),
+        verification_commands=(),
+        max_repair_attempts=2,
+    )
+    base.update(overrides)
+    return TaskSpec.build(**base)  # type: ignore[arg-type]
+
+
+def _running_life(root: Path, spec: TaskSpec) -> RunLifecycle:
+    prompt = root / "prompts" / "feature.md"
+    prompt.parent.mkdir(parents=True, exist_ok=True)
+    prompt.write_text("feature", encoding="utf-8")
+    run = Run.create("charcz", prompt, None, root / "storage" / "charcz", root)
+    life = RunLifecycle.initialize(run, tasks=[(spec.id, [])])
+    life.transition(spec.id, "running", actor=ACTOR_RUNNER)
+    return life
+
+
+class _ScriptedAdapter:
+    """The two-call dispatch shape (executor launch, then same-session status envelope).
+
+    ``on_launch`` runs once during the executor launch so a test can mutate the worktree
+    exactly inside the attributed window.
+    """
+
+    def __init__(self, *, on_launch=None, status: str = "implemented") -> None:
+        self.on_launch = on_launch
+        self.status = status
+
+    def launch(self, request):  # noqa: ANN001 - test double
+        if request.no_tools or request.resume_session_id:
+            body = json.dumps(
+                {"role": "executor", "status": self.status,
+                 "task_id": request.task_id, "attempt": 1})
+            Path(request.report_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(request.report_path).write_text(body, encoding="utf-8")
+            return LaunchResult(exit_code=0, stdout="", session_id="sess-1")
+        if self.on_launch is not None:
+            self.on_launch()
+        prose = f"# Executor report\n\n- Status: {self.status}\n"
+        Path(request.report_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(request.report_path).write_text(prose, encoding="utf-8")
+        return LaunchResult(exit_code=0, stdout="", session_id="sess-1")
+
+
+def _git(root: Path, *argv: str) -> None:
+    subprocess.run(["git", *argv], cwd=root, check=True, capture_output=True, text=True)
+
+
+def _init_repo(root: Path) -> None:
+    _git(root, "init", "-q")
+    _git(root, "config", "user.email", "t@example.com")
+    _git(root, "config", "user.name", "Test")
+    (root / "in_scope.py").write_text("start\n", encoding="utf-8")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-qm", "base")
+
+
+# --- F-01 --------------------------------------------------------------------------------------
+
+
+class F01DryRunAndExecuteCompileDifferentPipelines(unittest.TestCase):
+    """F-01 — the dry-run plan resolves a per-task route (stack, checks, subagents, root,
+    storage); ``execute`` resolves routes only far enough to pick the *first* storage
+    directory and then sends every task through one hard-coded request with a single
+    run-wide working root and role grant. Previewed routing is therefore not the routing
+    that runs.
+
+    Disposition: correct through an approved ADR (BL-03) — one ``ExecutionPlanCompiler``
+    produces the immutable plan consumed by both dry-run rendering and execution.
+    INTENDED FOLLOW-UP: CP-01 (compile all execution policy once) and CP-02 (cut dry-run,
+    execute, and resume over to the compiled plan).
+    """
+
+    def test_execute_request_carries_no_per_route_configuration(self) -> None:
+        request_fields = {f.name for f in fields(ExecuteRequest)}
+        exec_fields = {f.name for f in fields(TaskExecution)}
+        # A single run-wide working root and role grant reach execution...
+        self.assertIn("working_root", request_fields)
+        self.assertIn("role_grant", request_fields)
+        self.assertIn("working_root", exec_fields)
+        self.assertIn("role_grant", exec_fields)
+        # ...and nothing route-derived does: no per-task stack, checks, subagents, root, or
+        # storage crosses into the execute path.
+        for absent in ("route", "resolved_route", "stack", "checks", "subagents",
+                       "storage", "root"):
+            self.assertNotIn(absent, request_fields)
+            self.assertNotIn(absent, exec_fields)
+
+    def test_execute_uses_one_default_role_grant_for_every_task(self) -> None:
+        self.assertEqual(
+            execution_mod.DEFAULT_ROLE_GRANT, ("read", "run_checks", "write"))
+        default = ExecuteRequest.__dataclass_fields__["role_grant"].default
+        self.assertEqual(default, execution_mod.DEFAULT_ROLE_GRANT)
+
+    def test_execute_collapses_every_task_onto_the_first_resolved_storage(self) -> None:
+        src = inspect.getsource(runner_cli._execute)
+        # The storage loop stops at the first routable spec...
+        self.assertIn("for spec in specs:", src)
+        self.assertIn("storage_dir = resolved.storage", src)
+        self.assertIn("break", src)
+        # ...and that single directory is the run dir for the whole invocation.
+        self.assertIn('run_dir = (storage_dir or project_dir / ".pipeline" / "runs") / feature',
+                      src)
+        # execute never rejects a later unresolved route the way the dry run does.
+        self.assertNotIn("unresolved-executor", src)
+
+    def test_dry_run_plan_does_resolve_the_full_per_route_shape(self) -> None:
+        plan_src = inspect.getsource(runner_cli._plan_text)
+        for detail in ("resolved.route.stack", "resolved.route.checks",
+                       "resolved.route.subagents", "resolved.root", "resolved.storage"):
+            self.assertIn(detail, plan_src)
+
+
+# --- F-02 --------------------------------------------------------------------------------------
+
+
+class F02DurabilityInvariantIsNotMet(unittest.TestCase):
+    """F-02 — ``commands.run_command`` records a completed command straight onto the
+    in-memory ``Run`` and never flushes ``run.json``. A crash between the command finishing
+    and the surrounding flow's next save loses that command and its evidence from persisted
+    state, even though it really ran. ``RunLifecycle.record_command`` (the owning path) does
+    flush, but production command execution does not go through it.
+
+    Disposition: correct through an approved ADR (BL-03) — every durable change goes through
+    a repository transaction / lifecycle operation with a documented crash-consistency
+    boundary. INTENDED FOLLOW-UP: DS-01 (separate typed state and pure transitions) and
+    DS-03 (transactional persistence and run identity).
+    """
+
+    def test_run_command_mutates_memory_but_leaves_run_json_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = _spec()
+            life = _running_life(root, spec)
+            run = life.run
+            run.save()  # the last durable checkpoint before the command runs
+
+            run_command(run, f"task:{spec.id}", ".",
+                        [sys.executable, "-c", "print('did real work')"])
+
+            # In memory the command is recorded...
+            self.assertEqual(len(run.commands), 1)
+            self.assertEqual(run.commands[0]["stage"], f"task:{spec.id}")
+            # ...but a reader of run.json (a resume after a crash here) sees nothing.
+            persisted = json.loads(
+                (run.run_dir / "run.json").read_text(encoding="utf-8"))
+            self.assertEqual(persisted["commands"], [])
+
+    def test_the_owning_lifecycle_path_would_have_flushed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = _spec()
+            life = _running_life(root, spec)
+            life.run.save()
+
+            life.record_command(
+                f"task:{spec.id}", ".", ["echo", "hi"], 0, 0.0, "hi", "")
+
+            persisted = json.loads(
+                (life.run.run_dir / "run.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(persisted["commands"]), 1)
+
+
+# --- F-03 --------------------------------------------------------------------------------------
+
+
+class F03FreshRunIdentityAndOverwriteSemanticsAreUnsafe(unittest.TestCase):
+    """F-03 — run storage is ``<storage>/<feature>`` with no per-run directory, and the run
+    id has only timestamp-level uniqueness. A fresh invocation reuses the feature directory,
+    overwrites ``run.json`` in place, and leaves earlier evidence files beside the new state.
+
+    Disposition: correct through an approved ADR (BL-03) — an explicit run-identity policy
+    (one immutable directory per run instance plus a ``latest`` index, or a single-active-run
+    model that refuses a fresh start over existing state). INTENDED FOLLOW-UP: DS-02 (strict
+    schema v3 and explicit migration) and DS-03 (transactional persistence and run identity).
+    """
+
+    def test_two_fresh_runs_in_the_same_second_get_the_same_run_id(self) -> None:
+        original = state_mod._now
+        state_mod._now = lambda: "2026-09-03T12:00:00Z"
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                a = Run.create("feat", root / "p.md", None, root / "runs" / "feat", root)
+                b = Run.create("feat", root / "p.md", None, root / "runs" / "feat", root)
+            self.assertEqual(a.run_id, b.run_id)
+            self.assertEqual(a.run_dir, b.run_dir)  # no run-id component in the path
+        finally:
+            state_mod._now = original
+
+    def test_a_second_fresh_run_overwrites_run_json_and_orphans_old_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_dir = root / "runs" / "feat"
+
+            first = Run.create("feat", root / "p.md", None, run_dir, root)
+            first.add_task("T-1")
+            first.add_task("T-2")
+            first.save()
+            stale = run_dir / "reports" / "T-1" / "attempt-1" / "diagnostic-report.md"
+            stale.parent.mkdir(parents=True, exist_ok=True)
+            stale.write_text("evidence from the first run\n", encoding="utf-8")
+
+            second = Run.create("feat", root / "p.md", None, run_dir, root)
+            second.add_task("T-9")
+            second.save()
+
+            persisted = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+            self.assertEqual([t["id"] for t in persisted["tasks"]], ["T-9"])
+            # The first run's evidence is still on disk, now unreferenced by run.json.
+            self.assertTrue(stale.is_file())
+
+
+# --- F-04 --------------------------------------------------------------------------------------
+
+
+class F04OutOfScopeChangesAreNotEnforcedStructurally(unittest.TestCase):
+    """F-04 — worktree attribution *labels* a changed file ``out_of_scope`` but nothing
+    stops the task: ``dispatch_executor`` still transitions ``running -> implemented`` on a
+    trusted report and hands the decision to the LLM verifier. The CLI documents that
+    out-of-scope changes fail; the core has no deterministic gate for it.
+
+    Disposition: correct through an approved ADR (BL-03) — the pipeline blocks or fails
+    immediately after attribution when executor-owned out-of-scope changes exist; verifiers
+    explain but do not decide a mechanical invariant; the runner never auto-reverts.
+    INTENDED FOLLOW-UP: WT-02 (enforce the deterministic scope gate).
+    """
+
+    def test_attribution_labels_out_of_scope_without_raising_or_downgrading_trust(self) -> None:
+        before = worktree_mod.WorktreeSnapshot({"in_scope.py": _sf(b"a\n")}, available=True)
+        after = worktree_mod.WorktreeSnapshot(
+            {"in_scope.py": _sf(b"b\n"), "secret.py": _sf(b"leaked\n")}, available=True)
+
+        result = attribute_window(before, after, allowed_scope=("in_scope.py",))
+
+        # A trusted, non-error state even though a file landed outside the allowed scope.
+        self.assertEqual(result.state, STATE_KNOWN)
+        by_path = {c.path: c.classification for c in result.changed_files}
+        self.assertEqual(by_path["in_scope.py"], IN_SCOPE)
+        self.assertEqual(by_path["secret.py"], OUT_OF_SCOPE)
+
+    def test_dispatch_reaches_implemented_with_an_out_of_scope_change_in_the_window(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _init_repo(root)
+            spec = _spec()
+            life = _running_life(root, spec)
+
+            def _leak() -> None:
+                (root / "in_scope.py").write_text("touched\n", encoding="utf-8")
+                (root / "secret.py").write_text("written outside scope\n", encoding="utf-8")
+
+            outcome = dispatch_executor(
+                life,
+                DispatchRequest(
+                    spec=spec, role_grant=("read", "run_checks", "write"),
+                    anchors=EnvelopeAnchors(project_root=".", agents_root=".agents"),
+                    plan_path="docs/plans/2026-09-03-feature-pipeline-refactor.md"),
+                _ScriptedAdapter(on_launch=_leak),
+            )
+
+            self.assertEqual(outcome.status, "implemented")
+            self.assertEqual(life.run.task(spec.id).status, "implemented")
+            manifest = json.loads(
+                (root / outcome.attribution.manifest).read_text(encoding="utf-8"))
+            classes = {row["path"]: row["classification"]
+                       for row in manifest["changed_files"]}
+            self.assertEqual(classes.get("secret.py"), OUT_OF_SCOPE)
+
+
+def _sf(data: bytes) -> worktree_mod.SnapshotFile:
+    return worktree_mod.SnapshotFile(data)
+
+
+# --- F-05 --------------------------------------------------------------------------------------
+
+
+class F05DiagnosticsDoNotCollectAllRequiredEvidence(unittest.TestCase):
+    """F-05 — the diagnostic writer has ``git_diff`` / ``git_status`` parameters that default
+    to empty, and the production call site in ``execution.py`` passes neither. The report
+    still renders the required headings, so an unavailable evidence section is presented as
+    an empty successful one.
+
+    Disposition: correct through an approved ADR (BL-03) — diagnostic assembly queries a
+    read-only repository-inspection port at the moment of failure and records collection
+    errors explicitly, never representing missing evidence as an empty success.
+    INTENDED FOLLOW-UP: VP-01 (extract task, verification, and diagnostic services).
+    """
+
+    def test_production_call_site_passes_no_git_evidence(self) -> None:
+        src = inspect.getsource(execution_mod)
+        self.assertIn("write_diagnostic_report(", src)
+        self.assertNotIn("git_diff=", src)
+        self.assertNotIn("git_status=", src)
+
+    def test_report_renders_git_headings_with_an_empty_placeholder_body(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = _spec()
+            life = _running_life(root, spec)
+            run = life.run
+
+            path = write_diagnostic_report(
+                run, task_id=spec.id, attempt=1,
+                note="maximum repair attempts (2) reached")  # exactly as execution.py calls it
+
+            text = path.read_text(encoding="utf-8")
+            self.assertIn("## git diff", text)
+            self.assertIn("## git status", text)
+            diff_body = text.split("## git diff", 1)[1].split("## ", 1)[0]
+            # 'none' is reporting.fenced's placeholder for an empty body: the diff was never
+            # collected, yet nothing in the section says the evidence is unavailable.
+            self.assertIn("none", diff_body)
+            self.assertNotIn("diff --git", diff_body)
+            self.assertNotIn("unavailable", diff_body.lower())
+            self.assertNotIn("could not", diff_body.lower())
+
+
+# --- F-06 --------------------------------------------------------------------------------------
+
+
+class F06GitSafetyUsesABypassableDenylist(unittest.TestCase):
+    """F-06 — ``GitPort`` denies a command only when ``argv[0]`` is an exact denied
+    subcommand or a denied flag appears anywhere in argv. A global option before the
+    subcommand, or an alias/`-c` override, sails through the safety check.
+
+    Disposition: correct through an approved ADR (BL-03) — the safety boundary parses argv
+    into a known read-only operation with a fixed argument schema (an allowlist), so safety
+    never depends on recognizing every dangerous Git spelling. INTENDED FOLLOW-UP: RS-03
+    (enforce argv policy, Git safety, and launch controls).
+    """
+
+    def setUp(self) -> None:
+        self._real_run = subprocess.run
+        self._calls: list[list[str]] = []
+
+        def _fake_run(argv, **_kwargs):  # noqa: ANN001, ANN003
+            self._calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        subprocess.run = _fake_run  # type: ignore[assignment]
+
+    def tearDown(self) -> None:
+        subprocess.run = self._real_run  # type: ignore[assignment]
+
+    def test_plain_mutating_subcommand_is_denied(self) -> None:
+        port = GitPort(Path("."))
+        for argv in (["push"], ["reset", "--hard"], ["checkout", "main"]):
+            with self.assertRaises(GitSafetyError):
+                port.run(argv)
+        self.assertEqual(self._calls, [])  # nothing reached the subprocess
+
+    def test_global_option_or_alias_before_a_mutation_is_not_denied(self) -> None:
+        port = GitPort(Path("."))
+        bypasses = (
+            ["-c", "alias.sync=push", "sync"],       # -c alias indirection
+            ["-C", "/somewhere/else", "push"],       # global option before the subcommand
+            ["--git-dir=../other/.git", "push"],     # global option, attached form
+        )
+        for argv in bypasses:
+            result = port.run(argv)  # no GitSafetyError raised
+            self.assertIsInstance(result, GitResult)
+        # Every bypass argv was handed to git for execution.
+        self.assertEqual(len(self._calls), len(bypasses))
+        for argv, call in zip(bypasses, self._calls):
+            self.assertEqual(call, ["git", *argv])
+
+
+# --- F-07 --------------------------------------------------------------------------------------
+
+
+class F07ConfigurationValuesAreAcceptedButNotConsistentlyApplied(unittest.TestCase):
+    """F-07 — the output byte budgets and serialized-program mutex are accepted (CLI flags,
+    recorded controls) but never threaded into the command / adapter / report paths that run
+    a task's verification. ``run_command`` falls back to the hard-coded module budgets, and
+    execute passes no serialized-program set or comprehensive timeout policy.
+
+    Disposition: correct through an approved ADR (BL-03), with a deprecation window for any
+    control that becomes unsupported — every accepted control is validated, resolved,
+    persisted, and used, or explicitly rejected; no operational flag is a silent no-op.
+    INTENDED FOLLOW-UP: DF-02 (resolve controls and clocks at the boundary) and RS-01
+    (consolidate local process execution).
+    """
+
+    def test_budgets_are_controls_but_not_execution_inputs(self) -> None:
+        control_fields = {f.name for f in fields(ExecuteControls)}
+        self.assertIn("routine_output_byte_budget", control_fields)
+        self.assertIn("diagnostic_output_byte_budget", control_fields)
+
+        exec_fields = {f.name for f in fields(TaskExecution)}
+        for dropped in ("routine_output_byte_budget", "diagnostic_output_byte_budget",
+                        "serialized_programs"):
+            self.assertNotIn(dropped, exec_fields)
+
+    def test_verification_gate_wires_neither_budget_nor_mutex_nor_timeout_policy(self) -> None:
+        gate_src = inspect.getsource(execution_mod._verify_gate)
+        self.assertIn("run_verification_commands(", gate_src)
+        self.assertNotIn("output_limit", gate_src)
+        self.assertNotIn("byte_budget", gate_src)
+        self.assertNotIn("serialized_programs", gate_src)
+
+        run_src = inspect.getsource(execution_mod.run_task)
+        self.assertNotIn("serialized_programs", run_src)
+
+    def test_run_command_falls_back_to_the_hard_coded_module_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = _spec()
+            run = _running_life(root, spec).run
+            script = "import sys; sys.stderr.write('x' * 200000)"
+
+            record = run_command(
+                run, f"task:{spec.id}", ".", [sys.executable, "-c", script])
+
+            err = (run.run_dir / record["stderr_log"]).read_text(encoding="utf-8")
+            # Truncated to the fixed diagnostic budget — there is no path for a configured
+            # value to change this from inside a verification pass.
+            self.assertLessEqual(len(err.encode("utf-8")), DIAGNOSTIC_OUTPUT_BUDGET)
+            self.assertIn("bytes truncated", err)
+
+
+# --- F-08 --------------------------------------------------------------------------------------
+
+
+class F08ControlValidationCanOccurTooLate(unittest.TestCase):
+    """F-08 — the ``--max-repair-attempts`` override is applied with ``dataclasses.replace``,
+    which bypasses ``TaskSpec.build`` validation. A negative bound is accepted into the run
+    and only rejected later, if and when the repair loop actually starts.
+
+    Disposition: correct through an approved ADR (BL-03) — all CLI, profile, and task
+    controls are validated before run state is created, leases are acquired, or any adapter
+    is launched. INTENDED FOLLOW-UP: DF-02 (resolve controls and clocks at the boundary)
+    and IN-01 (build one normalized task definition).
+    """
+
+    def test_taskspec_build_rejects_a_negative_bound(self) -> None:
+        with self.assertRaises(SchemaError):
+            _spec(max_repair_attempts=-3)
+
+    def test_replace_and_apply_repair_bound_accept_the_negative_bound_unchecked(self) -> None:
+        spec = _spec(max_repair_attempts=2)
+
+        bypassed = replace(spec, max_repair_attempts=-3)
+        self.assertEqual(bypassed.max_repair_attempts, -3)
+
+        by_id = _apply_repair_bound([spec], -3)
+        self.assertEqual(by_id[spec.id].max_repair_attempts, -3)
+
+    def test_the_override_is_not_validated_before_state_or_launch(self) -> None:
+        # execute_run applies the bound (step 2) before it initializes the durable lifecycle
+        # or acquires the write lease (steps 3-4); the value itself is never validated here.
+        src = inspect.getsource(execution_mod.execute_run)
+        apply_at = src.index("_apply_repair_bound(")
+        lifecycle_at = src.index("RunLifecycle.")
+        lease_at = src.index("pipeline_lease(")
+        self.assertLess(apply_at, lifecycle_at)
+        self.assertLess(apply_at, lease_at)
+        apply_src = inspect.getsource(execution_mod._apply_repair_bound)
+        self.assertNotIn("SchemaError", apply_src)
+        self.assertNotIn("< 0", apply_src)
+
+
+if __name__ == "__main__":  # pragma: no cover
+    unittest.main()
