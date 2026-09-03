@@ -1,0 +1,98 @@
+$ run_pipeline.py --help
+exit: 0
+--- stdout ---
+usage: run_pipeline.py [-h] [--project-root DIR] [--agents-root DIR]
+                       [--core-root DIR] [--profile REL] [--project-skill REL]
+                       [--plan REL] [--task ID] [--through ID]
+                       [--attest-dependency DEP_ID=SOURCE_FEATURE] [--resume]
+                       [--mode {plan-only,unattended,execute,release-dry-run}]
+                       [--feature NAME] [--prompt REL] [--approve-plan]
+                       [--approve-final-diff] [--commit]
+                       [--commit-approved-manifest] [--dry-run] [--push]
+                       [--status] [--unattended] [--adapter NAME]
+                       [--max-repair-attempts N]
+                       [--routine-output-byte-budget N]
+                       [--diagnostic-output-byte-budget N] [--verbose]
+                       [--quiet]
+
+Portable feature-pipeline core runner. Every path is an explicit anchor or a
+logical path resolved below one; nothing is inferred.
+
+options:
+  -h, --help            show this help message and exit
+
+explicit anchors (filesystem roots):
+  --project-root DIR    filesystem root the project's logical paths resolve
+                        below
+  --agents-root DIR     filesystem root the shared agents/skills tree resolves
+                        below
+  --core-root DIR       filesystem root this portable core resolves below
+
+logical paths (relative to an anchor):
+  --profile REL         profile file, relative to --project-root
+  --project-skill REL   project skill directory, relative to --agents-root
+
+run selection and scope:
+  --plan REL            plan file, relative to the resolved project directory:
+                        JSON, or Markdown (a '| ID | Type | Depends on |' task
+                        table) for a '.md' path
+  --task ID             run only this task, if its dependencies pass
+  --through ID          select tasks from the first up to and including this
+                        one
+  --attest-dependency DEP_ID=SOURCE_FEATURE
+                        --task only: treat DEP_ID (one of the task's own
+                        dependencies) as satisfied because the already-closed
+                        run SOURCE_FEATURE verified it, without dispatching it
+                        in this run. Repeatable; real control for --mode
+                        execute and for --dry-run (both resolve and validate
+                        the source run read-only), accepted as a no-op
+                        otherwise
+  --resume              resume a previously recorded run instead of starting
+                        one
+  --mode {plan-only,unattended,execute,release-dry-run}
+                        run mode (default: plan-only). 'execute' runs stages
+                        5-9 — executor dispatch, independent verification, and
+                        bounded repair — and stops before
+                        documentation/delivery. 'release-dry-run' extends the
+                        plan-only dry run with the post-task lifecycle (stages
+                        10–16) and its gates in the C4/C6 plan, then stops at
+                        the final-diff / release dry-run boundary; it still
+                        writes nothing
+  --feature NAME        override the plan's feature name
+  --prompt REL          prompt file, relative to the resolved project
+                        directory (defaults to the plan file)
+
+delivery gates (all closed by default):
+  --approve-plan        satisfy the plan gate
+  --approve-final-diff  satisfy the final-diff gate; never bypasses an earlier
+                        gate
+  --commit              request the commit gate; it never bypasses the plan
+                        gate and this runner has no commit code path
+  --commit-approved-manifest
+                        request the commit gate for an approved manifest;
+                        never bypasses an earlier gate and this runner has no
+                        commit code path
+  --dry-run             print the deterministic, redacted plan and write
+                        nothing outside a temporary run directory
+  --push                denied before any run artifact is created
+
+compatibility surface (forwarded from the legacy CLI; see scripts/README.md):
+  --status              print the resolved run state and exit
+  --unattended          alias of --mode unattended
+  --adapter NAME        execution adapter for --mode execute (real control
+                        there); accepted as a no-op in plan-only/unattended
+  --max-repair-attempts N
+                        repair-loop bound for --mode execute (overrides each
+                        task's declared bound); accepted as a no-op in plan-
+                        only/unattended
+  --routine-output-byte-budget N
+                        recorded control for --mode execute; accepted as a no-
+                        op in plan-only/unattended
+  --diagnostic-output-byte-budget N
+                        recorded control for --mode execute; accepted as a no-
+                        op in plan-only/unattended
+  --verbose             accepted; reporter verbosity is owned by the project
+                        launcher
+  --quiet               accepted; reporter verbosity is owned by the project
+                        launcher
+--- stderr ---

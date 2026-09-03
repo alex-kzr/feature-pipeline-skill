@@ -1,0 +1,8 @@
+cli-help: 0
+plan-only-plan: 10
+denial-execute-plan-gate: 10
+denial-push: 1
+error-unknown-task-type: 30
+error-absolute-logical-path: 30
+blocked-unmet-dependency: 20
+status-no-recorded-run: 0

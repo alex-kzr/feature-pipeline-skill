@@ -1,0 +1,5 @@
+$ run_pipeline.py --project-root <project_root> --agents-root <agents_root> --core-root <core_root> --profile profile.json --plan plan-exec.json --mode execute
+exit: 10
+--- stdout ---
+plan gate pending: approve with --approve-plan or opt in with --unattended; execute mode dispatches no executor until then.
+--- stderr ---

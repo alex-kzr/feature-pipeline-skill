@@ -1,0 +1,48 @@
+$ run_pipeline.py --project-root <project_root> --agents-root <agents_root> --core-root <core_root> --profile profile.json --plan plan.json --task SF-02 --dry-run
+exit: 20
+--- stdout ---
+feature-pipeline core runner - dry run
+mode: plan-only
+profile: shared-project
+anchors:
+  project-root: <project_root>
+  agents-root: <agents_root>
+  core-root: <core_root>
+  profile: <project_root>/profile.json
+  project-skill: (none)
+
+C1. Selected tasks:
+  1. SF-02
+
+C2. Routing:
+  SF-02: stack=text root=<project_root>/content storage=<project_root>/.pipeline/runs checks=[lint] subagents=[executor]
+
+C3. Generated argv (shell-free):
+  SF-02:
+    stage implement: content apply
+    stage verification: content check
+    check lint: lint run
+
+C4. Pending delivery gates (in order):
+  1. plan - pending
+  2. final-diff - pending
+  3. commit - pending
+  4. verification-verdict - pending
+
+C5. Exit code: 20 (blocked)
+
+C6. Planned state transitions:
+  SF-02: pending -> blocked (dependency-not-satisfied: SF-01)
+
+C7. Redacted evidence manifest:
+  <project_root>/.pipeline/runs/<feature>/run.json
+
+C8. Safety posture:
+  push: denied before any artifact ("push is denied at this stage and the runner has no push code path.") [exit 1]
+  commit: never bypasses the plan gate; this runner has no commit code path
+  logical paths: absolute, ~, .. and \ separators are rejected
+  unknown task type: fail closed (unknown-task-type)
+  design / no registry route: fail closed (unresolved-executor)
+  verifier roles: read-only, enforced at profile load
+  unmet dependency: fail closed (dependency-not-satisfied)
+--- stderr ---

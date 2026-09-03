@@ -1,0 +1,5 @@
+$ run_pipeline.py --project-root <project_root> --agents-root <agents_root> --core-root <core_root> --profile profile.json --plan /srv/shared-project/plan.json --dry-run
+exit: 30
+--- stdout ---
+--- stderr ---
+--plan must be relative

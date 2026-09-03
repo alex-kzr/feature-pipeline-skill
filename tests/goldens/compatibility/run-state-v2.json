@@ -1,0 +1,276 @@
+{
+  "schema_version": 2,
+  "feature": "compat-sample",
+  "prompt_path": "prompt.md",
+  "plan_path": "plan.json",
+  "run_id": "<run-id>",
+  "status": "running",
+  "current_task": "T-02",
+  "controls": {
+    "max_repair_attempts": {
+      "value": 2,
+      "sourced": "default"
+    }
+  },
+  "environment": {},
+  "tasks": [
+    {
+      "id": "T-01",
+      "status": "verified",
+      "depends_on": [],
+      "attempts": 0,
+      "blocker": null,
+      "type": null,
+      "executor": null,
+      "adapter": null,
+      "session_id": null,
+      "verification": {
+        "task_verdict": "PASS",
+        "test_verdict": "PASS",
+        "verified_at": "<timestamp>"
+      },
+      "execution_evidence": {
+        "attempt": 0,
+        "executor_report": null,
+        "implementation": {
+          "state": "not-attempted",
+          "changed_files": [],
+          "manifest": null,
+          "diff": null
+        }
+      },
+      "changed_files": [],
+      "verification_tier": "full",
+      "accepts_scoped": [],
+      "promotion": null,
+      "unblocks": [],
+      "maintenance_audit": [],
+      "external_launch_failures": [],
+      "attested_dependencies": [],
+      "next_executor_launch_generation": 1,
+      "next_task_verifier_launch_generation": 1,
+      "next_test_verifier_launch_generation": 1
+    },
+    {
+      "id": "T-02",
+      "status": "implemented",
+      "depends_on": [
+        "T-01"
+      ],
+      "attempts": 0,
+      "blocker": null,
+      "type": null,
+      "executor": null,
+      "adapter": null,
+      "session_id": null,
+      "verification": {
+        "task_verdict": null,
+        "test_verdict": null,
+        "verified_at": null
+      },
+      "execution_evidence": {
+        "attempt": 0,
+        "executor_report": null,
+        "implementation": {
+          "state": "not-attempted",
+          "changed_files": [],
+          "manifest": null,
+          "diff": null
+        }
+      },
+      "changed_files": [],
+      "verification_tier": "full",
+      "accepts_scoped": [],
+      "promotion": null,
+      "unblocks": [],
+      "maintenance_audit": [],
+      "external_launch_failures": [],
+      "attested_dependencies": [],
+      "next_executor_launch_generation": 1,
+      "next_task_verifier_launch_generation": 1,
+      "next_test_verifier_launch_generation": 1
+    },
+    {
+      "id": "T-03",
+      "status": "blocked",
+      "depends_on": [
+        "T-01"
+      ],
+      "attempts": 0,
+      "blocker": "external dependency unavailable",
+      "type": null,
+      "executor": null,
+      "adapter": null,
+      "session_id": null,
+      "verification": {
+        "task_verdict": null,
+        "test_verdict": null,
+        "verified_at": null
+      },
+      "execution_evidence": {
+        "attempt": 0,
+        "executor_report": null,
+        "implementation": {
+          "state": "not-attempted",
+          "changed_files": [],
+          "manifest": null,
+          "diff": null
+        }
+      },
+      "changed_files": [],
+      "verification_tier": "full",
+      "accepts_scoped": [],
+      "promotion": null,
+      "unblocks": [],
+      "maintenance_audit": [],
+      "external_launch_failures": [],
+      "attested_dependencies": [],
+      "next_executor_launch_generation": 1,
+      "next_task_verifier_launch_generation": 1,
+      "next_test_verifier_launch_generation": 1
+    },
+    {
+      "id": "T-04",
+      "status": "pending",
+      "depends_on": [
+        "T-01"
+      ],
+      "attempts": 0,
+      "blocker": null,
+      "type": null,
+      "executor": null,
+      "adapter": null,
+      "session_id": null,
+      "verification": {
+        "task_verdict": null,
+        "test_verdict": null,
+        "verified_at": null
+      },
+      "execution_evidence": {
+        "attempt": 0,
+        "executor_report": null,
+        "implementation": {
+          "state": "not-attempted",
+          "changed_files": [],
+          "manifest": null,
+          "diff": null
+        }
+      },
+      "changed_files": [],
+      "verification_tier": "full",
+      "accepts_scoped": [],
+      "promotion": null,
+      "unblocks": [],
+      "maintenance_audit": [],
+      "external_launch_failures": [],
+      "attested_dependencies": [],
+      "next_executor_launch_generation": 1,
+      "next_task_verifier_launch_generation": 1,
+      "next_test_verifier_launch_generation": 1
+    }
+  ],
+  "history": [
+    {
+      "at": "<timestamp>",
+      "scope": "task:T-01",
+      "from": "pending",
+      "to": "ready",
+      "actor": "runner",
+      "note": null
+    },
+    {
+      "at": "<timestamp>",
+      "scope": "task:T-01",
+      "from": "ready",
+      "to": "running",
+      "actor": "runner",
+      "note": null
+    },
+    {
+      "at": "<timestamp>",
+      "scope": "task:T-01",
+      "from": "running",
+      "to": "implemented",
+      "actor": "executor",
+      "note": null
+    },
+    {
+      "at": "<timestamp>",
+      "scope": "task:T-01",
+      "from": "implemented",
+      "to": "verified",
+      "actor": "runner",
+      "note": "independent verdicts task=PASS test=PASS"
+    },
+    {
+      "at": "<timestamp>",
+      "scope": "verdicts:T-01",
+      "from": null,
+      "to": "verified",
+      "actor": "runner",
+      "note": "task_verdict=PASS test_verdict=PASS"
+    },
+    {
+      "at": "<timestamp>",
+      "scope": "task:T-02",
+      "from": "pending",
+      "to": "ready",
+      "actor": "runner",
+      "note": null
+    },
+    {
+      "at": "<timestamp>",
+      "scope": "task:T-02",
+      "from": "ready",
+      "to": "running",
+      "actor": "runner",
+      "note": null
+    },
+    {
+      "at": "<timestamp>",
+      "scope": "task:T-02",
+      "from": "running",
+      "to": "implemented",
+      "actor": "executor",
+      "note": null
+    },
+    {
+      "at": "<timestamp>",
+      "scope": "task:T-03",
+      "from": "pending",
+      "to": "ready",
+      "actor": "runner",
+      "note": null
+    },
+    {
+      "at": "<timestamp>",
+      "scope": "task:T-03",
+      "from": "ready",
+      "to": "blocked",
+      "actor": "runner",
+      "note": "external dependency unavailable"
+    }
+  ],
+  "commands": [
+    {
+      "id": "command-1",
+      "stage": "task:T-01",
+      "cwd": ".",
+      "argv": [
+        "true"
+      ],
+      "exit_code": 0,
+      "duration": 0,
+      "stdout": "",
+      "stderr": ""
+    }
+  ],
+  "stages": {
+    "task:T-01": {
+      "commands": [
+        "command-1"
+      ]
+    }
+  },
+  "artifacts": {}
+}

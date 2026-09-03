@@ -1,0 +1,5 @@
+$ run_pipeline.py --push
+exit: 1
+--- stdout ---
+--- stderr ---
+push is denied at this stage and the runner has no push code path.

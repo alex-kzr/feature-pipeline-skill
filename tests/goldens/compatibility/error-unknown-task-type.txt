@@ -1,0 +1,47 @@
+$ run_pipeline.py --project-root <project_root> --agents-root <agents_root> --core-root <core_root> --profile profile.json --plan plan-s5.json --task SF-04 --dry-run
+exit: 30
+--- stdout ---
+feature-pipeline core runner - dry run
+mode: plan-only
+profile: shared-project
+anchors:
+  project-root: <project_root>
+  agents-root: <agents_root>
+  core-root: <core_root>
+  profile: <project_root>/profile.json
+  project-skill: (none)
+
+C1. Selected tasks:
+  1. SF-04
+
+C2. Routing:
+  SF-04: unknown-task-type (type mystery)
+
+C3. Generated argv (shell-free):
+  SF-04:
+    stage implement: content apply
+    stage verification: content check
+
+C4. Pending delivery gates (in order):
+  1. plan - pending
+  2. final-diff - pending
+  3. commit - pending
+  4. verification-verdict - pending
+
+C5. Exit code: 30 (error)
+
+C6. Planned state transitions:
+  SF-04: pending -> blocked (unknown-task-type)
+
+C7. Redacted evidence manifest:
+  <project_root>/.pipeline/runs/<feature>/run.json
+
+C8. Safety posture:
+  push: denied before any artifact ("push is denied at this stage and the runner has no push code path.") [exit 1]
+  commit: never bypasses the plan gate; this runner has no commit code path
+  logical paths: absolute, ~, .. and \ separators are rejected
+  unknown task type: fail closed (unknown-task-type)
+  design / no registry route: fail closed (unresolved-executor)
+  verifier roles: read-only, enforced at profile load
+  unmet dependency: fail closed (dependency-not-satisfied)
+--- stderr ---

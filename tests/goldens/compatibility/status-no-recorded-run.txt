@@ -1,0 +1,6 @@
+$ run_pipeline.py --project-root <project_root> --agents-root <agents_root> --core-root <core_root> --profile profile.json --plan plan.json --status
+exit: 0
+--- stdout ---
+feature: shared-project-acceptance
+no recorded run
+--- stderr ---
