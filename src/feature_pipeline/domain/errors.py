@@ -73,6 +73,17 @@ class InvalidTerm(DomainError):
     code = "invalid-term"
 
 
+class InvalidControl(DomainError):
+    """An operational control value is outside its accepted domain.
+
+    Raised at the CLI/application boundary before any run state, lease, or launch — the same
+    rejection ``feature_pipeline.contracts.TaskSpec.build`` makes with ``SchemaError`` for a
+    negative or non-integer ``max_repair_attempts`` (finding F-08, ``docs/adr/007`` §5).
+    """
+
+    code = "invalid-control"
+
+
 __all__ = [
     "DomainError",
     "InvalidIdentifier",
@@ -81,4 +92,5 @@ __all__ = [
     "PathNotContained",
     "InvalidArgv",
     "InvalidTerm",
+    "InvalidControl",
 ]

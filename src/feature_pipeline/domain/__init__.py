@@ -17,9 +17,11 @@ slice once parity tests prove the new and old values are identical.
 from __future__ import annotations
 
 from .argv import SHELL_TOKENS, Argv
+from .controls import ControlSource, ResolvedControl
 from .errors import (
     DomainError,
     InvalidArgv,
+    InvalidControl,
     InvalidGlob,
     InvalidIdentifier,
     InvalidPath,
@@ -33,6 +35,7 @@ from .identifiers import (
     TaskId,
 )
 from .paths import RelativeGlob, RelativePath, ensure_within
+from .repair import DEFAULT_MAX_REPAIR_ATTEMPTS, RepairBound
 from .vocabulary import (
     Actor,
     AdapterName,
@@ -48,6 +51,7 @@ __all__ = [
     # errors
     "DomainError",
     "InvalidArgv",
+    "InvalidControl",
     "InvalidGlob",
     "InvalidIdentifier",
     "InvalidPath",
@@ -64,6 +68,11 @@ __all__ = [
     "ensure_within",
     "Argv",
     "SHELL_TOKENS",
+    # controls
+    "ControlSource",
+    "ResolvedControl",
+    "RepairBound",
+    "DEFAULT_MAX_REPAIR_ATTEMPTS",
     # vocabulary
     "TaskStatus",
     "RunStatus",
