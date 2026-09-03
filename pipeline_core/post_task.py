@@ -1,9 +1,9 @@
-"""Stages 10–13: the post-task lifecycle, modeled explicitly over one durable run-state
+"""Stages 10–16: the post-task lifecycle, modeled explicitly over one durable run-state
 contract.
 
 The minimum execution engine (:mod:`pipeline_core.execution`) drives every selected task to
-``verified`` and stops after stage 9. This module owns the four stages that may run *after*
-that, each behind an explicit guard:
+``verified`` and stops after stage 9. This module owns the stages that may run *after* that,
+each behind an explicit guard:
 
 ===== ===================== ================================================================
 Stage Name                  Guard
@@ -16,7 +16,18 @@ Stage Name                  Guard
                             ``graphify … install`` argv (AC-3)
 13    ``graphify-verification`` independently re-checks every configured output and the
                             tracked-empty policy (AC-3)
+14    ``final-verification`` unreachable until stage 13 is ``PASS``; runs only the
+                            project-declared final verification commands, sequentially
+15    ``final-diff-approval`` a human gate; ``BLOCKED`` (pending) without an explicit
+                            approval, but the lifecycle still emits stage 16's dry run
+16    ``release``           a deterministic, non-mutating release plan; a real commit needs
+                            an explicit commit control + an approved final diff + a passing
+                            final verification, and even then nothing is committed or pushed
 ===== ===================== ================================================================
+
+Stages 14–16 (:mod:`pipeline_core.release`) run only when the request carries a
+:class:`~pipeline_core.release.ReleasePolicy`; without one the lifecycle ends after stage 13,
+unchanged.
 
 Every stage verdict is flushed to ``run.json`` under ``stages[<name>]`` via
 :meth:`pipeline_core.state.Run.record_stage_outcome`, so a restart resumes at the first stage
@@ -41,6 +52,18 @@ from schemas import SchemaError, ToolStage
 
 from .integrations import GraphifyIntegration
 from .lifecycle import RunLifecycle
+from .release import (
+    FINAL_DIFF_APPROVAL,
+    FINAL_VERIFICATION,
+    RELEASE,
+    RELEASE_STAGES,
+    DiffProbe,
+    PointerProbe,
+    ReleasePolicy,
+    final_diff_result,
+    final_verification_result,
+    release_plan_result,
+)
 from .stages import BLOCKED, FAIL, PASS, CommandRunner, TrackedChangesProbe, run_tool_stage
 from .commands import run_command
 
@@ -49,13 +72,14 @@ DOCUMENTATION_AUDIT = "documentation-audit"
 GRAPHIFY_REFRESH = "graphify-refresh"
 GRAPHIFY_VERIFICATION = "graphify-verification"
 
-#: The explicit, ordered post-task lifecycle: ``(stage-number, stage-name)``.
+#: The explicit, ordered post-task lifecycle: ``(stage-number, stage-name)``. Stages 14–16
+#: (from :mod:`pipeline_core.release`) run only when the request carries a ``ReleasePolicy``.
 POST_TASK_STAGES: tuple[tuple[int, str], ...] = (
     (10, DOCUMENTATION),
     (11, DOCUMENTATION_AUDIT),
     (12, GRAPHIFY_REFRESH),
     (13, GRAPHIFY_VERIFICATION),
-)
+) + RELEASE_STAGES
 STAGE_NUMBERS = {name: number for number, name in POST_TASK_STAGES}
 
 #: argv verbs no post-task stage may run — this lifecycle produces evidence, never a mutation.
@@ -144,10 +168,19 @@ class PostTaskRequest:
     graphify_argv: tuple[str, ...] | None = None
     command_runner: CommandRunner = run_command
     tracked_changes: TrackedChangesProbe | None = None
+    #: Stages 14–16 run only when a release policy is supplied; without one the lifecycle
+    #: ends after stage 13, exactly as before.
+    release_policy: ReleasePolicy | None = None
+    final_diff_approved: bool = False
+    commit_control: bool = False
+    diff_probe: DiffProbe | None = None
+    submodule_pointer_probe: PointerProbe | None = None
+    verification_timeout: float | None = None
 
 
 def run_post_task_lifecycle(life: RunLifecycle, request: PostTaskRequest) -> PostTaskOutcome:
-    """Drive stages 10–13 in order, stopping at the first guard that is not satisfied.
+    """Drive stages 10–13 (and, with a ``release_policy``, 14–16) in order, stopping at the
+    first guard that is not satisfied.
 
     Restart-safe: a stage already recorded ``PASS`` on ``run.json`` is not re-run.
     """
@@ -227,7 +260,65 @@ def run_post_task_lifecycle(life: RunLifecycle, request: PostTaskRequest) -> Pos
     if r13.verdict != PASS:
         return PostTaskOutcome("blocked", tuple(results))
 
-    return PostTaskOutcome("complete", tuple(results))
+    if request.release_policy is None:
+        return PostTaskOutcome("complete", tuple(results))
+
+    return _run_release_tail(life, request, results)
+
+
+def _run_release_tail(
+    life: RunLifecycle, request: PostTaskRequest, results: list[StageResult]
+) -> PostTaskOutcome:
+    """Stages 14–16: final verification, the human final-diff gate, and the release plan."""
+    run = life.run
+    policy = request.release_policy
+    assert policy is not None  # guarded by the caller
+
+    # --- Stage 14: final verification. AC-1 — unreachable until Graphify verification passed.
+    r14 = _recorded(run, FINAL_VERIFICATION)
+    if r14 is None or r14.verdict != PASS:
+        graphify = _recorded(run, GRAPHIFY_VERIFICATION)
+        if graphify is None or graphify.verdict != PASS:
+            r14 = StageResult(
+                FINAL_VERIFICATION, 14, BLOCKED,
+                ("final verification cannot run before Graphify verification passes",))
+        else:
+            verdict, reasons, evidence = final_verification_result(
+                run, policy, command_runner=request.command_runner,
+                timeout=request.verification_timeout)
+            r14 = StageResult(FINAL_VERIFICATION, 14, verdict, reasons, evidence)
+        _record(life, r14)
+    results.append(r14)
+    if r14.verdict != PASS:
+        return PostTaskOutcome("blocked", tuple(results))
+
+    # --- Stage 15: the human final-diff gate. A missing approval records BLOCKED (pending)
+    #     but does NOT halt — stage 16 still emits its non-mutating dry run (AC-2).
+    verdict, reasons, evidence = final_diff_result(
+        approved=request.final_diff_approved, diff_probe=request.diff_probe)
+    r15 = StageResult(FINAL_DIFF_APPROVAL, 15, verdict, reasons, evidence)
+    _record(life, r15)
+    results.append(r15)
+
+    # --- Stage 16: the release plan — always non-mutating; PASS means "plan emitted".
+    verdict, reasons, plan = release_plan_result(
+        policy,
+        final_verification_pass=r14.verdict == PASS,
+        final_diff_approved=r15.verdict == PASS,
+        commit_control=request.commit_control,
+        submodule_pointer_probe=request.submodule_pointer_probe,
+    )
+    r16 = StageResult(RELEASE, 16, verdict, reasons, plan)
+    _record(life, r16)
+    results.append(r16)
+    if r16.verdict != PASS:
+        return PostTaskOutcome("blocked", tuple(results))
+
+    # A real commit was authorized (control + approval + passing verification) -> complete;
+    # otherwise the run legitimately ends at a non-mutating release dry run, still pending a
+    # human gate / commit control.
+    complete = bool(plan.get("would_commit"))
+    return PostTaskOutcome("complete" if complete else "gate-pending", tuple(results))
 
 
 # --- stage 12 / 13 internals -------------------------------------------------------------
@@ -387,12 +478,16 @@ __all__ = [
     "DOCUMENTATION_AUDIT",
     "DocumentationRequest",
     "Documenter",
+    "FINAL_DIFF_APPROVAL",
+    "FINAL_VERIFICATION",
     "GRAPHIFY_REFRESH",
     "GRAPHIFY_VERIFICATION",
     "POST_TASK_STAGES",
     "PostTaskError",
     "PostTaskOutcome",
     "PostTaskRequest",
+    "RELEASE",
+    "ReleasePolicy",
     "StageResult",
     "run_post_task_lifecycle",
 ]

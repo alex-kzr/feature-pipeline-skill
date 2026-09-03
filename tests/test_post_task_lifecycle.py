@@ -1,4 +1,4 @@
-"""Tests for the stage 10–13 post-task lifecycle (documentation, audit, Graphify)."""
+"""Tests for the stage 10–16 post-task lifecycle (documentation, audit, Graphify, release)."""
 
 from __future__ import annotations
 
@@ -11,14 +11,29 @@ from pipeline_core.lifecycle import RunLifecycle
 from pipeline_core.post_task import (
     DOCUMENTATION,
     DOCUMENTATION_AUDIT,
+    FINAL_DIFF_APPROVAL,
+    FINAL_VERIFICATION,
     GRAPHIFY_REFRESH,
     GRAPHIFY_VERIFICATION,
     POST_TASK_STAGES,
+    RELEASE,
     PostTaskError,
     PostTaskRequest,
     run_post_task_lifecycle,
 )
+from pipeline_core.release import ReleasePolicy
 from pipeline_core.state import ACTOR_EXECUTOR, ACTOR_RUNNER, Run
+from schemas.contracts import CommandSpec
+
+_RELEASE_POLICY = ReleasePolicy(
+    final_verification=(
+        CommandSpec.from_data({"cwd": "feature-pipeline-skill", "argv": ["run", "checks"]}),
+        CommandSpec.from_data({"cwd": ".", "argv": ["git", "diff", "--check"]}),
+    ),
+    stage_paths=("feature-pipeline-skill", "docs"),
+    submodule_pointer="feature-pipeline-skill",
+    commit_message_template="chore(feature-pipeline): {feature}",
+)
 
 _INTEGRATION = GraphifyIntegration.from_data({
     "schema_version": 1,
@@ -95,10 +110,11 @@ class LifecycleModelTests(unittest.TestCase):
         self.assertEqual(
             POST_TASK_STAGES,
             ((10, DOCUMENTATION), (11, DOCUMENTATION_AUDIT),
-             (12, GRAPHIFY_REFRESH), (13, GRAPHIFY_VERIFICATION)),
+             (12, GRAPHIFY_REFRESH), (13, GRAPHIFY_VERIFICATION),
+             (14, FINAL_VERIFICATION), (15, FINAL_DIFF_APPROVAL), (16, RELEASE)),
         )
 
-    def test_happy_path_runs_all_four_stages_and_persists_each_verdict(self) -> None:
+    def test_without_a_release_policy_the_lifecycle_ends_after_stage_13(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             life = _life(root)
@@ -106,9 +122,10 @@ class LifecycleModelTests(unittest.TestCase):
 
             self.assertEqual(outcome.status, "complete")
             self.assertEqual([s.verdict for s in outcome.stages], ["PASS"] * 4)
+            self.assertIsNone(outcome.stage(FINAL_VERIFICATION))
 
             reloaded = Run.load(life.run.run_dir, root)
-            for number, name in POST_TASK_STAGES:
+            for number, name in POST_TASK_STAGES[:4]:
                 self.assertEqual(reloaded.stages[name]["verdict"], "PASS", name)
                 self.assertEqual(reloaded.stages[name]["number"], number)
 
@@ -279,6 +296,176 @@ class GraphifyStageTests(unittest.TestCase):
                 tracked_changes=lambda: ["M docs/unrelated.md"])
             outcome = run_post_task_lifecycle(life, request)
             self.assertEqual(outcome.status, "complete")
+
+
+def _staged_runner(root: Path, *, final_verification_exit: int = 0):
+    """A command runner that creates the Graphify outputs for the wrapper stage and returns
+    ``final_verification_exit`` for every stage-14 command."""
+    base = _outputs_runner(root)
+    seen: list[str] = []
+
+    def runner(run, stage, cwd, argv, timeout=None):
+        seen.append(stage)
+        if stage == f"stage:{FINAL_VERIFICATION}":
+            return {"exit_code": final_verification_exit}
+        return base(run, stage, cwd, argv, timeout=timeout)
+
+    runner.seen = seen  # type: ignore[attr-defined]
+    return runner
+
+
+class ReleaseTailTests(unittest.TestCase):
+    def test_full_authorization_reaches_stage_16_commit_authorized(self) -> None:
+        # AC-1: stage 14 only runs after Graphify verification passed; full controls -> complete.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            life = _life(root)
+            request = _request(
+                root, life,
+                command_runner=_staged_runner(root),
+                release_policy=_RELEASE_POLICY,
+                final_diff_approved=True,
+                commit_control=True,
+                diff_probe=lambda: "diff --git a b\n",
+                submodule_pointer_probe=lambda: "deadbeef",
+            )
+            outcome = run_post_task_lifecycle(life, request)
+
+            self.assertEqual(outcome.status, "complete")
+            self.assertEqual(
+                [s.verdict for s in outcome.stages], ["PASS"] * 7)
+            plan = outcome.stage(RELEASE).evidence
+            self.assertTrue(plan["would_commit"])
+            self.assertEqual(plan["mode"], "commit-authorized")
+            self.assertEqual(plan["submodule_pointer_target"], "deadbeef")
+
+            reloaded = Run.load(life.run.run_dir, root)
+            for number, name in POST_TASK_STAGES:
+                self.assertEqual(reloaded.stages[name]["verdict"], "PASS", name)
+
+    def test_missing_commit_control_produces_a_non_mutating_dry_run(self) -> None:
+        # AC-2
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            life = _life(root)
+            request = _request(
+                root, life,
+                command_runner=_staged_runner(root),
+                release_policy=_RELEASE_POLICY,
+                final_diff_approved=True,
+                commit_control=False,
+            )
+            outcome = run_post_task_lifecycle(life, request)
+
+            self.assertEqual(outcome.status, "gate-pending")
+            plan = outcome.stage(RELEASE).evidence
+            self.assertEqual(plan["mode"], "dry-run")
+            self.assertFalse(plan["would_commit"])
+            self.assertIn(
+                "no explicit commit control was given", plan["reasons_release_is_dry_run"])
+
+    def test_missing_final_diff_approval_still_emits_the_dry_run(self) -> None:
+        # AC-2: a pending human gate does not halt before the non-mutating release plan.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            life = _life(root)
+            request = _request(
+                root, life,
+                command_runner=_staged_runner(root),
+                release_policy=_RELEASE_POLICY,
+                final_diff_approved=False,
+                commit_control=True,
+            )
+            outcome = run_post_task_lifecycle(life, request)
+
+            self.assertEqual(outcome.status, "gate-pending")
+            self.assertEqual(outcome.stage(FINAL_DIFF_APPROVAL).verdict, "BLOCKED")
+            self.assertEqual(outcome.stage(RELEASE).verdict, "PASS")
+            self.assertEqual(outcome.stage(RELEASE).evidence["mode"], "dry-run")
+
+    def test_final_verification_is_unreachable_until_graphify_verification_passes(self) -> None:
+        # AC-1: stage 13 fails (a pre-existing tracked diff), so stage 14 must never run.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            life = _life(root)
+            runner = _staged_runner(root)
+            request = _request(
+                root, life,
+                command_runner=runner,
+                tracked_changes=lambda: ["M tools/graphify/graphify-out/graph.json"],
+                release_policy=_RELEASE_POLICY,
+                final_diff_approved=True,
+                commit_control=True,
+            )
+            outcome = run_post_task_lifecycle(life, request)
+
+            self.assertEqual(outcome.status, "blocked")
+            self.assertEqual(outcome.stage(GRAPHIFY_VERIFICATION).verdict, "FAIL")
+            self.assertIsNone(outcome.stage(FINAL_VERIFICATION))
+            self.assertNotIn(f"stage:{FINAL_VERIFICATION}", runner.seen)
+
+    def test_a_failing_final_verification_blocks_before_the_diff_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            life = _life(root)
+            request = _request(
+                root, life,
+                command_runner=_staged_runner(root, final_verification_exit=1),
+                release_policy=_RELEASE_POLICY,
+                final_diff_approved=True,
+                commit_control=True,
+            )
+            outcome = run_post_task_lifecycle(life, request)
+
+            self.assertEqual(outcome.status, "blocked")
+            self.assertEqual(outcome.stage(FINAL_VERIFICATION).verdict, "FAIL")
+            self.assertIsNone(outcome.stage(FINAL_DIFF_APPROVAL))
+            self.assertIsNone(outcome.stage(RELEASE))
+
+    def test_no_commit_or_push_argv_appears_anywhere_in_the_recorded_evidence(self) -> None:
+        # AC-3 / validation step 2.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            life = _life(root)
+            request = _request(
+                root, life,
+                command_runner=_staged_runner(root),
+                release_policy=_RELEASE_POLICY,
+                final_diff_approved=True,
+                commit_control=True,
+            )
+            run_post_task_lifecycle(life, request)
+            stages = Run.load(life.run.run_dir, root).stages
+            # No stage recorded an executable argv that stages, commits, or pushes.
+            fv_argvs = [c["argv"] for c in stages[FINAL_VERIFICATION]["evidence"]["commands"]]
+            for argv in fv_argvs:
+                lowered = {t.lower() for t in argv}
+                self.assertEqual(lowered & {"push", "commit", "tag"}, set())
+            blob = repr(stages[RELEASE]["evidence"]).lower()
+            self.assertNotIn("git push", blob)
+            self.assertNotIn("git commit", blob)
+
+    def test_a_passed_stage_14_is_not_rerun_after_a_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            life = _life(root)
+            runner = _staged_runner(root)
+            first = _request(
+                root, life, command_runner=runner, release_policy=_RELEASE_POLICY,
+                final_diff_approved=True, commit_control=False)  # dry run -> gate-pending
+            self.assertEqual(run_post_task_lifecycle(life, first).status, "gate-pending")
+            fv_calls = runner.seen.count(f"stage:{FINAL_VERIFICATION}")
+            self.assertEqual(fv_calls, 2)
+
+            reloaded = RunLifecycle.load(life.run.run_dir, root)
+            runner2 = _staged_runner(root)
+            second = _request(
+                root, reloaded, command_runner=runner2, release_policy=_RELEASE_POLICY,
+                final_diff_approved=True, commit_control=True)
+            outcome = run_post_task_lifecycle(reloaded, second)
+
+            self.assertEqual(outcome.status, "complete")
+            self.assertEqual(runner2.seen.count(f"stage:{FINAL_VERIFICATION}"), 0)
 
 
 class RestartSafetyTests(unittest.TestCase):
