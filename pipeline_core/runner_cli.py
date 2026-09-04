@@ -57,7 +57,7 @@ from feature_pipeline.cli.parser import (
     build_parser,
 )
 from feature_pipeline.cli.use_cases import dispatch, make_execute_adapters
-from pipeline_core.redaction import build_rules, redact_text
+from feature_pipeline.bootstrap import redact_cli_error
 
 # Re-exported for compatibility: every existing caller and test that reaches these through
 # ``pipeline_core.runner_cli`` (the historical home of the whole CLI) keeps working unchanged.
@@ -91,7 +91,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         result = dispatch(command)
     except CliError as exc:
-        print(redact_text(exc.message, build_rules()), file=sys.stderr)
+        print(redact_cli_error(exc.message), file=sys.stderr)
         return exc.code
 
     print(result.message, end="")

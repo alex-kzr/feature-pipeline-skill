@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 from pathlib import Path
+import re
 from tempfile import TemporaryDirectory
 import unittest
 
@@ -34,6 +35,23 @@ class FakeAdapter:
 
 
 class CliBootstrapBoundaryTests(unittest.TestCase):
+    def test_console_entry_point_depends_on_cli_and_bootstrap_apis_only(self) -> None:
+        runner = Path(use_cases.__file__).parents[3] / "pipeline_core" / "runner_cli.py"
+        source = runner.read_text(encoding="utf-8")
+
+        self.assertIsNone(
+            re.search(r"^\s*(?:from|import)\s+pipeline_core", source, re.MULTILINE)
+        )
+
+    def test_cli_modules_depend_on_bootstrap_not_pipeline_core(self) -> None:
+        cli_root = Path(use_cases.__file__).parent
+        for module in ("use_cases.py", "renderers.py"):
+            source = (cli_root / module).read_text(encoding="utf-8")
+            self.assertIsNone(
+                re.search(r"^\s*(?:from|import)\s+pipeline_core", source, re.MULTILINE),
+                module,
+            )
+
     def test_cli_use_cases_do_not_import_concrete_claude_or_private_execution_helpers(
         self,
     ) -> None:
@@ -107,6 +125,38 @@ class CliBootstrapBoundaryTests(unittest.TestCase):
             self.assertEqual(environment, {"claude": True, "codex": False})
             self.assertEqual(seen_runtime[0].project_dir, root)
             self.assertEqual(seen_runtime[0].core_root, root / "core")
+
+    def test_bootstrap_reuses_one_registry_for_compile_and_adapter_creation(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            availability_checks = 0
+
+            def available() -> bool:
+                nonlocal availability_checks
+                availability_checks += 1
+                return True
+
+            composition = build_bootstrap(
+                root,
+                root / ".agents",
+                root / "core",
+                (
+                    AdapterFactory(
+                        name="claude",
+                        create=lambda _runtime: FakeAdapter(),
+                        available=available,
+                        supports_resume=True,
+                        supports_read_only=True,
+                        supports_write=True,
+                    ),
+                ),
+            )
+
+            registry = composition.adapter_registry
+            composition.make_execute_adapters()
+
+        self.assertIs(registry, composition.adapter_registry)
+        self.assertEqual(availability_checks, 1)
 
     def test_codex_factory_declares_an_available_non_resuming_adapter(self) -> None:
         with TemporaryDirectory() as directory:

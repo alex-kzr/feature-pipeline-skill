@@ -15,10 +15,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pipeline_core.post_task import POST_TASK_STAGES
-from pipeline_core.redaction import build_rules, redact_text
-from pipeline_core.release import ReleasePolicy
-from pipeline_core.state import Run, StateError
+from feature_pipeline.bootstrap import (
+    POST_TASK_STAGES,
+    ReleasePolicy,
+    Run,
+    StateError,
+    build_rules,
+    redact_text,
+)
 
 from .commands import RunCommand
 from .parser import EXIT_BLOCKED

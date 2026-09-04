@@ -37,10 +37,16 @@ from pipeline_core.execution import (
     _validate_attestation_scope,
     execute_run,
 )
+from pipeline_core.integrations import load_tool_integration
 from pipeline_core.plan_md import MarkdownPlanError, load_markdown_plan
+from pipeline_core.post_task import POST_TASK_STAGES
 from pipeline_core.profiles import Anchors
+from pipeline_core.project_profile import load_runnable_profile
 from pipeline_core.prompt_envelope import EnvelopeAnchors
 from pipeline_core.redaction import build_rules, redact_text
+from pipeline_core.release import ReleasePolicy, load_release_policy
+from pipeline_core.stages import plan_release_dry_run
+from pipeline_core.state import Run, StateError, pid_alive, read_lease
 from pipeline_core.task_files import load_task_spec
 from pipeline_core.verification import VerifierAnchors, VerifierLaunchers
 
@@ -88,10 +94,7 @@ class BootstrapComposition:
     agents_root: Path
     core_root: Path
     factories: tuple[AdapterFactory, ...]
-
-    @property
-    def adapter_registry(self) -> AdapterRegistry:
-        return AdapterRegistry(tuple(factory.capabilities() for factory in self.factories))
+    adapter_registry: AdapterRegistry
 
     def make_execute_adapters(
         self, adapter_name: str | None = None
@@ -104,8 +107,8 @@ class BootstrapComposition:
             core_root=self.core_root,
             add_dirs=resolve_add_dirs(self.project_dir, self.agents_root, self.core_root),
         )
-        factory_by_name = {factory.name: factory for factory in self.factories}
-        executor = factory_by_name[resolved.name].create(runtime)
+        factory = next(factory for factory in self.factories if factory.name == resolved.name)
+        executor = factory.create(runtime)
         launchers = VerifierLaunchers(task=executor, test=executor)
         environment = {cap.name: cap.available for cap in registry.adapters}
         environment.setdefault(CODEX, False)
@@ -166,11 +169,13 @@ def build_bootstrap(
     core_root: Path,
     factories: Sequence[AdapterFactory] | None = None,
 ) -> BootstrapComposition:
+    registered_factories = tuple(factories) if factories is not None else _production_factories()
     return BootstrapComposition(
         Path(project_dir),
         Path(agents_root),
         Path(core_root),
-        tuple(factories) if factories is not None else _production_factories(),
+        registered_factories,
+        AdapterRegistry(tuple(factory.capabilities() for factory in registered_factories)),
     )
 
 
@@ -320,6 +325,11 @@ def make_execute_adapters(
     return build_bootstrap(project_dir, agents_root, core_root).make_execute_adapters()
 
 
+def redact_cli_error(message: str) -> str:
+    """Render a CLI error without exposing host-specific paths or credentials."""
+    return redact_text(message, build_rules())
+
+
 def _registry_from_environment(environment: dict[str, bool]) -> AdapterRegistry:
     production = AdapterRegistry.default()
     return AdapterRegistry(
@@ -450,6 +460,21 @@ __all__ = [
     "BootstrapComposition",
     "build_bootstrap",
     "codex_factory",
+    "load_markdown_plan",
+    "MarkdownPlanError",
+    "load_runnable_profile",
+    "load_tool_integration",
+    "load_release_policy",
+    "ReleasePolicy",
+    "POST_TASK_STAGES",
+    "plan_release_dry_run",
+    "Run",
+    "StateError",
+    "read_lease",
+    "pid_alive",
+    "build_rules",
+    "redact_text",
+    "Anchors",
     "make_execute_adapters",
     "parse_attestations",
     "project_relative",
