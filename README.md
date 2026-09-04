@@ -73,6 +73,11 @@ Callers supply all anchors. The core does not infer host-specific locations or p
   or process exists; `plan_launch` then threads the resolved timeout, the per-kind output
   byte budget, and the serialized-program mutex into each launch. No operational control is
   a silent no-op.
+- **Codex and Claude use explicit adapter composition.** Codex launches through shell-free
+  `codex exec` argv with JSONL result parsing, resolved extra-directory grants, and the same
+  bounded process timeout handling as Claude. Its status-envelope continuation starts a fresh
+  read-only execution because `codex exec resume` cannot carry those grants. An explicit
+  unavailable Codex selection fails closed; `auto` retains the registry's compatibility order.
 - **An out-of-scope executor change is a mechanical block, not a verifier's opinion.**
   `feature_pipeline.application.execute_task.enforce_scope_gate` runs immediately after the
   bounded worktree attribution and *before* any verifier launches. It re-derives every

@@ -339,6 +339,30 @@ def build_claude_argv(
     return argv
 
 
+def build_codex_argv(
+    request: LaunchRequest,
+    *,
+    executable: str | Sequence[str] = "codex",
+    working_root: str | os.PathLike[str] | None = None,
+    add_dirs: Sequence[str | os.PathLike[str]] = (),
+) -> list[str]:
+    """Build the documented non-interactive ``codex exec`` argv for one launch."""
+    grant = effective_grant(request)
+    argv = _executable_prefix(executable) + ["exec"]
+    # ``codex exec resume --help`` intentionally exposes no sandbox, working-directory, or
+    # extra-directory flags. A runner status continuation is therefore a fresh, tool-free
+    # request so its read-only sandbox and resolved grants are present on the actual argv.
+    sandbox = "read-only" if request_is_read_only(request) else "workspace-write"
+    argv += ["--json", "--sandbox", sandbox]
+    if working_root is not None:
+        argv += ["--cd", str(working_root)]
+    for directory in add_dirs:
+        argv += ["--add-dir", str(directory)]
+    _assert_shell_free(argv)
+    _ = grant
+    return argv
+
+
 # --- result parsing ----------------------------------------------------------------------------
 
 
@@ -391,6 +415,30 @@ def parse_result_text(stdout: str) -> str | None:
         if isinstance(event, dict) and isinstance(event.get("result"), str):
             text_result = event["result"]
     return text_result
+
+
+def parse_codex_session_id(stdout: str) -> str | None:
+    """Return the thread id from Codex's documented JSONL event stream, if present."""
+    for event in _result_objects(stdout):
+        if isinstance(event, dict) and event.get("type") == "thread.started":
+            thread_id = event.get("thread_id")
+            if isinstance(thread_id, str):
+                return thread_id
+    return None
+
+
+def parse_codex_result_text(stdout: str) -> str | None:
+    """Return the latest Codex JSONL ``agent_message`` text, never a fabricated value."""
+    result: str | None = None
+    for event in _result_objects(stdout):
+        if not isinstance(event, dict) or event.get("type") != "item.completed":
+            continue
+        item = event.get("item")
+        if isinstance(item, dict) and item.get("type") == "agent_message":
+            text = item.get("text")
+            if isinstance(text, str):
+                result = text
+    return result
 
 
 # --- process lifetime ------------------------------------------------------------------------
@@ -517,6 +565,79 @@ class ClaudeAdapter:
             stderr=completed.stderr,
             session_id=parse_session_id(completed.stdout) or request.resume_session_id,
             raw_stdout=completed.stdout,
+        )
+
+    def _cwd_for(self, request: LaunchRequest) -> Path | None:
+        working_root = request.working_root or "."
+        if self._working_root is not None:
+            return self._working_root / working_root
+        if working_root != ".":
+            return Path(working_root)
+        return None
+
+
+class CodexAdapter:
+    """Adapter over the non-interactive ``codex exec`` CLI."""
+
+    name = "codex"
+
+    def __init__(
+        self,
+        *,
+        executable: str | Sequence[str] | None = None,
+        resolver: Callable[[], str | Sequence[str] | None] | None = None,
+        runner: ProcessRunner | None = None,
+        add_dirs: Sequence[str | os.PathLike[str]] = (),
+        env: dict[str, str] | None = None,
+        timeout: float = DEFAULT_TIMEOUT_S,
+        working_root: str | os.PathLike[str] | None = None,
+    ) -> None:
+        self._executable = executable
+        self._resolver = resolver or (lambda: shutil.which("codex"))
+        self._runner: ProcessRunner = runner or run_subprocess
+        self._add_dirs = tuple(add_dirs)
+        self._env = env
+        self._timeout = timeout
+        self._working_root = Path(working_root) if working_root is not None else None
+
+    def resolved_executable(self) -> str | Sequence[str] | None:
+        return self._executable if self._executable is not None else self._resolver()
+
+    def available(self) -> bool:
+        return self.resolved_executable() is not None
+
+    def plan(self, request: LaunchRequest) -> list[str]:
+        executable = self.resolved_executable() or "codex"
+        return build_codex_argv(
+            request,
+            executable=executable,
+            working_root=self._cwd_for(request),
+            add_dirs=self._add_dirs,
+        )
+
+    def launch(self, request: LaunchRequest) -> LaunchResult:
+        executable = self.resolved_executable()
+        if executable is None:
+            raise AdapterError("the Codex CLI is not available on PATH", "adapter-unavailable")
+        completed = self._runner(
+            build_codex_argv(
+                request,
+                executable=executable,
+                working_root=self._cwd_for(request),
+                add_dirs=self._add_dirs,
+            ),
+            prompt=request.prompt,
+            cwd=self._cwd_for(request),
+            timeout=request.timeout or self._timeout,
+            env=self._env,
+        )
+        text = parse_codex_result_text(completed.stdout)
+        return LaunchResult(
+            completed.exit_code,
+            text if text is not None else completed.stdout,
+            completed.stderr,
+            parse_codex_session_id(completed.stdout) or request.resume_session_id,
+            completed.stdout,
         )
 
     def _cwd_for(self, request: LaunchRequest) -> Path | None:

@@ -15,7 +15,9 @@ from pipeline_core.adapters import (
     EXIT_TIMEOUT,
     AdapterError,
     ClaudeAdapter,
+    CodexAdapter,
     LaunchRequest,
+    build_codex_argv,
     build_claude_argv,
     effective_grant,
     on_disk_agent_name,
@@ -47,6 +49,15 @@ print(json.dumps({
 """
 
 _SLOW_CLAUDE = "import time\ntime.sleep(30)\n"
+
+_FAKE_CODEX = """\
+import json, sys
+sys.stdin.read()
+print(json.dumps({"type": "thread.started", "thread_id": "thread-CODEX-1"}))
+print(json.dumps({"type": "item.completed", "item": {
+    "type": "agent_message", "text": "implemented\\n\\nreport body",
+}}))
+"""
 
 #: The literal oxidium-forge PCC-02 reproduction evidence (RDS-07): the raw
 #: ``--output-format json`` wrapper the CLI actually returned, its own ``result`` field
@@ -201,6 +212,45 @@ class ClaudeArgvTests(unittest.TestCase):
         self.assertNotIn("--allowed-tools", argv)
 
 
+class CodexArgvTests(unittest.TestCase):
+    def test_executor_argv_uses_exec_json_workspace_write_and_resolved_grants(self) -> None:
+        argv = build_codex_argv(
+            _request("executor", role_grant=("read", "run_checks", "write")),
+            executable="codex",
+            working_root="C:/repo",
+            add_dirs=("C:/agents", "C:/core"),
+        )
+        self.assertEqual(argv[:2], ["codex", "exec"])
+        self.assertIn("--json", argv)
+        self.assertEqual(argv[argv.index("--sandbox") + 1], "workspace-write")
+        self.assertEqual(argv[argv.index("--cd") + 1], "C:/repo")
+        self.assertEqual(
+            [argv[index + 1] for index, value in enumerate(argv) if value == "--add-dir"],
+            ["C:/agents", "C:/core"],
+        )
+
+    def test_status_continuation_starts_a_fresh_read_only_session_with_all_grants(self) -> None:
+        argv = build_codex_argv(
+            _request(
+                "task_verifier",
+                read_only=True,
+                no_tools=True,
+                resume_session_id="thread-9",
+            ),
+            executable="codex",
+            working_root="C:/repo",
+            add_dirs=("C:/agents", "C:/core"),
+        )
+        self.assertEqual(argv[:2], ["codex", "exec"])
+        self.assertNotIn("resume", argv)
+        self.assertEqual(argv[argv.index("--sandbox") + 1], "read-only")
+        self.assertEqual(argv[argv.index("--cd") + 1], "C:/repo")
+        self.assertEqual(
+            [argv[index + 1] for index, value in enumerate(argv) if value == "--add-dir"],
+            ["C:/agents", "C:/core"],
+        )
+
+
 # --- process capture --------------------------------------------------------------------------
 
 
@@ -252,6 +302,18 @@ class ClaudeLaunchTests(unittest.TestCase):
         with self.assertRaises(AdapterError) as ctx:
             adapter.launch(_request("executor"))
         self.assertEqual(ctx.exception.code, "adapter-unavailable")
+
+
+class CodexLaunchTests(unittest.TestCase):
+    def test_launch_parses_jsonl_agent_message_and_thread_id(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            executable = _fake_executable(Path(directory), _FAKE_CODEX, "fake_codex.py")
+            result = CodexAdapter(executable=executable).launch(
+                _request("executor", role_grant=("read", "write"))
+            )
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.stdout, "implemented\n\nreport body")
+        self.assertEqual(result.session_id, "thread-CODEX-1")
 
     def test_parse_session_id_never_invents_a_value(self) -> None:
         self.assertIsNone(parse_session_id(""))
@@ -379,13 +441,10 @@ class AdapterResolutionTests(unittest.TestCase):
             resolve_adapter("auto", {"claude": False})
         self.assertEqual(ctx.exception.code, "adapter-unavailable")
 
-    def test_codex_is_recognized_but_never_available(self) -> None:
-        with self.assertRaises(AdapterResolutionError) as ctx:
-            resolve_adapter("codex", {"codex": True})
-        self.assertEqual(ctx.exception.code, "adapter-unavailable")
-        # 'auto' must not fall back to another adapter when only codex is "present".
-        with self.assertRaises(AdapterResolutionError):
-            resolve_adapter("auto", {"codex": True})
+    def test_explicit_codex_resolves_without_falling_back_to_claude(self) -> None:
+        resolution = resolve_adapter("codex", {"claude": True, "codex": True})
+        self.assertEqual((resolution.requested, resolution.resolved, resolution.sourced),
+                         ("codex", "codex", "explicit"))
 
     def test_unknown_adapter_is_rejected(self) -> None:
         with self.assertRaises(AdapterResolutionError) as ctx:

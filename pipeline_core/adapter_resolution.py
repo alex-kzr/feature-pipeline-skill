@@ -6,8 +6,7 @@ choice is then pinned: :func:`pin_adapter` records ``controls.adapter_resolved``
 stamps every task, and :func:`ensure_pinned_adapter` rejects a resume that would silently
 switch tools.
 
-For this slice ``codex`` is a *recognized* name with no implementation, so it always resolves
-as unavailable. The core then fails closed with ``adapter-unavailable`` rather than falling
+An unavailable explicit adapter fails closed with ``adapter-unavailable`` rather than falling
 back to ``claude`` — no adapter is ever substituted for another.
 
 Standard library only.
@@ -24,9 +23,6 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 #: Adapter names the core recognizes, in ``auto`` preference order.
 KNOWN_ADAPTERS = ("claude", "codex")
 AUTO = "auto"
-
-#: Recognized but not yet implemented — unavailable regardless of what the environment claims.
-UNIMPLEMENTED_ADAPTERS = frozenset({"codex"})
 
 
 class AdapterResolutionError(RuntimeError):
@@ -47,8 +43,8 @@ class AdapterResolution:
 
 
 def adapter_available(environment: Mapping[str, object], name: str) -> bool:
-    """Whether ``name`` can run here. An unimplemented adapter is never available."""
-    if name in UNIMPLEMENTED_ADAPTERS or name not in KNOWN_ADAPTERS:
+    """Whether ``name`` can run here according to the injected environment facts."""
+    if name not in KNOWN_ADAPTERS:
         return False
     return bool(environment.get(name))
 
@@ -77,13 +73,9 @@ def resolve_adapter(
             f"unknown execution adapter '{choice}'", "adapter-unavailable"
         )
     if not adapter_available(environment, choice):
-        detail = (
-            "not yet implemented"
-            if choice in UNIMPLEMENTED_ADAPTERS
-            else "not available in this environment"
-        )
         raise AdapterResolutionError(
-            f"execution adapter '{choice}' is {detail}", "adapter-unavailable"
+            f"execution adapter '{choice}' is not available in this environment",
+            "adapter-unavailable",
         )
     return AdapterResolution(choice, choice, "explicit")
 

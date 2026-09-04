@@ -11,8 +11,8 @@ inspecting the host from inside this module. A caller that knows a tool is missi
 a registry that says so.
 
 Recognised names and the ``auto`` preference order mirror
-:data:`pipeline_core.adapter_resolution.KNOWN_ADAPTERS`; ``codex`` is recognised but carries
-no implementation, exactly as today. The default timeout mirrors
+:data:`pipeline_core.adapter_resolution.KNOWN_ADAPTERS`; availability is supplied by the
+bootstrap composition root. The default timeout mirrors
 :data:`pipeline_core.adapters.DEFAULT_TIMEOUT_S`.
 
 Standard library only.
@@ -101,8 +101,7 @@ class AdapterRegistry:
 
     @classmethod
     def default(cls) -> "AdapterRegistry":
-        """The built-in registry: ``claude`` is available and resumable; ``codex`` is
-        recognised but unimplemented, so it is never available."""
+        """The compatibility registry keeps Codex unavailable until a bootstrap supplies it."""
         return cls(
             (
                 AdapterCapabilities(

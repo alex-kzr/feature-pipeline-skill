@@ -142,8 +142,12 @@ or archive/purge code is reachable from `execute`.
   exits `10` and writes no run state.
 - **Real controls.** `--adapter {claude,codex,auto}` selects and *pins* the execution
   adapter (a resume that would switch it fails closed with `adapter-unavailable` /
-  `adapter-switch`); `codex` is recognized but unavailable, so it never falls back to
-  `claude`. `--max-repair-attempts N` overrides every selected task's declared bound.
+  `adapter-switch`). Codex is available only when its executable is discovered; an explicit
+  unavailable `--adapter codex` fails closed and never falls back to Claude. `auto` retains
+  the registry preference order. `--max-repair-attempts N` overrides every selected task's
+  declared bound.
+  Codex status-envelope continuations are fresh read-only `exec` launches: the Codex `resume`
+  subcommand cannot accept the sandbox or resolved directory grants required by the runner.
   `--routine-output-byte-budget` / `--diagnostic-output-byte-budget`, `--resume`, `--task`,
   and `--through` are recorded on `run.json` with their source (`explicit` / `default`).
 - **`--attest-dependency DEP_ID=SOURCE_FEATURE`.** `--task`-only, repeatable: treats `DEP_ID`
@@ -175,7 +179,7 @@ or archive/purge code is reachable from `execute`.
   symlink/junction whose real target is a *separate* checkout, not a subdirectory of the
   resolved `agents_root`. A task that must inspect the core itself (adapter/SPI relocation,
   core-contract characterisation) then needs that resolved real path too. Without it the
-  Claude CLI's own directory sandbox denies every `Read` (and read `Bash`) under that path,
+  CLI directory sandbox denies every `Read` (and read `Bash`) under that path,
   since the CLI checks the *resolved* target against its allowed-directory list, not the
   logical (symlinked) one requested — which breaks the executor/verifier contract. Each
   resolved anchor is emitted at most once, and only when it is genuinely outside every other
