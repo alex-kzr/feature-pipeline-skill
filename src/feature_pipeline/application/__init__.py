@@ -52,6 +52,12 @@ from .task_engine import (
     TaskExecution,
     TaskRunResult,
 )
+from .pipeline_engine import (
+    CallableStage,
+    PipelineEngine,
+    PipelineRun,
+    TaskExecutionStage,
+)
 from .verification_service import VerificationRequest, VerificationService
 from .run_repository import (
     RunPersistence,
@@ -100,4 +106,8 @@ __all__ = [
     "SelectionError",
     "dependency_status",
     "resolve_selection",
+    "CallableStage",
+    "PipelineEngine",
+    "PipelineRun",
+    "TaskExecutionStage",
 ]

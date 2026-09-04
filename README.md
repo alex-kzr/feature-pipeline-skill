@@ -75,6 +75,15 @@ Callers supply all anchors. The core does not infer host-specific locations or p
   executor never touched is not a candidate and cannot trip it. Its only side effect is a
   bounded manifest and diff, published through the typed artifact store with explicit run
   and repository coordinates for diagnostics and human review.
+- **An unsupported pipeline stage fails before any run state exists.**
+  `feature_pipeline.domain.stages.compile_stage_sequence` builds the immutable stage sequence
+  `feature_pipeline.application.pipeline_engine.PipelineEngine` executes, and rejects — at
+  compile time, before a run is created — a stage with no handler and no declared deferred
+  capability, a duplicate, or one out of the documented order. A deferred stage is recorded
+  as a compile-time capability, not callable dead code; `PipelineEngine` never calls it. The
+  engine holds no policy of its own: `TaskExecutionStage` wraps the existing `TaskEngine`
+  repair loop unchanged, and a run's terminal outcome maps onto the same `gate-pending` /
+  `blocked` / `error` exit codes the CLI already produces.
 
 Run the test suite from the repository root:
 

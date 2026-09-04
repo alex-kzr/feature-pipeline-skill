@@ -45,6 +45,20 @@ from .plan import (
 )
 from .repair import DEFAULT_MAX_REPAIR_ATTEMPTS, RepairBound
 from .scope import IN_ALLOWED_SCOPE, OUT_OF_SCOPE, AllowedScope, ScopeViolation
+from .stages import (
+    CompiledStageSequence,
+    DuplicateStage,
+    EmptyStageSequence,
+    StageContext,
+    StageError,
+    StageHandler,
+    StageOutcome,
+    StageSequenceError,
+    StageStatus,
+    StageStep,
+    UnsupportedStage,
+    compile_stage_sequence,
+)
 from .vocabulary import (
     Actor,
     AdapterName,
@@ -94,6 +108,19 @@ __all__ = [
     "ScopeViolation",
     "IN_ALLOWED_SCOPE",
     "OUT_OF_SCOPE",
+    # stage contracts + compiled stage sequence (PE-01)
+    "StageStatus",
+    "StageOutcome",
+    "StageContext",
+    "StageHandler",
+    "StageStep",
+    "CompiledStageSequence",
+    "compile_stage_sequence",
+    "StageError",
+    "UnsupportedStage",
+    "DuplicateStage",
+    "StageSequenceError",
+    "EmptyStageSequence",
     # vocabulary
     "TaskStatus",
     "RunStatus",
