@@ -20,10 +20,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from pipeline_core.adapters import LaunchResult
 from pipeline_core.execution import TaskExecution, run_task
 from pipeline_core.lifecycle import RunLifecycle
-from pipeline_core.prompt_envelope import EnvelopeAnchors
 from pipeline_core.reports import (
     consolidate_findings,
     newest_repair_report,
@@ -31,144 +29,27 @@ from pipeline_core.reports import (
     write_repair_report,
 )
 from pipeline_core.state import ACTOR_RUNNER, Run
-from pipeline_core.verification import VerifierAnchors, VerifierLaunchers
+from pipeline_core.verification import VerifierLaunchers
 from schemas.contracts import TaskSpec
 
-ENVELOPE_ANCHORS = EnvelopeAnchors(project_root=".", agents_root=".agents")
-VERIFIER_ANCHORS = VerifierAnchors(project_root="/repo", agents_root="/repo/.agents")
-
+from tests.support.builders import bounded_repair_spec, build_execution, initialize_run
+from tests.support.fakes import ENVELOPE_ANCHORS, ScriptedExecutor, StubVerifier, VERIFIER_ANCHORS
 
 # --- fixtures --------------------------------------------------------------------------------
 
-
-def _spec(task_id: str = "VR-03", *, max_repair_attempts: int = 2, **overrides: object) -> TaskSpec:
-    base: dict[str, object] = dict(
-        id=task_id,
-        title="Implement the bounded repair loop",
-        path=f"docs/plans/tasks/{task_id}_bounded-repair-loop.md",
-        task_type="python",
-        executor="python-executor",
-        allowed_scope=("feature-pipeline-skill/pipeline_core/execution.py",),
-        out_of_scope=("feature-pipeline-skill/pipeline_core/runner_cli.py",),
-        acceptance_criteria=(
-            "Each FAIL consumes at most one repair attempt.",
-            "Every repair returns through implemented and reruns the gate.",
-        ),
-        verification_commands=(),
-        max_repair_attempts=max_repair_attempts,
-    )
-    base.update(overrides)
-    return TaskSpec.build(**base)  # type: ignore[arg-type]
-
-
-def _write(path: object, text: str) -> None:
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(text, encoding="utf-8")
-
-
-class ScriptedExecutor:
-    """A two-call executor adapter (prose report, then same-session status envelope).
-
-    ``results`` gives the status the *n*-th executor launch settles to — ``"implemented"``,
-    ``"blocked"``, or ``"launch-fail"`` for a non-zero launch. The status envelope echoes the
-    ``attempt`` embedded in its own prompt, so a repair round (attempt 2, 3, …) settles too.
-    """
-
-    def __init__(self, results: tuple[str, ...] = ("implemented",)) -> None:
-        self.results = list(results)
-        self.launches = 0
-        self.calls: list[dict] = []
-        self._status = "implemented"
-
-    def launch(self, request):  # noqa: ANN001 - test double
-        prompt = request.prompt
-        if request.no_tools or request.resume_session_id:
-            match = re.search(r'"attempt":\s*(\d+)', prompt)
-            attempt = int(match.group(1)) if match else 1
-            text = json.dumps(
-                {"role": "executor", "status": self._status,
-                 "task_id": request.task_id, "attempt": attempt})
-            _write(request.report_path, text)
-            return LaunchResult(exit_code=0, stdout=text, session_id="exec-sess")
-
-        index = self.launches
-        self.launches += 1
-        status = self.results[index] if index < len(self.results) else self.results[-1]
-        self.calls.append(
-            {
-                "role": request.role,
-                "fresh_session": request.fresh_session,
-                "resume": request.resume_session_id,
-                "prompt": prompt,
-                "is_repair": "Repair of:" in prompt,
-            }
-        )
-        if status == "launch-fail":
-            return LaunchResult(exit_code=1, stdout="launch failed", session_id="exec-sess")
-        self._status = "implemented" if status == "implemented" else "blocked"
-        _write(
-            request.report_path,
-            f"# Executor report\n\n- Status: {self._status}\n\n## Files changed\n- none\n",
-        )
-        return LaunchResult(exit_code=0, stdout="", session_id="exec-sess")
-
-
-class StubVerifier:
-    """One verifier role. ``verdicts`` is the token this role returns per verification gate."""
-
-    def __init__(self, verdicts: tuple[str, ...]) -> None:
-        self.verdicts = list(verdicts)
-        self.gate = -1
-        self.calls: list[dict] = []
-
-    def _verdict(self) -> str:
-        return self.verdicts[min(self.gate, len(self.verdicts) - 1)]
-
-    def launch(self, request):  # noqa: ANN001 - test double
-        is_env = bool(request.resume_session_id)
-        if not is_env:
-            self.gate += 1
-        verdict = self._verdict()
-        self.calls.append(
-            {
-                "role": request.role,
-                "is_env": is_env,
-                "fresh_session": request.fresh_session,
-                "read_only": request.read_only,
-                "no_tools": request.no_tools,
-                "prompt": request.prompt,
-            }
-        )
-        if is_env:
-            match = re.search(r'"attempt":\s*(\d+)', request.prompt)
-            attempt = int(match.group(1)) if match else 1
-            text = json.dumps(
-                {"role": request.role, "verdict": verdict,
-                 "task_id": request.task_id, "attempt": attempt})
-        else:
-            finding = "clean" if verdict == "PASS" else "defect: guard clause still missing"
-            text = f"# {request.role}\n\n- Verdict: {verdict}\n\n- Findings: {finding}\n"
-        _write(request.report_path, text)
-        return LaunchResult(exit_code=0, stdout=text, session_id="ver-sess")
-
-
-def _run(root: Path, *, tasks=(("VR-03", ()),)) -> RunLifecycle:
-    prompt = root / "prompt.md"
-    prompt.write_text("feature prompt", encoding="utf-8")
-    run = Run.create("exec", prompt, None, root / "runs" / "exec", root)
-    return RunLifecycle.initialize(run, tasks=list(tasks))
+# ``_spec``/``_run``/``_execution`` are thin, file-scoped names kept for readability inside this
+# module's tests; the actual construction now lives in ``tests.support`` (QG-01) so
+# ``tests/test_execution.py`` shares the identical ``Run``/``TaskExecution`` builders instead of
+# re-deriving them.
+_spec = bounded_repair_spec
+_run = initialize_run
 
 
 def _execution(
     spec: TaskSpec, executor: ScriptedExecutor, task: StubVerifier, test: StubVerifier
 ) -> TaskExecution:
-    return TaskExecution(
-        spec=spec,
-        adapter=executor,
-        launchers=VerifierLaunchers(task=task, test=test),
-        verifier_anchors=VERIFIER_ANCHORS,
-        envelope_anchors=ENVELOPE_ANCHORS,
+    return build_execution(
+        spec, executor, task, test,
         plan_path="docs/plans/2026-09-01-core-execution-engine.md",
     )
 

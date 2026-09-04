@@ -164,6 +164,13 @@ no_implicit_optional = true
 #   uv run python -m unittest discover -s tests -t .
 # `coverage run` wraps it via `command_line` below so the discovery arguments live in one
 # place. `fail_under` starts at the value measured for the untouched package and only rises.
+#
+# QG-01 (docs/plans/tasks/QG-01_test-suite-structure.md): `tests/README.md` documents the
+# per-concern suite map (unit, contract, integration, installed-package, platform,
+# fault-injection, performance, compatibility) and gives each an explicit, deterministic
+# discovery command that is always a subset of the one command above. `tests/support/`
+# consolidates the fake adapters/verifiers, task/run builders, filesystem fixtures, and
+# assertion helpers previously duplicated per test module.
 # --------------------------------------------------------------------------------------------
 [tool.coverage.run]
 branch = true

@@ -16,52 +16,24 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from pipeline_core.adapters import LaunchResult
-from pipeline_core.execution import ExecutionError, TaskExecution, run_task
+from pipeline_core.execution import ExecutionError, run_task
 from pipeline_core.lifecycle import RunLifecycle
-from pipeline_core.prompt_envelope import EnvelopeAnchors
 from pipeline_core.state import Run
 from pipeline_core.task_files import render_blocker_entry, upsert_blockers_section
-from pipeline_core.verification import VerifierAnchors, VerifierLaunchers
 from schemas.contracts import TaskSpec
 
-from tests.test_repair import ScriptedExecutor, StubVerifier
+from tests.support.builders import build_execution, initialize_run, narrow_blocker_spec
+from tests.support.fakes import ScriptedExecutor, StubVerifier
 
-ENVELOPE_ANCHORS = EnvelopeAnchors(project_root=".", agents_root=".agents")
-VERIFIER_ANCHORS = VerifierAnchors(project_root="/repo", agents_root="/repo/.agents")
-
-
-def _spec(task_id: str = "VR-03", *, path: str | None = None, **overrides: object) -> TaskSpec:
-    base: dict[str, object] = dict(
-        id=task_id,
-        title="Implement the bounded repair loop",
-        path=path or f"docs/plans/tasks/{task_id}_bounded-repair-loop.md",
-        task_type="python",
-        executor="python-executor",
-        allowed_scope=("feature-pipeline-skill/pipeline_core/execution.py",),
-        acceptance_criteria=("The loop is bounded.",),
-        verification_commands=(),
-        max_repair_attempts=2,
-    )
-    base.update(overrides)
-    return TaskSpec.build(**base)  # type: ignore[arg-type]
-
-
-def _run(root: Path, *, tasks=(("VR-03", ()),)) -> RunLifecycle:
-    prompt = root / "prompt.md"
-    prompt.write_text("feature prompt", encoding="utf-8")
-    run = Run.create("exec", prompt, None, root / "runs" / "exec", root)
-    return RunLifecycle.initialize(run, tasks=list(tasks))
+# ``_spec``/``_run``/``_execution`` are thin, file-scoped names kept for readability inside this
+# module's tests; the actual construction lives in ``tests.support`` (QG-01), shared with
+# ``tests/test_repair.py`` and imported unchanged by ``tests/test_concrete_tool_grant.py``.
+_spec = narrow_blocker_spec
+_run = initialize_run
 
 
 def _execution(spec: TaskSpec, executor, task, test) -> TaskExecution:
-    return TaskExecution(
-        spec=spec,
-        adapter=executor,
-        launchers=VerifierLaunchers(task=task, test=test),
-        verifier_anchors=VERIFIER_ANCHORS,
-        envelope_anchors=ENVELOPE_ANCHORS,
-    )
+    return build_execution(spec, executor, task, test)
 
 
 class HappyPathTests(unittest.TestCase):
