@@ -13,6 +13,15 @@ from __future__ import annotations
 
 from .controls import ResolvedExecuteControls, resolve_execute_controls
 from .identity import RunIdentity, RunIdentityFactory
+from .launch_controls import (
+    InvalidControl,
+    LaunchControls,
+    ResolvedLaunch,
+    UnsupportedControl,
+    launch_scope,
+    plan_launch,
+    resolve_launch_controls,
+)
 from .results import Outcome, PipelineResult, ResultMapper
 from .run_repository import (
     RunPersistence,
@@ -35,6 +44,13 @@ __all__ = [
     "resolve_execute_controls",
     "RunIdentity",
     "RunIdentityFactory",
+    "InvalidControl",
+    "LaunchControls",
+    "ResolvedLaunch",
+    "UnsupportedControl",
+    "launch_scope",
+    "plan_launch",
+    "resolve_launch_controls",
     "RunPersistence",
     "initialise_run",
     "resume_existing_run",

@@ -42,6 +42,27 @@ Callers supply all anchors. The core does not infer host-specific locations or p
   [`scripts/README.md`](scripts/README.md) and
   [`fixtures/execution/README.md`](fixtures/execution/README.md).
 
+## Safety contracts
+
+- **Read-only Git is a parsed allowlist, not a denylist.** Every argv handed to `GitPort`
+  passes through `feature_pipeline.infrastructure.git.safety.parse_read_only_git`: the
+  subcommand must be the first token and one of a fixed set of read-only operations
+  (`rev-parse`, `ls-files`, `status`, `diff`, `show`, `log`, …), and every remaining token
+  must match that operation's argument schema. A leading global option, a `-c` alias
+  override, an attached `--git-dir=` redirect, and an unrecognised subcommand all fail
+  closed — an unknown spelling is never a reason a mutating call runs. `push` and every
+  history-rewriting operation stay permanently unavailable.
+- **A Git inspection never presents missing evidence as a clean result.**
+  `feature_pipeline.infrastructure.git.inspector.inspect` returns `available=False` with a
+  stated reason for a policy denial, a launch failure, a timeout, or a non-zero exit;
+  `available=True` is returned only for a real exit-zero run.
+- **Every accepted launch control is validated, persisted, and applied.**
+  `feature_pipeline.application.launch_controls.resolve_launch_controls` rejects an unknown
+  control key by name and a malformed value with its reason *before* any run state, lease,
+  or process exists; `plan_launch` then threads the resolved timeout, the per-kind output
+  byte budget, and the serialized-program mutex into each launch. No operational control is
+  a silent no-op.
+
 Run the test suite from the repository root:
 
 ```text

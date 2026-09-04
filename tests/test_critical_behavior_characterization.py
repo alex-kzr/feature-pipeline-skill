@@ -43,7 +43,7 @@ from pipeline_core.commands import (
 from pipeline_core.diagnostics import write_diagnostic_report
 from pipeline_core.dispatch import DispatchRequest, dispatch_executor
 from pipeline_core.execution import ExecuteControls, ExecuteRequest, TaskExecution, _apply_repair_bound
-from pipeline_core.git_port import GitPort, GitResult, GitSafetyError
+from pipeline_core.git_port import GitPort, GitSafetyError
 from pipeline_core.lifecycle import RunLifecycle
 from pipeline_core.prompt_envelope import EnvelopeAnchors
 from pipeline_core.state import ACTOR_RUNNER, Run
@@ -395,14 +395,15 @@ class F05DiagnosticsDoNotCollectAllRequiredEvidence(unittest.TestCase):
 
 
 class F06GitSafetyUsesABypassableDenylist(unittest.TestCase):
-    """F-06 — ``GitPort`` denies a command only when ``argv[0]`` is an exact denied
-    subcommand or a denied flag appears anywhere in argv. A global option before the
-    subcommand, or an alias/`-c` override, sails through the safety check.
+    """F-06 — RS-03 replaced the bypassable denylist with a parsed read-only allowlist
+    (ADR 007 §7). ``GitPort`` now recognises the subcommand as ``argv[0]`` itself and one of
+    a fixed set of read-only operations; a global option before the subcommand, an attached
+    ``--git-dir=`` redirect, and an alias/``-c`` override are each refused because there is no
+    position for them to hide in. A plain mutating subcommand is still denied, now because it
+    is simply not on the allowlist.
 
-    Disposition: correct through an approved ADR (BL-03) — the safety boundary parses argv
-    into a known read-only operation with a fixed argument schema (an allowlist), so safety
-    never depends on recognizing every dangerous Git spelling. INTENDED FOLLOW-UP: RS-03
-    (enforce argv policy, Git safety, and launch controls).
+    Landed by: RS-03 (enforce argv policy, Git safety, and launch controls). This test was
+    flipped from "the bypass sails through" to "the bypass is denied" when RS-03 landed.
     """
 
     def setUp(self) -> None:
@@ -425,7 +426,7 @@ class F06GitSafetyUsesABypassableDenylist(unittest.TestCase):
                 port.run(argv)
         self.assertEqual(self._calls, [])  # nothing reached the subprocess
 
-    def test_global_option_or_alias_before_a_mutation_is_not_denied(self) -> None:
+    def test_global_option_or_alias_before_a_mutation_is_now_denied(self) -> None:
         port = GitPort(Path("."))
         bypasses = (
             ["-c", "alias.sync=push", "sync"],       # -c alias indirection
@@ -433,12 +434,11 @@ class F06GitSafetyUsesABypassableDenylist(unittest.TestCase):
             ["--git-dir=../other/.git", "push"],     # global option, attached form
         )
         for argv in bypasses:
-            result = port.run(argv)  # no GitSafetyError raised
-            self.assertIsInstance(result, GitResult)
-        # Every bypass argv was handed to git for execution.
-        self.assertEqual(len(self._calls), len(bypasses))
-        for argv, call in zip(bypasses, self._calls):
-            self.assertEqual(call, ["git", *argv])
+            with self.subTest(argv=argv):
+                with self.assertRaises(GitSafetyError):
+                    port.run(argv)
+        # Not one bypass argv reached the subprocess.
+        self.assertEqual(self._calls, [])
 
 
 # --- F-07 --------------------------------------------------------------------------------------
