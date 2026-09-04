@@ -35,6 +35,14 @@ from .identifiers import (
     TaskId,
 )
 from .paths import RelativeGlob, RelativePath, ensure_within
+from .plan import (
+    CompiledRunPlan,
+    ConflictingStorage,
+    PlanCompilationError,
+    ResolvedCheck,
+    ResolvedTask,
+    UnsupportedControl,
+)
 from .repair import DEFAULT_MAX_REPAIR_ATTEMPTS, RepairBound
 from .vocabulary import (
     Actor,
@@ -68,6 +76,13 @@ __all__ = [
     "ensure_within",
     "Argv",
     "SHELL_TOKENS",
+    # compiled execution plan (CP-01)
+    "CompiledRunPlan",
+    "ResolvedTask",
+    "ResolvedCheck",
+    "PlanCompilationError",
+    "ConflictingStorage",
+    "UnsupportedControl",
     # controls
     "ControlSource",
     "ResolvedControl",
