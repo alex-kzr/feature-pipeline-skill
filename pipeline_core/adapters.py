@@ -28,12 +28,13 @@ Used                                         Evidence
 ``-r/--resume <id>``                         continue a healthy session
 ===========================================  =========================================
 
-``run_subprocess()`` pins ``encoding="utf-8"`` (with ``errors="strict"``) on the
-``subprocess.Popen`` call explicitly — the CLI is a Node.js process that always speaks UTF-8 on
-its stdio pipes, but Python's own ``text=True`` mode falls back to
-``locale.getpreferredencoding()`` for both directions when no ``encoding=`` is given, which is
-not UTF-8 on every host locale (RDS-11). Leaving it implicit silently corrupts every non-ASCII
-character crossing the pipe in either direction.
+``run_subprocess()`` spawns through the shared
+:class:`feature_pipeline.infrastructure.process.runner.LocalProcessRunner` (RS-01), which pins
+``encoding="utf-8"`` (with ``errors="strict"``) on the ``subprocess.Popen`` call explicitly —
+the CLI is a Node.js process that always speaks UTF-8 on its stdio pipes, but Python's own
+``text=True`` mode falls back to ``locale.getpreferredencoding()`` for both directions when no
+``encoding=`` is given, which is not UTF-8 on every host locale (RDS-11). Leaving it implicit
+silently corrupts every non-ASCII character crossing the pipe in either direction.
 
 There is no per-directory *write* sandbox on this CLI, so a read-only launch is enforced
 structurally: an effective grant with no write capability, a ``--tools`` set with no editing
@@ -50,11 +51,12 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import signal
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Protocol, Sequence
+
+from feature_pipeline.infrastructure.adapters.claude_launcher import ClaudeLauncher
+from feature_pipeline.ports.process import ProcessError
 
 #: Capabilities that let a role change the working tree. A read-only launch drops every one.
 WRITE_CAPABILITIES = frozenset({"write", "create", "delete", "modify", "filesystem_write"})
@@ -403,26 +405,6 @@ class CompletedProcess:
     stderr: str
 
 
-def _terminate_tree(process: "subprocess.Popen") -> None:
-    """Kill the whole process tree so no child or grandchild survives on Windows or POSIX."""
-    if process.poll() is not None:
-        return
-    if os.name == "nt":
-        subprocess.run(
-            ["taskkill", "/F", "/T", "/PID", str(process.pid)],
-            capture_output=True, check=False,
-        )
-    else:
-        try:
-            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-        except (OSError, AttributeError):
-            process.kill()
-    try:
-        process.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        pass
-
-
 def run_subprocess(
     argv: Sequence[str],
     *,
@@ -431,41 +413,27 @@ def run_subprocess(
     timeout: float | None = None,
     env: dict[str, str] | None = None,
 ) -> CompletedProcess:
-    """Run ``argv`` with no shell, feeding ``prompt`` on stdin and capturing both streams.
+    """Run ``argv`` with no shell through the one shared local process runner (RS-01).
 
-    On timeout the whole process tree is terminated, any partial output is preserved, and the
-    conventional :data:`EXIT_TIMEOUT` status is returned.
+    ``prompt`` is fed on stdin and both streams are captured. On timeout the whole process
+    tree is terminated, any partial output is preserved, and the conventional
+    :data:`EXIT_TIMEOUT` status is returned. A process that cannot be started at all is
+    surfaced as :class:`AdapterError` ``adapter-unavailable``, exactly as before — the launch
+    request/response contract is unchanged.
     """
-    popen_kwargs: dict[str, object] = dict(
-        cwd=str(cwd) if cwd is not None else None,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="strict",
-        env=env,
-    )
-    if os.name == "nt":
-        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    else:
-        popen_kwargs["start_new_session"] = True
-
     try:
-        process = subprocess.Popen(list(argv), **popen_kwargs)  # type: ignore[arg-type]
-    except OSError as exc:
+        outcome = ClaudeLauncher().run(
+            list(argv), prompt=prompt, cwd=cwd, timeout=timeout, env=env
+        )
+    except ProcessError as exc:
         raise AdapterError(
             f"could not start '{argv[0]}': {exc}", "adapter-unavailable"
         ) from None
 
-    try:
-        stdout, stderr = process.communicate(prompt, timeout=timeout)
-        return CompletedProcess(process.returncode, stdout or "", stderr or "")
-    except subprocess.TimeoutExpired:
-        _terminate_tree(process)
-        stdout, stderr = process.communicate()
-        note = f"\n[adapter] timed out after {timeout}s; process tree terminated\n"
-        return CompletedProcess(EXIT_TIMEOUT, stdout or "", (stderr or "") + note)
+    exit_code = EXIT_TIMEOUT if outcome.timed_out else (
+        outcome.exit_code if outcome.exit_code is not None else 0
+    )
+    return CompletedProcess(exit_code, outcome.stdout, outcome.stderr)
 
 
 # --- the adapter -----------------------------------------------------------------------------

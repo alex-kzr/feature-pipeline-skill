@@ -18,10 +18,12 @@ timeout or cancellation so no child survives on Windows or POSIX. Every invocati
 caller-declared serialized program (``serialized_programs``) takes the cross-process write
 mutex for that program first.
 
-The launcher pins ``encoding="utf-8"`` (with ``errors="strict"``) on the ``subprocess.Popen``
-call explicitly — ``text=True`` alone decodes stdout/stderr via ``locale.getpreferredencoding()``,
-which is not UTF-8 on every host locale (RDS-12), silently corrupting any non-ASCII byte a
-verification command's toolchain writes to its pipes.
+Every command spawns through the shared
+:class:`feature_pipeline.infrastructure.process.runner.LocalProcessRunner` (RS-01), which pins
+``encoding="utf-8"`` (with ``errors="strict"``) on the ``subprocess.Popen`` call explicitly —
+``text=True`` alone decodes stdout/stderr via ``locale.getpreferredencoding()``, which is not
+UTF-8 on every host locale (RDS-12), silently corrupting any non-ASCII byte a verification
+command's toolchain writes to its pipes.
 
 Standard library only.
 """
@@ -30,13 +32,15 @@ from __future__ import annotations
 
 import os
 import shutil
-import signal
-import subprocess
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
+
+from feature_pipeline.infrastructure.process import LocalProcessRunner
+from feature_pipeline.infrastructure.process.capture import tail_truncate as _tail_truncate
+from feature_pipeline.ports.process import ProcessError, ProcessSpec
 
 from .artifacts import write_text_atomic
 from .concurrency import is_serialized_program, write_mutex
@@ -49,8 +53,6 @@ DIAGNOSTIC_OUTPUT_BUDGET = 64 * 1024
 DISPOSITION_PASS = "PASS"
 DISPOSITION_FAIL = "FAIL"
 DISPOSITION_BLOCKED = "BLOCKED"
-
-_TRUNCATION_MARKER = "[truncated]"
 
 
 @dataclass(frozen=True)
@@ -99,26 +101,6 @@ def classify_outcome(exit_code: int | str) -> tuple[str, str | None]:
     return DISPOSITION_FAIL, f"command exited with {exit_code}"
 
 
-def _tail_truncate(text: str, budget: int) -> str:
-    """Keep the last ``budget`` bytes of UTF-8 text with an explicit dropped-bytes header."""
-    encoded = (text or "").encode("utf-8", errors="replace")
-    if len(encoded) <= budget:
-        return text or ""
-    if budget <= len(_TRUNCATION_MARKER):
-        return _TRUNCATION_MARKER[:budget]
-    tail_budget = budget
-    while True:
-        dropped = len(encoded) - tail_budget
-        header = f"[{dropped} bytes truncated; showing the last {tail_budget}]\n"
-        header_size = len(header.encode("utf-8"))
-        if header_size + tail_budget <= budget:
-            return header + encoded[-tail_budget:].decode("utf-8", errors="ignore")
-        resolved_tail = budget - header_size
-        if resolved_tail <= 0:
-            return _TRUNCATION_MARKER
-        tail_budget = min(tail_budget - 1, resolved_tail)
-
-
 def redact_then_truncate(text: str | None, budget: int, repo_root: str | Path) -> str:
     """Redact secrets and machine-local paths, *then* apply the byte budget."""
     return _tail_truncate(redact_text(text or "", output_rules(repo_root)), budget)
@@ -126,20 +108,6 @@ def redact_then_truncate(text: str | None, budget: int, repo_root: str | Path) -
 
 def _stage_slug(stage: str) -> str:
     return "".join(char if char.isalnum() or char in "._-" else "-" for char in stage)
-
-
-def _kill_process_tree(process: subprocess.Popen) -> None:
-    """Terminate the whole tree so no child or grandchild survives (AC-3)."""
-    if process.poll() is not None:
-        return
-    if os.name == "nt":
-        subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                       capture_output=True, check=False)
-    else:
-        try:
-            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            process.kill()
 
 
 def run_command(
@@ -177,38 +145,28 @@ def run_command(
         return _record(run, stage, full_cwd, declared, EXIT_NOT_FOUND,
                        time.monotonic() - start, "", f"{declared[0]}: {where}", output_limit)
 
-    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
     mutex = (
         write_mutex(run.repo_root, program, run_id=run.run_id)
         if is_serialized_program(program, serialized_programs)
         else nullcontext()
     )
-    process: subprocess.Popen | None = None
     try:
         with mutex:
-            process = subprocess.Popen(
-                [program, *declared[1:]], cwd=full_cwd, shell=False,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                encoding="utf-8", errors="strict",
-                start_new_session=os.name != "nt", creationflags=creationflags)
-            try:
-                stdout, stderr = process.communicate(timeout=timeout)
-                code: int | str = process.returncode
-            except subprocess.TimeoutExpired as exc:
-                _kill_process_tree(process)
-                remaining_out, remaining_err = process.communicate()
-                code = EXIT_TIMEOUT
-                stdout = (exc.stdout or "") + (remaining_out or "")
-                stderr = (exc.stderr or "") + (remaining_err or "")
-    except OSError as exc:
+            outcome = LocalProcessRunner().run(ProcessSpec(
+                argv=(program, *declared[1:]),
+                cwd=str(full_cwd),
+                timeout=timeout,
+            ))
+    except ProcessError as exc:
         return _record(run, stage, full_cwd, declared, EXIT_LAUNCH_FAILED,
                        time.monotonic() - start, "", str(exc), output_limit)
-    except BaseException:
-        if process is not None:
-            _kill_process_tree(process)
-        raise
+
+    if outcome.timed_out:
+        code: int | str = EXIT_TIMEOUT
+    else:
+        code = outcome.exit_code if outcome.exit_code is not None else EXIT_LAUNCH_FAILED
     return _record(run, stage, full_cwd, declared, code, time.monotonic() - start,
-                   stdout, stderr, output_limit)
+                   outcome.stdout, outcome.stderr, output_limit)
 
 
 def _record(
