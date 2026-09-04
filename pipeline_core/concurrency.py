@@ -80,7 +80,7 @@ def task_lock_path(project_root: str | Path, task_id: str) -> Path:
 
 def _program_slug(program: str | Path) -> str:
     """A filesystem-safe basename for the lock file of one serialized program."""
-    stem = Path(program).stem.lower()
+    stem = Path(str(program).replace("\\", "/")).stem.lower()
     safe = "".join(char if char.isalnum() or char in "._-" else "-" for char in stem)
     return safe or "program"
 
@@ -195,6 +195,9 @@ def is_serialized_program(
     """
     if not resolved_program:
         return False
-    stem = Path(resolved_program).stem.lower()
-    declared = {Path(name).stem.lower() for name in (serialized_programs or ())}
+    stem = Path(str(resolved_program).replace("\\", "/")).stem.lower()
+    declared = {
+        Path(str(name).replace("\\", "/")).stem.lower()
+        for name in (serialized_programs or ())
+    }
     return stem in declared

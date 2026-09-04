@@ -13,11 +13,11 @@ never updated automatically during a later refactor.
 
 from __future__ import annotations
 
-import getpass
 import re
 import socket
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from pipeline_core.reports import ENVELOPE_KEYS, STATUS_TOKENS
 from pipeline_core.state import SCHEMA_VERSION, VERDICT_TOKENS
@@ -72,10 +72,11 @@ class DeterminismTests(unittest.TestCase):
 class RedactionTests(unittest.TestCase):
     def _host_needles(self) -> list[str]:
         needles = [str(Path.home()), str(Path.home().resolve()), socket.gethostname()]
-        user = getpass.getuser()
-        if len(user) >= 4:
-            needles.append(user)
         return [n for n in needles if n]
+
+    def test_generic_runner_word_is_not_treated_as_a_host_leak(self) -> None:
+        with patch("tests.test_compatibility_goldens.socket.gethostname", return_value="host"):
+            self.assertNotIn("runner", self._host_needles())
 
     def test_no_golden_leaks_a_host_path_user_or_machine_name(self) -> None:
         needles = self._host_needles()

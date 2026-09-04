@@ -50,19 +50,20 @@ def output_rules(repo_root: str | Path | None = None) -> list[Rule]:
 
 
 def build_rules(repo_root: str | Path | None = None) -> list[Rule]:
-    """Build case-insensitive rules, with narrower roots taking precedence."""
+    """Build case-insensitive rules, retaining both supplied and resolved spellings."""
     roots = (
-        (Path(repo_root).resolve() if repo_root else None, REPO_TOKEN),
-        (Path(tempfile.gettempdir()).resolve(), TMP_TOKEN),
-        (Path.home().resolve(), HOME_TOKEN),
+        (Path(repo_root) if repo_root else None, REPO_TOKEN),
+        (Path(tempfile.gettempdir()), TMP_TOKEN),
+        (Path.home(), HOME_TOKEN),
     )
     rules: list[Rule] = []
     for root, token in roots:
         if root is None or len(str(root)) < 4:
             continue
-        native = str(root)
-        for spelling in (native.replace("\\", "\\\\"), native, root.as_posix()):
-            rules.append((re.compile(re.escape(spelling), re.IGNORECASE), token))
+        for path in (root, root.resolve()):
+            native = str(path)
+            for spelling in (native.replace("\\", "\\\\"), native, path.as_posix()):
+                rules.append((re.compile(re.escape(spelling), re.IGNORECASE), token))
     return rules
 
 

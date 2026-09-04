@@ -82,9 +82,21 @@ class _FileLease:
 
         spins = 0
         while True:
+            stamp = now_stamp()
+            rendered = render_record(
+                self._owner,
+                task_id=self._request.task_id,
+                acquired_at=stamp,
+                heartbeat_at=stamp,
+            )
+            temporary = self._path.with_name(
+                f".{self._path.name}.{self._owner.pid}.{self._owner.nonce}.tmp"
+            )
             try:
-                descriptor = os.open(self._path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                temporary.write_text(rendered, encoding="utf-8")
+                os.link(temporary, self._path)
             except FileExistsError:
+                _unlink_quietly(temporary)
                 record = read_holder(self._path)
                 if record is None:
                     # Freed between the failed create and the read - retry the create.
@@ -108,17 +120,10 @@ class _FileLease:
                     )
                 time.sleep(self._request.poll_interval_s)
                 continue
-
-            stamp = now_stamp()
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                handle.write(
-                    render_record(
-                        self._owner,
-                        task_id=self._request.task_id,
-                        acquired_at=stamp,
-                        heartbeat_at=stamp,
-                    )
-                )
+            except OSError:
+                _unlink_quietly(temporary)
+                raise
+            _unlink_quietly(temporary)
             self._held = True
             return self
 

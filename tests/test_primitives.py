@@ -12,6 +12,7 @@ from pathlib import Path
 from pipeline_core.artifacts import ArtifactReadError, write_json_atomic
 from pipeline_core.commands import run_command
 from pipeline_core.lease import LeaseHeldError, PipelineLease
+from pipeline_core.redaction import build_rules, redact_text
 from pipeline_core.state import (
     ACTOR_EXECUTOR,
     EXIT_LAUNCH_FAILED,
@@ -26,6 +27,17 @@ from pipeline_core.state import (
 
 
 class ArtifactCharacterizationTests(unittest.TestCase):
+    def test_redaction_preserves_the_original_repository_path_spelling(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "nested").mkdir()
+            spelling = root / "nested" / ".."
+
+            self.assertEqual(
+                redact_text(str(spelling / "secret"), build_rules(spelling)),
+                "<repo>\\secret",
+            )
+
     def test_atomic_write_redacts_nested_repository_paths(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

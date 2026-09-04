@@ -370,7 +370,7 @@ class GitWorktreeInspector:
                 key = self._key(root, repo_dir, rel)
                 if key is None or key in boundary_paths:
                     continue
-                absolute = (repo_dir / rel).resolve()
+                absolute = Path(os.path.abspath(repo_dir / rel))
                 if any(_within(absolute, Path(exc)) for exc in excludes):
                     continue
                 open_bodies[key] = _read_body(absolute)
@@ -401,7 +401,7 @@ class GitWorktreeInspector:
 
     @staticmethod
     def _key(root: Path, repo_dir: Path, rel: str) -> str | None:
-        absolute = (repo_dir / rel).resolve()
+        absolute = Path(os.path.abspath(repo_dir / rel))
         if not _within(absolute, root):
             return None
         return absolute.relative_to(root).as_posix()
@@ -457,7 +457,7 @@ class GitWorktreeInspector:
                 key = self._key(root, repo_dir, rel)
                 if key is None or key in boundary_paths:
                     continue
-                absolute = (repo_dir / rel).resolve()
+                absolute = Path(os.path.abspath(repo_dir / rel))
                 if any(_within(absolute, Path(exc)) for exc in excludes):
                     continue
                 candidates.add(key)
@@ -556,7 +556,7 @@ class GitWorktreeInspector:
 
     @staticmethod
     def _after_body(root: Path, key: str) -> _Body:
-        return _read_body((root / key).resolve())
+        return _read_body(root / key)
 
     @staticmethod
     def _boundary_relative(marker: WorktreeMarkerRecord, boundary: str, key: str) -> str:
