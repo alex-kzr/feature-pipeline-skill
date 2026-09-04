@@ -41,6 +41,7 @@ from .reports import (
     ReportError,
     VerdictResolution,
     build_verdict_envelope_prompt,
+    parse_verifier_verdict,
     settle_verifier_verdict,
     verifier_artifacts,
 )
@@ -524,11 +525,21 @@ def _run_one_verifier(
                    f"cannot be settled",
             result=result, report_text=report_text)
 
+    observed_verdict = None
+    if getattr(adapter, "requires_fresh_envelope_context", False):
+        try:
+            observed_verdict = parse_verifier_verdict(report_text)
+        except ReportError:
+            pass
+
     envelope_request = LaunchRequest(
         role=normalized,
         task_id=spec.id,
         prompt=build_verdict_envelope_prompt(
-            role=normalized, task_id=spec.id, attempt=attempt),
+            role=normalized,
+            task_id=spec.id,
+            attempt=attempt,
+            observed_verdict=observed_verdict),
         report_path=artifacts.envelope(normalized),
         read_only=True,
         working_root=".",

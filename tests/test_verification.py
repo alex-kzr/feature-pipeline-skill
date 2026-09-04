@@ -27,7 +27,7 @@ from pipeline_core.adapters import (
     LaunchResult,
     build_claude_argv,
 )
-from pipeline_core.reports import verifier_artifacts
+from pipeline_core.reports import build_verdict_envelope_prompt, verifier_artifacts
 from pipeline_core.state import Run, StateError
 from pipeline_core.verification import (
     VerificationError,
@@ -43,6 +43,15 @@ from pipeline_core.verification import (
 from schemas.contracts import TaskSpec
 
 ANCHORS = VerifierAnchors(project_root="/repo", agents_root="/repo/.agents")
+
+
+class FreshEnvelopePromptTests(unittest.TestCase):
+    def test_fresh_continuation_receives_runner_observed_verdict(self) -> None:
+        prompt = build_verdict_envelope_prompt(
+            role="task_verifier", task_id="VR-02", attempt=1, observed_verdict="PASS"
+        )
+
+        self.assertIn("Runner-observed verdict from the verifier report: PASS.", prompt)
 
 
 def _spec(**overrides: object) -> TaskSpec:

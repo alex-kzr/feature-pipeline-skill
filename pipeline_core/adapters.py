@@ -56,6 +56,7 @@ from pathlib import Path
 from typing import Callable, Protocol, Sequence
 
 from feature_pipeline.infrastructure.adapters.claude_launcher import ClaudeLauncher
+from feature_pipeline.infrastructure.adapters.codex_launcher import CodexLauncher
 from feature_pipeline.ports.process import ProcessError
 
 #: Capabilities that let a role change the working tree. A read-only launch drops every one.
@@ -484,6 +485,30 @@ def run_subprocess(
     return CompletedProcess(exit_code, outcome.stdout, outcome.stderr)
 
 
+def run_codex_subprocess(
+    argv: Sequence[str],
+    *,
+    prompt: str = "",
+    cwd: str | os.PathLike[str] | None = None,
+    timeout: float | None = None,
+    env: dict[str, str] | None = None,
+) -> CompletedProcess:
+    """Run a Codex argv through its concrete launcher and map start failures consistently."""
+    try:
+        outcome = CodexLauncher().run(
+            list(argv), prompt=prompt, cwd=cwd, timeout=timeout, env=env
+        )
+    except ProcessError as exc:
+        raise AdapterError(
+            f"could not start '{argv[0]}': {exc}", "adapter-unavailable"
+        ) from None
+
+    exit_code = EXIT_TIMEOUT if outcome.timed_out else (
+        outcome.exit_code if outcome.exit_code is not None else 0
+    )
+    return CompletedProcess(exit_code, outcome.stdout, outcome.stderr)
+
+
 # --- the adapter -----------------------------------------------------------------------------
 
 
@@ -580,6 +605,10 @@ class CodexAdapter:
     """Adapter over the non-interactive ``codex exec`` CLI."""
 
     name = "codex"
+    # ``codex exec resume`` cannot carry the sandbox or resolved-directory flags required for
+    # the runner's tool-free status continuation. The coordinator supplies only the parsed
+    # report token to this fresh, read-only context.
+    requires_fresh_envelope_context = True
 
     def __init__(
         self,
@@ -594,7 +623,7 @@ class CodexAdapter:
     ) -> None:
         self._executable = executable
         self._resolver = resolver or (lambda: shutil.which("codex"))
-        self._runner: ProcessRunner = runner or run_subprocess
+        self._runner: ProcessRunner = runner or run_codex_subprocess
         self._add_dirs = tuple(add_dirs)
         self._env = env
         self._timeout = timeout

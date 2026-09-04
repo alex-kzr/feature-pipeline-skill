@@ -46,6 +46,7 @@ from .reports import (
     ReportError,
     build_status_envelope_prompt,
     launch_artifacts,
+    parse_executor_status,
     settle_executor_status,
 )
 from .state import ACTOR_EXECUTOR, repo_relative
@@ -177,9 +178,20 @@ def dispatch_executor(
             "executor launch returned no session id; the status envelope cannot be settled",
         )
 
-    # The strict JSON status envelope: one same-session, tool-free continuation.
+    # The strict JSON status envelope: one same-session, tool-free continuation. Codex cannot
+    # resume with its read-only sandbox and resolved anchor grants, so it declares that its
+    # continuation is fresh; supply only the runner-parsed status token in that case.
+    observed_status = None
+    if getattr(adapter, "requires_fresh_envelope_context", False):
+        try:
+            observed_status = parse_executor_status(report_text)
+        except ReportError:
+            pass
     envelope_prompt = build_status_envelope_prompt(
-        role=EXECUTOR_ROLE, task_id=task_id, attempt=request.attempt
+        role=EXECUTOR_ROLE,
+        task_id=task_id,
+        attempt=request.attempt,
+        observed_status=observed_status,
     )
     envelope_request = LaunchRequest(
         role=spec.executor,

@@ -17,6 +17,7 @@ import unittest
 from pathlib import Path
 
 from feature_pipeline.infrastructure.adapters.claude_launcher import ClaudeLauncher
+from feature_pipeline.infrastructure.adapters.codex_launcher import CodexLauncher
 from feature_pipeline.infrastructure.process.capture import TRUNCATION_MARKER, tail_truncate
 from feature_pipeline.infrastructure.process.runner import (
     LocalProcessRunner,
@@ -242,6 +243,26 @@ class ClaudeLauncherTests(unittest.TestCase):
 
         with self.assertRaises(ProcessError):
             ClaudeLauncher(runner=Failing()).run(["claude"])
+
+
+class CodexLauncherTests(unittest.TestCase):
+    def test_builds_the_spec_from_the_launch_inputs(self) -> None:
+        seen: dict[str, ProcessSpec] = {}
+
+        class FakeRunner:
+            def run(self, spec: ProcessSpec) -> ProcessOutcome:
+                seen["spec"] = spec
+                return ProcessOutcome(exit_code=0, stdout="ok")
+
+        out = CodexLauncher(runner=FakeRunner()).run(
+            ["codex", "exec"], prompt="P", cwd="/w", timeout=12, env={"A": "b"}
+        )
+
+        self.assertEqual(out.stdout, "ok")
+        self.assertEqual(seen["spec"].argv, ("codex", "exec"))
+        self.assertEqual(seen["spec"].stdin, "P")
+        self.assertEqual(seen["spec"].cwd, "/w")
+        self.assertEqual(seen["spec"].timeout, 12)
 
 
 class MigratedCallSiteTests(unittest.TestCase):

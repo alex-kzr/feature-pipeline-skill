@@ -364,6 +364,23 @@ class PromptEnvelopeTests(unittest.TestCase):
 
 
 class StatusSettlementTests(unittest.TestCase):
+    def test_fresh_envelope_adapter_receives_the_runner_observed_status(self) -> None:
+        class FreshEnvelopeAdapter(ScriptedAdapter):
+            requires_fresh_envelope_context = True
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = _spec()
+            life = _running_life(root, spec)
+            adapter = FreshEnvelopeAdapter()
+            outcome = dispatch_executor(life, _request(spec), adapter)
+
+        self.assertEqual(outcome.status, "implemented")
+        self.assertIn(
+            "Runner-observed status from the executor report: implemented.",
+            adapter.calls[1]["prompt"],
+        )
+
     def test_agreeing_prose_and_envelope_yield_implemented(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

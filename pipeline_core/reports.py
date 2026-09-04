@@ -106,22 +106,30 @@ def launch_artifacts(run_dir: str | Path, task_id: str, generation: int) -> Laun
     )
 
 
-def build_status_envelope_prompt(*, role: str, task_id: str, attempt: int) -> str:
-    """The same-session, tool-free continuation that asks only for the JSON status envelope."""
+def build_status_envelope_prompt(
+    *, role: str, task_id: str, attempt: int, observed_status: str | None = None
+) -> str:
+    """Ask for the strict JSON status envelope.
+
+    A fresh, read-only continuation may receive the runner-parsed report token; it never needs
+    to regain write access or read a mutable artifact just to repeat that status.
+    """
     shape = (
         f'{{"role": "{role}", "status": <one of {list(STATUS_TOKENS)}>, '
         f'"task_id": "{task_id}", "attempt": {attempt}}}'
     )
-    return "\n".join(
-        [
-            "Reply with only the following JSON object and nothing else — no other text, no "
-            "code fence, no explanation, no markdown:",
-            shape,
-            "",
-            "Use the real status from the report you just wrote; do not copy the placeholder "
-            "token.",
-        ]
-    )
+    lines = [
+        "Reply with only the following JSON object and nothing else — no other text, no "
+        "code fence, no explanation, no markdown:",
+        shape,
+        "",
+    ]
+    if observed_status is not None:
+        lines.append(f"Runner-observed status from the executor report: {observed_status}.")
+    else:
+        lines.append("Use the real status from the report you just wrote; do not copy the "
+                     "placeholder token.")
+    return "\n".join(lines)
 
 
 def parse_executor_status(text: str) -> str:
@@ -269,22 +277,26 @@ def verifier_artifacts(
     )
 
 
-def build_verdict_envelope_prompt(*, role: str, task_id: str, attempt: int) -> str:
-    """The same-session, tool-free continuation that asks only for the JSON verdict envelope."""
+def build_verdict_envelope_prompt(
+    *, role: str, task_id: str, attempt: int, observed_verdict: str | None = None
+) -> str:
+    """Ask for the strict JSON verdict envelope, optionally with a runner-parsed token."""
     shape = (
         f'{{"role": "{role}", "verdict": <one of {list(VERDICT_TOKENS)}>, '
         f'"task_id": "{task_id}", "attempt": {attempt}}}'
     )
-    return "\n".join(
-        [
-            "Reply with only the following JSON object and nothing else — no other text, no "
-            "code fence, no explanation, no markdown:",
-            shape,
-            "",
-            "Use the real verdict from the report you just wrote; do not copy the placeholder "
-            "token.",
-        ]
-    )
+    lines = [
+        "Reply with only the following JSON object and nothing else — no other text, no "
+        "code fence, no explanation, no markdown:",
+        shape,
+        "",
+    ]
+    if observed_verdict is not None:
+        lines.append(f"Runner-observed verdict from the verifier report: {observed_verdict}.")
+    else:
+        lines.append("Use the real verdict from the report you just wrote; do not copy the "
+                     "placeholder token.")
+    return "\n".join(lines)
 
 
 def parse_verifier_verdict(text: str) -> str:
