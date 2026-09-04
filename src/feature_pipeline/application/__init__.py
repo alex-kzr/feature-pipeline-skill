@@ -14,6 +14,11 @@ and pipeline engine (``docs/adr/002`` §5.4).
 from __future__ import annotations
 
 from .controls import ResolvedExecuteControls, resolve_execute_controls
+from .diagnostic_service import (
+    DIAGNOSTIC_COLLECTION_FAILED,
+    DiagnosticService,
+    GitRepositoryInspection,
+)
 from .execute_task import (
     ATTRIBUTION_UNAVAILABLE,
     SCOPE_CLEAN,
@@ -33,6 +38,14 @@ from .launch_controls import (
     resolve_launch_controls,
 )
 from .results import Outcome, PipelineResult, ResultMapper
+from .task_engine import (
+    ExecutionError,
+    RepairPass,
+    TaskEngine,
+    TaskExecution,
+    TaskRunResult,
+)
+from .verification_service import VerificationRequest, VerificationService
 from .run_repository import (
     RunPersistence,
     initialise_run,

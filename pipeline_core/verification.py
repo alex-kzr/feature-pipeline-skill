@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
+from feature_pipeline.application.diagnostic_service import DiagnosticService
+
 from .adapters import (
     Adapter,
     AdapterError,
@@ -35,7 +37,6 @@ from .adapters import (
 )
 from .artifacts import write_json_atomic, write_text_atomic
 from .commands import VerificationRun
-from .diagnostics import write_diagnostic_report
 from .reports import (
     ReportError,
     VerdictResolution,
@@ -47,6 +48,10 @@ from .state import ACTOR_RUNNER, Run
 
 
 VERDICTS = frozenset({"PASS", "FAIL", "BLOCKED"})
+
+#: Every verifier-failure diagnostic is assembled through the one service path so it carries
+#: real ``git diff`` / ``git status`` evidence — or an explicit collection failure (AC-2).
+_DIAGNOSTICS = DiagnosticService()
 
 #: The command-record keys carried into the evidence payload. Redacted, budgeted stdout/stderr
 #: text stays in the persisted log files; the payload references those logs, it never inlines
@@ -460,7 +465,7 @@ def _diagnose(
         },
         repo_root=run.repo_root,
     )
-    diagnostic = write_diagnostic_report(
+    diagnostic = _DIAGNOSTICS.collect(
         run, task_id=spec.id, attempt=attempt,
         note=f"{normalize_role(role)} verification failed: {reason}",
         reports_dir=artifacts.directory,

@@ -6,6 +6,14 @@ re-running anything: the current command output, the recent commands, ``git diff
 the runner holds (captured output, ``git`` porcelain), so the finished document is redacted
 as a whole and the two truncated inputs are additionally redacted before their byte budget.
 
+:func:`write_diagnostic_report` is the *renderer*. Every production failure path now reaches
+it through the one boundary that first collects ``git diff`` / ``git status`` at the moment
+of failure —
+:class:`feature_pipeline.application.diagnostic_service.DiagnosticService` — so an
+uncollected section is never rendered as an empty successful one (BL-02 finding F-05). A
+direct call with no ``git_diff`` / ``git_status`` is still supported for tests and golden
+capture.
+
 Standard library only.
 """
 

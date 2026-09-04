@@ -32,15 +32,21 @@ from pathlib import Path
 from schemas import SchemaError
 from schemas.contracts import TaskSpec
 
+from feature_pipeline.application import task_engine as task_engine_mod
+from feature_pipeline.application import verification_service as verification_service_mod
+from feature_pipeline.application.diagnostic_service import (
+    DIAGNOSTIC_COLLECTION_FAILED,
+    DiagnosticService,
+)
 from pipeline_core import dispatch as dispatch_mod
 from pipeline_core import execution as execution_mod
 from pipeline_core import runner_cli
+from pipeline_core import verification as verification_mod
 from pipeline_core.adapters import LaunchResult
 from pipeline_core.commands import (
     DIAGNOSTIC_OUTPUT_BUDGET,
     run_command,
 )
-from pipeline_core.diagnostics import write_diagnostic_report
 from pipeline_core.dispatch import DispatchRequest, dispatch_executor
 from pipeline_core.execution import ExecuteControls, ExecuteRequest, TaskExecution, _apply_repair_bound
 from pipeline_core.git_port import GitPort, GitSafetyError
@@ -351,44 +357,64 @@ def _sf(data: bytes) -> worktree_mod.SnapshotFile:
 
 
 class F05DiagnosticsDoNotCollectAllRequiredEvidence(unittest.TestCase):
-    """F-05 — the diagnostic writer has ``git_diff`` / ``git_status`` parameters that default
-    to empty, and the production call site in ``execution.py`` passes neither. The report
-    still renders the required headings, so an unavailable evidence section is presented as
-    an empty successful one.
+    """F-05 — CORRECTED by VP-01 (extract task, verification, and diagnostic services).
 
-    Disposition: correct through an approved ADR (BL-03) — diagnostic assembly queries a
-    read-only repository-inspection port at the moment of failure and records collection
-    errors explicitly, never representing missing evidence as an empty success.
-    INTENDED FOLLOW-UP: VP-01 (extract task, verification, and diagnostic services).
+    History: the diagnostic writer took ``git_diff`` / ``git_status`` parameters that
+    defaulted to empty and the production call sites passed neither, so an uncollected
+    section rendered as an empty *successful* one.
+
+    Now every production failure path assembles its diagnostic through the one boundary,
+    :class:`feature_pipeline.application.diagnostic_service.DiagnosticService`, which queries
+    a read-only Git inspection at the moment of failure. Real evidence is embedded; a
+    collection failure is stated explicitly (``diagnostic-collection-failed`` in the Note
+    plus an ``evidence unavailable`` section body) and never presented as an empty success
+    (ADR 007 §-diagnostics).
     """
 
-    def test_production_call_site_passes_no_git_evidence(self) -> None:
-        src = inspect.getsource(execution_mod)
-        self.assertIn("write_diagnostic_report(", src)
-        self.assertNotIn("git_diff=", src)
-        self.assertNotIn("git_status=", src)
+    def test_production_failure_paths_route_through_the_one_service_boundary(self) -> None:
+        # The renderer is no longer called directly from the orchestration modules; the
+        # engine and the verifier orchestration both go through DiagnosticService.collect.
+        self.assertNotIn("write_diagnostic_report(", inspect.getsource(execution_mod))
+        self.assertNotIn("write_diagnostic_report(", inspect.getsource(verification_mod))
+        engine_src = inspect.getsource(task_engine_mod.TaskEngine)
+        self.assertIn("_diagnostics.collect(", engine_src)
+        self.assertIn("_DIAGNOSTICS.collect(", inspect.getsource(verification_mod))
 
-    def test_report_renders_git_headings_with_an_empty_placeholder_body(self) -> None:
+    def test_service_embeds_real_git_evidence_collected_at_the_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            _init_repo(root)
+            (root / "in_scope.py").write_text("changed by the executor\n", encoding="utf-8")
             spec = _spec()
-            life = _running_life(root, spec)
-            run = life.run
+            run = _running_life(root, spec).run
 
-            path = write_diagnostic_report(
+            path = DiagnosticService().collect(
                 run, task_id=spec.id, attempt=1,
-                note="maximum repair attempts (2) reached")  # exactly as execution.py calls it
+                note="maximum repair attempts (2) reached")
 
             text = path.read_text(encoding="utf-8")
-            self.assertIn("## git diff", text)
-            self.assertIn("## git status", text)
             diff_body = text.split("## git diff", 1)[1].split("## ", 1)[0]
-            # 'none' is reporting.fenced's placeholder for an empty body: the diff was never
-            # collected, yet nothing in the section says the evidence is unavailable.
-            self.assertIn("none", diff_body)
-            self.assertNotIn("diff --git", diff_body)
-            self.assertNotIn("unavailable", diff_body.lower())
-            self.assertNotIn("could not", diff_body.lower())
+            status_body = text.split("## git status", 1)[1].split("## ", 1)[0]
+            self.assertIn("diff --git", diff_body)
+            self.assertIn("changed by the executor", diff_body)
+            self.assertIn("in_scope.py", status_body)
+            self.assertNotIn(DIAGNOSTIC_COLLECTION_FAILED, text)
+
+    def test_service_states_collection_failure_when_git_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)  # deliberately not a git repository
+            spec = _spec()
+            run = _running_life(root, spec).run
+
+            path = DiagnosticService().collect(
+                run, task_id=spec.id, attempt=1, note="blocked at the limit")
+
+            text = path.read_text(encoding="utf-8")
+            self.assertIn(DIAGNOSTIC_COLLECTION_FAILED, text)
+            diff_body = text.split("## git diff", 1)[1].split("## ", 1)[0]
+            self.assertIn("evidence unavailable", diff_body.lower())
+            # the note is preserved alongside the explicit collection-failure marker.
+            self.assertIn("blocked at the limit", text)
 
 
 # --- F-06 --------------------------------------------------------------------------------------
@@ -468,13 +494,14 @@ class F07ConfigurationValuesAreAcceptedButNotConsistentlyApplied(unittest.TestCa
             self.assertNotIn(dropped, exec_fields)
 
     def test_verification_gate_wires_neither_budget_nor_mutex_nor_timeout_policy(self) -> None:
-        gate_src = inspect.getsource(execution_mod._verify_gate)
+        # VP-01 moved the gate into VerificationService; the F-07 wiring gap is unchanged.
+        gate_src = inspect.getsource(verification_service_mod.VerificationService.verify)
         self.assertIn("run_verification_commands(", gate_src)
         self.assertNotIn("output_limit", gate_src)
         self.assertNotIn("byte_budget", gate_src)
         self.assertNotIn("serialized_programs", gate_src)
 
-        run_src = inspect.getsource(execution_mod.run_task)
+        run_src = inspect.getsource(task_engine_mod.TaskEngine.run)
         self.assertNotIn("serialized_programs", run_src)
 
     def test_run_command_falls_back_to_the_hard_coded_module_budget(self) -> None:
