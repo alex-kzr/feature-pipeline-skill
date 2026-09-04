@@ -20,7 +20,10 @@ feature-pipeline orchestration.
 - `scripts/` — portable command-line entry points.
 - `roles/`, `reports/`, and `schemas/` — versioned core contracts.
 - `templates/` — portable core templates.
-- `tests/` — core test suite.
+- `tests/` — core test suite; see [`tests/README.md`](tests/README.md) for the per-concern
+  suite map (unit, contract, integration, installed-package, platform, fault-injection,
+  performance, compatibility), each with its own deterministic discovery command, and where
+  reusable test support (`tests/support/`) lives.
 
 ## Launch contract
 
