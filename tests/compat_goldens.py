@@ -49,7 +49,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from pipeline_core import runner_cli
 from pipeline_core.commands import run_command
 from pipeline_core.diagnostics import write_diagnostic_report
-from pipeline_core.redaction import build_rules, redact_text
+from pipeline_core.redaction import build_rules, path_variants, redact_text
 from pipeline_core.reports import ENVELOPE_KEYS, STATUS_TOKENS
 from pipeline_core.state import Run
 from pipeline_core.verification import VERDICTS
@@ -82,8 +82,11 @@ _INTERPRETER_RE = re.compile(r"<(?:home|workdir|project_root)>[^\s`]*python(?:\.
 
 
 def _spellings(path: Path) -> list[str]:
-    native = str(path)
-    return [native.replace("\\", "\\\\"), native, path.as_posix()]
+    spellings: list[str] = []
+    for variant in path_variants(path):
+        native = str(variant)
+        spellings.extend((native.replace("\\", "\\\\"), native, variant.as_posix()))
+    return list(dict.fromkeys(spellings))
 
 
 def _anchor_rules(*, project_root: Path, agents_root: Path, core_root: Path,
@@ -97,7 +100,7 @@ def _anchor_rules(*, project_root: Path, agents_root: Path, core_root: Path,
     ]
     rules: list[tuple[re.Pattern[str], str]] = []
     for path, token in ordered:
-        for spelling in _spellings(path.resolve()):
+        for spelling in _spellings(path):
             if len(spelling) >= 4:
                 rules.append((re.compile(re.escape(spelling), re.IGNORECASE), token))
     return rules

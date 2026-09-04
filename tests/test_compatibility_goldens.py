@@ -78,6 +78,24 @@ class RedactionTests(unittest.TestCase):
         with patch("tests.test_compatibility_goldens.socket.gethostname", return_value="host"):
             self.assertNotIn("runner", self._host_needles())
 
+    def test_anchor_rules_normalize_windows_short_path_spelling(self) -> None:
+        long_root = Path(r"C:\Users\runneradmin\AppData\Local\Temp\compat\project")
+        short_root = Path(r"C:\Users\RUNNER~1\AppData\Local\Temp\compat\project")
+        def variants(path: Path) -> tuple[Path, ...]:
+            return (long_root, short_root) if path == short_root else (path,)
+
+        with patch("tests.compat_goldens.path_variants", side_effect=variants):
+            rules = harness._anchor_rules(
+                project_root=short_root,
+                agents_root=Path(r"C:\agents"),
+                core_root=Path(r"C:\core"),
+                workdir=Path(r"C:\work"),
+            )
+        self.assertEqual(
+            harness._normalize(str(long_root / "profile.json"), rules),
+            r"<project_root>\profile.json",
+        )
+
     def test_no_golden_leaks_a_host_path_user_or_machine_name(self) -> None:
         needles = self._host_needles()
         for name, text in harness.regenerate().items():

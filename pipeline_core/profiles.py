@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -63,10 +64,11 @@ def resolve_route(profile: Profile, task_type: str, anchors: Anchors) -> Resolve
 
 
 def _under_anchor(anchor: Path, logical_path: str, field: str) -> Path:
-    root = Path(anchor).resolve()
-    candidate = (root / logical_path).resolve()
+    root = Path(os.path.abspath(anchor))
+    resolved_root = root.resolve()
+    candidate = root / logical_path
     try:
-        candidate.relative_to(root)
+        candidate.resolve().relative_to(resolved_root)
     except ValueError:
         raise SchemaError(f"{field} escapes its explicit anchor") from None
     return candidate

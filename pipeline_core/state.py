@@ -249,7 +249,7 @@ class Run:
 
     @classmethod
     def create(cls, feature: str, prompt_path: str | Path, plan_path: str | Path | None, run_dir: str | Path, repo_root: str | Path) -> "Run":
-        root = Path(repo_root).resolve()
+        root = Path(os.path.abspath(repo_root))
         return cls(feature, repo_relative(prompt_path, root), repo_relative(plan_path, root) if plan_path else None, Path(run_dir), root, f"{_now().replace(':', '-')}-{feature}")
 
     def set_control(self, name: str, value: Any, *, sourced: str = "explicit") -> None:
@@ -582,7 +582,7 @@ class Run:
         tasks = {entry["id"]: TaskRecord.from_dict(entry) for entry in data.get("tasks", [])}
         return cls(
             data["feature"], data["prompt_path"], data.get("plan_path"), directory,
-            Path(repo_root).resolve(), data["run_id"], data.get("status", "pending"),
+            Path(os.path.abspath(repo_root)), data["run_id"], data.get("status", "pending"),
             tasks, data.get("history", []), data.get("commands", []),
             data.get("controls", {}), data.get("environment", {}),
             data.get("current_task"), data.get("stages", {}), data.get("artifacts", {}),

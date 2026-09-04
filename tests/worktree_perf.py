@@ -297,7 +297,7 @@ def _vcs_file_list(root: Path) -> list[str]:
             for part in out.split("\0"):
                 if not part:
                     continue
-                absolute = (cwd / part).resolve()
+                absolute = Path(os.path.abspath(cwd / part))
                 try:
                     files.add(absolute.relative_to(root).as_posix())
                 except ValueError:

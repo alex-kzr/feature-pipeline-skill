@@ -61,14 +61,14 @@ def build_rules(repo_root: str | Path | None = None) -> list[Rule]:
     for root, token in roots:
         if root is None or len(str(root)) < 4:
             continue
-        for path in _path_variants(root):
+        for path in path_variants(root):
             native = str(path)
             for spelling in (native.replace("\\", "\\\\"), native, path.as_posix()):
                 rules.append((re.compile(re.escape(spelling), re.IGNORECASE), token))
     return rules
 
 
-def _path_variants(path: Path) -> tuple[Path, ...]:
+def path_variants(path: Path) -> tuple[Path, ...]:
     """Return native aliases for a root, including Windows short and long paths."""
     variants = [path, path.resolve()]
     if os.name == "nt":

@@ -51,7 +51,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from pipeline_core import runner_cli
-from pipeline_core.redaction import build_rules, redact_text
+from pipeline_core.redaction import build_rules, path_variants, redact_text
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 
@@ -156,8 +156,11 @@ SCENARIOS: dict[str, Scenario] = {
 
 
 def _spellings(path: Path) -> list[str]:
-    native = str(path)
-    return [native.replace("\\", "\\\\"), native, path.as_posix()]
+    spellings: list[str] = []
+    for variant in path_variants(path):
+        native = str(variant)
+        spellings.extend((native.replace("\\", "\\\\"), native, variant.as_posix()))
+    return list(dict.fromkeys(spellings))
 
 
 def _anchor_rules(*, project_root: Path, agents_root: Path, core_root: Path,
@@ -176,7 +179,7 @@ def _anchor_rules(*, project_root: Path, agents_root: Path, core_root: Path,
     ]
     rules: list[tuple[re.Pattern[str], str]] = []
     for path, token in ordered:
-        for spelling in _spellings(path.resolve()):
+        for spelling in _spellings(path):
             if len(spelling) >= 4:
                 rules.append((re.compile(re.escape(spelling), re.IGNORECASE), token))
     return rules
