@@ -37,6 +37,13 @@ from .launch_controls import (
     plan_launch,
     resolve_launch_controls,
 )
+from .report_gates import (
+    both_verifiers_pass,
+    command_exit_gate,
+    evidence_presence_gate,
+    protocol_gate,
+    scope_gate,
+)
 from .results import Outcome, PipelineResult, ResultMapper
 from .task_engine import (
     ExecutionError,
@@ -60,6 +67,11 @@ from .selection import (
 )
 
 __all__ = [
+    "both_verifiers_pass",
+    "command_exit_gate",
+    "evidence_presence_gate",
+    "protocol_gate",
+    "scope_gate",
     "Outcome",
     "PipelineResult",
     "ResultMapper",

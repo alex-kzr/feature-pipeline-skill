@@ -19,36 +19,50 @@ Standard library only.
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+from feature_pipeline.reports.settlement import (
+    STATUS_CONTRACT as _STATUS_CONTRACT,
+    VERDICT_CONTRACT as _VERDICT_CONTRACT,
+    ReportProtocolError as _ReportProtocolError,
+    parse_envelope as _parse_envelope,
+    parse_prose_token as _parse_prose_token,
+    settle as _settle,
+)
+
 from .artifacts import write_text_atomic
 
 #: The only two states an executor launch may report. There is deliberately no ``verified``
-#: token: nothing an executor writes can carry a task past ``implemented``.
-STATUS_TOKENS = ("implemented", "blocked")
+#: token: nothing an executor writes can carry a task past ``implemented``. Sourced from the
+#: one settlement contract (VP-02) so the vocabulary is defined in exactly one place.
+STATUS_TOKENS = _STATUS_CONTRACT.token_values
 
 #: The strict JSON status-envelope shape — exactly these keys, nothing missing, nothing extra.
-ENVELOPE_KEYS = frozenset({"role", "status", "task_id", "attempt"})
+ENVELOPE_KEYS = _STATUS_CONTRACT.keys
 
 REPORTS_DIRNAME = "reports"
 
-#: A ``Status:`` line: an optional leading ``- ``, optional ``*``/``_`` emphasis around the
-#: field name and/or the token, then one of the known tokens. Nothing else parses.
-_STATUS_RE = re.compile(
-    r"(?im)^\s*-?\s*[*_]*\s*Status\s*[*_]*\s*:\s*[*_]*\s*(implemented|blocked)\b"
-)
-
 
 class ReportError(RuntimeError):
-    """A report/artifact failure. ``code`` is a stable, machine-readable reason."""
+    """A report/artifact failure. ``code`` is a stable, machine-readable reason.
+
+    Report-protocol settlement (VP-02) is done by
+    :mod:`feature_pipeline.reports.settlement`; its :class:`ReportProtocolError` is re-raised
+    here with the same ``code`` and message so every historical caller and golden is
+    unaffected.
+    """
 
     def __init__(self, message: str, code: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+def _reraise(exc: _ReportProtocolError) -> "ReportError":
+    """Translate a settlement failure to the historical :class:`ReportError`."""
+    return ReportError(str(exc), exc.code)
 
 
 @dataclass(frozen=True)
@@ -111,57 +125,27 @@ def build_status_envelope_prompt(*, role: str, task_id: str, attempt: int) -> st
 
 
 def parse_executor_status(text: str) -> str:
-    """The lower-cased token from the prose ``- Status:`` line, or ``unparseable-report``."""
-    match = _STATUS_RE.search(text or "")
-    if not match:
-        raise ReportError(
-            "executor report has no parseable '- Status: implemented | blocked' line — a "
-            "claim without the required field is not evidence",
-            "unparseable-report",
-        )
-    return match.group(1).lower()
+    """The lower-cased token from the prose ``- Status:`` line, or ``unparseable-report``.
+
+    Delegates to the one parameterized prose parser (VP-02).
+    """
+    try:
+        return _parse_prose_token(text or "", _STATUS_CONTRACT)
+    except _ReportProtocolError as exc:
+        raise _reraise(exc) from None
 
 
 def parse_status_envelope(text: str, *, role: str, task_id: str, attempt: int) -> str:
-    """Strictly parse one JSON status envelope. Never infers, never falls back to the prose."""
-    stripped = (text or "").strip()
+    """Strictly parse one JSON status envelope. Never infers, never falls back to the prose.
+
+    Delegates to the one parameterized envelope parser (VP-02).
+    """
     try:
-        data = json.loads(stripped)
-    except (json.JSONDecodeError, ValueError):
-        raise ReportError(
-            f"status envelope is not valid JSON: {stripped[:200]!r}",
-            "unparseable-status-envelope",
-        ) from None
-    if not isinstance(data, dict):
-        raise ReportError("status envelope is not a JSON object", "unparseable-status-envelope")
-    if set(data.keys()) != set(ENVELOPE_KEYS):
-        raise ReportError(
-            f"status envelope has keys {sorted(data.keys())}, expected exactly "
-            f"{sorted(ENVELOPE_KEYS)} — none missing, none extra",
-            "unparseable-status-envelope",
+        return _parse_envelope(
+            text or "", _STATUS_CONTRACT, role=role, task_id=task_id, attempt=attempt
         )
-    token = data.get("status")
-    if token not in STATUS_TOKENS:
-        raise ReportError(
-            f"status envelope 'status' is {token!r}, expected one of {list(STATUS_TOKENS)}",
-            "unparseable-status-envelope",
-        )
-    if data.get("role") != role:
-        raise ReportError(
-            f"status envelope declares role {data.get('role')!r}, expected {role!r}",
-            "unparseable-status-envelope",
-        )
-    if data.get("task_id") != task_id:
-        raise ReportError(
-            f"status envelope declares task_id {data.get('task_id')!r}, expected {task_id!r}",
-            "unparseable-status-envelope",
-        )
-    if data.get("attempt") != attempt or isinstance(data.get("attempt"), bool):
-        raise ReportError(
-            f"status envelope declares attempt {data.get('attempt')!r}, expected {attempt!r}",
-            "unparseable-status-envelope",
-        )
-    return token
+    except _ReportProtocolError as exc:
+        raise _reraise(exc) from None
 
 
 @dataclass(frozen=True)
@@ -183,54 +167,40 @@ def settle_executor_status(
     * envelope valid, prose valid, they agree → that token;
     * envelope valid, prose valid, they disagree → ``status-envelope-mismatch`` (fail closed);
     * envelope valid, prose absent/malformed → the envelope token, with ``drift`` set.
+
+    Delegates to the one parameterized settlement function (VP-02); the return shape is kept
+    for every historical caller.
     """
-    envelope_token = parse_status_envelope(
-        envelope_text, role=role, task_id=task_id, attempt=attempt
-    )
-
-    prose_token: str | None = None
-    prose_error: str | None = None
     try:
-        prose_token = parse_executor_status(prose_text)
-    except ReportError as exc:
-        prose_error = str(exc)
-
-    if prose_token is not None and prose_token != envelope_token:
-        raise ReportError(
-            f"executor status disagreement for {task_id} attempt {attempt}: prose reported "
-            f"{prose_token!r}, envelope reported {envelope_token!r} — not resolved "
-            f"automatically",
-            "status-envelope-mismatch",
+        settled = _settle(
+            _STATUS_CONTRACT,
+            prose_text=prose_text,
+            envelope_text=envelope_text,
+            role=role,
+            task_id=task_id,
+            attempt=attempt,
         )
-
-    drift = None
-    if prose_token is None:
-        drift = (
-            f"prose status line unusable ({prose_error}); envelope status "
-            f"{envelope_token!r} stands"
-        )
-    return StatusResolution(envelope_token, prose_token, envelope_token, drift)
+    except _ReportProtocolError as exc:
+        raise _reraise(exc) from None
+    return StatusResolution(
+        settled.token, settled.prose_token, settled.envelope_token, settled.drift
+    )
 
 
 # --- independent verifier artifacts and verdict settlement (VR-02) --------------------------
 
-#: The only verdict tokens a verifier launch may report.
-VERDICT_TOKENS = ("PASS", "FAIL", "BLOCKED")
+#: The only verdict tokens a verifier launch may report. Sourced from the one settlement
+#: contract (VP-02).
+VERDICT_TOKENS = _VERDICT_CONTRACT.token_values
 
 #: The strict JSON verdict-envelope shape — exactly these keys, nothing missing, nothing extra.
-VERDICT_ENVELOPE_KEYS = frozenset({"role", "verdict", "task_id", "attempt"})
+VERDICT_ENVELOPE_KEYS = _VERDICT_CONTRACT.keys
 
 #: The two independent verifier roles. ``verify-<attempt>/`` is their per-attempt home so a
 #: repair pass never overwrites the previous attempt's reports (AC-3).
 VERIFIER_ROLES = ("task_verifier", "test_verifier")
 
 _VERIFIER_ROLE_KEY = {"task_verifier": "task", "test_verifier": "test"}
-
-#: A ``Verdict:`` line: an optional leading ``- ``, optional ``*``/``_`` emphasis around the
-#: field name and/or the token, then one of the known tokens. Nothing else parses.
-_VERDICT_RE = re.compile(
-    r"(?im)^\s*-?\s*[*_]*\s*Verdict\s*[*_]*\s*:\s*[*_]*\s*(PASS|FAIL|BLOCKED)\b"
-)
 
 
 def _verifier_role_key(role: str) -> str:
@@ -318,59 +288,27 @@ def build_verdict_envelope_prompt(*, role: str, task_id: str, attempt: int) -> s
 
 
 def parse_verifier_verdict(text: str) -> str:
-    """The upper-cased token from the prose ``- Verdict:`` line, or ``unparseable-report``."""
-    match = _VERDICT_RE.search(text or "")
-    if not match:
-        raise ReportError(
-            "verifier report has no parseable '- Verdict: PASS | FAIL | BLOCKED' line — a "
-            "claim without the required field is not evidence",
-            "unparseable-report",
-        )
-    return match.group(1).upper()
+    """The upper-cased token from the prose ``- Verdict:`` line, or ``unparseable-report``.
+
+    Delegates to the one parameterized prose parser (VP-02).
+    """
+    try:
+        return _parse_prose_token(text or "", _VERDICT_CONTRACT)
+    except _ReportProtocolError as exc:
+        raise _reraise(exc) from None
 
 
 def parse_verdict_envelope(text: str, *, role: str, task_id: str, attempt: int) -> str:
-    """Strictly parse one JSON verdict envelope. Never infers, never falls back to the prose."""
-    stripped = (text or "").strip()
+    """Strictly parse one JSON verdict envelope. Never infers, never falls back to the prose.
+
+    Delegates to the one parameterized envelope parser (VP-02).
+    """
     try:
-        data = json.loads(stripped)
-    except (json.JSONDecodeError, ValueError):
-        raise ReportError(
-            f"verdict envelope is not valid JSON: {stripped[:200]!r}",
-            "unparseable-verdict-envelope",
-        ) from None
-    if not isinstance(data, dict):
-        raise ReportError(
-            "verdict envelope is not a JSON object", "unparseable-verdict-envelope")
-    if set(data.keys()) != set(VERDICT_ENVELOPE_KEYS):
-        raise ReportError(
-            f"verdict envelope has keys {sorted(data.keys())}, expected exactly "
-            f"{sorted(VERDICT_ENVELOPE_KEYS)} — none missing, none extra",
-            "unparseable-verdict-envelope",
+        return _parse_envelope(
+            text or "", _VERDICT_CONTRACT, role=role, task_id=task_id, attempt=attempt
         )
-    verdict = data.get("verdict")
-    if verdict not in VERDICT_TOKENS:
-        raise ReportError(
-            f"verdict envelope 'verdict' is {verdict!r}, expected one of "
-            f"{list(VERDICT_TOKENS)}",
-            "unparseable-verdict-envelope",
-        )
-    if data.get("role") != role:
-        raise ReportError(
-            f"verdict envelope declares role {data.get('role')!r}, expected {role!r}",
-            "unparseable-verdict-envelope",
-        )
-    if data.get("task_id") != task_id:
-        raise ReportError(
-            f"verdict envelope declares task_id {data.get('task_id')!r}, expected {task_id!r}",
-            "unparseable-verdict-envelope",
-        )
-    if data.get("attempt") != attempt or isinstance(data.get("attempt"), bool):
-        raise ReportError(
-            f"verdict envelope declares attempt {data.get('attempt')!r}, expected {attempt!r}",
-            "unparseable-verdict-envelope",
-        )
-    return verdict
+    except _ReportProtocolError as exc:
+        raise _reraise(exc) from None
 
 
 @dataclass(frozen=True)
@@ -392,33 +330,24 @@ def settle_verifier_verdict(
     * envelope valid, prose valid, they agree → that token;
     * envelope valid, prose valid, they disagree → ``verdict-envelope-mismatch`` (fail closed);
     * envelope valid, prose absent/malformed → the envelope token, with ``drift`` set.
+
+    Delegates to the one parameterized settlement function (VP-02); the return shape is kept
+    for every historical caller.
     """
-    envelope_token = parse_verdict_envelope(
-        envelope_text, role=role, task_id=task_id, attempt=attempt
-    )
-
-    prose_token: str | None = None
-    prose_error: str | None = None
     try:
-        prose_token = parse_verifier_verdict(prose_text)
-    except ReportError as exc:
-        prose_error = str(exc)
-
-    if prose_token is not None and prose_token != envelope_token:
-        raise ReportError(
-            f"verifier verdict disagreement for {task_id} attempt {attempt}: prose reported "
-            f"{prose_token!r}, envelope reported {envelope_token!r} — not resolved "
-            f"automatically",
-            "verdict-envelope-mismatch",
+        settled = _settle(
+            _VERDICT_CONTRACT,
+            prose_text=prose_text,
+            envelope_text=envelope_text,
+            role=role,
+            task_id=task_id,
+            attempt=attempt,
         )
-
-    drift = None
-    if prose_token is None:
-        drift = (
-            f"prose verdict line unusable ({prose_error}); envelope verdict "
-            f"{envelope_token!r} stands"
-        )
-    return VerdictResolution(envelope_token, prose_token, envelope_token, drift)
+    except _ReportProtocolError as exc:
+        raise _reraise(exc) from None
+    return VerdictResolution(
+        settled.token, settled.prose_token, settled.envelope_token, settled.drift
+    )
 
 
 # --- bounded-repair report consolidation (VR-03) -------------------------------------------

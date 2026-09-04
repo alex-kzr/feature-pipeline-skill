@@ -128,6 +128,8 @@ module = [
     "pipeline_core.execution",
     "pipeline_core.legacy_adapter",
     "pipeline_core.plan_md",
+    # VP-02 routed settlement/parsing through `feature_pipeline.reports`; the residual
+    # `write_repair_report(run: object, spec: object)` debt keeps this module parked.
     "pipeline_core.reports",
     "pipeline_core.roles",
     "pipeline_core.runner_cli",
