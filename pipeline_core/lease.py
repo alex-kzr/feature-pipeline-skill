@@ -1,21 +1,23 @@
 """Exclusive lease for write-capable portable stages.
 
-Exactly one write-capable process may hold a given lease at a time. Acquisition is an atomic
-``O_CREAT | O_EXCL`` create; when the file already exists the lease is reclaimed only if its
-recorded PID is *proven dead*. A live owner, an unreadable lease, or a PID whose liveness
-cannot be determined all fail closed — the caller is told the lease is held rather than
-having an ambiguous owner deleted. Release only ever removes a lease still owned by this
-run and PID, including on the exception path out of the context manager.
+Exactly one write-capable process may hold a given lease at a time. Since RS-02 the mechanism
+is the one bounded primitive in :mod:`feature_pipeline.infrastructure.locks` - an atomic
+``O_CREAT | O_EXCL`` create, an owner token (run id + PID + a per-process nonce, so a reused
+PID cannot pass for the process that crashed), and reclaim only of an owner *proven dead*. A
+live owner, an unreadable lease, or a PID whose liveness cannot be determined all fail closed
+with :class:`LeaseHeldError` rather than having an ambiguous owner deleted. Release only ever
+removes a lease still owned by this token, including on the exception path out of the context
+manager.
 """
 
 from __future__ import annotations
 
-import json
 import os
-from datetime import datetime, timezone
 from pathlib import Path
 
-from .state import pid_alive, read_lease
+from feature_pipeline.infrastructure.locks.manager import FileLeaseManager
+from feature_pipeline.infrastructure.locks.owner import current_owner
+from feature_pipeline.ports.locks import Lease, LeaseHeld, LeaseRequest, LeaseTimeout
 
 
 class LeaseHeldError(Exception):
@@ -26,62 +28,48 @@ class LeaseHeldError(Exception):
         self.code = code
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
 class PipelineLease:
-    """Acquire via atomic creation and reclaim only demonstrably stale leases."""
+    """Acquire via the shared bounded lease and reclaim only demonstrably stale owners.
+
+    ``acquire`` asks for an immediate verdict (``acquire_timeout_s=0``): a live or ambiguous
+    owner raises :class:`LeaseHeldError` straight away, matching the historical semantics
+    where the caller is told the lease is held rather than made to wait.
+    """
 
     def __init__(self, path: str | Path, run_id: str, pid: int | None = None) -> None:
         self.path = Path(path)
         self.run_id = run_id
         self.pid = pid if pid is not None else os.getpid()
+        self._owner = current_owner(run_id, pid=self.pid)
+        self._manager = FileLeaseManager()
+        self._lease: Lease | None = None
         self._held_for: str | None = None
         self._held = False
 
+    def _new_lease(self, task_id: str | None) -> Lease:
+        return self._manager.lease(
+            LeaseRequest(
+                path=str(self.path),
+                owner=self._owner,
+                acquire_timeout_s=0,
+                task_id=task_id,
+            )
+        )
+
     def acquire(self, task_id: str | None = None) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "run_id": self.run_id,
-            "pid": self.pid,
-            "task_id": task_id,
-            "started_at": _now(),
-        }
-        while True:
-            try:
-                descriptor = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            except FileExistsError:
-                held = read_lease(self.path)
-                if held is None:
-                    # Freed between the failed create and the read — retry the create.
-                    continue
-                if held.get("unreadable") or held.get("pid") is None or pid_alive(held.get("pid")):
-                    raise LeaseHeldError(
-                        f"write lease at '{self.path}' is held by pid {held.get('pid')} "
-                        f"(task {held.get('task_id')!r})")
-                try:
-                    self.path.unlink()
-                except FileNotFoundError:
-                    pass
-                except OSError as exc:
-                    raise LeaseHeldError(
-                        f"stale write lease at '{self.path}' could not be reclaimed: {exc}"
-                    ) from None
-                continue
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                handle.write(json.dumps(payload, indent=2) + "\n")
-            self._held_for = task_id
-            self._held = True
-            return
+        lease = self._new_lease(task_id)
+        try:
+            lease.acquire()
+        except (LeaseHeld, LeaseTimeout) as exc:
+            raise LeaseHeldError(str(exc), getattr(exc, "code", "lease-held")) from None
+        self._lease = lease
+        self._held_for = task_id
+        self._held = True
 
     def release(self) -> None:
-        held = read_lease(self.path)
-        if held and held.get("run_id") == self.run_id and held.get("pid") == self.pid:
-            try:
-                self.path.unlink()
-            except FileNotFoundError:
-                pass
+        lease = self._lease if self._lease is not None else self._new_lease(self._held_for)
+        lease.release()
+        self._lease = None
         self._held_for = None
         self._held = False
 

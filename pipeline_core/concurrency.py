@@ -3,33 +3,43 @@
 Two independent guarantees, both enforced with lock files under an explicit project root
 (never inferred from the user home) so they hold across separate OS processes:
 
-* **Write leases** — at most one write-capable stage per working tree
+* **Write leases** - at most one write-capable stage per working tree
   (``docs/.agents/locks/pipeline.lock``) and at most one owner of a given task while its
   executor or repair runs (``docs/.agents/locks/<task-id>.lock``). Read-only verifiers never
   take a lease, which is what keeps concurrent verification safe.
-* **Write mutex** — :class:`FileMutex` at ``docs/.agents/locks/serialized-<program>.lock``
+* **Write mutex** - :class:`FileMutex` at ``docs/.agents/locks/serialized-<program>.lock``
   serializes every invocation of a *caller-declared* write-heavy program across *all* stages,
   including otherwise-concurrent verifiers. Overlapping builds that contend on the same output
-  files deadlock — the Windows linker's file locks are the canonical case — so any project
+  files deadlock - the Windows linker's file locks are the canonical case - so any project
   with a compiled-language build tool declares that tool's basename and the runner takes this
   mutex around it. The set of serialized program names is supplied by the caller
   (:func:`pipeline_core.commands.run_command`); nothing is baked in here.
 
-An ambiguous owner (a live PID, an unreadable lock) always blocks; only a demonstrably dead
-owner is reclaimed. Standard library only.
+Since RS-02 both the lease and the mutex are thin adapters over the one bounded primitive in
+:mod:`feature_pipeline.infrastructure.locks`. An ambiguous owner (a live PID, an unreadable
+lock) always blocks; only a demonstrably dead owner is reclaimed. The mutex no longer waits
+forever by default - it inherits
+:data:`feature_pipeline.ports.locks.DEFAULT_ACQUIRE_TIMEOUT_S` and a caller that truly wants
+an unbounded wait passes ``timeout=None`` explicitly. Standard library only.
 """
 
 from __future__ import annotations
 
-import json
 import os
-import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
+from feature_pipeline.infrastructure.locks.manager import FileLeaseManager
+from feature_pipeline.infrastructure.locks.owner import current_owner
+from feature_pipeline.ports.locks import (
+    DEFAULT_ACQUIRE_TIMEOUT_S,
+    DEFAULT_POLL_INTERVAL_S,
+    Lease,
+    LeaseRequest,
+    LeaseTimeout,
+)
+
 from .lease import LeaseHeldError, PipelineLease
-from .state import pid_alive, read_lease
 
 __all__ = [
     "LeaseHeldError",
@@ -51,17 +61,6 @@ _LOCKS_SUBPATH = ("docs", ".agents", "locks")
 #: Per-program write-mutex lock file: ``serialized-<program-basename>.lock``.
 SERIALIZED_LOCK_PREFIX = "serialized-"
 PIPELINE_LOCK_NAME = "pipeline.lock"
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _unlink_quietly(path: Path) -> None:
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        pass
 
 
 def locks_dir(project_root: str | Path) -> Path:
@@ -102,7 +101,7 @@ def task_lease(project_root: str | Path, run_id: str, task_id: str, pid: int | N
 
 
 class MutexTimeout(TimeoutError):
-    """A cross-process mutex was not acquired within its timeout."""
+    """A cross-process mutex was not acquired within its (now always bounded) timeout."""
 
 
 class FileMutex:
@@ -110,9 +109,11 @@ class FileMutex:
 
     Unlike ``threading.Lock`` this survives the process boundary: the engine launches
     executors and verifiers as separate processes, so write serialization has to live on
-    disk. Acquisition spins on atomic ``O_CREAT | O_EXCL`` creation; a lock whose recorded
-    PID is proven dead is reclaimed, while a live or unreadable owner blocks until it frees
-    the lock or the optional timeout elapses.
+    disk. Acquisition is delegated to
+    :class:`feature_pipeline.infrastructure.locks.manager.FileLeaseManager`: a lock whose
+    recorded PID is proven dead is reclaimed, a live or unreadable owner blocks until it
+    frees the lock or ``timeout`` elapses (:class:`MutexTimeout`). ``timeout`` defaults to a
+    bounded value; pass ``None`` to wait with no ceiling.
     """
 
     def __init__(
@@ -121,52 +122,42 @@ class FileMutex:
         *,
         run_id: str | None = None,
         pid: int | None = None,
-        poll_interval: float = 0.02,
-        timeout: float | None = None,
+        poll_interval: float = DEFAULT_POLL_INTERVAL_S,
+        timeout: float | None = DEFAULT_ACQUIRE_TIMEOUT_S,
     ) -> None:
         self.path = Path(path)
         self.run_id = run_id
         self.pid = pid if pid is not None else os.getpid()
         self.poll_interval = poll_interval
         self.timeout = timeout
+        self._owner = current_owner(run_id, pid=self.pid)
+        self._manager = FileLeaseManager()
+        self._lease: Lease | None = None
         self._held = False
 
     def acquire(self) -> "FileMutex":
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        deadline = None if self.timeout is None else time.monotonic() + self.timeout
-        while True:
-            try:
-                descriptor = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            except FileExistsError:
-                held = read_lease(self.path)
-                dead_owner = (
-                    held is not None
-                    and not held.get("unreadable")
-                    and held.get("pid") is not None
-                    and not pid_alive(held.get("pid"))
-                )
-                if dead_owner:
-                    _unlink_quietly(self.path)
-                    continue
-                if deadline is not None and time.monotonic() >= deadline:
-                    raise MutexTimeout(
-                        f"write mutex at '{self.path}' was not acquired within {self.timeout}s")
-                time.sleep(self.poll_interval)
-                continue
-            payload = {"run_id": self.run_id, "pid": self.pid, "acquired_at": _now()}
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                handle.write(json.dumps(payload, indent=2) + "\n")
-            self._held = True
-            return self
+        lease = self._manager.lease(
+            LeaseRequest(
+                path=str(self.path),
+                owner=self._owner,
+                acquire_timeout_s=self.timeout,
+                poll_interval_s=self.poll_interval,
+            )
+        )
+        try:
+            lease.acquire()
+        except LeaseTimeout:
+            raise MutexTimeout(
+                f"write mutex at '{self.path}' was not acquired within {self.timeout}s"
+            ) from None
+        self._lease = lease
+        self._held = True
+        return self
 
     def release(self) -> None:
-        if not self._held:
-            return
-        held = read_lease(self.path)
-        if held and held.get("pid") == self.pid and (
-            self.run_id is None or held.get("run_id") == self.run_id
-        ):
-            _unlink_quietly(self.path)
+        if self._lease is not None:
+            self._lease.release()
+        self._lease = None
         self._held = False
 
     def __enter__(self) -> "FileMutex":
@@ -182,9 +173,12 @@ def write_mutex(
     *,
     run_id: str | None = None,
     pid: int | None = None,
-    timeout: float | None = None,
+    timeout: float | None = DEFAULT_ACQUIRE_TIMEOUT_S,
 ) -> FileMutex:
-    """The process-wide write mutex serializing one caller-declared program in a project tree."""
+    """The process-wide write mutex serializing one caller-declared program in a project tree.
+
+    ``timeout`` is bounded by default (RS-02 AC-1); pass ``None`` for an unbounded wait.
+    """
     return FileMutex(
         serialized_lock_path(project_root, program), run_id=run_id, pid=pid, timeout=timeout)
 
@@ -194,7 +188,7 @@ def is_serialized_program(
 ) -> bool:
     """True when a *resolved* executable's basename is one the caller declared must be serialized.
 
-    ``serialized_programs`` is caller-supplied data — a set of program basenames (a bare name,
+    ``serialized_programs`` is caller-supplied data - a set of program basenames (a bare name,
     a name with an extension, or a full path are all compared by lowercased stem). Keyed off
     the resolved path rather than the declared ``argv[0]`` so the serialization is a property
     of what actually launches, per RDS-01.

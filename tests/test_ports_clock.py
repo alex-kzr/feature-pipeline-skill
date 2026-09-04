@@ -36,7 +36,6 @@ from feature_pipeline.ports.clock import (
 )
 
 from pipeline_core import execution as execution_mod
-from pipeline_core import lease as lease_mod
 from pipeline_core import state as state_mod
 
 _STAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
@@ -82,7 +81,9 @@ class FormatTimestampTests(unittest.TestCase):
 
     def test_the_format_constant_is_the_literal_used_across_pipeline_core(self) -> None:
         self.assertEqual(TIMESTAMP_FORMAT, "%Y-%m-%dT%H:%M:%SZ")
-        for module in (state_mod, execution_mod, lease_mod):
+        # ``pipeline_core.lease`` / ``concurrency`` stopped formatting timestamps at RS-02 -
+        # the lock-file stamp now lives in ``feature_pipeline.infrastructure.locks.record``.
+        for module in (state_mod, execution_mod):
             self.assertIn(TIMESTAMP_FORMAT, inspect.getsource(module))
 
     def test_a_non_utc_instant_is_normalised_to_utc(self) -> None:
