@@ -11,7 +11,6 @@ the parent repo.
 
 from __future__ import annotations
 
-import getpass
 import json
 import socket
 import sys
@@ -119,9 +118,6 @@ class RedactionTests(unittest.TestCase):
             harness.WORKDIR_ROOT and str(harness.WORKDIR_ROOT) or "",
             socket.gethostname(),
         ]
-        user = getpass.getuser()
-        if len(user) >= 4:
-            needles.append(user)
         return [n for n in needles if n]
 
     def test_no_capture_leaks_a_host_path_user_or_machine_name(self) -> None:

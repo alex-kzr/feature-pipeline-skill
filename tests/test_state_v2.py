@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -175,7 +176,10 @@ class RoundTripTests(unittest.TestCase):
             run = _run(root)
             run.artifacts = {"report": str(root / "reports" / "EX-1" / "executor-1.md")}
             stored = json.loads(run.save().read_text(encoding="utf-8"))
-            self.assertEqual(stored["artifacts"]["report"], "<repo>\\reports\\EX-1\\executor-1.md")
+            self.assertEqual(
+                stored["artifacts"]["report"],
+                f"<repo>{os.sep}reports{os.sep}EX-1{os.sep}executor-1.md",
+            )
 
 
 class CommandAndGenerationTests(unittest.TestCase):

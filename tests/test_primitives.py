@@ -35,7 +35,7 @@ class ArtifactCharacterizationTests(unittest.TestCase):
 
             self.assertEqual(
                 redact_text(str(spelling / "secret"), build_rules(spelling)),
-                "<repo>\\secret",
+                f"<repo>{os.sep}secret",
             )
 
     def test_atomic_write_redacts_nested_repository_paths(self) -> None:
@@ -44,7 +44,7 @@ class ArtifactCharacterizationTests(unittest.TestCase):
             target = root / "reports" / "result.json"
             write_json_atomic(target, {"path": str(root / "secret"), "items": [str(root)]}, repo_root=root)
             stored = json.loads(target.read_text(encoding="utf-8"))
-            self.assertEqual(stored, {"path": "<repo>\\secret", "items": ["<repo>"]})
+            self.assertEqual(stored, {"path": f"<repo>{os.sep}secret", "items": ["<repo>"]})
 
     def test_non_serializable_payload_preserves_existing_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

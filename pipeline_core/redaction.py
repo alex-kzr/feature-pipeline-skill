@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import os
 import tempfile
 from pathlib import Path
 from typing import Any, Iterable
@@ -60,11 +61,24 @@ def build_rules(repo_root: str | Path | None = None) -> list[Rule]:
     for root, token in roots:
         if root is None or len(str(root)) < 4:
             continue
-        for path in (root, root.resolve()):
+        for path in _path_variants(root):
             native = str(path)
             for spelling in (native.replace("\\", "\\\\"), native, path.as_posix()):
                 rules.append((re.compile(re.escape(spelling), re.IGNORECASE), token))
     return rules
+
+
+def _path_variants(path: Path) -> tuple[Path, ...]:
+    """Return native aliases for a root, including Windows short and long paths."""
+    variants = [path, path.resolve()]
+    if os.name == "nt":
+        import ctypes
+
+        for function in (ctypes.windll.kernel32.GetLongPathNameW, ctypes.windll.kernel32.GetShortPathNameW):
+            buffer = ctypes.create_unicode_buffer(32768)
+            if function(str(path), buffer, len(buffer)):
+                variants.append(Path(buffer.value))
+    return tuple(dict.fromkeys(variants))
 
 
 def redact_text(text: str | None, rules: Iterable[Rule]) -> str:

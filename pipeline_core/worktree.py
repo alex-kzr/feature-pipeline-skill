@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -263,7 +264,7 @@ def _legacy_capture_snapshot(
                 ),
             )
         for relative in relatives:
-            absolute = (boundary / relative).resolve()
+            absolute = Path(os.path.abspath(boundary / relative))
             if not _within(absolute, root):
                 continue
             if any(_within(absolute, exclude) for exclude in excludes):
