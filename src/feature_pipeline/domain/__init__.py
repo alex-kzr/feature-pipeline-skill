@@ -44,6 +44,7 @@ from .plan import (
     UnsupportedControl,
 )
 from .repair import DEFAULT_MAX_REPAIR_ATTEMPTS, RepairBound
+from .scope import IN_ALLOWED_SCOPE, OUT_OF_SCOPE, AllowedScope, ScopeViolation
 from .vocabulary import (
     Actor,
     AdapterName,
@@ -88,6 +89,11 @@ __all__ = [
     "ResolvedControl",
     "RepairBound",
     "DEFAULT_MAX_REPAIR_ATTEMPTS",
+    # allowed-scope classification (WT-02)
+    "AllowedScope",
+    "ScopeViolation",
+    "IN_ALLOWED_SCOPE",
+    "OUT_OF_SCOPE",
     # vocabulary
     "TaskStatus",
     "RunStatus",

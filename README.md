@@ -62,6 +62,19 @@ Callers supply all anchors. The core does not infer host-specific locations or p
   or process exists; `plan_launch` then threads the resolved timeout, the per-kind output
   byte budget, and the serialized-program mutex into each launch. No operational control is
   a silent no-op.
+- **An out-of-scope executor change is a mechanical block, not a verifier's opinion.**
+  `feature_pipeline.application.execute_task.enforce_scope_gate` runs immediately after the
+  bounded worktree attribution and *before* any verifier launches. It re-derives every
+  changed path's classification from the task's `Allowed scope` with
+  `feature_pipeline.domain.scope.AllowedScope` (it does not trust the label attribution
+  attached), and returns a deterministic decision: `clean` (verification proceeds),
+  `scope-violation` (an executor-owned change landed outside the scope — the task is
+  blocked), or `attribution-unavailable` (the window could not be attributed with
+  confidence — fail closed). The gate **never reverts or cleans a file** — out-of-scope
+  paths may hold user work — and a file the user left dirty before the run that the
+  executor never touched is not a candidate and cannot trip it. Its only side effect is a
+  bounded manifest and diff, published through the typed artifact store with explicit run
+  and repository coordinates for diagnostics and human review.
 
 Run the test suite from the repository root:
 

@@ -12,8 +12,13 @@ uses):
 ``RelativePath`` additionally rejects a ``*`` (parity with
 ``contracts._spec_paths(allow_glob=False)``, used for ``documentation_impact`` and
 ``required_skills``). ``RelativeGlob`` keeps ``*`` so it can describe an allowed-scope entry
-such as ``src/feature_pipeline/domain/**``. Matching a path against a glob is deliberately
-**not** part of this module — the deterministic scope gate (WT-02) owns that.
+such as ``src/feature_pipeline/domain/**``, and — since **WT-02** — knows how to *match* a
+path against itself: :meth:`RelativeGlob.matches` is the one canonical scope matcher the
+deterministic scope gate (:mod:`feature_pipeline.application.execute_task`) and
+:class:`feature_pipeline.domain.scope.AllowedScope` build on. Its ``*`` / ``**`` semantics
+are byte-identical to the ``_scope_regex`` translation ``pipeline_core.worktree`` has always
+used: ``**`` spans path separators (and swallows a following ``/``), ``*`` and ``?`` do not,
+and no other metacharacter is honoured.
 
 Standard library only.
 """
@@ -22,10 +27,40 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 
 from .errors import InvalidGlob, InvalidPath, PathNotContained
 
 _DRIVE_RE = re.compile(r"^[A-Za-z]:/")
+
+
+@lru_cache(maxsize=512)
+def _glob_regex(pattern: str) -> re.Pattern[str]:
+    """Translate a normalized repository-relative scope glob to an anchored regex.
+
+    ``**`` -> ``.*`` (and a directly following ``/`` is consumed); ``*`` -> ``[^/]*``;
+    ``?`` -> ``[^/]``; every other character is matched literally. Byte-for-byte the
+    translation in ``pipeline_core.worktree._scope_regex`` and
+    ``feature_pipeline.infrastructure.worktree.inspector._scope_regex``.
+    """
+    out: list[str] = []
+    index = 0
+    while index < len(pattern):
+        char = pattern[index]
+        if char == "*":
+            if pattern[index : index + 2] == "**":
+                out.append(".*")
+                index += 2
+                if pattern[index : index + 1] == "/":
+                    index += 1
+                continue
+            out.append("[^/]*")
+        elif char == "?":
+            out.append("[^/]")
+        else:
+            out.append(re.escape(char))
+        index += 1
+    return re.compile("^" + "".join(out) + "$")
 
 
 def _normalize(value: object, *, error: type[InvalidPath | InvalidGlob]) -> str:
@@ -92,6 +127,21 @@ class RelativeGlob:
     @property
     def is_glob(self) -> bool:
         return "*" in self.value
+
+    def matches(self, path: "str | RelativePath") -> bool:
+        """True when ``path`` equals this glob or matches its ``*`` / ``**`` translation.
+
+        ``path`` is normalized with the same rules as :meth:`RelativePath.parse` (a
+        backslash is folded, ``.`` / empty segments drop) before the test, so a
+        Windows-style path is matched identically to its POSIX form. Mirrors
+        ``pipeline_core.worktree._in_allowed_scope`` for a single pattern: an exact string
+        equality shortcut, then the anchored regex.
+        """
+        target = (
+            path.value if isinstance(path, RelativePath)
+            else _normalize(path, error=InvalidPath)
+        )
+        return target == self.value or _glob_regex(self.value).match(target) is not None
 
     def __str__(self) -> str:
         return self.value
