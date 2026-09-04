@@ -156,6 +156,13 @@ class TaskExecutionStage:
     The run lifecycle and the :class:`~feature_pipeline.application.task_engine.TaskExecution`
     request are read from the context ``resources`` under ``"lifecycle"`` and
     ``"task_execution"``; PE-02 supplies them from the compiled run plan.
+
+    A caller that needs the raw :class:`~feature_pipeline.application.task_engine.TaskRunResult`
+    — not just the :class:`StageOutcome` it is mapped onto — opts in with an optional
+    ``"task_result_sink"`` resource: a mutable list this stage appends the result to. Absent
+    (the default), nothing changes; PE-02's :func:`pipeline_core.execution.execute_run` is the
+    one caller that supplies it, to keep composing ``ExecuteResult.task_results`` from real
+    :class:`TaskRunResult` objects.
     """
 
     stage: ClassVar[StageId] = StageId.IMPLEMENTATION
@@ -166,6 +173,9 @@ class TaskExecutionStage:
         life = cast(RunLifecycle, context.resource("lifecycle"))
         request = cast(TaskExecution, context.resource("task_execution"))
         result = self.engine.run(life, request)
+        sink = context.resources.get("task_result_sink")
+        if sink is not None:
+            cast(list, sink).append(result)
         return _task_run_outcome(result)
 
 

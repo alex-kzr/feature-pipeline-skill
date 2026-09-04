@@ -1,4 +1,10 @@
-"""Generic, data-only recovery descriptor loading."""
+"""Generic, data-only recovery descriptor loading.
+
+**Deferred (PE-02):** no accepted pipeline stage performs a recovery — SKILL.md §3 stops at
+``push`` (stage 17). This module is a primitive kept ready for a future, separately approved
+recovery stage, not connected to any production caller today
+(``tests/test_safety_ports.py::DeferredPrimitiveTests`` proves the absence).
+"""
 
 from __future__ import annotations
 

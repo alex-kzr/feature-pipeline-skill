@@ -34,8 +34,13 @@ import re
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Sequence, cast
 
+from feature_pipeline.application.pipeline_engine import (
+    CallableStage,
+    PipelineEngine,
+    TaskExecutionStage,
+)
 from feature_pipeline.application.task_engine import (
     ExecutionError,
     RepairPass,
@@ -44,6 +49,14 @@ from feature_pipeline.application.task_engine import (
     TaskRunResult,
 )
 from feature_pipeline.domain.plan import CompiledRunPlan
+from feature_pipeline.domain.stages import (
+    StageContext,
+    StageHandler,
+    StageOutcome,
+    StageStatus,
+    compile_stage_sequence,
+)
+from feature_pipeline.domain.vocabulary import StageId
 from schemas.contracts import TaskSpec
 
 from .adapter_resolution import (
@@ -119,6 +132,85 @@ def run_task(life: RunLifecycle, request: TaskExecution) -> TaskRunResult:
     execute-mode integration and the existing tests import.
     """
     return TaskEngine().run(life, request)
+
+
+# ============================================================================================
+# PE-02: stages 5-9 (task selection, executor routing, implementation/verification/repair) run
+# through the one explicit ``PipelineEngine`` (PE-01) — no second production stage sequence.
+# ============================================================================================
+#
+# Task selection (stage 5) and executor routing (stage 6) are no longer *decisions* made at
+# task-loop time — CP-01/CP-02 resolved both once, into ``CompiledRunPlan``, before any task
+# ran. These two handlers make that already-resolved decision visible on the engine's outcome
+# trail; they never re-decide it. Stages 7-9 stay exactly what PE-01 built:
+# :class:`~feature_pipeline.application.pipeline_engine.TaskExecutionStage` delegating whole to
+# :class:`TaskEngine`.
+
+
+def _task_selection_stage(context: StageContext) -> StageOutcome:
+    """Stage 5 — the task ``execute_run``'s loop already chose (dependency-ready, plan order)."""
+    task_id = cast(str, context.resource("selected_task_id"))
+    return StageOutcome(
+        StageId.TASK_SELECTION, StageStatus.COMPLETED,
+        detail=f"{task_id} selected (dependency-ready, plan order)",
+        evidence={"task_id": task_id},
+    )
+
+
+def _executor_routing_stage(context: StageContext) -> StageOutcome:
+    """Stage 6 — the adapter/role the compiled plan already routed this task to
+    (:class:`~feature_pipeline.domain.plan.ResolvedTask`)."""
+    task_id = cast(str, context.resource("selected_task_id"))
+    resolved = context.plan.task(task_id)
+    return StageOutcome(
+        StageId.EXECUTOR_ROUTING, StageStatus.COMPLETED,
+        detail=f"{task_id} routed to adapter {resolved.adapter!r}, role {resolved.role!r}",
+        evidence={"task_id": task_id, "adapter": resolved.adapter, "role": resolved.role},
+    )
+
+
+_STAGE_HANDLERS: Mapping[StageId, StageHandler] = {
+    StageId.TASK_SELECTION: CallableStage(_task_selection_stage),
+    StageId.EXECUTOR_ROUTING: CallableStage(_executor_routing_stage),
+    StageId.IMPLEMENTATION: TaskExecutionStage(TaskEngine()),
+}
+
+#: The one compiled sequence for stages 5-9 — built once at import time (the handler set never
+#: changes at runtime) and reused for every selected task.
+_STAGE_SEQUENCE = compile_stage_sequence(
+    [StageId.TASK_SELECTION, StageId.EXECUTOR_ROUTING, StageId.IMPLEMENTATION],
+    _STAGE_HANDLERS,
+)
+
+
+def _run_selected_task(
+    life: RunLifecycle, plan: CompiledRunPlan | None, task_id: str, request: TaskExecution,
+) -> TaskRunResult:
+    """Drive one dependency-ready task to a terminal state.
+
+    When a compiled plan is present — the real CLI path (CP-02), every ``execute`` invocation
+    that reaches here through :mod:`pipeline_core.runner_cli` — this is the *only* production
+    call into :class:`~feature_pipeline.application.pipeline_engine.PipelineEngine`: stages 5-9
+    run through the one compiled sequence, and the terminal
+    :class:`~feature_pipeline.application.task_engine.TaskRunResult` is recovered from the
+    ``"task_result_sink"`` resource the ``IMPLEMENTATION`` stage populates (never re-dispatched
+    to read it back). ``plan is None`` keeps the pre-CP-02 wiring :func:`run_task` used
+    directly — the focused unit scenarios that construct an :class:`ExecuteRequest` without a
+    compiled plan; that surface is unchanged by PE-02.
+    """
+    if plan is None:
+        return run_task(life, request)
+    sink: list[TaskRunResult] = []
+    PipelineEngine(_STAGE_SEQUENCE).run(
+        plan,
+        resources={
+            "lifecycle": life,
+            "task_execution": request,
+            "selected_task_id": task_id,
+            "task_result_sink": sink,
+        },
+    )
+    return sink[0]
 
 
 # ============================================================================================
@@ -672,8 +764,8 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
                     "blocked", EXIT_BLOCKED, f"{exc.code}: {exc}",
                     request.run_dir, life.run.run_id, tuple(results))
             try:
-                outcome = run_task(
-                    life,
+                outcome = _run_selected_task(
+                    life, plan, task_id,
                     TaskExecution(
                         spec=spec,
                         adapter=request.adapter,

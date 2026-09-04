@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import tempfile
 import unittest
@@ -80,3 +81,38 @@ class SafetyPortTests(unittest.TestCase):
             path.write_text("{}", encoding="utf-8")
             with self.assertRaises(DescriptorError):
                 load_descriptor(path)
+
+
+class DeferredPrimitiveTests(unittest.TestCase):
+    """PE-02 (``docs/plans/tasks/PE-02_pipeline-engine-cutover.md``): ``archive.py`` and
+    ``recovery_descriptors.py`` implement no accepted stage — SKILL.md §3 stops at ``push``,
+    stage 17; nothing in the documented sequence archives, purges, or recovers. They are
+    explicitly deferred primitives (module docstrings), kept for a future stage rather than
+    removed (Risks: "deleting test-only code before proving caller absence can erase an
+    intended compatibility facade"). This proves the other half of that call: no production
+    module reaches them today.
+    """
+
+    _PRODUCTION_ROOTS = (
+        Path(__file__).resolve().parents[1] / "pipeline_core",
+        Path(__file__).resolve().parents[1] / "src" / "feature_pipeline",
+    )
+    _DEFERRED_MODULES = frozenset({"archive", "recovery_descriptors"})
+
+    def test_no_production_module_imports_a_deferred_primitive(self) -> None:
+        offenders: list[str] = []
+        for root in self._PRODUCTION_ROOTS:
+            for path in sorted(root.rglob("*.py")):
+                if path.stem in self._DEFERRED_MODULES:
+                    continue
+                tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.ImportFrom):
+                        module = (node.module or "").rsplit(".", 1)[-1]
+                        if module in self._DEFERRED_MODULES:
+                            offenders.append(f"{path}: from {node.module} import ...")
+                    elif isinstance(node, ast.Import):
+                        for alias in node.names:
+                            if alias.name.rsplit(".", 1)[-1] in self._DEFERRED_MODULES:
+                                offenders.append(f"{path}: import {alias.name}")
+        self.assertEqual(offenders, [])

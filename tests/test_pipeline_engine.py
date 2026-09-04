@@ -351,6 +351,24 @@ class TaskExecutionStageTests(unittest.TestCase):
         with self.assertRaises(KeyError):
             stage.run(context)
 
+    def test_an_optional_sink_resource_captures_the_raw_task_run_result(self) -> None:
+        # PE-02: a caller that needs the full ``TaskRunResult`` (not just the mapped
+        # ``StageOutcome`` — e.g. ``execute_run``'s ``ExecuteResult.task_results``) opts in by
+        # passing a mutable list under ``"task_result_sink"``. Absent, nothing changes (the
+        # earlier tests above pass no such key and still pass).
+        result = _FakeTaskRunResult("T-1", "verified", attempts=1, gates=2)
+        stage = TaskExecutionStage(_FakeTaskEngine(result))  # type: ignore[arg-type]
+        sink: list[object] = []
+        context = StageContext(
+            plan=_plan(), stage=StageId.IMPLEMENTATION,
+            resources={"lifecycle": object(), "task_execution": object(),
+                       "task_result_sink": sink},
+        )
+
+        stage.run(context)
+
+        self.assertEqual(sink, [result])
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

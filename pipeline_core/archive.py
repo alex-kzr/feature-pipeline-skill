@@ -1,4 +1,10 @@
-"""Read-only, digest-bound archive manifest primitives."""
+"""Read-only, digest-bound archive manifest primitives.
+
+**Deferred (PE-02):** no accepted pipeline stage archives anything — SKILL.md §3 stops at
+``push`` (stage 17). This module is a primitive kept ready for a future, separately approved
+archive/purge stage, not connected to any production caller today
+(``tests/test_safety_ports.py::DeferredPrimitiveTests`` proves the absence).
+"""
 
 from __future__ import annotations
 

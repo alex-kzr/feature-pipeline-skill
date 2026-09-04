@@ -84,6 +84,17 @@ Callers supply all anchors. The core does not infer host-specific locations or p
   engine holds no policy of its own: `TaskExecutionStage` wraps the existing `TaskEngine`
   repair loop unchanged, and a run's terminal outcome maps onto the same `gate-pending` /
   `blocked` / `error` exit codes the CLI already produces.
+- **Stages 5-9 have exactly one production path.** Whenever a real `execute` invocation has a
+  compiled plan (every CLI run, since CP-02), `pipeline_core.execution.execute_run` drives
+  each dependency-ready task through the one `PipelineEngine`-compiled sequence — task
+  selection and executor routing are recorded as evidence from the already-resolved
+  `CompiledRunPlan`, never re-decided, and stages 7-9 stay `TaskExecutionStage`'s unchanged
+  `TaskEngine` delegation. `pipeline_core.stages` (the generic, project-declared runner) is a
+  distinct, still-connected path for stages 10-16 (`post_task.py`, `release.py`) and is out of
+  this cutover's scope. `pipeline_core.archive` and `pipeline_core.recovery_descriptors` are
+  explicitly deferred primitives — no accepted stage reaches either today
+  (`tests/test_safety_ports.py::DeferredPrimitiveTests` proves it) — kept for a future,
+  separately approved archive/purge/recovery stage rather than removed.
 
 Run the test suite from the repository root:
 
