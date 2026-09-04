@@ -16,7 +16,7 @@ from __future__ import annotations
 import re
 import socket
 import unittest
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from unittest.mock import patch
 
 from pipeline_core.reports import ENVELOPE_KEYS, STATUS_TOKENS
@@ -79,9 +79,9 @@ class RedactionTests(unittest.TestCase):
             self.assertNotIn("runner", self._host_needles())
 
     def test_anchor_rules_normalize_windows_short_path_spelling(self) -> None:
-        long_root = Path(r"C:\Users\runneradmin\AppData\Local\Temp\compat\project")
-        short_root = Path(r"C:\Users\RUNNER~1\AppData\Local\Temp\compat\project")
-        def variants(path: Path) -> tuple[Path, ...]:
+        long_root = PureWindowsPath(r"C:\Users\runneradmin\AppData\Local\Temp\compat\project")
+        short_root = PureWindowsPath(r"C:\Users\RUNNER~1\AppData\Local\Temp\compat\project")
+        def variants(path: PureWindowsPath) -> tuple[PureWindowsPath, ...]:
             return (long_root, short_root) if path == short_root else (path,)
 
         with patch("tests.compat_goldens.path_variants", side_effect=variants):
