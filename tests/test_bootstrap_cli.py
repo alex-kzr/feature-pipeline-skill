@@ -84,12 +84,15 @@ class CliBootstrapBoundaryTests(unittest.TestCase):
 
             with self.assertRaises(AdapterUnavailable):
                 composition.adapter_registry.resolve(None)
+            executor, _launchers, environment = composition.make_execute_adapters()
             with self.assertRaises(IncompatibleAdapter):
                 composition.adapter_registry.require("claude", (RESUME,))
             self.assertEqual(
                 composition.adapter_registry.require("claude", (READ_ONLY,)).name,
                 "claude",
             )
+            self.assertIsInstance(executor, FakeAdapter)
+            self.assertEqual(environment, {"claude": False, "codex": False})
 
     def test_bootstrap_can_substitute_a_fake_adapter_factory(self) -> None:
         with TemporaryDirectory() as directory:

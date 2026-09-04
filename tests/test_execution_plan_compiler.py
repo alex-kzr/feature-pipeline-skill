@@ -127,6 +127,21 @@ class AdapterRegistryTests(unittest.TestCase):
         with self.assertRaises(AdapterUnavailable):
             empty.resolve(None)
 
+    def test_plan_selection_keeps_a_declared_unavailable_adapter(self) -> None:
+        registry = AdapterRegistry(
+            (AdapterCapabilities("claude", False, True, True, True, 3600.0),)
+        )
+        self.assertEqual(registry.select(None).name, "claude")
+
+    def test_plan_selection_prefers_an_available_adapter(self) -> None:
+        registry = AdapterRegistry(
+            (
+                AdapterCapabilities("claude", False, True, True, True, 3600.0),
+                AdapterCapabilities("codex", True, False, True, True, 3600.0),
+            )
+        )
+        self.assertEqual(registry.select(None).name, "codex")
+
     def test_require_a_capability_the_adapter_lacks(self) -> None:
         registry = AdapterRegistry(
             (AdapterCapabilities("claude", True, False, True, True, 3600.0),)

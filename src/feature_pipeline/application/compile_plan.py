@@ -117,6 +117,7 @@ def compile_run_plan(
     task: str | None = None,
     through: str | None = None,
     required_adapter_capabilities: Sequence[str] = (),
+    allow_unavailable_adapter: bool = False,
 ) -> CompiledRunPlan:
     """Compile one :class:`CompiledRunPlan`. Pure — no state, lease, artifact, or process."""
     registry = adapters if adapters is not None else AdapterRegistry.default()
@@ -126,8 +127,13 @@ def compile_run_plan(
     graph = TaskGraph.from_definitions(definitions)
     selection = resolve_selection(graph, task=task, through=through)
 
-    # 2. Resolve the execution adapter once; reject a required capability it cannot meet.
-    adapter = registry.resolve(overrides.adapter)
+    # 2. Plan-only paths need a stable adapter identity but do not launch it. Execute paths
+    #    defer availability validation until after the plan gate opens.
+    adapter = (
+        registry.select(overrides.adapter)
+        if allow_unavailable_adapter
+        else registry.resolve(overrides.adapter)
+    )
     if required_adapter_capabilities:
         registry.require(adapter.name, required_adapter_capabilities)
     adapter_explicit = overrides.adapter is not None

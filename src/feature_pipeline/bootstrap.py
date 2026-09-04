@@ -100,7 +100,7 @@ class BootstrapComposition:
         self, adapter_name: str | None = None
     ) -> tuple[Adapter, VerifierLaunchers, dict[str, bool]]:
         registry = self.adapter_registry
-        resolved = registry.resolve(adapter_name)
+        resolved = registry.select(adapter_name)
         runtime = AdapterRuntime(
             project_dir=self.project_dir,
             agents_root=self.agents_root,
@@ -403,6 +403,7 @@ def run_execute(
             adapters=adapter_registry,
             task=command.task,
             through=command.through,
+            allow_unavailable_adapter=True,
         )
     except DomainError as exc:
         raise CliError(EXIT_ERROR, f"{getattr(exc, 'code', 'plan-error')}: {exc}") from None

@@ -138,20 +138,33 @@ class AdapterRegistry:
         is unknown raises :class:`UnknownAdapter`; one that is known but unavailable raises
         :class:`AdapterUnavailable`. Nothing is ever substituted.
         """
-        choice = (requested or AUTO).strip().lower()
-        if choice == AUTO:
-            for adapter in self.adapters:
-                if adapter.available:
-                    return adapter
-            raise AdapterUnavailable(
-                "no execution adapter is available in this environment"
-            )
-        adapter = self.get(choice)
+        adapter = self.select(requested)
         if not adapter.available:
+            choice = (requested or AUTO).strip().lower()
+            if choice == AUTO:
+                raise AdapterUnavailable(
+                    "no execution adapter is available in this environment"
+                )
             raise AdapterUnavailable(
                 f"execution adapter '{choice}' is not available in this environment"
             )
         return adapter
+
+    def select(self, requested: str | None) -> AdapterCapabilities:
+        """Choose a declared adapter without requiring its executable to be available.
+
+        Plan construction and argv rendering need a stable adapter identity, but do not launch
+        it. Actual execution must use :meth:`resolve`, which performs the availability check.
+        """
+        choice = (requested or AUTO).strip().lower()
+        if choice != AUTO:
+            return self.get(choice)
+        for adapter in self.adapters:
+            if adapter.available:
+                return adapter
+        if self.adapters:
+            return self.adapters[0]
+        raise AdapterUnavailable("no execution adapter is registered")
 
     def require(
         self, name: str, capabilities: Iterable[str]

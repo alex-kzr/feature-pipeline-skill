@@ -264,6 +264,7 @@ def run_command(command: RunCommand) -> PipelineResult:
                 adapters=composition.adapter_registry,
                 task=command.task,
                 through=command.through,
+                allow_unavailable_adapter=True,
             )
         except DomainError as exc:
             raise CliError(EXIT_ERROR, str(exc)) from None
