@@ -5,7 +5,18 @@ feature-pipeline orchestration.
 
 ## Layout
 
-- `pipeline_core/` — importable core package.
+- `pipeline_core/` — importable core package. `pipeline_core/runner_cli.py` is the public CLI
+  entry point (`main`); it only parses argv, builds a typed command, dispatches to a use case,
+  and prints the rendered result — every parsing, dispatch, and rendering concern behind it
+  lives in `src/feature_pipeline/cli/` (see below).
+- `src/feature_pipeline/cli/` — the thin CLI boundary, split by responsibility so no module
+  mixes flag definitions with routing, gate, or lifecycle decisions: `parser.py` (the argparse
+  surface and its frozen constants), `errors.py` (`CliError`, the one fail-closed exception),
+  `commands.py` (`RunCommand`, the typed argparse-free view of a parsed invocation), `use_cases.py`
+  (status/dry-run/execute, dispatched from one typed `dispatch()`, each returning a typed
+  `feature_pipeline.application.results.PipelineResult` independent of rendering — no use case
+  mutates domain state or launches a process itself), and `renderers.py` (pure text rendering).
+  See the package docstring for the full contract.
 - `scripts/` — portable command-line entry points.
 - `roles/`, `reports/`, and `schemas/` — versioned core contracts.
 - `templates/` — portable core templates.

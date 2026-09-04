@@ -54,7 +54,7 @@ from feature_pipeline.domain import (
 )
 
 from pipeline_core import adapter_resolution, commands, state
-from pipeline_core.runner_cli import _FEATURE_RE
+from feature_pipeline.cli.parser import FEATURE_RE as _FEATURE_RE
 
 
 # --------------------------------------------------------------------------------------------

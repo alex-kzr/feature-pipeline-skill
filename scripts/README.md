@@ -7,8 +7,11 @@ never infers a project layout.
 
 ## `run_pipeline.py`
 
-The portable core runner. It is a thin shim over `pipeline_core.runner_cli`; all behavior and
-its tests live there.
+The portable core runner. It is a thin shim over `pipeline_core.runner_cli`, which itself only
+parses argv, builds a typed command, dispatches to a use case, and prints the rendered result —
+the actual parsing, typed dispatch, and rendering behavior lives in `src/feature_pipeline/cli/`
+(`parser.py`, `errors.py`, `commands.py`, `use_cases.py`, `renderers.py`; see the package
+docstring and the top-level `README.md`). Its tests live in `tests/`.
 
 ### Anchor contract
 

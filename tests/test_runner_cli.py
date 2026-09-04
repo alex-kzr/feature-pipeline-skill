@@ -17,6 +17,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from feature_pipeline.cli import use_cases
 from pipeline_core import runner_cli
 from pipeline_core.adapters import LaunchRequest
 from pipeline_core.lifecycle import RunLifecycle
@@ -661,7 +662,7 @@ class ExecuteModeTests(unittest.TestCase):
     def test_execute_without_plan_approval_is_gate_pending(self) -> None:
         with TemporaryDirectory() as directory:
             seed = self._seed_rich(directory, [RICH_EXECUTE_TASK])
-            with patch.object(runner_cli, "make_execute_adapters", _fake_execute_adapters):
+            with patch.object(use_cases, "make_execute_adapters", _fake_execute_adapters):
                 code, out, err = _run(seed["anchors"] + [
                     "--profile", seed["profile_rel"], "--plan", "plan.json", "--mode", "execute",
                 ])
@@ -674,7 +675,7 @@ class ExecuteModeTests(unittest.TestCase):
     def test_execute_with_plan_approval_runs_a_task_to_verified(self) -> None:
         with TemporaryDirectory() as directory:
             seed = self._seed_rich(directory, [RICH_EXECUTE_TASK])
-            with patch.object(runner_cli, "make_execute_adapters", _fake_execute_adapters):
+            with patch.object(use_cases, "make_execute_adapters", _fake_execute_adapters):
                 code, out, err = _run(seed["anchors"] + [
                     "--profile", seed["profile_rel"], "--plan", "plan.json",
                     "--mode", "execute", "--approve-plan",
@@ -689,7 +690,7 @@ class ExecuteModeTests(unittest.TestCase):
     def test_execute_rejects_an_id_and_type_only_plan(self) -> None:
         with TemporaryDirectory() as directory:
             seed = self._seed_rich(directory, [{"id": "TSK-01", "type": "docs"}])
-            with patch.object(runner_cli, "make_execute_adapters", _fake_execute_adapters):
+            with patch.object(use_cases, "make_execute_adapters", _fake_execute_adapters):
                 code, out, err = _run(seed["anchors"] + [
                     "--profile", seed["profile_rel"], "--plan", "plan.json",
                     "--mode", "execute", "--approve-plan",
@@ -700,7 +701,7 @@ class ExecuteModeTests(unittest.TestCase):
     def test_execute_unattended_opt_in_satisfies_the_gate(self) -> None:
         with TemporaryDirectory() as directory:
             seed = self._seed_rich(directory, [RICH_EXECUTE_TASK])
-            with patch.object(runner_cli, "make_execute_adapters", _fake_execute_adapters):
+            with patch.object(use_cases, "make_execute_adapters", _fake_execute_adapters):
                 code, out, err = _run(seed["anchors"] + [
                     "--profile", seed["profile_rel"], "--plan", "plan.json",
                     "--mode", "execute", "--unattended",
@@ -717,7 +718,7 @@ class ExecuteModeTests(unittest.TestCase):
                     _project_dir, _agents_root, _core_root)
                 return executor, launchers, {}
 
-            with patch.object(runner_cli, "make_execute_adapters", _no_adapter):
+            with patch.object(use_cases, "make_execute_adapters", _no_adapter):
                 code, _out, err = _run(seed["anchors"] + [
                     "--profile", seed["profile_rel"], "--plan", "plan.json",
                     "--mode", "execute", "--approve-plan",
@@ -728,7 +729,7 @@ class ExecuteModeTests(unittest.TestCase):
     def test_attest_dependency_needs_an_equals_separator(self) -> None:
         with TemporaryDirectory() as directory:
             seed = self._seed_rich(directory, [RICH_EXECUTE_TASK])
-            with patch.object(runner_cli, "make_execute_adapters", _fake_execute_adapters):
+            with patch.object(use_cases, "make_execute_adapters", _fake_execute_adapters):
                 code, _out, err = _run(seed["anchors"] + [
                     "--profile", seed["profile_rel"], "--plan", "plan.json",
                     "--mode", "execute", "--approve-plan", "--task", "TSK-01",
@@ -740,7 +741,7 @@ class ExecuteModeTests(unittest.TestCase):
     def test_attest_dependency_rejects_an_unsafe_source_feature(self) -> None:
         with TemporaryDirectory() as directory:
             seed = self._seed_rich(directory, [RICH_EXECUTE_TASK])
-            with patch.object(runner_cli, "make_execute_adapters", _fake_execute_adapters):
+            with patch.object(use_cases, "make_execute_adapters", _fake_execute_adapters):
                 code, _out, err = _run(seed["anchors"] + [
                     "--profile", seed["profile_rel"], "--plan", "plan.json",
                     "--mode", "execute", "--approve-plan", "--task", "TSK-01",

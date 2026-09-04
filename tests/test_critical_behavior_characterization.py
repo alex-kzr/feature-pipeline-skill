@@ -40,6 +40,7 @@ from feature_pipeline.application.diagnostic_service import (
 )
 from pipeline_core import dispatch as dispatch_mod
 from pipeline_core import execution as execution_mod
+from feature_pipeline.cli import use_cases as cli_use_cases_mod
 from pipeline_core import runner_cli
 from pipeline_core import verification as verification_mod
 from pipeline_core.adapters import LaunchResult
@@ -166,10 +167,11 @@ class F01DryRunAndExecuteCompileDifferentPipelines(unittest.TestCase):
             execution_mod.DEFAULT_ROLE_GRANT, ("read", "run_checks", "write"))
 
     def test_execute_now_builds_and_consumes_the_one_compiled_plan(self) -> None:
-        # CP-02 landed: ``_execute`` compiles one ``CompiledRunPlan`` (the object the
+        # CP-02 landed: ``run_execute`` compiles one ``CompiledRunPlan`` (the object the
         # dry-run preview also renders), rejects an unroutable / mixed-storage selection
-        # before any run state, and hands the plan to ``execute_run``.
-        src = inspect.getsource(runner_cli._execute)
+        # before any run state, and hands the plan to ``execute_run``. CLI-01 relocated it
+        # from ``runner_cli._execute`` to ``feature_pipeline.cli.use_cases.run_execute``.
+        src = inspect.getsource(cli_use_cases_mod.run_execute)
         self.assertIn("compile_run_plan(", src)
         self.assertIn("compiled_plan=compiled_plan", src)
         self.assertIn("route_reasons(", src)
@@ -180,10 +182,12 @@ class F01DryRunAndExecuteCompileDifferentPipelines(unittest.TestCase):
         self.assertIn("_ensure_plan_compatible", exec_src)
 
     def test_dry_run_now_renders_from_the_one_compiled_plan(self) -> None:
-        # CP-02 landed: the dry-run preview no longer hand-resolves a route. ``_build``
+        # CP-02 landed: the dry-run preview no longer hand-resolves a route. ``run_command``
         # compiles one ``CompiledRunPlan`` (the object execute also consumes) and renders
         # C1–C8 from it via ``feature_pipeline.application.render_plan.render_dry_run``.
-        build_src = inspect.getsource(runner_cli._build)
+        # CLI-01 relocated it from ``runner_cli._build`` to
+        # ``feature_pipeline.cli.use_cases.run_command``.
+        build_src = inspect.getsource(cli_use_cases_mod.run_command)
         self.assertIn("compile_run_plan(", build_src)
         self.assertIn("render_dry_run(", build_src)
         self.assertFalse(hasattr(runner_cli, "_plan_text"))
