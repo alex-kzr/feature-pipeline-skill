@@ -1,0 +1,94 @@
+{
+  "schema_version": 2,
+  "feature": "malformed-sample",
+  "prompt_path": "prompt.md",
+  "plan_path": "plan.json",
+  "run_id": "2026-09-01T08-00-00Z-malformed-sample",
+  "status": "running",
+  "current_task": null,
+  "controls": {},
+  "environment": {},
+  "tasks": [
+    {
+      "id": "M-01",
+      "status": "implemented",
+      "depends_on": [],
+      "attempts": 0,
+      "blocker": null,
+      "type": null,
+      "executor": null,
+      "adapter": null,
+      "session_id": null,
+      "verification": {
+        "task_verdict": null,
+        "test_verdict": null,
+        "verified_at": null
+      },
+      "execution_evidence": {
+        "attempt": 0,
+        "executor_report": null,
+        "implementation": {
+          "state": "not-attempted",
+          "changed_files": [],
+          "manifest": null,
+          "diff": null
+        }
+      },
+      "changed_files": [],
+      "verification_tier": "full",
+      "accepts_scoped": [],
+      "promotion": null,
+      "unblocks": [],
+      "maintenance_audit": [],
+      "external_launch_failures": [],
+      "attested_dependencies": [],
+      "next_executor_launch_generation": 1,
+      "next_task_verifier_launch_generation": 1,
+      "next_test_verifier_launch_generation": 1,
+      "mystery_field": "surprise"
+    },
+    {
+      "id": "M-02",
+      "status": "pending",
+      "depends_on": [
+        "M-01"
+      ],
+      "attempts": 0,
+      "blocker": null,
+      "type": null,
+      "executor": null,
+      "adapter": null,
+      "session_id": null,
+      "verification": {
+        "task_verdict": null,
+        "test_verdict": null,
+        "verified_at": null
+      },
+      "execution_evidence": {
+        "attempt": 0,
+        "executor_report": null,
+        "implementation": {
+          "state": "not-attempted",
+          "changed_files": [],
+          "manifest": null,
+          "diff": null
+        }
+      },
+      "changed_files": [],
+      "verification_tier": "full",
+      "accepts_scoped": [],
+      "promotion": null,
+      "unblocks": [],
+      "maintenance_audit": [],
+      "external_launch_failures": [],
+      "attested_dependencies": [],
+      "next_executor_launch_generation": 1,
+      "next_task_verifier_launch_generation": 1,
+      "next_test_verifier_launch_generation": 1
+    }
+  ],
+  "history": [],
+  "commands": [],
+  "stages": {},
+  "artifacts": {}
+}

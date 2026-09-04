@@ -1,0 +1,227 @@
+{
+  "schema_version": 2,
+  "feature": "rich-feature",
+  "prompt_path": "prompts/rich-feature.md",
+  "plan_path": "docs/plans/2026-09-01-rich-feature.md",
+  "run_id": "2026-09-01T09-30-00Z-rich-feature",
+  "status": "running",
+  "current_task": "RF-02",
+  "controls": {
+    "adapter": {
+      "value": "claude",
+      "sourced": "explicit"
+    },
+    "max_repair_attempts": {
+      "value": 3,
+      "sourced": "explicit"
+    }
+  },
+  "environment": {
+    "platform": "win32",
+    "python": "3.11.9",
+    "tools": {
+      "claude": "1.2.3"
+    }
+  },
+  "tasks": [
+    {
+      "id": "RF-01",
+      "status": "verified",
+      "depends_on": [],
+      "attempts": 1,
+      "blocker": null,
+      "type": "python",
+      "executor": "python-executor",
+      "adapter": "claude",
+      "session_id": "sess-rf-01",
+      "verification": {
+        "task_verdict": "PASS",
+        "test_verdict": "PASS",
+        "verified_at": "2026-09-01T09:40:00Z"
+      },
+      "execution_evidence": {
+        "attempt": 1,
+        "executor_report": "reports/RF-01/launch-1/executor-1.md",
+        "implementation": {
+          "state": "captured",
+          "changed_files": [
+            "pipeline_core/state.py"
+          ],
+          "manifest": "reports/RF-01/launch-1/implementation-manifest-1.json",
+          "diff": "reports/RF-01/launch-1/implementation-diff-1.md"
+        }
+      },
+      "changed_files": [
+        "pipeline_core/state.py",
+        "tests/test_state_v2.py"
+      ],
+      "verification_tier": "scoped",
+      "accepts_scoped": [
+        "RF-00"
+      ],
+      "promotion": {
+        "from_run": "2026-08-31T00-00-00Z-rich-feature",
+        "authorized_by": "human"
+      },
+      "unblocks": [
+        "RF-02"
+      ],
+      "maintenance_audit": [
+        {
+          "kind": "maintenance-task-evidence",
+          "ref": "m-1"
+        }
+      ],
+      "external_launch_failures": [
+        {
+          "stage": "task:RF-01",
+          "generation": 1,
+          "exit_code": "timeout",
+          "detail": "adapter-timeout",
+          "at": "2026-09-01T09:35:00Z"
+        }
+      ],
+      "attested_dependencies": [
+        {
+          "dep_id": "RF-00",
+          "source_feature": "elsewhere",
+          "source_run_id": "2026-08-30T00-00-00Z-elsewhere",
+          "source_digest": "sha256:abc",
+          "task_verdict": "PASS",
+          "test_verdict": "PASS",
+          "verified_at": "2026-08-30T10:00:00Z",
+          "attested_at": "2026-09-01T09:31:00Z"
+        }
+      ],
+      "next_executor_launch_generation": 3,
+      "next_task_verifier_launch_generation": 2,
+      "next_test_verifier_launch_generation": 2
+    },
+    {
+      "id": "RF-02",
+      "status": "repairing",
+      "depends_on": [
+        "RF-01"
+      ],
+      "attempts": 1,
+      "blocker": null,
+      "type": "python",
+      "executor": "python-executor",
+      "adapter": "claude",
+      "session_id": "sess-rf-02",
+      "verification": {
+        "task_verdict": "FAIL",
+        "test_verdict": "PASS",
+        "verified_at": "2026-09-01T09:45:00Z"
+      },
+      "execution_evidence": {
+        "attempt": 1,
+        "executor_report": "reports/RF-02/launch-1/executor-1.md",
+        "implementation": {
+          "state": "captured",
+          "changed_files": [
+            "pipeline_core/execution.py"
+          ],
+          "manifest": "reports/RF-02/launch-1/implementation-manifest-1.json",
+          "diff": "reports/RF-02/launch-1/implementation-diff-1.md"
+        }
+      },
+      "changed_files": [
+        "pipeline_core/execution.py"
+      ],
+      "verification_tier": "full",
+      "accepts_scoped": [],
+      "promotion": null,
+      "unblocks": [],
+      "maintenance_audit": [],
+      "external_launch_failures": [],
+      "attested_dependencies": [],
+      "next_executor_launch_generation": 2,
+      "next_task_verifier_launch_generation": 2,
+      "next_test_verifier_launch_generation": 2
+    }
+  ],
+  "history": [
+    {
+      "at": "2026-09-01T09:31:00Z",
+      "scope": "attestation:RF-01:RF-00",
+      "from": null,
+      "to": "attested",
+      "actor": "runner",
+      "note": "RF-00 attested via elsewhere"
+    },
+    {
+      "at": "2026-09-01T09:40:00Z",
+      "scope": "task:RF-01",
+      "from": "implemented",
+      "to": "verified",
+      "actor": "runner",
+      "note": "independent verdicts task=PASS test=PASS"
+    },
+    {
+      "at": "2026-09-01T09:45:00Z",
+      "scope": "task:RF-02",
+      "from": "implemented",
+      "to": "verification_failed",
+      "actor": "runner",
+      "note": "independent verdicts task=FAIL test=PASS"
+    },
+    {
+      "at": "2026-09-01T09:46:00Z",
+      "scope": "repair-attempt:RF-02",
+      "from": "0",
+      "to": "1",
+      "actor": "runner",
+      "note": "repair attempt consumed"
+    }
+  ],
+  "commands": [
+    {
+      "id": "command-1",
+      "stage": "task:RF-01",
+      "cwd": ".",
+      "argv": [
+        "uv",
+        "run",
+        "python",
+        "-m",
+        "pytest"
+      ],
+      "exit_code": 0,
+      "duration": 1.5,
+      "stdout": "ok",
+      "stderr": ""
+    },
+    {
+      "id": "command-2",
+      "stage": "task:RF-02",
+      "cwd": ".",
+      "argv": [
+        "uv",
+        "run",
+        "python",
+        "-m",
+        "pytest"
+      ],
+      "exit_code": 1,
+      "duration": 2.0,
+      "stdout": "F",
+      "stderr": "assert failed"
+    }
+  ],
+  "stages": {
+    "task:RF-01": {
+      "commands": [
+        "command-1"
+      ]
+    },
+    "task:RF-02": {
+      "commands": [
+        "command-2"
+      ]
+    }
+  },
+  "artifacts": {
+    "executor_report": "reports/RF-01/launch-1/executor-1.md"
+  }
+}

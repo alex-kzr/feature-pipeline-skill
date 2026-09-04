@@ -172,11 +172,17 @@ class MoveIsPureRelocation(unittest.TestCase):
             self.assertIs(getattr(schemas, name), getattr(contracts, name))
 
     def test_fixture_tree_untouched(self) -> None:
+        # The PKG-02 move must not modify or delete any pre-existing fixture. Later tasks
+        # may legitimately *add* fixtures (DS-02 adds ``fixtures/state/`` in its Allowed
+        # scope), so brand-new untracked paths are not a move regression.
         done = subprocess.run(
-            ["git", "status", "--porcelain", "--", "fixtures"],
+            ["git", "status", "--porcelain", "--untracked-files=no", "--", "fixtures"],
             capture_output=True, text=True, cwd=_CORE_ROOT,
         )
-        self.assertEqual(done.stdout.strip(), "", "PKG-02 must not modify fixtures/")
+        touched = [
+            line for line in done.stdout.splitlines() if not line.startswith("A ")
+        ]
+        self.assertEqual(touched, [], "PKG-02 must not modify or delete fixtures/")
 
 
 if __name__ == "__main__":
