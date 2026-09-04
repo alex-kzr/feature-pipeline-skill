@@ -127,56 +127,63 @@ def _init_repo(root: Path) -> None:
 
 
 class F01DryRunAndExecuteCompileDifferentPipelines(unittest.TestCase):
-    """F-01 — the dry-run plan resolves a per-task route (stack, checks, subagents, root,
-    storage); ``execute`` resolves routes only far enough to pick the *first* storage
-    directory and then sends every task through one hard-coded request with a single
-    run-wide working root and role grant. Previewed routing is therefore not the routing
-    that runs.
+    """F-01 — historically the dry-run plan resolved a per-task route (stack, checks,
+    subagents, root, storage) while ``execute`` resolved routes only far enough to pick the
+    *first* storage directory, so previewed routing was not the routing that ran.
 
-    Disposition: correct through an approved ADR (BL-03) — one ``ExecutionPlanCompiler``
-    produces the immutable plan consumed by both dry-run rendering and execution.
-    INTENDED FOLLOW-UP: CP-01 (compile all execution policy once) and CP-02 (cut dry-run,
-    execute, and resume over to the compiled plan).
+    Disposition: corrected through an approved ADR (BL-03) — CP-01 built the one immutable
+    ``CompiledRunPlan`` + its pure compiler, and **CP-02 (this landing)** cut the production
+    dry-run / execute / resume paths over to it. The tests below now assert the *unified*
+    path: one ``compile_run_plan`` call per invocation, one plan object, rendered by the
+    preview and consumed by execution.
     """
 
-    def test_execute_request_carries_no_per_route_configuration(self) -> None:
+    def test_execute_now_carries_the_resolved_route_as_one_immutable_plan(self) -> None:
         request_fields = {f.name for f in fields(ExecuteRequest)}
-        exec_fields = {f.name for f in fields(TaskExecution)}
-        # A single run-wide working root and role grant reach execution...
-        self.assertIn("working_root", request_fields)
-        self.assertIn("role_grant", request_fields)
-        self.assertIn("working_root", exec_fields)
-        self.assertIn("role_grant", exec_fields)
-        # ...and nothing route-derived does: no per-task stack, checks, subagents, root, or
-        # storage crosses into the execute path.
-        for absent in ("route", "resolved_route", "stack", "checks", "subagents",
-                       "storage", "root"):
-            self.assertNotIn(absent, request_fields)
-            self.assertNotIn(absent, exec_fields)
+        # Route/selection/control resolution reaches execution as ONE object, not as
+        # scattered ad-hoc fields.
+        self.assertIn("compiled_plan", request_fields)
+        for scattered in ("route", "resolved_route", "stack", "checks", "subagents",
+                          "storage", "root"):
+            self.assertNotIn(scattered, request_fields)
+        # ``execute_run`` reads the selection, per-task repair bound and the resume guard
+        # off that plan instead of re-deriving them.
+        exec_src = inspect.getsource(execution_mod.execute_run)
+        self.assertIn("plan = request.compiled_plan", exec_src)
+        self.assertIn("plan.selection", exec_src)
+        self.assertIn("plan.task(tid).repair_bound", exec_src)
 
-    def test_execute_uses_one_default_role_grant_for_every_task(self) -> None:
+    def test_default_role_grant_constant_is_still_the_documented_fallback(self) -> None:
+        # The compiled plan now carries a per-task ``role_grant``; the module constant
+        # remains the value it resolves to for every synthesised route.
         self.assertEqual(
             execution_mod.DEFAULT_ROLE_GRANT, ("read", "run_checks", "write"))
-        default = ExecuteRequest.__dataclass_fields__["role_grant"].default
-        self.assertEqual(default, execution_mod.DEFAULT_ROLE_GRANT)
 
-    def test_execute_collapses_every_task_onto_the_first_resolved_storage(self) -> None:
+    def test_execute_now_builds_and_consumes_the_one_compiled_plan(self) -> None:
+        # CP-02 landed: ``_execute`` compiles one ``CompiledRunPlan`` (the object the
+        # dry-run preview also renders), rejects an unroutable / mixed-storage selection
+        # before any run state, and hands the plan to ``execute_run``.
         src = inspect.getsource(runner_cli._execute)
-        # The storage loop stops at the first routable spec...
-        self.assertIn("for spec in specs:", src)
-        self.assertIn("storage_dir = resolved.storage", src)
-        self.assertIn("break", src)
-        # ...and that single directory is the run dir for the whole invocation.
-        self.assertIn('run_dir = (storage_dir or project_dir / ".pipeline" / "runs") / feature',
-                      src)
-        # execute never rejects a later unresolved route the way the dry run does.
-        self.assertNotIn("unresolved-executor", src)
+        self.assertIn("compile_run_plan(", src)
+        self.assertIn("compiled_plan=compiled_plan", src)
+        self.assertIn("route_reasons(", src)
+        self.assertNotIn("storage_dir = resolved.storage", src)
+        # ``execute_run`` takes its selection, repair bound and resume guard from the plan.
+        exec_src = inspect.getsource(execution_mod.execute_run)
+        self.assertIn("request.compiled_plan", exec_src)
+        self.assertIn("_ensure_plan_compatible", exec_src)
 
-    def test_dry_run_plan_does_resolve_the_full_per_route_shape(self) -> None:
-        plan_src = inspect.getsource(runner_cli._plan_text)
-        for detail in ("resolved.route.stack", "resolved.route.checks",
-                       "resolved.route.subagents", "resolved.root", "resolved.storage"):
-            self.assertIn(detail, plan_src)
+    def test_dry_run_now_renders_from_the_one_compiled_plan(self) -> None:
+        # CP-02 landed: the dry-run preview no longer hand-resolves a route. ``_build``
+        # compiles one ``CompiledRunPlan`` (the object execute also consumes) and renders
+        # C1–C8 from it via ``feature_pipeline.application.render_plan.render_dry_run``.
+        build_src = inspect.getsource(runner_cli._build)
+        self.assertIn("compile_run_plan(", build_src)
+        self.assertIn("render_dry_run(", build_src)
+        self.assertFalse(hasattr(runner_cli, "_plan_text"))
+        self.assertFalse(hasattr(runner_cli, "_select"))
+        for gone in ("resolved.route.stack", "resolved.route.subagents", "resolved.storage"):
+            self.assertNotIn(gone, build_src)
 
 
 # --- F-02 --------------------------------------------------------------------------------------

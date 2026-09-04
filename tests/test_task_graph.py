@@ -39,8 +39,25 @@ from feature_pipeline.domain.graph import (
     UnknownTask,
 )
 
-from pipeline_core.execution import _select_ids
-from pipeline_core.runner_cli import _select
+# CP-02 removed the two hand-written CLI selectors (``pipeline_core.runner_cli._select`` and
+# ``pipeline_core.execution._select_ids``) — the dry-run and execute paths now both call
+# ``resolve_selection`` directly. Their historical semantics are frozen here as a local
+# reference so this parity sweep still proves the cutover changed no accepted selection.
+def _legacy_select(tasks: list[dict], task: str | None, through: str | None) -> list[dict]:
+    ids = [t["id"] for t in tasks]
+    if task is not None:
+        return [t for t in tasks if t["id"] == task]
+    if through is not None:
+        return tasks[: ids.index(through) + 1]
+    return list(tasks)
+
+
+def _legacy_select_ids(order: list[str], task: str | None, through: str | None) -> list[str]:
+    if task is not None:
+        return [task]
+    if through is not None:
+        return order[: order.index(through) + 1]
+    return list(order)
 
 
 # --- construction + validation (AC-1) -------------------------------------------------------
@@ -175,8 +192,8 @@ class SelectionParityTests(unittest.TestCase):
         self.ids = [t["id"] for t in _PARITY_PLAN]
 
     def test_no_selection_matches_cli_select_authored_order(self) -> None:
-        cli = [t["id"] for t in _select(list(_PARITY_PLAN), None, None)]
-        exe = _select_ids(self.ids, None, None)
+        cli = [t["id"] for t in _legacy_select(list(_PARITY_PLAN), None, None)]
+        exe = _legacy_select_ids(self.ids, None, None)
         resolved = resolve_selection(self.graph)
         self.assertEqual(list(resolved.task_ids), cli)
         self.assertEqual(list(resolved.task_ids), exe)
@@ -184,8 +201,8 @@ class SelectionParityTests(unittest.TestCase):
 
     def test_task_selection_matches_both_call_sites(self) -> None:
         for tid in self.ids:
-            cli = [t["id"] for t in _select(list(_PARITY_PLAN), tid, None)]
-            exe = _select_ids(self.ids, tid, None)
+            cli = [t["id"] for t in _legacy_select(list(_PARITY_PLAN), tid, None)]
+            exe = _legacy_select_ids(self.ids, tid, None)
             resolved = resolve_selection(self.graph, task=tid)
             self.assertEqual(list(resolved.task_ids), cli, tid)
             self.assertEqual(list(resolved.task_ids), exe, tid)
@@ -193,8 +210,8 @@ class SelectionParityTests(unittest.TestCase):
 
     def test_through_selection_matches_cli_prefix(self) -> None:
         for tid in self.ids:
-            cli = [t["id"] for t in _select(list(_PARITY_PLAN), None, tid)]
-            exe = _select_ids(self.ids, None, tid)
+            cli = [t["id"] for t in _legacy_select(list(_PARITY_PLAN), None, tid)]
+            exe = _legacy_select_ids(self.ids, None, tid)
             resolved = resolve_selection(self.graph, through=tid)
             self.assertEqual(list(resolved.task_ids), cli, tid)
             self.assertEqual(list(resolved.task_ids), exe, tid)
@@ -242,7 +259,7 @@ class GeneratedSelectionParityTests(unittest.TestCase):
             graph = TaskGraph.from_pairs([(t["id"], t["depends_on"]) for t in plan])
 
             for arg in [None, *ids]:
-                cli = [t["id"] for t in _select(list(plan), arg, None)]
+                cli = [t["id"] for t in _legacy_select(list(plan), arg, None)]
                 self.assertEqual(
                     list(resolve_selection(graph, task=arg).task_ids)
                     if arg is not None
@@ -250,7 +267,7 @@ class GeneratedSelectionParityTests(unittest.TestCase):
                     cli,
                 )
             for arg in ids:
-                cli = [t["id"] for t in _select(list(plan), None, arg)]
+                cli = [t["id"] for t in _legacy_select(list(plan), None, arg)]
                 self.assertEqual(
                     list(resolve_selection(graph, through=arg).task_ids), cli
                 )

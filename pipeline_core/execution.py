@@ -37,6 +37,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from feature_pipeline.domain.plan import CompiledRunPlan
 from schemas.contracts import TaskSpec
 
 from .adapter_resolution import (
@@ -521,6 +522,12 @@ class ExecuteRequest:
     #: The plan file path as it should appear in executor/verifier prompts (logical, not host).
     plan_prompt_path: str | None = None
     working_root: str = "."
+    #: The one immutable execution plan (CP-02). When set, ``execute_run`` takes its
+    #: selection, per-task working root and role grant, and repair bound from here — the same
+    #: object the dry-run preview renders — and persists its fingerprint so a resume can
+    #: report field-level plan incompatibility. ``None`` keeps the pre-CP-02 wiring for the
+    #: focused unit scenarios that construct a request directly.
+    compiled_plan: CompiledRunPlan | None = None
     timeout: float | None = None
     #: Injected so a test can pin the lease owner; production uses this process.
     pipeline_pid: int | None = None
@@ -775,6 +782,74 @@ def _apply_repair_bound(
     return {tid: replace(spec, max_repair_attempts=maximum) for tid, spec in by_id.items()}
 
 
+def _plan_fingerprint(plan: CompiledRunPlan) -> dict[str, str]:
+    """A flat ``{field-path: value}`` map over every resolved decision in ``plan``.
+
+    Persisted verbatim on ``run.json`` (control ``plan_fingerprint``); a resume recomputes it
+    from the freshly compiled plan and reports the **first** key whose value moved (AC-3).
+    The order mirrors ``feature_pipeline.domain.plan._canonical_plan`` so the first
+    divergence a reader sees is the most significant one.
+    """
+    out: dict[str, str] = {
+        "selection_mode": plan.selection_mode,
+        "selection": ",".join(plan.selection),
+        "order": ",".join(plan.order),
+        "adapter": plan.adapter,
+    }
+    for control in plan.controls:
+        out[f"control.{control.name}"] = f"{control.value!r} ({control.source})"
+    for task in plan.tasks:
+        prefix = f"task.{task.task_id}"
+        out[f"{prefix}.working_root"] = str(task.working_root)
+        out[f"{prefix}.storage_root"] = str(task.storage_root)
+        out[f"{prefix}.role"] = task.role
+        out[f"{prefix}.role_grant"] = ",".join(task.role_grant)
+        out[f"{prefix}.adapter"] = task.adapter
+        out[f"{prefix}.checks"] = "; ".join(
+            f"{check.name}:{' '.join(check.argv)}" for check in task.checks
+        )
+        out[f"{prefix}.timeout_s"] = repr(task.timeout_s)
+        out[f"{prefix}.routine_output_budget"] = repr(task.routine_output_budget)
+        out[f"{prefix}.diagnostic_output_budget"] = repr(task.diagnostic_output_budget)
+        out[f"{prefix}.repair_bound"] = repr(int(task.repair_bound))
+        out[f"{prefix}.depends_on"] = ",".join(task.depends_on)
+        for control in task.controls:
+            out[f"{prefix}.control.{control.name}"] = (
+                f"{control.value!r} ({control.source})"
+            )
+    return out
+
+
+def _ensure_plan_compatible(run: Run, plan: CompiledRunPlan) -> None:
+    """Resume guard: the freshly compiled plan must match the recorded one field for field.
+
+    Raises :class:`ExecutionError` naming the first divergent field, before the run is
+    mutated in any way (AC-3).
+    """
+    recorded = run.controls.get("plan_fingerprint", {}).get("value")
+    now = _plan_fingerprint(plan)
+    if not isinstance(recorded, dict):
+        # A run created before CP-02 (or by the pre-CP-02 wiring) recorded no fingerprint;
+        # a bare digest check is the strongest statement available.
+        recorded_digest = run.controls.get("plan_digest", {}).get("value")
+        if recorded_digest is not None and recorded_digest != plan.digest:
+            raise ExecutionError(
+                "resume: the recorded run's plan digest does not match the plan compiled "
+                "now; recompile from the same inputs or start a new run",
+                "plan-incompatible",
+            )
+        return
+    for key in list(recorded) + [k for k in now if k not in recorded]:
+        before = recorded.get(key, "<absent>")
+        after = now.get(key, "<absent>")
+        if before != after:
+            raise ExecutionError(
+                f"resume: compiled plan is incompatible with the recorded run at "
+                f"'{key}': recorded={before!r}, now={after!r}",
+                "plan-incompatible",
+            )
+
+
 def execute_run(request: ExecuteRequest) -> ExecuteResult:
     """Drive every selected task to ``verified`` or to a truthful non-zero terminal state.
 
@@ -802,9 +877,15 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
         return _error("execute mode needs at least one task in the plan", request)
     order = [spec.id for spec in specs]
     spec_by_id = {spec.id: spec for spec in specs}
+    plan = request.compiled_plan
 
     try:
-        selected = _select_ids(order, request.controls.task, request.controls.through)
+        if plan is not None:
+            # The compiled plan already resolved the selection (through
+            # ``resolve_selection``); trust it and only re-run the shape checks.
+            selected = list(plan.selection)
+        else:
+            selected = _select_ids(order, request.controls.task, request.controls.through)
         _validate_attestation_scope(request.controls, spec_by_id)
     except ExecutionError as exc:
         return _error(f"{exc.code}: {exc}", request)
@@ -824,8 +905,24 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
     except AdapterResolutionError as exc:
         return _error(f"{exc.code}: {exc}", request)
 
-    by_id = _apply_repair_bound(specs, request.controls.max_repair_attempts)
+    if plan is not None:
+        planned_ids = {task.task_id for task in plan.tasks}
+        by_id = {
+            tid: (
+                replace(spec_by_id[tid],
+                        max_repair_attempts=int(plan.task(tid).repair_bound))
+                if tid in planned_ids else spec_by_id[tid]
+            )
+            for tid in order
+        }
+    else:
+        by_id = _apply_repair_bound(specs, request.controls.max_repair_attempts)
     specs = [by_id[tid] for tid in order]
+
+    controls_map = _controls_map(request.controls, resolution)
+    if plan is not None:
+        controls_map["plan_digest"] = (plan.digest, "explicit")
+        controls_map["plan_fingerprint"] = (_plan_fingerprint(plan), "explicit")
 
     # 3. Durable lifecycle: initialize a fresh run, or resume the persisted one. A fresh run's
     #    attestations are resolved against their source runs before any run.json exists
@@ -840,7 +937,9 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
             )
             ensure_pinned_adapter(life.run, resolution)
             _ensure_attestations_match(life.run, request.controls.attested_dependencies)
-            for name, (value, sourced) in _controls_map(request.controls, resolution).items():
+            if plan is not None:
+                _ensure_plan_compatible(life.run, plan)
+            for name, (value, sourced) in controls_map.items():
                 if sourced == "explicit":
                     life.run.set_control(name, value, sourced=sourced)
         else:
@@ -857,7 +956,7 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
             life = RunLifecycle.initialize(
                 run,
                 tasks=[(spec.id, list(spec.depends_on)) for spec in specs],
-                controls=_controls_map(request.controls, resolution),
+                controls=controls_map,
                 adapter_requested=resolution.requested,
                 adapter_resolved=resolution.resolved,
             )

@@ -24,7 +24,7 @@ Standard library only.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, Sequence, Union
 
 from feature_pipeline.application.selection import resolve_selection
 from feature_pipeline.domain.controls import ControlSource, ResolvedControl
@@ -62,6 +62,33 @@ SERIALIZED_PROGRAMS: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
+class ShallowTaskInput:
+    """A route-only task input: id, type and dependency edges, nothing from the task body.
+
+    The dry-run preview never loads task files — it routes an ``id`` + ``type`` (+
+    ``depends_on``) plan. That is not enough to build a :class:`TaskDefinition` (its wrapped
+    :class:`~feature_pipeline.contracts.TaskSpec` requires an allowed scope), so the preview
+    feeds these instead. Execute mode always passes full :class:`TaskDefinition` values.
+    None of the dry-run plan's C1–C8 sections displays a task-body field, so the shallow
+    input drives the preview completely.
+    """
+
+    id: str
+    task_type: str
+    depends_on: tuple[str, ...] = ()
+    executor: str = ""
+    allowed_scope: tuple[str, ...] = ()
+    out_of_scope: tuple[str, ...] = ()
+    max_repair_attempts: int = DEFAULT_MAX_REPAIR_ATTEMPTS
+
+
+#: What :func:`compile_run_plan` accepts per task — a fully normalized definition (execute)
+#: or a route-only shallow input (dry-run preview). Both satisfy the ``.id`` / ``.depends_on``
+#: shape :meth:`TaskGraph.from_definitions` needs.
+TaskInput = Union[TaskDefinition, ShallowTaskInput]
+
+
+@dataclass(frozen=True)
 class ControlOverrides:
     """The operational controls a caller may set explicitly.
 
@@ -83,7 +110,7 @@ _NO_OVERRIDES = ControlOverrides()
 def compile_run_plan(
     *,
     feature: str,
-    definitions: Sequence[TaskDefinition],
+    definitions: Sequence[TaskInput],
     profile: CompiledProfile,
     overrides: ControlOverrides = _NO_OVERRIDES,
     adapters: AdapterRegistry | None = None,
@@ -196,7 +223,7 @@ def compile_run_plan(
 
 
 def _repair_control(
-    definition: TaskDefinition, override: int | None
+    definition: "TaskInput", override: int | None
 ) -> ResolvedControl[Any]:
     """Resolve one task's repair bound.
 
@@ -248,5 +275,7 @@ __all__ = [
     "EXECUTOR_ROLE",
     "SERIALIZED_PROGRAMS",
     "ControlOverrides",
+    "ShallowTaskInput",
+    "TaskInput",
     "compile_run_plan",
 ]
