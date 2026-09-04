@@ -692,6 +692,41 @@ class RunStateV3:
     def with_revision(self, revision: int) -> "RunStateV3":
         return replace(self, revision=revision)
 
+    def with_task(self, entry: TaskEntryV3) -> "RunStateV3":
+        """Return a copy with ``entry`` replacing the same-id task (order preserved)."""
+        if not any(task.id == entry.id for task in self.tasks):
+            raise KeyError(entry.id)
+        return replace(
+            self,
+            tasks=tuple(entry if task.id == entry.id else task for task in self.tasks),
+        )
+
+    def with_appended_command(self, command: CommandRecordV3) -> "RunStateV3":
+        """Return a copy with ``command`` appended to :attr:`commands`."""
+        return replace(self, commands=self.commands + (command,))
+
+    def with_artifact(self, key: str, relative_path: str) -> "RunStateV3":
+        """Return a copy that registers ``key -> relative_path`` under :attr:`artifacts`."""
+        artifacts = dict(self.artifacts)
+        artifacts[key] = relative_path
+        return replace(self, artifacts=artifacts)
+
+    def referenced_artifacts(self) -> frozenset[str]:
+        """Every run-relative evidence path this state names.
+
+        The union of the :attr:`artifacts` registry values and each task's
+        ``execution_evidence.executor_report`` — the paths orphan reconciliation
+        (``docs/adr/004``) must keep.
+        """
+        refs: set[str] = {
+            value for value in self.artifacts.values() if isinstance(value, str)
+        }
+        for task in self.tasks:
+            report = task.execution_evidence.executor_report
+            if isinstance(report, str) and report:
+                refs.add(report)
+        return frozenset(refs)
+
 
 __all__ = [
     "STATE_SCHEMA_VERSION",

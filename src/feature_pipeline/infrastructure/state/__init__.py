@@ -27,6 +27,7 @@ Standard library only.
 
 from __future__ import annotations
 
+from .durability import atomic_write, atomic_write_text, fsync_dir, unique_temp_name
 from .errors import (
     FieldTypeError,
     FieldValueError,
@@ -36,7 +37,22 @@ from .errors import (
     UnknownFieldError,
 )
 from .migration import load_state, migrate_v2_to_v3
+from .orphans import reconcile_orphans
 from .repository import StateRepository
+from .run_layout import (
+    RUN_ID_RE,
+    ActiveRunPresent,
+    RunAlreadyExists,
+    RunIdentityError,
+    RunIdentityPolicy,
+    RunLayout,
+    StaleRunPointer,
+    allocate_run,
+    mint_run_id,
+    read_latest,
+    resume_run,
+    write_latest,
+)
 from .schema_v3 import (
     CONTRACT_SCHEMA_VERSION,
     STATE_SCHEMA_VERSION,
@@ -76,4 +92,23 @@ __all__ = [
     "migrate_v2_to_v3",
     "load_state",
     "StateRepository",
+    # DS-03 — durability primitive
+    "atomic_write",
+    "atomic_write_text",
+    "fsync_dir",
+    "unique_temp_name",
+    # DS-03 — run-directory identity (docs/adr/004)
+    "RUN_ID_RE",
+    "RunLayout",
+    "RunIdentityError",
+    "RunIdentityPolicy",
+    "RunAlreadyExists",
+    "ActiveRunPresent",
+    "StaleRunPointer",
+    "allocate_run",
+    "mint_run_id",
+    "read_latest",
+    "resume_run",
+    "write_latest",
+    "reconcile_orphans",
 ]

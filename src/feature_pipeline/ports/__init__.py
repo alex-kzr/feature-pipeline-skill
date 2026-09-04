@@ -16,6 +16,13 @@ Standard library only.
 
 from __future__ import annotations
 
+from .artifacts import (
+    ArtifactKind,
+    ArtifactNameError,
+    ArtifactRef,
+    ArtifactStorePort,
+    OrphanReport,
+)
 from .clock import (
     TIMESTAMP_FORMAT,
     Clock,
@@ -25,6 +32,7 @@ from .clock import (
     SystemClock,
     format_timestamp,
 )
+from .state_repository import LoadedState, StateRepositoryPort, StateRevisionConflict
 
 __all__ = [
     "TIMESTAMP_FORMAT",
@@ -34,4 +42,13 @@ __all__ = [
     "RunIdFactory",
     "SystemClock",
     "format_timestamp",
+    # DS-03 — durable-persistence ports
+    "ArtifactKind",
+    "ArtifactNameError",
+    "ArtifactRef",
+    "ArtifactStorePort",
+    "OrphanReport",
+    "LoadedState",
+    "StateRepositoryPort",
+    "StateRevisionConflict",
 ]

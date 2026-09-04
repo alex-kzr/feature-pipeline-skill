@@ -14,6 +14,11 @@ from __future__ import annotations
 from .controls import ResolvedExecuteControls, resolve_execute_controls
 from .identity import RunIdentity, RunIdentityFactory
 from .results import Outcome, PipelineResult, ResultMapper
+from .run_repository import (
+    RunPersistence,
+    initialise_run,
+    resume_existing_run,
+)
 from .selection import (
     DependencyStatus,
     ResolvedSelection,
@@ -30,6 +35,9 @@ __all__ = [
     "resolve_execute_controls",
     "RunIdentity",
     "RunIdentityFactory",
+    "RunPersistence",
+    "initialise_run",
+    "resume_existing_run",
     "DependencyStatus",
     "ResolvedSelection",
     "SelectionError",
