@@ -16,7 +16,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from pipeline_core.execution import ExecutionError, run_task
+from pipeline_core.execution import ExecutionError, TaskExecution, run_task
 from pipeline_core.lifecycle import RunLifecycle
 from pipeline_core.state import Run
 from pipeline_core.task_files import render_blocker_entry, upsert_blockers_section

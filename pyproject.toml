@@ -80,7 +80,7 @@ extend-exclude = [
 # unrelated cleanup into the packaging commit). Broader families — `UP` typing modernization,
 # `SIM`/`C4`/`RUF`/`ISC`/`FLY`/`FURB` style — are adopted by the Phase task that does that
 # module's cleanup (prompt L633), each raising `select` as its diff lands.
-select = ["E", "F", "I", "B"]
+select = ["E", "F", "I", "B", "C90"]
 # Pre-existing findings only (`ruff check .` at PKG-01), which PKG-01's Allowed scope forbids
 # reformatting away (Risks note). Everything else in `select` is enforced now. Burn-down owners:
 #   E501  long lines ...................... style debt, no reformat here
@@ -90,6 +90,16 @@ select = ["E", "F", "I", "B"]
 #   B904  raise ... from in except ........ RS-01 (concurrency.py), RS-02 (lease.py)
 #   B905  zip() without strict= ........... CLI-01 (runner_cli.py render helper)
 ignore = ["E501", "F401", "I001", "B023", "B904", "B905"]
+
+[tool.ruff.lint.mccabe]
+# QG-02: complexity ratchet, not a target. `max-complexity = 28` is today's measured ceiling —
+# the single most complex function in the tree (`pipeline_core.commands.run_command`, cyclomatic
+# 28) — so nothing currently in scope trips the gate; any *new* function above today's ceiling
+# fails the build immediately. `docs/validation/quality-gates.md` names every orchestration
+# hotspot at or above 15 (the next tier) as the explicit burn-down list: lowering any of them is
+# out of QG-02's Allowed scope (`feature-pipeline-skill/src/**`, `pipeline_core/**` are Out of
+# scope here) and is left to the Phase task that next touches that module.
+max-complexity = 28
 
 [tool.ruff.lint.per-file-ignores]
 # Test doubles and denial-path assertions use idioms bugbear flags; not this task's cleanup.
@@ -104,6 +114,15 @@ ignore = ["E501", "F401", "I001", "B023", "B904", "B905"]
 # newly added module is checked immediately rather than silently inheriting the skip. The
 # not-yet-created `feature_pipeline.domain.*` / `feature_pipeline.ports.*` packages are strict
 # from introduction (prompt L482, docs/adr/003 acceptance test 3).
+#
+# QG-02 widens the strict override to `feature_pipeline.application.*` / `.infrastructure.*`
+# (Requirements bullet 2). Turning that on surfaced 4 pre-existing errors mypy had never been
+# run against in CI before this task (AC-1's whole point): 2 in already-strict-adjacent modules
+# (`application.pipeline_engine`, `infrastructure.state.migration`) and 2 in modules this widen
+# doesn't even reach (`feature_pipeline.bootstrap`, `feature_pipeline.cli.use_cases`, checked at
+# the module's prior default level). None are QG-02's to fix — `src/feature_pipeline/**` is Out
+# of scope here — so all 4 are parked BY NAME below, same as the F-20 debt, pending a follow-up
+# task scoped to fix them.
 # --------------------------------------------------------------------------------------------
 [tool.mypy]
 python_version = "3.11"
@@ -142,14 +161,25 @@ module = [
     # The `schemas.*` deprecation shim (re-exports only); dropped whole in DOC-02.
     "schemas",
     "schemas.contracts",
+    # QG-02: newly surfaced by widening the strict override below to application/infrastructure
+    # (first time mypy has run in CI); each is a genuine pre-existing error, not something QG-02
+    # introduced or may fix (`src/feature_pipeline/**` Out of scope). One follow-up task per pair.
+    "feature_pipeline.application.pipeline_engine",
+    "feature_pipeline.infrastructure.state.migration",
+    "feature_pipeline.bootstrap",
+    "feature_pipeline.cli.use_cases",
 ]
 ignore_errors = true
 
 [[tool.mypy.overrides]]
-# Strict from day one for the packages later phases introduce.
+# Strict from day one for the packages later phases introduce; QG-02 widens this to
+# `application.*` / `infrastructure.*` (module-by-module carve-outs above where that surfaced
+# pre-existing errors out of this task's scope to fix).
 module = [
     "feature_pipeline.domain.*",
     "feature_pipeline.ports.*",
+    "feature_pipeline.application.*",
+    "feature_pipeline.infrastructure.*",
 ]
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
@@ -187,7 +217,13 @@ omit = [
 # Ratchet, not a target: `coverage report` measured 90% (branch) over pipeline_core/ +
 # schemas/ at PKG-01 with 7 environment-dependent cases skipped. The floor sits 2 points
 # below that and only ever rises.
-fail_under = 88
+#
+# QG-02 (docs/validation/quality-gates.md): re-measured at 92% branch over the now much larger
+# `feature_pipeline` + `pipeline_core` + `schemas` source set (1029 tests, 8 skipped). Raised
+# 88 -> 90, keeping the same 2-point margin below measured rather than pinning to today's exact
+# number — this is CI's first run of `coverage`/`ruff`/`mypy` (AC-1), and the margin is deliberate
+# headroom against ordinary test-to-test variance, not slack to burn down.
+fail_under = 90
 show_missing = true
 exclude_lines = [
     "pragma: no cover",

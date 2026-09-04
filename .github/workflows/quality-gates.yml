@@ -1,0 +1,112 @@
+# QG-02 — turn quality signals into explicit, gradual gates.
+#
+# Task: docs/plans/tasks/QG-02_quality-performance-ratchets.md
+# Plan: docs/plans/2026-09-03-feature-pipeline-refactor.md (Phase 11)
+# Doc: docs/validation/quality-gates.md (measured thresholds + mutation-test decision)
+#
+# `installed-package.yml` already proves the built wheel on the full OS/Python matrix. This
+# workflow is the rest of AC-1's list — the policies nothing in CI checked before QG-02:
+#
+#   coverage    — `coverage run` (branch mode) + `coverage report`, `fail_under` from pyproject
+#   complexity  — Ruff's `C90` (mccabe), `max-complexity` from pyproject
+#   Ruff        — the declared `select`/`ignore` policy (pyproject.toml)
+#   mypy        — the declared strict-boundary policy (pyproject.toml)
+#   platform    — tests/README.md's `platform` suite, both OSes
+#   fault       — tests/README.md's `fault-injection` suite, both OSes
+#   performance — tests/README.md's `performance` suite, both OSes
+#
+# Each suite command below is copied verbatim from `tests/README.md` (QG-01) — that file is the
+# single source of truth for what each named suite discovers; keep the two in step.
+
+name: quality-gates
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-types:
+    name: ruff + mypy (incl. complexity)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: feature-pipeline-skill
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # Ruff's `C90` (mccabe) select carries the complexity ratchet; both live in [tool.ruff].
+      - name: Ruff (lint + complexity policy)
+        run: uv run --with ruff ruff check .
+
+      - name: mypy (typing-boundary policy)
+        run: uv run --with mypy mypy
+
+  coverage:
+    name: coverage (branch, ratcheted floor)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: feature-pipeline-skill
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Full suite under coverage
+        run: uv run --with coverage coverage run -m unittest discover -s tests -t .
+
+      # `coverage report` exits non-zero on its own once total branch coverage drops below
+      # `[tool.coverage.report].fail_under` — the ratchet lives entirely in pyproject.toml.
+      - name: Coverage report (enforces the ratcheted floor)
+        run: uv run --with coverage coverage report
+
+  policy-suites:
+    name: ${{ matrix.suite }} · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        suite: [platform, fault-injection, performance]
+    defaults:
+      run:
+        working-directory: feature-pipeline-skill
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: platform suite
+        if: matrix.suite == 'platform'
+        run: uv run python -m unittest tests.test_process_runner tests.test_worktree tests.test_worktree_bounded_attribution
+
+      - name: fault-injection suite
+        if: matrix.suite == 'fault-injection'
+        run: uv run python -m unittest tests.test_concurrency tests.test_scope_gate tests.test_git_safety_allowlist tests.test_launch_controls tests.test_critical_behavior_characterization
+
+      # Structural/budget assertions only (docs/validation/worktree-performance-baseline.md):
+      # no CI-run wall-clock threshold. `test_large_retained_heap_far_below_legacy` is a
+      # pre-existing, environment-dependent flake on some machines (tests/README.md "Known
+      # exceptions"); out of QG-02's Allowed scope to fix or relax.
+      - name: performance suite
+        if: matrix.suite == 'performance'
+        run: uv run python -m unittest tests.test_worktree_performance_baseline
