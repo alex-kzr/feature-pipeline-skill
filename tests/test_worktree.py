@@ -56,10 +56,13 @@ def _snap(files: dict[str, bytes | None]) -> WorktreeSnapshot:
 
 
 class CaptureSnapshotTests(unittest.TestCase):
-    def test_tracked_untracked_captured_and_run_dir_excluded(self) -> None:
+    def test_bounded_capture_reads_only_dirty_and_untracked_and_excludes_run_dir(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             _init_repo(root)
+            (root / "a.py").write_text("alpha edited\n", encoding="utf-8")  # dirty
             (root / "new.py").write_text("fresh\n", encoding="utf-8")  # untracked
             run_dir = root / "runs" / "r1"
             run_dir.mkdir(parents=True)
@@ -68,10 +71,16 @@ class CaptureSnapshotTests(unittest.TestCase):
             snapshot = capture_snapshot(root, exclude_roots=(run_dir,))
 
             self.assertTrue(snapshot.available)
-            self.assertEqual(
-                set(snapshot.files), {"a.py", "b.py", "new.py"})
-            self.assertNotIn("runs/run.json", snapshot.files)
-            self.assertIn(b"alpha", snapshot.files["a.py"].data or b"")
+            # Only the paths that could carry a change had their bytes read; the clean
+            # 'b.py' was never opened.
+            self.assertEqual(set(snapshot.files), {"a.py", "new.py"})
+            self.assertNotIn("runs/r1/run.json", snapshot.files)
+            self.assertIn(b"alpha edited", snapshot.files["a.py"].data or b"")
+            # The clean majority is known from index metadata, not from a body read.
+            self.assertIsNotNone(snapshot.marker)
+            assert snapshot.marker is not None
+            self.assertIn("b.py", snapshot.marker.tracked)
+            self.assertNotIn("b.py", snapshot.files)
 
     def test_missing_repository_boundary_is_unavailable_with_a_reason(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

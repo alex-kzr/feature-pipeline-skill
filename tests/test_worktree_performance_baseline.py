@@ -1,12 +1,17 @@
-"""BL-04 — structural checks over the worktree-attribution performance baseline.
+"""WT-01 — structural checks and budget assertions over the bounded worktree inspector.
 
-Plan: ``docs/plans/2026-09-03-feature-pipeline-refactor.md`` (Phase 0). This module drives
-:mod:`tests.worktree_perf` once and asserts the *shape* of the recorded baseline: both
-scenarios present with every metric populated (AC-1), the synthetic recipe reproducible
-(AC-2), explicit WT-01 parity/improvement thresholds (AC-3), and the ``O(total repository
-bytes)`` snapshot relationship finding F-16 predicts. No wall-clock value is asserted —
-those are recorded, with the comparison method, in
-``docs/validation/worktree-performance-baseline.md``.
+Plan: ``docs/plans/2026-09-03-feature-pipeline-refactor.md`` (Phase 7). This module drives
+:mod:`tests.worktree_perf` once and asserts:
+
+* AC-1 parity — the bounded inspector's attribution of one window matches the retained
+  legacy full-snapshot attribution of the *same* window: identical state, identical
+  changed-candidate count, identical per-candidate classification, ``evidence_bytes``
+  within +/-5%;
+* AC-2 — an unavailable/partial attribution never appears as an empty successful manifest;
+* AC-3 improvement — ``bytes_read`` is ``O(changed candidates)`` and far below
+  ``total_repo_bytes``; ``peak_heap_bytes`` is far below the legacy snapshot peak;
+* the synthetic recipe is reproducible (AC-2 of BL-04, carried forward);
+* wall-clock is recorded, never asserted as an absolute.
 
 Standard library only.
 """
@@ -33,8 +38,8 @@ def _shared_report() -> dict[str, harness.Metrics]:
     return _REPORT
 
 
-class BaselineReportShapeTests(unittest.TestCase):
-    """AC-1 — the baseline reports time, memory, and artifact size for both scenarios."""
+class BoundedReportShapeTests(unittest.TestCase):
+    """The harness reports time, memory, and artifact size for both scenarios."""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -48,11 +53,14 @@ class BaselineReportShapeTests(unittest.TestCase):
             "boundary_count",
             "vcs_file_count",
             "total_repo_bytes",
-            "snapshot_bytes_read",
+            "bytes_read",
+            "legacy_bytes_read",
             "changed_candidate_count",
             "snapshot_seconds",
             "window_seconds",
-            "snapshot_peak_heap_bytes",
+            "legacy_window_seconds",
+            "peak_heap_bytes",
+            "legacy_peak_heap_bytes",
             "evidence_bytes",
         }
         self.assertTrue(numeric.issubset({f.name for f in fields(harness.Metrics)}))
@@ -60,19 +68,6 @@ class BaselineReportShapeTests(unittest.TestCase):
             for field_name in numeric:
                 value = getattr(metrics, field_name)
                 self.assertGreater(value, 0, f"{name}.{field_name} was {value!r}")
-
-    def test_time_memory_and_artifact_size_are_all_reported(self) -> None:
-        for metrics in self.report.values():
-            self.assertGreater(metrics.snapshot_seconds, 0.0)  # elapsed time
-            self.assertGreater(metrics.window_seconds, 0.0)
-            self.assertGreater(metrics.snapshot_peak_heap_bytes, 0)  # peak memory
-            self.assertGreater(metrics.evidence_bytes, 0)  # artifact size
-
-    def test_attribution_is_known_and_confined_to_scope(self) -> None:
-        for metrics in self.report.values():
-            self.assertEqual(metrics.attribution_state, STATE_KNOWN)
-            self.assertTrue(metrics.in_window_edit_attributed)
-            self.assertTrue(metrics.preexisting_dirt_excluded)
 
     def test_candidate_matrix_is_exercised_in_both_scenarios(self) -> None:
         for name, metrics in self.report.items():
@@ -84,46 +79,132 @@ class BaselineReportShapeTests(unittest.TestCase):
             self.assertGreaterEqual(metrics.boundary_count, 2, name)
 
 
-class F16ScalingTests(unittest.TestCase):
-    """The snapshot cost the refactor must remove: O(total repository bytes)."""
+class ParityTests(unittest.TestCase):
+    """AC-1 — bounded attribution equals the legacy full-snapshot attribution."""
 
     @classmethod
     def setUpClass(cls) -> None:
         cls.report = _shared_report()
 
-    def test_snapshot_reads_essentially_the_whole_repository(self) -> None:
-        for name, metrics in self.report.items():
-            ratio = metrics.snapshot_bytes_read / metrics.total_repo_bytes
-            self.assertGreaterEqual(ratio, 0.999, f"{name}: only read {ratio:.4%}")
-            self.assertLessEqual(ratio, 1.001, f"{name}: read {ratio:.4%}")
+    def test_state_and_changed_count_match_legacy(self) -> None:
+        for name, m in self.report.items():
+            self.assertEqual(m.attribution_state, STATE_KNOWN, name)
+            self.assertEqual(m.legacy_attribution_state, STATE_KNOWN, name)
+            self.assertEqual(
+                m.changed_candidate_count, m.legacy_changed_candidate_count, name
+            )
 
-    def test_large_scenario_reads_far_more_than_its_changed_candidates(self) -> None:
+    def test_every_candidate_classification_matches_legacy(self) -> None:
+        for name, m in self.report.items():
+            self.assertTrue(m.classifications_match, name)
+
+    def test_evidence_bytes_within_five_percent_of_legacy(self) -> None:
+        for name, m in self.report.items():
+            drift = abs(m.evidence_bytes - m.legacy_evidence_bytes)
+            self.assertLessEqual(
+                drift,
+                0.05 * m.legacy_evidence_bytes,
+                f"{name}: evidence_bytes {m.evidence_bytes} vs legacy "
+                f"{m.legacy_evidence_bytes}",
+            )
+
+    def test_preexisting_dirt_excluded_and_window_edit_attributed(self) -> None:
+        for name, m in self.report.items():
+            self.assertTrue(m.preexisting_dirt_excluded, name)
+            self.assertTrue(m.in_window_edit_attributed, name)
+
+
+class ImprovementBudgetTests(unittest.TestCase):
+    """AC-3 — the bounded inspector meets the BL-04 improvement budgets."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.report = _shared_report()
+
+    def test_bytes_read_is_order_changed_candidates(self) -> None:
+        for name, m in self.report.items():
+            budget = 4 * harness.LARGE_TEXT_BYTES * m.changed_candidate_count + 262144
+            self.assertLessEqual(m.bytes_read, budget, name)
+
+    def test_large_bytes_read_far_below_total_repo_bytes(self) -> None:
         large = self.report["large"]
-        # Generous over-estimate of the bytes a candidate-only snapshot would touch.
-        changed_bytes = large.changed_candidate_count * harness.LARGE_TEXT_BYTES * 4
-        self.assertGreater(
-            large.snapshot_bytes_read,
-            changed_bytes * 20,
-            "snapshot cost is not dominated by total repository bytes",
+        self.assertGreaterEqual(
+            large.total_repo_bytes,
+            large.bytes_read * 20,
+            "bounded snapshot still reads a large fraction of the repository",
+        )
+        # The legacy snapshot, by contrast, reads essentially the whole repository.
+        self.assertGreaterEqual(
+            large.legacy_bytes_read, large.total_repo_bytes * 0.9
         )
 
-    def test_snapshot_cost_grows_with_repository_size(self) -> None:
-        small, large = self.report["small"], self.report["large"]
-        self.assertGreater(large.snapshot_bytes_read, small.snapshot_bytes_read * 10)
-        self.assertGreater(large.snapshot_peak_heap_bytes, small.snapshot_peak_heap_bytes)
-        # The attributed change set is the same tiny size regardless of repository size.
-        self.assertEqual(
-            small.changed_candidate_count, large.changed_candidate_count
+    def test_large_retained_heap_far_below_legacy(self) -> None:
+        large = self.report["large"]
+        # The marker retains index metadata + a few small bodies; the legacy snapshot
+        # retains every file's bytes. That structural difference is the F-16 memory win.
+        self.assertGreaterEqual(
+            large.legacy_retained_heap_bytes,
+            large.retained_heap_bytes * 10,
+            f"bounded retained heap {large.retained_heap_bytes} vs legacy "
+            f"{large.legacy_retained_heap_bytes}",
         )
+
+    def test_bounded_window_not_slower_than_legacy_on_this_machine(self) -> None:
+        # Ratio comparison only (advisory), and generous — CI noise must not flake it.
+        large = self.report["large"]
+        self.assertLess(
+            large.window_seconds,
+            large.legacy_window_seconds * 2.0,
+            "bounded window is dramatically slower than the legacy window",
+        )
+
+    def test_small_scenario_does_not_regress_versus_legacy(self) -> None:
+        small = self.report["small"]
+        # A tiny repository: the metadata-first path must not read more than the legacy
+        # full snapshot did, plus a small fixed allowance.
+        self.assertLessEqual(small.bytes_read, small.legacy_bytes_read + 262144)
+
+
+class UnavailableNeverEmptyTests(unittest.TestCase):
+    """AC-2 — a partial or unavailable attribution is never an empty successful manifest."""
+
+    def test_missing_boundary_is_unavailable_not_empty_known(self) -> None:
+        from pipeline_core.reports import launch_artifacts
+        from pipeline_core.worktree import (
+            STATE_UNAVAILABLE,
+            attribute_executor_window,
+            capture_snapshot,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)  # not a git repo
+            marker = capture_snapshot(root)
+            self.assertFalse(marker.available)
+            artifacts = launch_artifacts(root / "run", "WT-01", 1)
+            result = attribute_executor_window(
+                marker, root, artifacts=artifacts, task_id="WT-01",
+                allowed_scope=("**",), attempt=1, generation=1,
+                executor_report=artifacts.executor_report, exclude_roots=(),
+            )
+            self.assertEqual(result.state, STATE_UNAVAILABLE)
+            self.assertTrue(result.reason)
+            self.assertEqual(result.changed_files, [])
+            import json as _json
+
+            manifest = _json.loads(
+                artifacts.implementation_manifest.read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["attribution_state"], STATE_UNAVAILABLE)
+            self.assertIsNotNone(manifest["reason"])
 
 
 class ReproducibilityTests(unittest.TestCase):
-    """AC-2 — the synthetic repository recipe is reproducible."""
+    """AC-2 (BL-04, carried forward) — the synthetic repository recipe is reproducible."""
 
     def _fingerprint(self, root: Path) -> list[tuple[str, int]]:
-        from pipeline_core.worktree import capture_snapshot
+        from pipeline_core.worktree import _legacy_capture_snapshot
 
-        snapshot = capture_snapshot(root)
+        snapshot = _legacy_capture_snapshot(root)
         self.assertTrue(snapshot.available)
         return sorted(
             (name, len(entry.data or b"")) for name, entry in snapshot.files.items()
@@ -143,23 +224,9 @@ class ReproducibilityTests(unittest.TestCase):
                 self._fingerprint(first.root), self._fingerprint(second.root)
             )
 
-    def test_file_count_drives_snapshot_size(self) -> None:
-        from pipeline_core.worktree import capture_snapshot
-
-        with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
-            small = harness.build_scenario("large", 20, 512, 1024, Path(a))
-            big = harness.build_scenario("large", 80, 512, 1024, Path(b))
-            small_read = sum(
-                len(e.data or b"") for e in capture_snapshot(small.root).files.values()
-            )
-            big_read = sum(
-                len(e.data or b"") for e in capture_snapshot(big.root).files.values()
-            )
-            self.assertGreater(big_read, small_read * 2)
-
 
 class ThresholdsAndEnvironmentTests(unittest.TestCase):
-    """AC-3 — WT-01 has explicit parity and improvement thresholds to satisfy."""
+    """AC-3 — WT-01 has explicit parity and improvement thresholds."""
 
     def test_wt01_thresholds_are_explicit_and_quantified(self) -> None:
         thresholds = harness.WT01_THRESHOLDS
@@ -180,7 +247,6 @@ class ThresholdsAndEnvironmentTests(unittest.TestCase):
 
     def test_wall_clock_is_advisory_not_asserted(self) -> None:
         self.assertTrue(harness.WALL_CLOCK_ADVISORY)
-        # The harness itself defines no test case — it only records.
         self.assertFalse(
             any(
                 isinstance(getattr(harness, name), type)
@@ -195,15 +261,14 @@ class RenderingTests(unittest.TestCase):
         rendered = harness.render_markdown(_shared_report(), harness.environment())
         for heading in (
             "## Scenario recipe",
-            "## Measured baseline",
-            "## Approved budgets",
+            "## Measured (bounded vs legacy)",
             "## WT-01 thresholds",
             "## Environment",
         ):
             self.assertIn(heading, rendered)
         self.assertIn("small", rendered)
         self.assertIn("large", rendered)
-        self.assertIn("snapshot_bytes_read", rendered)
+        self.assertIn("bytes_read", rendered)
 
 
 if __name__ == "__main__":

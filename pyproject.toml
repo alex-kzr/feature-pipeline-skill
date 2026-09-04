@@ -134,7 +134,6 @@ module = [
     "pipeline_core.state",
     "pipeline_core.task_files",
     "pipeline_core.verification",
-    "pipeline_core.worktree",
     # Relocated by PKG-02 from the top-level `schemas.contracts`; same code, same debt,
     # cleared with the rest of the contracts work in DF-01.
     "feature_pipeline.contracts",

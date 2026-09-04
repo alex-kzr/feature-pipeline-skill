@@ -4,13 +4,17 @@ The runner cannot trust an executor's prose about what it changed, and it must n
 pre-existing workspace dirt or its own run/lock/report artifacts leak into the record of
 one generation's work. This module produces that evidence independently:
 
-* :func:`capture_snapshot` takes a content snapshot of every VCS-relevant path across the
-  repository boundary — the working root plus any declared nested repository — immediately
-  before and after a single executor launch, skipping the runner-owned run directory.
-* :func:`attribute_window` subtracts the before-snapshot from the after-snapshot. A path
-  that only carried a pre-existing change has identical content on both sides and drops
-  out; a path the executor further modified survives because its bytes changed. What
-  remains is classified against the task's declared allowed scope.
+* :func:`capture_snapshot` records the cheap before-state of one executor window — every
+  repository boundary, each boundary's index metadata, and the *bytes* of only the paths
+  already dirty or untracked. It reads no clean file body.
+* :func:`attribute_executor_window` closes that window: it reads the *after* bytes for the
+  bounded candidate set (dirty or untracked at open, plus anything Git now reports
+  changed), resolves each before body from the recorded bytes or the path's index blob,
+  subtracts the two, classifies the result against the task's declared allowed scope, and
+  persists the evidence. Its cost is ``O(changed candidates)`` — never the repository
+  total (WT-01, BL-02 finding F-16).
+* :func:`attribute_window` is the pure subtraction over two explicit
+  :class:`WorktreeSnapshot` values that the bounded path and the parity harness share.
 * :func:`persist_attribution` writes ``implementation-manifest-<n>.json`` (every attributed
   path with its change status, content digest, and ``in_allowed_scope`` / ``out_of_scope``
   classification) and ``implementation-diff-<n>.md`` (the unified diff for exactly that
@@ -21,8 +25,10 @@ cannot be trusted — no repository boundary, a failed Git query, a changed file
 content could not be read — is :data:`STATE_UNAVAILABLE` with a stated reason, and is
 never collapsed to an empty delta.
 
-Every Git call goes through :class:`~pipeline_core.git_port.GitPort` as literal argv; this
-module adds no staging, commit, or release behaviour.
+The bounded mechanism lives in
+:mod:`feature_pipeline.infrastructure.worktree.inspector`; the legacy full-repository
+snapshot is retained here as :func:`_legacy_capture_snapshot` for the WT-01 parity harness
+only. This module adds no staging, commit, or release behaviour.
 
 Standard library only.
 """
@@ -35,6 +41,15 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
+
+from feature_pipeline.infrastructure.worktree.inspector import (
+    GitWorktreeInspector,
+    WorktreeMarkerRecord,
+)
+from feature_pipeline.ports.worktree import (
+    WorktreeInspection,
+    WorktreeInspectionError,
+)
 
 from .artifacts import write_json_atomic, write_text_atomic
 from .git_port import GitPort, GitSafetyError
@@ -77,11 +92,18 @@ class SnapshotFile:
 
 @dataclass(frozen=True)
 class WorktreeSnapshot:
-    """A content snapshot of one repository boundary set, or an explained failure."""
+    """A content snapshot of one repository boundary set, or an explained failure.
+
+    ``files`` holds only the *bounded* set the window opened reading — the paths already
+    dirty or untracked. ``marker`` is the bounded before-state
+    :func:`attribute_executor_window` needs to close the window; it is absent on a snapshot
+    built by hand for :func:`attribute_window` or by :func:`_legacy_capture_snapshot`.
+    """
 
     files: dict[str, SnapshotFile]
     available: bool
     reason: str | None = None
+    marker: WorktreeMarkerRecord | None = None
 
 
 @dataclass(frozen=True)
@@ -182,12 +204,42 @@ def _within(path: Path, parent: Path) -> bool:
 def capture_snapshot(
     repo_root: str | Path, *, exclude_roots: Sequence[str | Path] = ()
 ) -> WorktreeSnapshot:
-    """Capture VCS-relevant file content across every repository boundary under ``repo_root``.
+    """Record the bounded before-state of one executor window under ``repo_root``.
 
-    Paths under any ``exclude_roots`` entry (the runner's own run/lock/report directory) are
-    dropped so runner-owned churn never enters an executor window. A missing repository
-    boundary or a failed ``git ls-files`` yields an unavailable snapshot with a reason.
+    Walks every repository boundary and reads each boundary's index metadata, but reads file
+    *bytes* only for the paths already dirty or untracked — the clean majority of the
+    repository is never opened (WT-01). Paths under any ``exclude_roots`` entry (the
+    runner's own run/lock/report directory) are dropped so runner-owned churn never enters
+    an executor window. A missing repository boundary or a failed Git query yields an
+    unavailable snapshot with a reason.
+
+    The returned :class:`WorktreeSnapshot` carries a ``marker`` that
+    :func:`attribute_executor_window` consumes to close the window; ``files`` exposes the
+    bounded set of bodies that were read at open.
     """
+    marker = _INSPECTOR.capture_marker(
+        str(Path(repo_root).resolve()),
+        exclude_roots=[str(Path(entry).resolve()) for entry in exclude_roots],
+    )
+    files = {
+        key: SnapshotFile(body.data, unreadable=body.unreadable)
+        for key, body in marker.open_bodies.items()
+    }
+    return WorktreeSnapshot(
+        files, available=marker.available, reason=marker.reason, marker=marker
+    )
+
+
+#: One shared bounded inspector — it holds no per-call state.
+_INSPECTOR = GitWorktreeInspector()
+
+
+def _legacy_capture_snapshot(
+    repo_root: str | Path, *, exclude_roots: Sequence[str | Path] = ()
+) -> WorktreeSnapshot:
+    """The pre-WT-01 full-repository content snapshot. Retained for the parity harness in
+    ``tests/worktree_parity.py`` only — every VCS-relevant path's bytes are read, so its
+    cost is ``O(total repository bytes)`` (BL-02 finding F-16)."""
     root = Path(repo_root).resolve()
     excludes = [Path(entry).resolve() for entry in exclude_roots]
     boundaries = _repository_boundaries(root)
@@ -325,7 +377,7 @@ def attribute_window(
             else "modified"
         )
         digest = (
-            "sha256:" + hashlib.sha256(after_state[1]).hexdigest()
+            "sha256:" + hashlib.sha256(after_state[1] or b"").hexdigest()
             if after_state[0] == "present"
             else None
         )
@@ -424,6 +476,20 @@ def persist_attribution(
     )
 
 
+def _inspection_to_attribution(inspection: WorktreeInspection) -> WindowAttribution:
+    """Adapt the port's :class:`WorktreeInspection` onto this module's persisted shape."""
+    changed = tuple(
+        ChangedPath(c.path, c.change.value, c.digest, c.classification)
+        for c in inspection.candidates
+    )
+    return WindowAttribution(
+        state=inspection.confidence,
+        changed_files=changed,
+        diff_text=inspection.diff_text,
+        reason=inspection.reason,
+    )
+
+
 def attribute_executor_window(
     before: WorktreeSnapshot,
     repo_root: str | Path,
@@ -436,10 +502,28 @@ def attribute_executor_window(
     executor_report: str | Path,
     exclude_roots: Sequence[str | Path] = (),
 ) -> AttributionResult:
-    """Close one executor window: capture the after-snapshot, attribute the delta against
-    ``allowed_scope``, and persist the manifest and diff. Returns the persisted result."""
-    after = capture_snapshot(repo_root, exclude_roots=exclude_roots)
-    attribution = attribute_window(before, after, allowed_scope=allowed_scope)
+    """Close one executor window: attribute the bounded candidate delta against
+    ``allowed_scope`` and persist the manifest and diff. Returns the persisted result.
+
+    A ``before`` snapshot from :func:`capture_snapshot` carries a bounded marker and is
+    closed by the ``O(changed candidates)`` inspector. A snapshot without a marker (a
+    hand-built one, or the legacy full snapshot) falls back to the pure
+    :func:`attribute_window` subtraction over a legacy after-snapshot.
+    """
+    if before.marker is not None:
+        try:
+            inspection = _INSPECTOR.attribute(
+                before.marker,
+                str(Path(repo_root).resolve()),
+                allowed_scope=list(allowed_scope),
+                exclude_roots=[str(Path(entry).resolve()) for entry in exclude_roots],
+            )
+        except WorktreeInspectionError as exc:
+            raise WorktreeError(str(exc), exc.code) from exc
+        attribution = _inspection_to_attribution(inspection)
+    else:
+        after = _legacy_capture_snapshot(repo_root, exclude_roots=exclude_roots)
+        attribution = attribute_window(before, after, allowed_scope=allowed_scope)
     return persist_attribution(
         artifacts,
         attribution,

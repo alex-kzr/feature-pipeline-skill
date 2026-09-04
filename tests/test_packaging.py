@@ -47,7 +47,8 @@ _KNOWN_TYPING_DEBT = {
     "pipeline_core.state",
     "pipeline_core.task_files",
     "pipeline_core.verification",
-    "pipeline_core.worktree",
+    # `pipeline_core.worktree` — debt cleared in WT-01 (bounded inspector rewrite); the
+    # module is now checked at the default mypy level.
     # PKG-02 relocated the top-level `schemas.contracts` under the package namespace.
     "feature_pipeline.contracts",
 }

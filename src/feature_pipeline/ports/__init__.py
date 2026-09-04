@@ -33,6 +33,19 @@ from .clock import (
     format_timestamp,
 )
 from .state_repository import LoadedState, StateRepositoryPort, StateRevisionConflict
+from .worktree import (
+    CONFIDENCE_KNOWN,
+    CONFIDENCE_KNOWN_EMPTY,
+    CONFIDENCE_UNAVAILABLE,
+    BoundaryKind,
+    CandidateChange,
+    ChangeKind,
+    RepositoryBoundary,
+    WorktreeInspection,
+    WorktreeInspectionError,
+    WorktreeInspector,
+    WorktreeMarker,
+)
 
 __all__ = [
     "TIMESTAMP_FORMAT",
@@ -51,4 +64,16 @@ __all__ = [
     "LoadedState",
     "StateRepositoryPort",
     "StateRevisionConflict",
+    # WT-01 — bounded worktree-attribution port
+    "CONFIDENCE_KNOWN",
+    "CONFIDENCE_KNOWN_EMPTY",
+    "CONFIDENCE_UNAVAILABLE",
+    "BoundaryKind",
+    "CandidateChange",
+    "ChangeKind",
+    "RepositoryBoundary",
+    "WorktreeInspection",
+    "WorktreeInspectionError",
+    "WorktreeInspector",
+    "WorktreeMarker",
 ]
