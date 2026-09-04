@@ -270,6 +270,14 @@ def _legacy_capture_snapshot(
             if any(_within(absolute, exclude) for exclude in excludes):
                 continue
             key = absolute.relative_to(root).as_posix()
+            if absolute.is_symlink():
+                try:
+                    target = os.readlink(absolute)
+                except OSError:
+                    files[key] = SnapshotFile(None, unreadable=True)
+                else:
+                    files[key] = SnapshotFile(("symlink -> " + target).encode("utf-8"))
+                continue
             if not absolute.is_file():
                 files[key] = SnapshotFile(None)
                 continue
