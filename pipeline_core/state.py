@@ -168,6 +168,9 @@ class TaskRecord:
     unblocks: list[str] = field(default_factory=list)
     maintenance_audit: list[dict[str, Any]] = field(default_factory=list)
     external_launch_failures: list[dict[str, Any]] = field(default_factory=list)
+    task_path: str | None = None
+    task_contract_digest: str | None = None
+    reused_verification: list[dict[str, Any]] = field(default_factory=list)
     #: Read-only evidence that a declared dependency was attested from another, already-closed
     #: run instead of being dispatched in this one (``--attest-dependency``). Each entry:
     #: ``dep_id``, ``source_feature``, ``source_run_id``, ``source_digest`` (a
@@ -491,6 +494,28 @@ class Run:
         self.record_event(
             f"attestation:{task_id}:{dep_id}", to="attested",
             note=f"{dep_id} attested via {entry.get('source_feature')}")
+        return entry
+
+    def set_task_contract(self, task_id: str, task_path: str, digest: str) -> None:
+        """Persist the canonical identity that makes a future verified task reusable."""
+        record = self.task(task_id)
+        record.task_path = repo_relative(task_path, self.repo_root)
+        record.task_contract_digest = digest
+
+    def record_reused_verification(
+        self, task_id: str, evidence: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Persist reuse evidence on the consuming task only."""
+        record = self.task(task_id)
+        entry = dict(evidence)
+        dependency_id = entry.get("dependency_id")
+        record.reused_verification = [
+            existing for existing in record.reused_verification
+            if existing.get("dependency_id") != dependency_id
+        ] + [entry]
+        self.record_event(
+            f"reused-verification:{task_id}:{dependency_id}", to="reused",
+            note=f"{dependency_id} reused from {entry.get('source_run_id')}")
         return entry
 
     def begin_repair(self, task_id: str, *, maximum: int) -> bool:

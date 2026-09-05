@@ -48,6 +48,10 @@ from feature_pipeline.application.task_engine import (
     TaskExecution,
     TaskRunResult,
 )
+from feature_pipeline.application.verified_reuse import (
+    canonical_task_path,
+    task_contract_digest,
+)
 from feature_pipeline.domain.plan import CompiledRunPlan
 from feature_pipeline.domain.stages import (
     StageContext,
@@ -111,12 +115,23 @@ __all__ = [
     "TaskExecution",
     "TaskRunResult",
     "execute_run",
+    "persist_task_contracts",
     "run_task",
 ]
 
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def persist_task_contracts(run: Run, specs: Sequence[TaskSpec]) -> None:
+    """Record the reusable identity for every task in the current run."""
+    for spec in specs:
+        run.set_task_contract(
+            spec.id,
+            canonical_task_path(spec, run.repo_root),
+            task_contract_digest(spec),
+        )
 
 
 def run_task(life: RunLifecycle, request: TaskExecution) -> TaskRunResult:
@@ -736,6 +751,7 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
     except (StateError, ResumeError, AdapterResolutionError, ExecutionError) as exc:
         return _error(f"{getattr(exc, 'code', 'state-error')}: {exc}", request)
 
+    persist_task_contracts(life.run, specs)
     pin_adapter(life.run, resolution)
     life.run.save()
 

@@ -131,6 +131,14 @@ class RoundTripTests(unittest.TestCase):
                 {"dep_id": "EX-0", "source_feature": "elsewhere", "source_run_id": "prior-run-id",
                  "source_digest": "sha256:abc", "task_verdict": "PASS", "test_verdict": "PASS",
                  "verified_at": "2026-09-01T09:00:00Z", "attested_at": "2026-09-01T10:00:00Z"}]
+            record.task_path = "docs/plans/tasks/EX-1.md"
+            record.task_contract_digest = "sha256:contract"
+            record.reused_verification = [{
+                "dependency_id": "EX-0", "source_run_id": "prior-run-id",
+                "source_run_digest": "sha256:source", "evidence_identity": "legacy-task-id",
+                "task_verdict": "PASS", "test_verdict": "PASS",
+                "verified_at": "2026-09-01T09:00:00Z", "reused_at": "2026-09-01T10:00:00Z",
+            }]
             record.next_executor_launch_generation = 4
             record.next_task_verifier_launch_generation = 2
             record.next_test_verifier_launch_generation = 3
@@ -283,6 +291,18 @@ class AttestationTests(unittest.TestCase):
             attested = run.task("EX-2").attested_dependencies
             self.assertEqual(len(attested), 1)
             self.assertEqual(attested[0]["source_feature"], "b")
+
+    def test_task_contract_and_reuse_evidence_are_recorded_only_on_the_consumer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = _run(root)
+            run.add_task("EX-1")
+            run.set_task_contract("EX-1", "docs/plans/tasks/EX-1.md", "sha256:contract")
+            run.record_reused_verification("EX-1", {"dependency_id": "EX-0", "source_run_id": "source"})
+            record = run.task("EX-1")
+            self.assertEqual(record.task_path, "docs/plans/tasks/EX-1.md")
+            self.assertEqual(record.task_contract_digest, "sha256:contract")
+            self.assertEqual(record.reused_verification, [{"dependency_id": "EX-0", "source_run_id": "source"}])
 
 
 if __name__ == "__main__":

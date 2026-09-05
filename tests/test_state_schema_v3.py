@@ -224,6 +224,19 @@ class UnknownFieldPolicyIsExplicit(unittest.TestCase):
         self.assertEqual(emitted["undocumented_run_key"], 7)
 
 
+class VerifiedReuseFieldsRoundTrip(unittest.TestCase):
+    def test_task_contract_and_reused_verification_are_strict_v3_fields(self) -> None:
+        payload = migrate_v2_to_v3(_read(_FIXTURES / "v2" / "run-state-basic.json"))
+        task = payload["tasks"][0]
+        task["task_path"] = "docs/plans/tasks/T-01.md"
+        task["task_contract_digest"] = "sha256:contract"
+        task["reused_verification"] = [{"dependency_id": "T-00", "source_run_id": "source",
+                                         "source_run_digest": "sha256:source",
+                                         "evidence_identity": "legacy-task-id", "task_verdict": "PASS",
+                                         "test_verdict": "PASS", "verified_at": "then", "reused_at": "now"}]
+        self.assertEqual(RunStateV3.from_mapping(payload).to_mapping(), payload)
+
+
 class LoadingNeverWritesAndCommitIsTheOnlyWriter(unittest.TestCase):
     """AC-3 — load is read-only; commit emits deterministic schema v3."""
 
