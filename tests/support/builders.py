@@ -18,7 +18,7 @@ from pipeline_core.execution import TaskExecution
 from pipeline_core.lifecycle import RunLifecycle
 from pipeline_core.state import Run
 from pipeline_core.verification import VerifierLaunchers
-from schemas.contracts import TaskSpec
+from feature_pipeline.contracts import TaskSpec
 
 from tests.support.fakes import ENVELOPE_ANCHORS, VERIFIER_ANCHORS
 

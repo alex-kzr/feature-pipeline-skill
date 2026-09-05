@@ -40,7 +40,7 @@ from pipeline_core.state import Run
 
 
 def _native_profile(*, two_storage: bool = False) -> dict:
-    """A native ``schemas.Profile`` document with a closed registry."""
+    """A native ``feature_pipeline.contracts.Profile`` document with a closed registry."""
     return {
         "version": 1,
         "name": "cutover-project",

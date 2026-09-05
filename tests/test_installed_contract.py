@@ -4,7 +4,7 @@ Plan: ``docs/plans/2026-09-03-feature-pipeline-refactor.md`` (Phase 1),
 ``docs/plans/tasks/PKG-03_installed-wheel-ci.md``.
 
 Every assertion in this module depends **only** on what a built wheel installs:
-the ``pipeline_core``, ``schemas`` and ``feature_pipeline`` import namespaces and the
+the ``pipeline_core`` and ``feature_pipeline`` import namespaces and the
 ``feature-pipeline`` console entry point. It reads no fixture, resolves no source-tree
 path, and never puts the repository on ``sys.path``. That is deliberate — the module is
 discovered and run twice:
@@ -31,7 +31,8 @@ import unittest
 from pathlib import Path
 
 # The curated public surface the installable facade guarantees (kept in lockstep with
-# ``feature_pipeline.__all__`` and the ``schemas`` shim; see PKG-02).
+# ``feature_pipeline.__all__``; see PKG-02). The historical ``schemas`` compatibility shim
+# was removed in DOC-02 after its one deprecation window (docs/adr/007).
 _PUBLIC_SURFACE = {
     "AcceptanceCriterionSpec", "CommandSpec", "LogicalPaths", "Profile", "ProfileRegistry",
     "RunState", "SchemaError", "TaskMetadata", "TaskRoute", "TaskSpec", "ToolStage",
@@ -48,7 +49,6 @@ class InstalledImportSurface(unittest.TestCase):
     def test_core_and_facade_import(self) -> None:
         import feature_pipeline
         import pipeline_core  # noqa: F401
-        import schemas  # noqa: F401  (deprecation shim, one window — docs/adr/007)
 
         self.assertTrue(feature_pipeline.__all__, "the facade must declare a non-empty __all__")
 
@@ -67,15 +67,6 @@ class InstalledImportSurface(unittest.TestCase):
         self.assertEqual(contracts.__name__, "feature_pipeline.contracts")
         for name in _PUBLIC_SURFACE | {"DIFF_POLICIES", "TASK_TYPES", "SCHEMA_VERSION"}:
             self.assertTrue(hasattr(contracts, name), f"contracts lost {name!r}")
-
-    def test_schemas_shim_reexports_identical_objects(self) -> None:
-        # The shim re-exports, it does not redefine: one class identity across both
-        # spellings (PKG-02 "no duplicate class identity" risk).
-        contracts = importlib.import_module("feature_pipeline.contracts")
-        import schemas
-
-        self.assertIs(schemas.Profile, contracts.Profile)
-        self.assertIs(schemas.SchemaError, contracts.SchemaError)
 
 
 class InstalledConsoleContract(unittest.TestCase):

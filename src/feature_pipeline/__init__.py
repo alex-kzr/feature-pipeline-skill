@@ -5,8 +5,8 @@ This package is the migration target defined by
 **compatibility facade**: the behaviour still lives in the flat ``pipeline_core`` package
 and is moved here one coherent module group at a time. The first group to land is the
 project-neutral schema contracts, now at :mod:`feature_pipeline.contracts` (previously the
-collision-prone top-level ``schemas`` package, kept working for one deprecation window via a
-shim — ``docs/adr/007``).
+collision-prone top-level ``schemas`` package; its one-deprecation-window compatibility shim
+was removed in DOC-02 — ``docs/adr/007``).
 
 Public API
 ----------

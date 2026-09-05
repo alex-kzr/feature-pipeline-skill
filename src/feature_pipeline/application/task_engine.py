@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
-from schemas.contracts import TaskSpec
+from feature_pipeline.contracts import TaskSpec
 
 from pipeline_core.adapters import Adapter
 from pipeline_core.artifacts import write_json_atomic

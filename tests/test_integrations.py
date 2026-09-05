@@ -13,7 +13,7 @@ from pipeline_core.integrations import (
     is_forbidden_installer_command,
     load_graphify_integration,
 )
-from schemas import SchemaError
+from feature_pipeline.contracts import SchemaError
 
 _VALID = {
     "schema_version": 1,

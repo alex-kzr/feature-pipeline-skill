@@ -6,7 +6,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from schemas import Profile, SchemaError, TaskRoute
+from feature_pipeline.contracts import Profile, SchemaError, TaskRoute
 
 
 @dataclass(frozen=True)

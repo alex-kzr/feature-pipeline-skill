@@ -40,7 +40,7 @@ from pipeline_core.verification import (
     missing_command_evidence,
     verifier_evidence_payload,
 )
-from schemas.contracts import CommandSpec
+from feature_pipeline.contracts import CommandSpec
 
 
 def _run(root: Path) -> Run:

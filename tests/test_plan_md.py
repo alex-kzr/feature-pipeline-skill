@@ -24,8 +24,7 @@ from pipeline_core.plan_md import (
     load_markdown_plan_specs,
 )
 from pipeline_core.task_files import TaskDefaults
-from schemas import SchemaError
-from schemas.contracts import CommandSpec
+from feature_pipeline.contracts import CommandSpec, SchemaError
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 

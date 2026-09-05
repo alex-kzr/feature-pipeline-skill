@@ -12,7 +12,8 @@ What it proves (PKG-03 acceptance criteria):
 * **AC-1** — ``uv build --wheel`` produces a wheel that ``uv pip install`` puts into a
   throwaway environment, and the ``feature-pipeline`` console command then starts from an
   unrelated working directory with **no source-tree path injection** (the installed
-  ``pipeline_core`` / ``schemas`` / ``feature_pipeline`` resolve from ``site-packages``).
+  ``pipeline_core`` / ``feature_pipeline`` resolve from ``site-packages``). The historical
+  ``schemas`` compatibility shim was removed in DOC-02 and is no longer part of this check.
 * **AC-2** — the same isolated-install contract is what CI runs on Windows and Linux; the
   supported matrix is :data:`SUPPORTED_MATRIX` and the CI job at
   :data:`CI_WORKFLOW` reads it.
@@ -64,8 +65,8 @@ def redact(text: str) -> str:
 #: The console command the wheel installs (``pyproject.toml`` ``[project.scripts]``).
 CONSOLE_COMMAND = "feature-pipeline"
 
-#: The three import namespaces a correct wheel makes available without the source tree.
-INSTALLED_NAMESPACES = ("pipeline_core", "schemas", "feature_pipeline")
+#: The import namespaces a correct wheel makes available without the source tree.
+INSTALLED_NAMESPACES = ("pipeline_core", "feature_pipeline")
 
 _PUSH_DENIED_MESSAGE = "push is denied at this stage and the runner has no push code path."
 
@@ -190,9 +191,9 @@ def collect_evidence() -> AcceptanceEvidence:
 
         # AC-1 — the shipped namespaces import from site-packages, not the checkout.
         probe = (
-            "import json, pipeline_core, schemas, feature_pipeline; "
+            "import json, pipeline_core, feature_pipeline; "
             "print(json.dumps({n: getattr(__import__(n), '__file__', '') "
-            "for n in ['pipeline_core', 'schemas', 'feature_pipeline']}))"
+            "for n in ['pipeline_core', 'feature_pipeline']}))"
         )
         done = _run([str(python), "-I", "-c", probe], cwd=elsewhere)
         located = json.loads(done.stdout or "{}") if done.returncode == 0 else {}

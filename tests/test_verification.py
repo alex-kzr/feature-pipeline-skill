@@ -40,7 +40,7 @@ from pipeline_core.verification import (
     missing_command_evidence,
     orchestrate_verification,
 )
-from schemas.contracts import TaskSpec
+from feature_pipeline.contracts import TaskSpec
 
 ANCHORS = VerifierAnchors(project_root="/repo", agents_root="/repo/.agents")
 

@@ -110,8 +110,6 @@ class PublicApiSurfaceTests(unittest.TestCase):
         )
         self.assertIsNotNone(sentence, "could not find the documented export-list sentence")
         documented = set(re.findall(r"`(\w+)`", sentence.group(1)))
-        # `schemas` is called out separately as a compatibility shim, not part of this list.
-        documented.discard("schemas")
         for name in documented:
             self.assertIn(name, feature_pipeline.__all__,
                            f"documented export {name!r} missing from feature_pipeline.__all__")

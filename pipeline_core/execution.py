@@ -57,7 +57,7 @@ from feature_pipeline.domain.stages import (
     compile_stage_sequence,
 )
 from feature_pipeline.domain.vocabulary import StageId
-from schemas.contracts import TaskSpec
+from feature_pipeline.contracts import TaskSpec
 
 from .adapter_resolution import (
     AdapterResolution,

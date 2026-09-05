@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Sequence
 
-from schemas import Profile, SchemaError, ensure_no_role_escalation
+from feature_pipeline.contracts import Profile, SchemaError, ensure_no_role_escalation
 
 
 VERIFIER_ROLES = frozenset({"task_verifier", "test_verifier"})

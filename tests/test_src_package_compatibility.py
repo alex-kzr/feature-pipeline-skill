@@ -3,20 +3,19 @@
 Plan: ``docs/plans/2026-09-03-feature-pipeline-refactor.md`` (Phase 1),
 ``docs/adr/002-installable-package-layout.md``.
 
-PKG-02 creates ``src/feature_pipeline`` and moves the colliding top-level ``schemas``
-namespace under it behind a temporary shim. These tests pin the contract of that move:
+PKG-02 created ``src/feature_pipeline`` and moved the colliding top-level ``schemas``
+namespace under it behind a temporary shim. DOC-02 removed that shim after its one
+deprecation window (``docs/adr/007-compatibility-and-versioning-policy.md`` §8); the
+historical-spelling assertions that used to live here moved to
+``tests/test_no_legacy_schemas_namespace.py``, which now pins the *absence* of the old
+namespace. What remains here:
 
 * AC-1 — ``import feature_pipeline`` / ``feature_pipeline.contracts`` resolve with **no**
   source-tree ``sys.path`` injection (the package is picked up from the editable install
   that ``uv run`` materialises), and the facade exposes an explicit ``__all__``.
-* AC-2 — every historical spelling still works: ``import schemas``,
-  ``from schemas import <name>`` and ``from schemas.contracts import <name>``. The shim
-  re-exports the *same* objects (``schemas.X is feature_pipeline.contracts.X``), so the
-  "dual class identity" risk in the task file cannot occur. The ``scripts/run_pipeline.py``
-  launcher keeps its argv, exit codes and ``--push`` denial byte-for-byte.
-* AC-3 — the move is pure relocation: the public contract surface exported by the old
-  ``schemas`` package is exactly what ``feature_pipeline.contracts`` exports now, and no
-  fixture is touched.
+* AC-2 — the ``scripts/run_pipeline.py`` launcher keeps its argv, exit codes and ``--push``
+  denial byte-for-byte.
+* AC-3 — the move is pure relocation: no fixture is touched.
 
 Standard library only.
 """
@@ -31,8 +30,8 @@ from pathlib import Path
 
 _CORE_ROOT = Path(__file__).resolve().parents[1]
 
-# The curated public surface the pre-move ``schemas/__init__.py`` exported. The move may
-# not drop or add a name (AC-3).
+# The curated public surface the pre-move ``schemas/__init__.py`` exported, and that
+# ``feature_pipeline.contracts`` must still expose now that it is the only spelling.
 _HISTORICAL_SCHEMAS_ALL = {
     "AcceptanceCriterionSpec", "CommandSpec", "LogicalPaths", "Profile", "ProfileRegistry",
     "RunState", "SchemaError", "TaskMetadata", "TaskRoute", "TaskSpec", "ToolStage",
@@ -40,8 +39,8 @@ _HISTORICAL_SCHEMAS_ALL = {
     "validate_relative_path",
 }
 
-# Names imported from ``schemas.contracts`` by current call sites that are *not* in the
-# curated ``__all__`` — the module-level shim must keep exposing them too.
+# Names imported from ``schemas.contracts`` by former call sites that are *not* in the
+# curated ``__all__`` — ``feature_pipeline.contracts`` must keep exposing them too.
 _CONTRACTS_EXTRA_NAMES = {"DIFF_POLICIES", "TASK_TYPES", "SCHEMA_VERSION"}
 
 
@@ -89,45 +88,6 @@ class NewPackageImports(unittest.TestCase):
             self.assertTrue(hasattr(contracts, name), f"feature_pipeline.contracts lost {name}")
 
 
-class HistoricalImportCompatibility(unittest.TestCase):
-    """AC-2 — the pre-move spellings keep working and resolve to the same objects."""
-
-    def test_top_level_schemas_still_imports(self) -> None:
-        import schemas  # noqa: F401
-
-    def test_from_schemas_import_names(self) -> None:
-        from schemas import Profile, SchemaError, load_profile  # noqa: F401
-
-    def test_from_schemas_contracts_import_names(self) -> None:
-        from schemas.contracts import DIFF_POLICIES, TASK_TYPES, TaskSpec  # noqa: F401
-
-    def test_shim_reexports_identical_objects(self) -> None:
-        import feature_pipeline.contracts as canonical
-        import schemas
-        from schemas import contracts as shim_contracts
-
-        self.assertIs(schemas.Profile, canonical.Profile)
-        self.assertIs(schemas.SchemaError, canonical.SchemaError)
-        self.assertIs(shim_contracts.TaskSpec, canonical.TaskSpec)
-        self.assertIs(shim_contracts.DIFF_POLICIES, canonical.DIFF_POLICIES)
-
-    def test_no_duplicate_class_identity(self) -> None:
-        # The task file's risk: "Dual import paths can create distinct class identities if
-        # shims duplicate modules." The shim re-exports objects, it does not redefine them,
-        # so an object built through one spelling is an instance of the class named by the
-        # other.
-        import feature_pipeline.contracts as canonical
-        from schemas.contracts import SchemaError as ShimSchemaError
-
-        self.assertIs(ShimSchemaError, canonical.SchemaError)
-        raised = None
-        try:
-            canonical.validate_relative_path("/abs", "field")
-        except canonical.SchemaError as exc:  # built by the canonical module
-            raised = exc
-        self.assertIsInstance(raised, ShimSchemaError)  # caught by the shim's name
-
-
 class LauncherCompatibility(unittest.TestCase):
     """AC-2 — scripts/run_pipeline.py keeps its argv / exit / denial behaviour."""
 
@@ -159,17 +119,6 @@ class LauncherCompatibility(unittest.TestCase):
 
 class MoveIsPureRelocation(unittest.TestCase):
     """AC-3 — no public contract or fixture change is hidden in the move."""
-
-    def test_public_surface_matches_the_pre_move_schemas_all(self) -> None:
-        import feature_pipeline.contracts as contracts
-        import schemas
-
-        self.assertEqual(
-            set(schemas.__all__), _HISTORICAL_SCHEMAS_ALL,
-            "the schemas shim must re-export exactly the pre-move public surface",
-        )
-        for name in _HISTORICAL_SCHEMAS_ALL:
-            self.assertIs(getattr(schemas, name), getattr(contracts, name))
 
     def test_fixture_tree_untouched(self) -> None:
         # The PKG-02 move must not modify or delete any pre-existing fixture. Later tasks

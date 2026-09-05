@@ -8,8 +8,8 @@ it into a throwaway ``uv`` environment, and invoke the ``feature-pipeline`` cons
 and ``python -m unittest`` discovery from an unrelated working directory:
 
 * **AC-1** — the wheel installs and the console command starts with no source-tree path
-  injection (``pipeline_core`` / ``schemas`` / ``feature_pipeline`` resolve from
-  ``site-packages``).
+  injection (``pipeline_core`` / ``feature_pipeline`` resolve from ``site-packages``; the
+  historical ``schemas`` compatibility shim was removed in DOC-02).
 * **AC-2** — a Windows job and a Linux job run the *same* isolated-install contract; the
   supported matrix lives in one place (:data:`installed_wheel.SUPPORTED_MATRIX`) and the
   committed workflow reads it.

@@ -29,8 +29,7 @@ import unittest
 from dataclasses import fields, replace
 from pathlib import Path
 
-from schemas import SchemaError
-from schemas.contracts import TaskSpec
+from feature_pipeline.contracts import SchemaError, TaskSpec
 
 from feature_pipeline.application import task_engine as task_engine_mod
 from feature_pipeline.application import verification_service as verification_service_mod

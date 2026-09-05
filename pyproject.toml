@@ -1,9 +1,11 @@
 # Packaging and quality contract for the portable feature-pipeline core.
 #
 # PKG-01 (docs/plans/tasks/PKG-01_package-quality-configuration.md) declares the build,
-# Python, CLI, and development-tool contract WITHOUT moving any implementation. Source still
-# lives in the flat `pipeline_core/` and `schemas/` packages; docs/adr/002 moves them under
-# `src/feature_pipeline/` in PKG-02 behind a compatibility facade.
+# Python, CLI, and development-tool contract WITHOUT moving any implementation. docs/adr/002
+# moved the top-level `schemas` package under `src/feature_pipeline/` in PKG-02 behind a
+# compatibility facade; DOC-02 removed that facade after its one deprecation window
+# (docs/adr/007). `pipeline_core/` remains the flat implementation package, migrating one
+# group at a time.
 #
 # Runtime import graph: standard library only (docs/adr/003). Everything below `dev` is
 # development/CI tooling and is never imported by `scripts/run_pipeline.py`.
@@ -48,20 +50,20 @@ Documentation = "https://example.invalid/feature-pipeline/docs/agents/README.md"
 
 [tool.hatch.build.targets.wheel]
 # PKG-02 (docs/adr/002): the migration target `src/feature_pipeline` is the canonical
-# package; `pipeline_core` (implementation, migrating one group at a time) and the `schemas`
-# import shim (one deprecation window, docs/adr/007) ship alongside it until Phase 12.
-packages = ["src/feature_pipeline", "pipeline_core", "schemas"]
+# package; `pipeline_core` (implementation, migrating one group at a time) ships alongside
+# it. The `schemas` import shim shipped only through Phase 12; DOC-02 dropped it.
+packages = ["src/feature_pipeline", "pipeline_core"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src", "pipeline_core", "schemas", "scripts", "templates", "roles", "reports", "README.md", "SKILL.md"]
+include = ["src", "pipeline_core", "scripts", "templates", "roles", "reports", "README.md", "SKILL.md"]
 
 # --------------------------------------------------------------------------------------------
 # Ruff — explicit rule set with a NAMED baseline (AC-2).
 #
 # `select` is the enforced set: a new violation of any of these rules fails the build now.
-# `ignore` is the pre-existing debt in `pipeline_core/` and `schemas/`, which PKG-01 may not
-# touch (Allowed scope; docs/adr/002). Each ignored code is cleared by the Phase task that
-# owns the module — this commit does no reformatting or `--fix` (PKG-01 Risks note).
+# `ignore` is the pre-existing debt in `pipeline_core/`, which PKG-01 may not touch (Allowed
+# scope; docs/adr/002). Each ignored code is cleared by the Phase task that owns the module —
+# this commit does no reformatting or `--fix` (PKG-01 Risks note).
 # --------------------------------------------------------------------------------------------
 [tool.ruff]
 target-version = "py311"
@@ -126,7 +128,7 @@ max-complexity = 28
 # --------------------------------------------------------------------------------------------
 [tool.mypy]
 python_version = "3.11"
-files = ["src/feature_pipeline", "pipeline_core", "schemas"]
+files = ["src/feature_pipeline", "pipeline_core"]
 mypy_path = "src"
 namespace_packages = true
 explicit_package_bases = true
@@ -158,9 +160,6 @@ module = [
     # Relocated by PKG-02 from the top-level `schemas.contracts`; same code, same debt,
     # cleared with the rest of the contracts work in DF-01.
     "feature_pipeline.contracts",
-    # The `schemas.*` deprecation shim (re-exports only); dropped whole in DOC-02.
-    "schemas",
-    "schemas.contracts",
     # QG-02: newly surfaced by widening the strict override below to application/infrastructure
     # (first time mypy has run in CI); each is a genuine pre-existing error, not something QG-02
     # introduced or may fix (`src/feature_pipeline/**` Out of scope). One follow-up task per pair.
@@ -205,7 +204,7 @@ no_implicit_optional = true
 [tool.coverage.run]
 branch = true
 command_line = "-m unittest discover -s tests -t ."
-source = ["feature_pipeline", "pipeline_core", "schemas"]
+source = ["feature_pipeline", "pipeline_core"]
 omit = [
     "fixtures/*",
     "tests/*",
@@ -223,6 +222,9 @@ omit = [
 # 88 -> 90, keeping the same 2-point margin below measured rather than pinning to today's exact
 # number — this is CI's first run of `coverage`/`ruff`/`mypy` (AC-1), and the margin is deliberate
 # headroom against ordinary test-to-test variance, not slack to burn down.
+#
+# DOC-02 removed the `schemas` shim package from the source set; its lines were re-exports
+# only, so the measured floor is left as-is rather than nudged for a coverage-neutral deletion.
 fail_under = 90
 show_missing = true
 exclude_lines = [

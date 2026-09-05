@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from schemas.contracts import TaskSpec
+from feature_pipeline.contracts import TaskSpec
 
 from pipeline_core.commands import run_verification_commands, verification_stage
 from pipeline_core.state import Run

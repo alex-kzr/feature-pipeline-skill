@@ -48,7 +48,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
-from schemas import SchemaError, ToolStage
+from feature_pipeline.contracts import SchemaError, ToolStage
 
 from .integrations import GraphifyIntegration
 from .lifecycle import RunLifecycle

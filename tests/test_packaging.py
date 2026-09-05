@@ -167,7 +167,9 @@ class MypyBaseline(unittest.TestCase):
     def test_checked_paths_are_declared(self) -> None:
         files = " ".join(self.mypy.get("files", []))
         self.assertIn("pipeline_core", files)
-        self.assertIn("schemas", files)
+        self.assertIn("feature_pipeline", files)
+        # DOC-02 removed the `schemas` shim package; it must not reappear in the checked set.
+        self.assertNotIn("schemas", files)
 
     def test_known_debt_modules_are_parked_by_name(self) -> None:
         overrides = self.mypy.get("overrides", [])

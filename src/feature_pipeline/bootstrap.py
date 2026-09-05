@@ -25,8 +25,7 @@ from feature_pipeline.ports.adapters import (
     AdapterCapabilities,
     AdapterRegistry,
 )
-from schemas import SchemaError
-from schemas.contracts import TaskSpec
+from feature_pipeline.contracts import SchemaError, TaskSpec
 
 from pipeline_core.adapters import Adapter, ClaudeAdapter, CodexAdapter
 from pipeline_core.execution import (

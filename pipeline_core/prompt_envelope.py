@@ -1,6 +1,7 @@
 """Build the Standard Subagent Prompt Envelope for one executor launch.
 
-Every field is filled verbatim from the normalized :class:`~schemas.contracts.TaskSpec` plus
+Every field is filled verbatim from the normalized :class:`~feature_pipeline.contracts.TaskSpec`
+plus
 the explicit repository anchors, the execution mode, the plan/task/kanban paths, the composed
 role grant, and the report path the runner will read back. A fresh executor has no memory of
 the orchestrating session, so nothing needed to execute the task is left implicit.
@@ -13,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence
 
-from schemas.contracts import TaskSpec
+from feature_pipeline.contracts import TaskSpec
 
 EXECUTOR_ROLE = "executor"
 

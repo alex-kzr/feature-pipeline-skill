@@ -24,7 +24,7 @@ from tempfile import TemporaryDirectory
 from pipeline_core import runner_cli
 from pipeline_core.profiles import Anchors, resolve_route
 from pipeline_core.project_profile import load_runnable_profile
-from schemas import SchemaError
+from feature_pipeline.contracts import SchemaError
 
 ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = ROOT.parent

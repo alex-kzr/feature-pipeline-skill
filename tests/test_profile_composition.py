@@ -10,7 +10,7 @@ import unittest
 
 from pipeline_core.profiles import Anchors, resolve_paths, resolve_route
 from pipeline_core.roles import compose_role
-from schemas import Profile, SchemaError
+from feature_pipeline.contracts import Profile, SchemaError
 
 
 def profile_data() -> dict[str, object]:

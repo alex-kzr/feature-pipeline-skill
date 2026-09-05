@@ -41,7 +41,7 @@ from feature_pipeline.ports.diagnostics import RepositorySnapshot
 from pipeline_core import execution as execution_mod
 from pipeline_core.lifecycle import RunLifecycle
 from pipeline_core.state import ACTOR_RUNNER, Run
-from schemas.contracts import TaskSpec
+from feature_pipeline.contracts import TaskSpec
 
 
 def _spec(**overrides: object) -> TaskSpec:

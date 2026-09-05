@@ -37,8 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from schemas import SchemaError, validate_relative_path
-from schemas.contracts import CommandSpec
+from feature_pipeline.contracts import CommandSpec, SchemaError, validate_relative_path
 
 from .commands import run_command
 from .state import EXIT_LAUNCH_FAILED, EXIT_NOT_FOUND, EXIT_TIMEOUT
@@ -98,7 +97,8 @@ def load_release_policy(path: str | Path) -> ReleasePolicy:
     """Read and validate ``release.json`` into a :class:`ReleasePolicy`.
 
     ``final_verification`` is a non-empty list of check names that must each be defined in the
-    sibling ``checks.json``; every other document shape raises :class:`schemas.SchemaError`.
+    sibling ``checks.json``; every other document shape raises
+    :class:`feature_pipeline.contracts.SchemaError`.
     Propagates :class:`FileNotFoundError` / :class:`json.JSONDecodeError` for the caller.
     """
     config_path = Path(path)

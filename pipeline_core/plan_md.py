@@ -35,7 +35,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from schemas.contracts import TaskSpec
+from feature_pipeline.contracts import TaskSpec
 
 from .task_files import TaskDefaults, load_task_spec
 

@@ -59,7 +59,7 @@ from feature_pipeline.application.results import Outcome, PipelineResult
 from feature_pipeline.application.selection import SelectionError, resolve_selection
 from feature_pipeline.domain.errors import DomainError
 from feature_pipeline.domain.graph import TaskGraph
-from schemas import SchemaError, validate_relative_path
+from feature_pipeline.contracts import SchemaError, validate_relative_path
 
 from .commands import RunCommand
 from .errors import CliError

@@ -29,7 +29,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from schemas.contracts import TaskSpec
+from feature_pipeline.contracts import TaskSpec
 
 from .adapters import (
     Adapter,

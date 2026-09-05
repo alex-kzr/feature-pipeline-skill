@@ -1,4 +1,4 @@
-"""Bridge a native ``schemas.Profile`` into the typed compiler inputs (CP-02).
+"""Bridge a native ``feature_pipeline.contracts.Profile`` into the typed compiler inputs (CP-02).
 
 CP-01's :func:`feature_pipeline.application.compile_plan.compile_run_plan` consumes a
 :class:`feature_pipeline.inputs.profile.CompiledProfile`, which parses the *generated*
@@ -70,7 +70,8 @@ def route_reasons(profile: Profile, task_types: Iterable[str]) -> dict[str, str]
 
 
 def compiled_profile_from_core(profile: Profile) -> CompiledProfile:
-    """Map a native ``schemas.Profile`` (with a closed registry) to a :class:`CompiledProfile`.
+    """Map a native ``feature_pipeline.contracts.Profile`` (with a closed registry) to a
+    :class:`CompiledProfile`.
 
     Every declared task type becomes a :class:`RoutePolicy` carrying that route's own stack,
     working root, subagents and check names; every registry check becomes a

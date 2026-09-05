@@ -7,7 +7,7 @@ from tempfile import TemporaryDirectory
 import json
 import unittest
 
-from schemas import (
+from feature_pipeline.contracts import (
     Profile,
     RunState,
     SchemaError,

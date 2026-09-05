@@ -29,7 +29,7 @@ from pipeline_core.lifecycle import RunLifecycle
 from pipeline_core.prompt_envelope import EnvelopeAnchors
 from pipeline_core.state import ACTOR_RUNNER, Run, pid_alive
 from pipeline_core.verification import VerifierAnchors, VerifierLaunchers
-from schemas.contracts import TaskSpec
+from feature_pipeline.contracts import TaskSpec
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "execution"
 if str(FIXTURES) not in sys.path:

@@ -15,7 +15,7 @@ from pipeline_core.stages import (
     run_tool_stage,
 )
 from pipeline_core.state import EXIT_NOT_FOUND, Run
-from schemas import SchemaError, ToolStage
+from feature_pipeline.contracts import SchemaError, ToolStage
 
 
 def _run(root: Path) -> Run:

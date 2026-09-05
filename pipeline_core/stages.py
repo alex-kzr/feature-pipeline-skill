@@ -1,6 +1,6 @@
 """Generic deterministic stages driven entirely by project-declared data.
 
-A stage is described by a :class:`schemas.ToolStage`: an argv, the logical paths it needs
+A stage is described by a :class:`feature_pipeline.contracts.ToolStage`: an argv, the logical paths it needs
 present before it runs (``prerequisites``), the logical paths it must produce (``outputs``), an
 optional timeout, and a ``diff_policy``. :func:`run_tool_stage` executes that description the
 same way for every project — there is no branch on project identity, tool name, or route here.
@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
 
-from schemas import SchemaError, ToolStage
+from feature_pipeline.contracts import SchemaError, ToolStage
 
 from .commands import run_command
 from .state import EXIT_NOT_FOUND, EXIT_TIMEOUT, Run
@@ -123,7 +123,7 @@ def run_tool_stage(
 def plan_release_dry_run(stages: Sequence[ToolStage], root: str | Path) -> tuple[PlannedCommand, ...]:
     """Resolve declared release steps to planned commands without executing anything.
 
-    Raises :class:`schemas.SchemaError` if a step would plan a mutating verb — a dry run that
+    Raises :class:`feature_pipeline.contracts.SchemaError` if a step would plan a mutating verb — a dry run that
     could push or commit is not a dry run.
     """
     base = Path(root)

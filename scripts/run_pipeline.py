@@ -15,10 +15,10 @@ import sys
 from pathlib import Path
 
 # Thin compatibility launcher (docs/adr/002): make the core importable whether or not the
-# `feature-pipeline` package is installed. `parents[1]` carries the flat `pipeline_core` /
-# `schemas` packages; `parents[1]/src` carries the migration-target `feature_pipeline`
-# namespace the `schemas` shim now re-exports from. Both entries are dropped once the
-# migration finishes and every caller runs from the installed distribution.
+# `feature-pipeline` package is installed. `parents[1]` carries the flat `pipeline_core`
+# package; `parents[1]/src` carries the migration-target `feature_pipeline` namespace (the
+# `schemas` shim it once re-exported from was removed in DOC-02). Both entries are dropped
+# once the migration finishes and every caller runs from the installed distribution.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 

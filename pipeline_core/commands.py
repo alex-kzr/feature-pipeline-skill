@@ -227,7 +227,8 @@ def verification_stage(task_id: str, *, attempt: int | None = None) -> str:
 
 
 def _declared_cwd_argv(command: object) -> tuple[str, tuple[str, ...]]:
-    """Read ``(cwd, argv)`` from a :class:`~schemas.contracts.CommandSpec` or a plain mapping."""
+    """Read ``(cwd, argv)`` from a :class:`~feature_pipeline.contracts.CommandSpec` or a plain
+    mapping."""
     cwd = getattr(command, "cwd", None)
     argv = getattr(command, "argv", None)
     if argv is None and isinstance(command, Mapping):

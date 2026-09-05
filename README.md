@@ -25,7 +25,8 @@ deferred.
   mutates domain state or launches a process itself), and `renderers.py` (pure text rendering).
   See the package docstring for the full contract.
 - `scripts/` — portable command-line entry points.
-- `roles/`, `reports/`, and `schemas/` — versioned core contracts.
+- `roles/` and `reports/` — versioned core contracts. Project-neutral schema contracts live at
+  `src/feature_pipeline/contracts.py` (the top-level `schemas/` shim was removed in DOC-02).
 - `templates/` — portable core templates.
 - `tests/` — core test suite; see [`tests/README.md`](tests/README.md) for the per-concern
   suite map (unit, contract, integration, installed-package, platform, fault-injection,

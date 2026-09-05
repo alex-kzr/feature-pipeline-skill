@@ -22,7 +22,7 @@ from pipeline_core.reports import (
     settle_executor_status,
 )
 from pipeline_core.state import ACTOR_EXECUTOR, ACTOR_RUNNER, Run, TransitionError
-from schemas.contracts import TaskSpec
+from feature_pipeline.contracts import TaskSpec
 
 
 # --- fixtures --------------------------------------------------------------------------------

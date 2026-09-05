@@ -1,7 +1,7 @@
 """Tests for the normalized execution task contract (EDF-01).
 
 Three layers:
-* the immutable ``CommandSpec`` / ``TaskSpec`` contracts in :mod:`schemas.contracts` and their
+* the immutable ``CommandSpec`` / ``TaskSpec`` contracts in :mod:`feature_pipeline.contracts` and their
   fail-closed validation;
 * :func:`pipeline_core.task_files.load_task_spec` — parsing a native Markdown task file's
   ``## Execution Metadata`` and ``## Acceptance Criteria`` blocks, and synthesising
@@ -18,8 +18,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from schemas import SchemaError
-from schemas.contracts import AcceptanceCriterionSpec, CommandSpec, TaskSpec
+from feature_pipeline.contracts import AcceptanceCriterionSpec, CommandSpec, SchemaError, TaskSpec
 
 from pipeline_core.legacy_adapter import adapt_task_spec
 from pipeline_core.task_files import (

@@ -1,6 +1,6 @@
 """One versioned project-profile boundary for the portable core runner.
 
-The portable core's internal model is :class:`schemas.Profile` (``version`` /
+The portable core's internal model is :class:`feature_pipeline.contracts.Profile` (``version`` /
 ``logical_paths`` / ``role_grants`` / ``stages`` / ``registry``). A repository that
 is configured by the ``feature-pipeline-project-setup`` skill instead carries a
 *project profile* — ``tools/feature-pipeline/config/pipeline.profile.json`` — whose
@@ -11,16 +11,17 @@ shape is the setup contract's ``schema_version`` document: explicit ``anchors``,
 exactly two inputs and nothing in between:
 
 * a **native core profile** (a top-level ``version``) — passed straight to
-  :meth:`schemas.Profile.from_data`, unchanged;
+  :meth:`feature_pipeline.contracts.Profile.from_data`, unchanged;
 * a **generated project profile** (a top-level ``schema_version``) — converted here,
-  once, to an equivalent :class:`schemas.Profile` so the generated file is directly
-  runnable.
+  once, to an equivalent :class:`feature_pipeline.contracts.Profile` so the generated file is
+  directly runnable.
 
 Every other file is rejected fail-closed: a document carrying both discriminators,
 neither, an unknown ``schema_version``, or a ``schema_version`` document missing a
-required generated key (a half-converted file) raises :class:`schemas.SchemaError`
-before any run artifact can be created. This mirrors the translation the setup
-skill's smoke harness documents, but as the real, tested core path.
+required generated key (a half-converted file) raises
+:class:`feature_pipeline.contracts.SchemaError` before any run artifact can be created. This
+mirrors the translation the setup skill's smoke harness documents, but as the real, tested
+core path.
 
 Standard library only.
 """
@@ -31,7 +32,7 @@ import json
 from pathlib import Path
 from typing import Any, Mapping
 
-from schemas import Profile, SchemaError
+from feature_pipeline.contracts import Profile, SchemaError
 
 #: The only project-profile ``schema_version`` this core understands. A different
 #: value is an unknown schema and is refused, never best-effort parsed.
@@ -51,9 +52,9 @@ _EXECUTOR = "executor"
 
 
 def load_runnable_profile(profile_path: Path) -> Profile:
-    """Load ``profile_path`` as a runnable :class:`schemas.Profile`.
+    """Load ``profile_path`` as a runnable :class:`feature_pipeline.contracts.Profile`.
 
-    Raises :class:`schemas.SchemaError` for an ambiguous, unknown-version, or
+    Raises :class:`feature_pipeline.contracts.SchemaError` for an ambiguous, unknown-version, or
     half-converted document. Propagates :class:`FileNotFoundError` and
     :class:`json.JSONDecodeError` for the caller to map to its own exit code.
     """

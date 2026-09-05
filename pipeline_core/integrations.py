@@ -9,7 +9,8 @@ require, which diff policy to enforce, and which ``graphify … install`` argvs 
 
 Loading is fail-closed: an unknown ``schema_version``, a missing ``graphify`` object, an
 unsafe path, an unknown ``diff_policy``, or a ``forbidden`` entry that is not actually a
-``graphify … install`` command all raise :class:`schemas.SchemaError` before any stage runs.
+``graphify … install`` command all raise :class:`feature_pipeline.contracts.SchemaError` before
+any stage runs.
 
 Standard library only.
 """
@@ -22,8 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from schemas import SchemaError, validate_relative_path
-from schemas.contracts import DIFF_POLICIES
+from feature_pipeline.contracts import DIFF_POLICIES, SchemaError, validate_relative_path
 
 #: The only ``schema_version`` this loader understands. A different value is an unknown schema
 #: and is refused, never best-effort parsed.
@@ -145,7 +145,8 @@ def load_graphify_integration(path: str | Path) -> GraphifyIntegration:
     """Read and validate ``integrations.json`` into a :class:`GraphifyIntegration`.
 
     Propagates :class:`FileNotFoundError` and :class:`json.JSONDecodeError` for the caller to
-    map to its own exit code; raises :class:`schemas.SchemaError` for a contract violation.
+    map to its own exit code; raises :class:`feature_pipeline.contracts.SchemaError` for a
+    contract violation.
     """
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     return GraphifyIntegration.from_data(raw)

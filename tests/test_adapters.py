@@ -34,7 +34,7 @@ from pipeline_core.adapter_resolution import (
 )
 from pipeline_core.roles import compose_role
 from pipeline_core.state import Run
-from schemas import Profile
+from feature_pipeline.contracts import Profile
 
 
 # --- fixtures --------------------------------------------------------------------------------

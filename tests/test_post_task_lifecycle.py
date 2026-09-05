@@ -23,7 +23,7 @@ from pipeline_core.post_task import (
 )
 from pipeline_core.release import ReleasePolicy
 from pipeline_core.state import ACTOR_EXECUTOR, ACTOR_RUNNER, Run
-from schemas.contracts import CommandSpec
+from feature_pipeline.contracts import CommandSpec
 
 _RELEASE_POLICY = ReleasePolicy(
     final_verification=(

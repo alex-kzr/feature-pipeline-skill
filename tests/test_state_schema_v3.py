@@ -33,7 +33,7 @@ from feature_pipeline.infrastructure.state import (
     load_state,
     migrate_v2_to_v3,
 )
-from schemas.contracts import SCHEMA_VERSION as CONTRACT_SCHEMA_VERSION
+from feature_pipeline.contracts import SCHEMA_VERSION as CONTRACT_SCHEMA_VERSION
 
 _FIXTURES = Path(__file__).resolve().parent.parent / "fixtures" / "state"
 _V2_FIXTURES = sorted((_FIXTURES / "v2").glob("*.json"))

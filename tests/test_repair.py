@@ -30,7 +30,7 @@ from pipeline_core.reports import (
 )
 from pipeline_core.state import ACTOR_RUNNER, Run
 from pipeline_core.verification import VerifierLaunchers
-from schemas.contracts import TaskSpec
+from feature_pipeline.contracts import TaskSpec
 
 from tests.support.builders import bounded_repair_spec, build_execution, initialize_run
 from tests.support.fakes import ENVELOPE_ANCHORS, ScriptedExecutor, StubVerifier, VERIFIER_ANCHORS

@@ -17,7 +17,7 @@ from pipeline_core.release import (
     release_plan_result,
 )
 from pipeline_core.state import EXIT_NOT_FOUND
-from schemas import SchemaError
+from feature_pipeline.contracts import SchemaError
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 

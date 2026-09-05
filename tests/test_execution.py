@@ -20,7 +20,7 @@ from pipeline_core.execution import ExecutionError, TaskExecution, run_task
 from pipeline_core.lifecycle import RunLifecycle
 from pipeline_core.state import Run
 from pipeline_core.task_files import render_blocker_entry, upsert_blockers_section
-from schemas.contracts import TaskSpec
+from feature_pipeline.contracts import TaskSpec
 
 from tests.support.builders import build_execution, initialize_run, narrow_blocker_spec
 from tests.support.fakes import ScriptedExecutor, StubVerifier

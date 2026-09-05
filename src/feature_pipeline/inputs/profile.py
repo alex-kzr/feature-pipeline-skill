@@ -3,7 +3,8 @@
 ``pipeline_core`` reads the generated project profile
 (``tools/feature-pipeline/config/pipeline.profile.json`` + its sibling ``checks.json``)
 through :func:`pipeline_core.project_profile.load_runnable_profile`, which *synthesises* a
-native :class:`schemas.Profile`. CP-01 instead parses the same document into small typed value
+native :class:`feature_pipeline.contracts.Profile`. CP-01 instead parses the same document into
+small typed value
 objects the plan compiler consumes directly, so route resolution lives in one place and every
 rejection is a :class:`~feature_pipeline.domain.errors.DomainError` raised before any run
 artifact exists.
