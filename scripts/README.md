@@ -2,6 +2,11 @@
 
 Command-line entry points for the portable core.
 
+For the complete command contract and a runnable invocation template, see
+[`../../docs/contracts/feature-pipeline.md`](../../docs/contracts/feature-pipeline.md).
+Migration and recovery procedures are in
+[`../../docs/migration/feature-pipeline-v3.md`](../../docs/migration/feature-pipeline-v3.md).
+
 Every entry point accepts explicit `project_root`, `agents_root`, and `core_root` anchors and
 never infers a project layout.
 

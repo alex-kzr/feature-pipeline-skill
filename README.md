@@ -3,6 +3,13 @@
 This independently versioned repository contains a portable, standard-library-only core for
 feature-pipeline orchestration.
 
+The authoritative user-facing documentation is maintained in the umbrella repository:
+[architecture](../docs/architecture/feature-pipeline.md),
+[contracts](../docs/contracts/feature-pipeline.md), and
+[v3 migration and recovery](../docs/migration/feature-pipeline-v3.md). This README is a
+concise implementation map; it does not promise a feature that the linked contracts mark as
+deferred.
+
 ## Layout
 
 - `pipeline_core/` — importable core package. `pipeline_core/runner_cli.py` is the public CLI
