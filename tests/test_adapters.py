@@ -214,6 +214,43 @@ class ClaudeArgvTests(unittest.TestCase):
 
 
 class CodexArgvTests(unittest.TestCase):
+    def test_write_launch_grants_only_the_external_root_named_by_allowed_scope(self) -> None:
+        adapter = CodexAdapter(
+            executable="codex",
+            working_root="C:/repo",
+            scope_roots=((".agents", "C:/agents"), ("shared-core", "C:/core")),
+        )
+
+        argv = adapter.plan(
+            _request(
+                "executor",
+                role_grant=("read", "write"),
+                allowed_scope=(".agents/skills/example/SKILL.md",),
+            )
+        )
+
+        self.assertEqual(
+            [argv[index + 1] for index, value in enumerate(argv) if value == "--add-dir"],
+            [str(Path("C:/agents/skills/example"))],
+        )
+
+    def test_read_only_launch_does_not_grant_external_roots(self) -> None:
+        adapter = CodexAdapter(
+            executable="codex",
+            working_root="C:/repo",
+            scope_roots=((".agents", "C:/agents"),),
+        )
+
+        argv = adapter.plan(
+            _request(
+                "task_verifier",
+                read_only=True,
+                allowed_scope=(".agents/skills/example/SKILL.md",),
+            )
+        )
+
+        self.assertNotIn("--add-dir", argv)
+
     def test_executor_argv_uses_exec_json_workspace_write_and_resolved_grants(self) -> None:
         argv = build_codex_argv(
             _request("executor", role_grant=("read", "run_checks", "write")),

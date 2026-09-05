@@ -236,6 +236,40 @@ def grant_tool_names(grant: Sequence[str]) -> tuple[str, ...]:
     return tuple(ordered)
 
 
+def scoped_add_dirs(
+    request: LaunchRequest,
+    scope_roots: Sequence[tuple[str, str | os.PathLike[str]]],
+) -> tuple[str, ...]:
+    """Return external write roots justified by this request's validated scope.
+
+    ``--add-dir`` widens Codex's workspace-write sandbox, so it is deliberately unavailable to
+    read-only roles.  Each configured root has a logical, project-relative prefix; only an
+    allowed-scope entry at or below that prefix can select it.
+    """
+    if request_is_read_only(request) or not set(effective_grant(request)) & WRITE_CAPABILITIES:
+        return ()
+    granted: list[str] = []
+    normalized_scope = tuple(entry.replace("\\", "/").strip("/") for entry in request.allowed_scope)
+    for logical_root, physical_root in scope_roots:
+        root = logical_root.replace("\\", "/").strip("/")
+        if not root or root.startswith("../") or Path(root).is_absolute():
+            raise AdapterError("external root has no safe logical scope", "unscoped-external-root")
+        for entry in normalized_scope:
+            if entry != root and not entry.startswith(f"{root}/"):
+                continue
+            suffix = entry.removeprefix(root).lstrip("/")
+            parts = tuple(part for part in suffix.split("/") if part)
+            wildcard = next(
+                (index for index, part in enumerate(parts) if "*" in part or "?" in part),
+                None,
+            )
+            safe_parts = parts[:wildcard] if wildcard is not None else parts[:-1]
+            directory = str(Path(physical_root).joinpath(*safe_parts))
+            if directory not in granted:
+                granted.append(directory)
+    return tuple(granted)
+
+
 # --- argv ----------------------------------------------------------------------------------------
 
 
@@ -644,7 +678,7 @@ class ClaudeAdapter:
         resolver: Callable[[], str | Sequence[str] | None] | None = None,
         runner: ProcessRunner | None = None,
         settings_path: str | os.PathLike[str] | None = None,
-        add_dirs: Sequence[str | os.PathLike[str]] = (),
+        scope_roots: Sequence[tuple[str, str | os.PathLike[str]]] = (),
         env: dict[str, str] | None = None,
         timeout: float = DEFAULT_TIMEOUT_S,
         working_root: str | os.PathLike[str] | None = None,
@@ -653,7 +687,7 @@ class ClaudeAdapter:
         self._resolver = resolver or (lambda: shutil.which("claude"))
         self._runner: ProcessRunner = runner or run_subprocess
         self._settings_path = settings_path
-        self._add_dirs = tuple(add_dirs)
+        self._scope_roots = tuple(scope_roots)
         self._env = env
         self._timeout = timeout
         self._working_root = Path(working_root) if working_root is not None else None
@@ -672,7 +706,7 @@ class ClaudeAdapter:
         executable = self.resolved_executable() or "claude"
         return build_claude_argv(
             request, executable=executable,
-            settings_path=self._settings_path, add_dirs=self._add_dirs,
+            settings_path=self._settings_path, add_dirs=self._add_dirs_for(request),
         )
 
     def launch(self, request: LaunchRequest) -> LaunchResult:
@@ -683,7 +717,7 @@ class ClaudeAdapter:
             )
         argv = build_claude_argv(
             request, executable=executable,
-            settings_path=self._settings_path, add_dirs=self._add_dirs,
+            settings_path=self._settings_path, add_dirs=self._add_dirs_for(request),
         )
         completed = self._runner(
             argv,
@@ -712,6 +746,9 @@ class ClaudeAdapter:
             return Path(working_root)
         return None
 
+    def _add_dirs_for(self, request: LaunchRequest) -> tuple[str, ...]:
+        return scoped_add_dirs(request, self._scope_roots)
+
 
 class CodexAdapter:
     """Adapter over the non-interactive ``codex exec`` CLI."""
@@ -728,7 +765,7 @@ class CodexAdapter:
         executable: str | Sequence[str] | None = None,
         resolver: Callable[[], str | Sequence[str] | None] | None = None,
         runner: ProcessRunner | None = None,
-        add_dirs: Sequence[str | os.PathLike[str]] = (),
+        scope_roots: Sequence[tuple[str, str | os.PathLike[str]]] = (),
         env: dict[str, str] | None = None,
         timeout: float = DEFAULT_TIMEOUT_S,
         working_root: str | os.PathLike[str] | None = None,
@@ -736,7 +773,7 @@ class CodexAdapter:
         self._executable = executable
         self._resolver = resolver or (lambda: shutil.which("codex"))
         self._runner: ProcessRunner = runner or run_codex_subprocess
-        self._add_dirs = tuple(add_dirs)
+        self._scope_roots = tuple(scope_roots)
         self._env = env
         self._timeout = timeout
         self._working_root = Path(working_root) if working_root is not None else None
@@ -753,7 +790,7 @@ class CodexAdapter:
             request,
             executable=executable,
             working_root=self._cwd_for(request),
-            add_dirs=self._add_dirs,
+            add_dirs=self._add_dirs_for(request),
         )
 
     def launch(self, request: LaunchRequest) -> LaunchResult:
@@ -765,7 +802,7 @@ class CodexAdapter:
                 request,
                 executable=executable,
                 working_root=self._cwd_for(request),
-                add_dirs=self._add_dirs,
+                add_dirs=self._add_dirs_for(request),
             ),
             prompt=request.prompt,
             cwd=self._cwd_for(request),
@@ -788,3 +825,6 @@ class CodexAdapter:
         if working_root != ".":
             return Path(working_root)
         return None
+
+    def _add_dirs_for(self, request: LaunchRequest) -> tuple[str, ...]:
+        return scoped_add_dirs(request, self._scope_roots)

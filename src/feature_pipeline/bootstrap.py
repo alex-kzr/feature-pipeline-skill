@@ -69,7 +69,7 @@ class AdapterRuntime:
     project_dir: Path
     agents_root: Path
     core_root: Path
-    add_dirs: tuple[Path, ...]
+    scope_roots: tuple[tuple[str, Path], ...]
 
 
 @dataclass(frozen=True)
@@ -102,6 +102,7 @@ class BootstrapComposition:
     project_dir: Path
     agents_root: Path
     core_root: Path
+    logical_scope_roots: tuple[tuple[str, str], ...]
     factories: tuple[AdapterFactory, ...]
     adapter_registry: AdapterRegistry
 
@@ -114,7 +115,12 @@ class BootstrapComposition:
             project_dir=self.project_dir,
             agents_root=self.agents_root,
             core_root=self.core_root,
-            add_dirs=resolve_add_dirs(self.project_dir, self.agents_root, self.core_root),
+            scope_roots=resolve_scope_roots(
+                self.project_dir,
+                self.agents_root,
+                self.core_root,
+                dict(self.logical_scope_roots),
+            ),
         )
         factory = next(factory for factory in self.factories if factory.name == resolved.name)
         executor = factory.create(runtime)
@@ -133,7 +139,7 @@ def codex_factory(
         return CodexAdapter(
             resolver=resolver,
             working_root=runtime.project_dir,
-            add_dirs=runtime.add_dirs,
+            scope_roots=runtime.scope_roots,
         )
 
     def codex_available() -> bool:
@@ -153,7 +159,7 @@ def _production_factories() -> tuple[AdapterFactory, ...]:
     def create_claude(runtime: AdapterRuntime) -> ClaudeAdapter:
         return ClaudeAdapter(
             working_root=str(runtime.project_dir),
-            add_dirs=runtime.add_dirs,
+            scope_roots=runtime.scope_roots,
         )
 
     def claude_available() -> bool:
@@ -177,12 +183,16 @@ def build_bootstrap(
     agents_root: Path,
     core_root: Path,
     factories: Sequence[AdapterFactory] | None = None,
+    *,
+    logical_paths: Mapping[str, str] | None = None,
 ) -> BootstrapComposition:
     registered_factories = tuple(factories) if factories is not None else _production_factories()
+    paths = logical_paths or {"agents": ".agents", "core": "core"}
     return BootstrapComposition(
         Path(project_dir),
         Path(agents_root),
         Path(core_root),
+        tuple((name, paths[name]) for name in ("agents", "core")),
         registered_factories,
         AdapterRegistry(tuple(factory.capabilities() for factory in registered_factories)),
     )
@@ -326,6 +336,29 @@ def resolve_add_dirs(project_dir: Path, *anchors: Path) -> tuple[Path, ...]:
     return tuple(granted)
 
 
+def resolve_scope_roots(
+    project_dir: Path,
+    agents_root: Path,
+    core_root: Path,
+    logical_paths: Mapping[str, str],
+) -> tuple[tuple[str, Path], ...]:
+    """Map external runtime anchors to the logical roots task scopes may name.
+
+    Roots already inside the project workspace need no ``--add-dir`` grant.  The retained
+    logical names are explicit adapter capabilities, rather than a list of directories handed
+    to every role.
+    """
+    external = resolve_add_dirs(project_dir, agents_root, core_root)
+    by_path = {path.resolve(): path for path in external}
+    roots: list[tuple[str, Path]] = []
+    for name, physical in (("agents", agents_root), ("core", core_root)):
+        logical = logical_paths[name]
+        resolved = Path(physical).resolve()
+        if resolved in by_path:
+            roots.append((logical, by_path[resolved]))
+    return tuple(roots)
+
+
 def make_execute_adapters(
     project_dir: Path,
     agents_root: Path,
@@ -378,7 +411,15 @@ def run_execute(
         bad = ", ".join(f"{t} ({r})" for t, r in sorted(reason_by_type.items()))
         raise CliError(EXIT_ERROR, f"execute mode: unroutable task type(s): {bad}")
 
-    composition = build_bootstrap(project_dir, agents_root, anchors.core_root)
+    composition = build_bootstrap(
+        project_dir,
+        agents_root,
+        anchors.core_root,
+        logical_paths={
+            "agents": profile.logical_paths.agents,
+            "core": profile.logical_paths.core,
+        },
+    )
     executor = None
     launchers = None
     environment = None
@@ -498,6 +539,7 @@ __all__ = [
     "parse_attestations",
     "project_relative",
     "resolve_add_dirs",
+    "resolve_scope_roots",
     "resolve_attested_dependency_ids",
     "run_execute",
 ]

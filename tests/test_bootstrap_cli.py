@@ -128,6 +128,39 @@ class CliBootstrapBoundaryTests(unittest.TestCase):
             self.assertEqual(environment, {"claude": True, "codex": False})
             self.assertEqual(seen_runtime[0].project_dir, root)
             self.assertEqual(seen_runtime[0].core_root, root / "core")
+            self.assertEqual(
+                seen_runtime[0].scope_roots,
+                (),
+            )
+
+    def test_bootstrap_uses_profile_logical_paths_for_external_scope_roots(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory) / "project"
+            agents_root = Path(directory) / "agents"
+            core_root = Path(directory) / "core"
+            seen_runtime: list[AdapterRuntime] = []
+
+            composition = build_bootstrap(
+                root,
+                agents_root,
+                core_root,
+                (AdapterFactory(
+                    name="claude",
+                    create=lambda runtime: seen_runtime.append(runtime) or FakeAdapter(),
+                    available=lambda: True,
+                    supports_resume=True,
+                    supports_read_only=True,
+                    supports_write=True,
+                ),),
+                logical_paths={"agents": "shared/agents", "core": "shared/core"},
+            )
+
+            composition.make_execute_adapters()
+
+        self.assertEqual(
+            seen_runtime[0].scope_roots,
+            (("shared/agents", agents_root.resolve()), ("shared/core", core_root.resolve())),
+        )
 
     def test_bootstrap_reuses_one_registry_for_compile_and_adapter_creation(self) -> None:
         with TemporaryDirectory() as directory:
