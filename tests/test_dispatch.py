@@ -443,6 +443,40 @@ class StatusSettlementTests(unittest.TestCase):
 
 
 class RecoveryEvidenceTests(unittest.TestCase):
+    def test_reverse_diff_evidence_is_satisfied_in_the_executor_envelope(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "recover.txt"
+            target.write_bytes(b"original bytes\n")
+            spec = _spec(
+                allowed_scope=("recover.txt",),
+                runner_evidence="reverse-diff-and-restore",
+            )
+            life = _running_life(root, spec)
+            adapter = ScriptedAdapter()
+
+            dispatch_executor(life, _request(spec), adapter)
+
+            prompt = adapter.calls[0]["prompt"]
+            self.assertIn(
+                "- Runner evidence: satisfied — reverse-diff-and-restore completed by the runner.",
+                prompt,
+            )
+            self.assertIn(
+                "- This evidence is runner-owned; do not write any run artifacts.", prompt)
+            self.assertNotIn(str(root), prompt)
+
+    def test_no_runner_evidence_does_not_invent_an_envelope_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = _spec()
+            life = _running_life(root, spec)
+            adapter = ScriptedAdapter()
+
+            dispatch_executor(life, _request(spec), adapter)
+
+            self.assertNotIn("Runner evidence:", adapter.calls[0]["prompt"])
+
     def test_runner_captures_and_proves_requested_recovery_evidence_before_launch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

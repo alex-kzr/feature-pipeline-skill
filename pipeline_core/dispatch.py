@@ -125,6 +125,7 @@ def dispatch_executor(
     generation = life.consume_launch_generation(task_id, EXECUTOR_ROLE)
     artifacts = launch_artifacts(run.run_dir, task_id, generation)
     artifacts.directory.mkdir(parents=True, exist_ok=True)
+    runner_evidence_satisfied = False
     if spec.runner_evidence == "reverse-diff-and-restore":
         try:
             capture_recovery_evidence(
@@ -132,6 +133,7 @@ def dispatch_executor(
             )
         except ReportError as exc:
             raise DispatchError(str(exc), exc.code) from None
+        runner_evidence_satisfied = True
 
     envelope = build_executor_envelope(
         spec,
@@ -142,6 +144,7 @@ def dispatch_executor(
         attempt=request.attempt,
         plan_path=request.plan_path,
         repair_report_path=request.repair_report_path,
+        runner_evidence_satisfied=runner_evidence_satisfied,
     )
     write_text_atomic(artifacts.prompt_envelope, envelope, repo_root=run.repo_root)
 

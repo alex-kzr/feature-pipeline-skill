@@ -47,6 +47,7 @@ def build_executor_envelope(
     attempt: int = 1,
     plan_path: str | None = None,
     repair_report_path: str | None = None,
+    runner_evidence_satisfied: bool = False,
 ) -> str:
     """Render the filled envelope; the runner captures all executor evidence itself."""
     lines = [
@@ -71,6 +72,13 @@ def build_executor_envelope(
         "- Verification commands:",
         _commands_block(spec),
         f"- Maximum repair attempts: {spec.max_repair_attempts}",
+    ]
+    if runner_evidence_satisfied:
+        lines += [
+            "- Runner evidence: satisfied — reverse-diff-and-restore completed by the runner.",
+            "- This evidence is runner-owned; do not write any run artifacts.",
+        ]
+    lines += [
         "",
         "Role:",
         f"- {EXECUTOR_ROLE}",
