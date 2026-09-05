@@ -2,8 +2,8 @@
 
 Every field is filled verbatim from the normalized :class:`~feature_pipeline.contracts.TaskSpec`
 plus
-the explicit repository anchors, the execution mode, the plan/task/kanban paths, the composed
-role grant, and the report path the runner will read back. A fresh executor has no memory of
+the explicit repository anchors, the execution mode, the plan/task/kanban paths, and the composed
+role grant. A fresh executor has no memory of
 the orchestrating session, so nothing needed to execute the task is left implicit.
 
 Standard library only.
@@ -48,7 +48,7 @@ def build_executor_envelope(
     plan_path: str | None = None,
     repair_report_path: str | None = None,
 ) -> str:
-    """Render the filled envelope. ``report_path`` is where the runner will read the report."""
+    """Render the filled envelope; the runner captures all executor evidence itself."""
     lines = [
         "Context:",
         f"- Project root: {anchors.project_root}",
@@ -75,7 +75,6 @@ def build_executor_envelope(
         "Role:",
         f"- {EXECUTOR_ROLE}",
         f"- Role grant: {', '.join(sorted(role_grant)) or 'none'}",
-        f"- Report path: {report_path}",
         "",
         "Rules:",
         "- Read required skills first.",
@@ -97,6 +96,7 @@ def build_executor_envelope(
     lines += [
         "",
         "Final report:",
+        "- The runner captures your final output as executor evidence; do not write report artifacts.",
         "- Status: implemented | blocked",
         "- Files changed:",
         "- Validation:",
@@ -105,7 +105,6 @@ def build_executor_envelope(
         "- Blockers:",
         "",
         "Codex final result protocol:",
-        "- Write the human Markdown report to the Report path above.",
         "- Your one final assistant message must be only this machine-readable JSON object:",
         f'- {{"role":"executor","task_id":"{spec.id}","attempt":{attempt},"status":"implemented"}}',
         "- For blocked, add a non-empty verbatim reason: "

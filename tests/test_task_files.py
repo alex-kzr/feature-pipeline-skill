@@ -110,6 +110,7 @@ def _semantic(spec: TaskSpec) -> dict[str, object]:
         "verification_tier": spec.verification_tier,
         "accepts_scoped": spec.accepts_scoped,
         "deferred_verification_commands": spec.deferred_verification_commands,
+        "runner_evidence": spec.runner_evidence,
         "blocking_conditions": spec.blocking_conditions,
         "acceptance_criteria": spec.acceptance_criteria,
     }
@@ -246,6 +247,12 @@ class TaskSpecBuildTests(unittest.TestCase):
         )
         self.assertEqual(spec.deferred_verification_commands, deferred)
 
+    def test_runner_evidence_accepts_only_the_supported_recovery_directive(self) -> None:
+        spec = self._complete(runner_evidence="reverse-diff-and-restore")
+        self.assertEqual(spec.runner_evidence, "reverse-diff-and-restore")
+        with self.assertRaises(SchemaError):
+            self._complete(runner_evidence="upload-everything")
+
 
 class LoadTaskSpecMarkdownTests(unittest.TestCase):
     def test_declared_markdown_task_file_normalizes_completely(self) -> None:
@@ -279,6 +286,18 @@ class LoadTaskSpecMarkdownTests(unittest.TestCase):
         broken = DECLARED_TASK_MD.replace("- Executor: python-executor\n", "")
         with TemporaryDirectory() as raw:
             path = _write(Path(raw), "AB-01_normalize.md", broken)
+            with self.assertRaises(TaskFileError):
+                load_task_spec(path)
+
+    def test_runner_evidence_metadata_is_normalized_and_unknown_values_fail_closed(self) -> None:
+        declared = DECLARED_TASK_MD.replace(
+            "- Blocking conditions: none\n",
+            "- Runner evidence: reverse-diff-and-restore\n- Blocking conditions: none\n",
+        )
+        with TemporaryDirectory() as raw:
+            path = _write(Path(raw), "AB-01_normalize.md", declared)
+            self.assertEqual(load_task_spec(path).runner_evidence, "reverse-diff-and-restore")
+            path.write_text(declared.replace("reverse-diff-and-restore", "unknown"), encoding="utf-8")
             with self.assertRaises(TaskFileError):
                 load_task_spec(path)
 

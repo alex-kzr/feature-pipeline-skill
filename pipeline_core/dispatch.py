@@ -47,6 +47,7 @@ from .reports import (
     LaunchArtifacts,
     ReportError,
     build_status_envelope_prompt,
+    capture_recovery_evidence,
     launch_artifacts,
     parse_executor_status,
     settle_executor_status,
@@ -124,6 +125,13 @@ def dispatch_executor(
     generation = life.consume_launch_generation(task_id, EXECUTOR_ROLE)
     artifacts = launch_artifacts(run.run_dir, task_id, generation)
     artifacts.directory.mkdir(parents=True, exist_ok=True)
+    if spec.runner_evidence == "reverse-diff-and-restore":
+        try:
+            capture_recovery_evidence(
+                artifacts, repo_root=run.repo_root, allowed_scope=spec.allowed_scope
+            )
+        except ReportError as exc:
+            raise DispatchError(str(exc), exc.code) from None
 
     envelope = build_executor_envelope(
         spec,
@@ -168,7 +176,11 @@ def dispatch_executor(
             None, f"adapter error ({exc.code}): {exc}",
         )
 
-    report_text = _settle_text(artifacts.executor_report, result.stdout, run)
+    report_text = _settle_text(
+        artifacts.executor_report,
+        result.raw_stdout if getattr(adapter, "name", None) == "codex" else result.stdout,
+        run,
+    )
 
     if result.exit_code != 0:
         return _retryable_failure(
@@ -327,13 +339,19 @@ def _settle_codex_final_result(
     except AdapterError as exc:
         return _retryable_failure(life, request, artifacts, generation, result, None,
                                   f"{exc.code}: {exc}", protocol=True)
-    existing = _settle_text(artifacts.status_envelope, "", run) if artifacts.status_envelope.exists() else ""
+    # A Codex adapter may have generated an envelope while launching.  It is not executor
+    # evidence (the executor artifact is always runner-captured output), but a conflicting
+    # generated envelope must still fail closed before the canonical payload overwrites it.
+    existing = (
+        artifacts.status_envelope.read_text(encoding="utf-8")
+        if artifacts.status_envelope.exists() else ""
+    )
     if existing and not _same_codex_final_payload(existing, final.raw_payload):
         return _retryable_failure(life, request, artifacts, generation, result, None,
                                   "result-protocol-invalid: generated envelope contradicts canonical final result",
                                   protocol=True, envelope_stdout=existing)
     write_text_atomic(artifacts.status_envelope, final.raw_payload, repo_root=run.repo_root)
-    report_text = _settle_text(artifacts.executor_report, result.stdout, run)
+    report_text = _settle_text(artifacts.executor_report, result.raw_stdout or result.stdout, run)
     if final.status == "blocked":
         life.block(request.spec.id, final.reason or "")
         return DispatchOutcome(request.spec.id, generation, "blocked", "blocked", artifacts,
@@ -364,17 +382,14 @@ def _same_codex_final_payload(generated: str, canonical: str) -> bool:
 
 
 def _settle_text(path: Path, fallback_stdout: str, run) -> str:
-    """Read the artifact the adapter wrote (or fall back to its stdout), redact it, return it.
+    """Persist runner-captured adapter output as an artifact, redact it, and return it.
 
-    Both a report file the adapter/CLI wrote and its captured stdout can carry the absolute
-    paths the agent saw while working, so whichever we use is rewritten through the redaction
-    boundary and read back, keeping the committed artifact and the text the runner reasons
-    about the same bytes.
+    The executor must never own the evidence channel.  In particular, a pre-existing artifact
+    at ``path`` could have been written by an adapter or executor, so it is deliberately
+    overwritten with captured output rather than read.  The runner then reasons about the
+    same redacted bytes it persisted.
     """
     target = Path(path)
-    if target.exists():
-        text = target.read_text(encoding="utf-8")
-    else:
-        text = fallback_stdout or ""
+    text = fallback_stdout or ""
     written = write_text_atomic(target, text, repo_root=run.repo_root)
     return Path(written).read_text(encoding="utf-8")

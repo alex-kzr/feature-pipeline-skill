@@ -53,6 +53,7 @@ FIELD_ALIASES: dict[str, str] = {
     "verification tier": "verification_tier",
     "accepts scoped": "accepts_scoped",
     "deferred verification commands": "deferred_verification_commands",
+    "runner evidence": "runner_evidence",
 }
 
 #: Keys a *declared* metadata block must carry; every other key may be defaulted.

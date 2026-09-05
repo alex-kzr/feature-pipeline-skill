@@ -21,6 +21,7 @@ SHELL_TOKENS = frozenset({"|", "&&", ";", ">", "<"})
 WRITE_CAPABILITIES = frozenset({"write", "create", "delete", "modify", "filesystem_write"})
 DIFF_POLICIES = frozenset({"ignore", "tracked-empty"})
 VERIFICATION_TIERS = frozenset({"full", "scoped"})
+RUNNER_EVIDENCE = frozenset({"reverse-diff-and-restore"})
 
 #: A task ID as written on a board or in a plan: two-to-six letters, a hyphen, one-to-four
 #: digits (``EDF-01``, ``LT-9``, ``PCC-05``). Kept deliberately looser than any one project's
@@ -533,6 +534,7 @@ class TaskSpec:
     verification_tier: str
     accepts_scoped: tuple[str, ...]
     deferred_verification_commands: tuple[CommandSpec, ...]
+    runner_evidence: str | None
     blocking_conditions: str | None
     acceptance_criteria: tuple[AcceptanceCriterionSpec, ...]
     metadata_source: str
@@ -557,6 +559,7 @@ class TaskSpec:
         verification_tier: str = "full",
         accepts_scoped: Sequence[object] = (),
         deferred_verification_commands: Sequence[object] = (),
+        runner_evidence: object = None,
         blocking_conditions: object = None,
         acceptance_criteria: Sequence[object] = (),
         metadata_source: str = "declared",
@@ -607,6 +610,10 @@ class TaskSpec:
                 "deferred_verification_commands require verification_tier 'scoped'"
             )
 
+        evidence = None if runner_evidence is None else _string(runner_evidence, "runner_evidence")
+        if evidence is not None and evidence not in RUNNER_EVIDENCE:
+            raise SchemaError(f"unknown runner evidence: {runner_evidence}")
+
         blocking = None if blocking_conditions is None else _string(blocking_conditions,
                                                                     "blocking_conditions")
 
@@ -627,6 +634,7 @@ class TaskSpec:
             verification_tier=tier,
             accepts_scoped=scoped,
             deferred_verification_commands=deferred,
+            runner_evidence=evidence,
             blocking_conditions=blocking,
             acceptance_criteria=validate_acceptance_criteria(acceptance_criteria),
             metadata_source=str(metadata_source or "declared"),

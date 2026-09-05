@@ -19,7 +19,10 @@ Standard library only.
 
 from __future__ import annotations
 
+import base64
+import glob
 import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -33,7 +36,7 @@ from feature_pipeline.reports.settlement import (
     settle as _settle,
 )
 
-from .artifacts import write_text_atomic
+from .artifacts import write_json_atomic, write_text_atomic
 
 #: The only two states an executor launch may report. There is deliberately no ``verified``
 #: token: nothing an executor writes can carry a task past ``implemented``. Sourced from the
@@ -84,6 +87,8 @@ class LaunchArtifacts:
     implementation_diff: Path
     launch_failure: Path
     result_protocol_invalid: Path
+    recovery_patch: Path
+    recovery_proof: Path
 
 
 def launch_artifacts(run_dir: str | Path, task_id: str, generation: int) -> LaunchArtifacts:
@@ -105,7 +110,62 @@ def launch_artifacts(run_dir: str | Path, task_id: str, generation: int) -> Laun
         implementation_diff=directory / f"implementation-diff-{generation}.md",
         launch_failure=directory / f"launch-failure-{generation}.json",
         result_protocol_invalid=directory / f"result-protocol-invalid-{generation}.json",
+        recovery_patch=directory / f"recovery-reverse-patch-{generation}.json",
+        recovery_proof=directory / f"recovery-restoration-proof-{generation}.json",
     )
+
+
+def capture_recovery_evidence(
+    artifacts: LaunchArtifacts, *, repo_root: str | Path, allowed_scope: Sequence[str]
+) -> None:
+    """Capture original bytes and prove the runner can restore them in a disposable copy."""
+    root = Path(repo_root)
+    entries: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for pattern in allowed_scope:
+        matches = glob.glob(str(root / pattern), recursive=True) if any(char in pattern for char in "*?[") else [str(root / pattern)]
+        for raw in matches:
+            path = Path(raw)
+            relative = path.relative_to(root).as_posix()
+            if relative in seen:
+                continue
+            seen.add(relative)
+            if path.exists() and not path.is_file():
+                raise ReportError(f"recovery evidence cannot snapshot non-file '{relative}'", "recovery-evidence-failed")
+            data = path.read_bytes() if path.exists() else None
+            entries.append({"path": relative, "exists": data is not None,
+                            "data": None if data is None else base64.b64encode(data).decode("ascii")})
+    if not entries:
+        raise ReportError("recovery evidence matched no allowed files", "recovery-evidence-failed")
+    write_json_atomic(artifacts.recovery_patch, {"format": "runner-reverse-patch-v1", "files": entries}, repo_root=root)
+    restored = _prove_recovery_patch(entries)
+    write_json_atomic(artifacts.recovery_proof, {"restored": restored, "files": entries}, repo_root=root)
+    if not restored:
+        raise ReportError("recovery evidence did not restore original bytes", "recovery-evidence-failed")
+
+
+def _prove_recovery_patch(entries: Sequence[dict[str, object]]) -> bool:
+    """Apply the byte snapshot to deliberately divergent files in an isolated copy."""
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        for entry in entries:
+            target = root / str(entry["path"])
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"runner-recovery-proof-divergence")
+        for entry in entries:
+            target = root / str(entry["path"])
+            if not entry["exists"]:
+                target.unlink()
+            else:
+                target.write_bytes(base64.b64decode(str(entry["data"])))
+        for entry in entries:
+            target = root / str(entry["path"])
+            if entry["exists"]:
+                if not target.is_file() or target.read_bytes() != base64.b64decode(str(entry["data"])):
+                    return False
+            elif target.exists():
+                return False
+    return True
 
 
 def build_status_envelope_prompt(

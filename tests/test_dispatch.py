@@ -78,8 +78,9 @@ class ScriptedAdapter:
         session_id: str | None = "sess-1",
         launch_exit: int = 0,
         envelope_exit: int = 0,
-        write_report: bool = True,
+        write_report: bool = False,
         write_envelope: bool = True,
+        written_report_text: str | None = None,
         raise_code: str | None = None,
         on_launch=None,
     ) -> None:
@@ -92,6 +93,7 @@ class ScriptedAdapter:
         self.envelope_exit = envelope_exit
         self.write_report = write_report
         self.write_envelope = write_envelope
+        self.written_report_text = written_report_text
         self.raise_code = raise_code
         #: Optional callable invoked once, on the executor launch, to simulate the executor
         #: mutating the workspace inside its window.
@@ -113,14 +115,16 @@ class ScriptedAdapter:
         if self.on_launch is not None:
             self.on_launch()
         text = self.prose_text if self.prose_text is not None else _prose(self.prose_status)
-        return self._deliver(request, text, self.launch_exit, self.write_report)
+        return self._deliver(
+            request, text, self.launch_exit, self.write_report, self.written_report_text)
 
-    def _deliver(self, request, text: str, exit_code: int, write: bool) -> LaunchResult:  # noqa: ANN001
+    def _deliver(
+        self, request, text: str, exit_code: int, write: bool, written_text: str | None = None,
+    ) -> LaunchResult:  # noqa: ANN001
         if write:
             path = Path(request.report_path)
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(text, encoding="utf-8")
-            return LaunchResult(exit_code=exit_code, stdout="", session_id=self.session_id)
+            path.write_text(written_text if written_text is not None else text, encoding="utf-8")
         return LaunchResult(exit_code=exit_code, stdout=text, session_id=self.session_id)
 
 
@@ -134,8 +138,6 @@ class CodexFinalAdapter:
         self.exit_code = exit_code
 
     def launch(self, request):  # noqa: ANN001 - test double
-        Path(request.report_path).parent.mkdir(parents=True, exist_ok=True)
-        Path(request.report_path).write_text("# Human report\n\n- Status: implemented\n", encoding="utf-8")
         events = [json.dumps({"type": "item.completed", "item": {
             "type": "agent_message", "text": json.dumps(payload),
         }}) for payload in self.payloads]
@@ -210,6 +212,36 @@ class ReportParsingTests(unittest.TestCase):
 
 
 class GenerationTests(unittest.TestCase):
+    def test_runner_uses_generic_adapter_stdout_when_executor_writes_report_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = _spec()
+            life = _running_life(root, spec)
+            captured = _prose()
+            outcome = dispatch_executor(
+                life,
+                _request(spec),
+                ScriptedAdapter(
+                    prose_text=captured,
+                    write_report=True,
+                    written_report_text="executor-controlled artifact\n",
+                ),
+            )
+
+            self.assertEqual(outcome.status, "implemented")
+            self.assertEqual(outcome.artifacts.executor_report.read_text(encoding="utf-8"), captured)
+
+    def test_runner_persists_generic_adapter_stdout_without_adapter_report_write(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = _spec()
+            life = _running_life(root, spec)
+            outcome = dispatch_executor(
+                life, _request(spec), ScriptedAdapter(write_report=False))
+
+            self.assertEqual(outcome.status, "implemented")
+            self.assertEqual(outcome.artifacts.executor_report.read_text(encoding="utf-8"), _prose())
+
     def test_success_consumes_one_generation_and_owns_its_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -356,6 +388,15 @@ class ResultTextExtractionTests(unittest.TestCase):
 
 
 class PromptEnvelopeTests(unittest.TestCase):
+    def test_envelope_makes_report_evidence_runner_owned(self) -> None:
+        text = build_executor_envelope(
+            _spec(), anchors=_anchors(), role_grant=("read", "write"),
+            execution_mode="separate", report_path="reports/RDS-04/launch-1/executor-1.md",
+        )
+        self.assertNotIn("Report path:", text)
+        self.assertNotIn("Write the human Markdown report", text)
+        self.assertIn("runner captures your final output", text)
+
     def test_envelope_carries_exact_scope_skills_checks_and_report_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -378,7 +419,7 @@ class PromptEnvelopeTests(unittest.TestCase):
         self.assertIn("  - feature-pipeline-skill -> uv run python -m unittest", text)
         self.assertIn("- separate", text)
         self.assertIn("- Role grant: read, run_checks, write", text)
-        self.assertRegex(text, r"- Report path: .*launch-1/executor-1\.md")
+        self.assertNotIn("Report path:", text)
         self.assertIn("- Status: implemented | blocked", text)
 
 
@@ -397,6 +438,36 @@ class StatusSettlementTests(unittest.TestCase):
             }]))
             self.assertEqual(outcome.status, "implemented")
             self.assertEqual(life.run.task(spec.id).status, "implemented")
+            captured = outcome.artifacts.executor_report.read_text(encoding="utf-8")
+            self.assertIn('"status\\": \\"implemented\\"', captured)
+
+
+class RecoveryEvidenceTests(unittest.TestCase):
+    def test_runner_captures_and_proves_requested_recovery_evidence_before_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "recover.txt"
+            target.write_bytes(b"original bytes\n")
+            spec = _spec(allowed_scope=("recover.txt",), runner_evidence="reverse-diff-and-restore")
+            life = _running_life(root, spec)
+            outcome = dispatch_executor(life, _request(spec), ScriptedAdapter())
+
+            self.assertEqual(outcome.status, "implemented")
+            self.assertTrue(outcome.artifacts.recovery_patch.is_file())
+            proof = json.loads(outcome.artifacts.recovery_proof.read_text(encoding="utf-8"))
+            self.assertTrue(proof["restored"])
+            self.assertEqual(proof["files"][0]["path"], "recover.txt")
+
+    def test_recovery_capture_failure_stops_before_adapter_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = _spec(allowed_scope=(".",), runner_evidence="reverse-diff-and-restore")
+            life = _running_life(root, spec)
+            adapter = ScriptedAdapter()
+
+            with self.assertRaisesRegex(Exception, "recovery"):
+                dispatch_executor(life, _request(spec), adapter)
+            self.assertEqual(adapter.calls, [])
 
     def test_codex_multiple_or_invalid_final_events_are_retryable_not_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

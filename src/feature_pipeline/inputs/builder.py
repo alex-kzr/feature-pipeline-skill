@@ -97,6 +97,7 @@ class _Resolved:
     verification_tier: str
     accepts_scoped: tuple[object, ...]
     deferred_verification_commands: tuple[object, ...]
+    runner_evidence: str | None
     blocking_conditions: str | None
     acceptance_criteria: tuple[AcceptanceCriterionSpec, ...]
     metadata_source: str
@@ -245,6 +246,8 @@ class TaskDefinitionBuilder:
             deferred_verification_commands=_as_tuple(
                 raw.get("deferred_verification_commands"), error=error
             ),
+            runner_evidence=(None if raw.get("runner_evidence") is None else
+                             str(raw["runner_evidence"])),
             blocking_conditions=blocking,
             acceptance_criteria=criteria,
             metadata_source="declared" if has_metadata else "defaults",
@@ -301,6 +304,7 @@ class TaskDefinitionBuilder:
                 verification_tier="full",
                 accepts_scoped=(),
                 deferred_verification_commands=(),
+                runner_evidence=None,
                 blocking_conditions=None,
                 acceptance_criteria=criteria,
                 metadata_source="defaults",
@@ -363,6 +367,8 @@ class TaskDefinitionBuilder:
             deferred_verification_commands=tuple(
                 {"cwd": cwd, "command": command} for cwd, command in raw.deferred
             ),
+            runner_evidence=(None if "runner_evidence" not in fields else
+                             strip_backticks(fields["runner_evidence"])),
             blocking_conditions=blocking,
             acceptance_criteria=criteria,
             metadata_source="declared",
@@ -397,6 +403,7 @@ class TaskDefinitionBuilder:
                     resolved.deferred_verification_commands,
                     field="deferred_verification_commands",
                 ),
+                runner_evidence=resolved.runner_evidence,
                 blocking_conditions=resolved.blocking_conditions,
                 acceptance_criteria=resolved.acceptance_criteria,
                 metadata_source=resolved.metadata_source,
