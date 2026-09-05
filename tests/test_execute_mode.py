@@ -736,6 +736,48 @@ class BoardProjectionWiringTests(unittest.TestCase):
             self.assertNotIn("EX-01", board_text)
             self.assertIn("- [x] Done", task_path.read_text(encoding="utf-8"))
 
+    def test_fresh_reuse_projects_the_reused_dependency_after_pruning_its_ancestor(self) -> None:
+        """A pruned ancestor is not a lifecycle record, but its reused dependent is."""
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            board = _seed_board(root)
+            source_task = FIXTURES / "tasks" / "EX-03_repair-then-verify.md"
+            target_task = root / "fixtures/execution/tasks/EX-03_repair-then-verify.md"
+            target_task.write_text(source_task.read_text(encoding="utf-8"), encoding="utf-8")
+            board.write_text(
+                board.read_text(encoding="utf-8")
+                + "- [EX-03: Repair then verify task]"
+                "(../fixtures/execution/tasks/EX-03_repair-then-verify.md)\n",
+                encoding="utf-8",
+            )
+            prompt = root / "prompt.md"
+            plan = root / "plan.json"
+            prompt.write_text("feature prompt", encoding="utf-8")
+            plan.write_text(json.dumps(PLAN, indent=2) + "\n", encoding="utf-8")
+            source = Run.create("source-feature", prompt, plan, root / "runs" / "source-feature", root)
+            source_life = RunLifecycle.initialize(source, tasks=[("EX-02", [])])
+            source_life.transition("EX-02", "running", actor=ACTOR_RUNNER)
+            source_life.transition("EX-02", "implemented", actor=ACTOR_RUNNER)
+            source.record_verdicts("EX-02", "PASS", "PASS")
+            source.status = "verified"
+            source.save()
+
+            executor = sa.ScriptedExecutor(("implemented",))
+            result = execute_run(
+                _request(
+                    root, _specs(("EX-01", "EX-02", "EX-03")), executor=executor,
+                    launchers=VerifierLaunchers(
+                        task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))),
+                    controls=ExecuteControls(plan_approved=True, task="EX-03"),
+                    environment={"claude": True}, board_path=board))
+
+            self.assertTrue(result.ok, result.message)
+            self.assertEqual([call["task_id"] for call in executor.calls], ["EX-03"])
+            self.assertNotIn("EX-02", board.read_text(encoding="utf-8"))
+            reused_task = root / "fixtures/execution/tasks/EX-02_dependent-verify.md"
+            self.assertIn("- [x] Done", reused_task.read_text(encoding="utf-8"))
+            self.assertEqual(reused_task.read_text(encoding="utf-8").count("## Result"), 1)
+
     def test_boardless_execution_is_unaffected(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

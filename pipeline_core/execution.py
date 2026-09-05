@@ -672,7 +672,7 @@ def _ensure_plan_compatible(run: Run, plan: CompiledRunPlan) -> None:
 
 def _reconcile_projection(
     life: RunLifecycle, board_path: Path, by_id: Mapping[str, TaskSpec],
-    selected: Sequence[str],
+    execution_scope: Sequence[str],
 ) -> None:
     """**KLC-03**. On every ``--resume``, repair the Markdown board/task files from whatever
     ``run.json`` already recorded — before the loop below dispatches (or skips) anything.
@@ -684,7 +684,7 @@ def _reconcile_projection(
     anyway — this only ever touches the human-facing files). Idempotent when nothing was
     actually stale.
     """
-    for task_id in selected:
+    for task_id in execution_scope:
         spec = by_id.get(task_id)
         if spec is None or not spec.path:
             continue
@@ -822,7 +822,7 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
                 if sourced == "explicit":
                     life.run.set_control(name, value, sourced=sourced)
             if request.board_path is not None:
-                _reconcile_projection(life, request.board_path, by_id, selected)
+                _reconcile_projection(life, request.board_path, by_id, active_scope)
             scope = active_scope
         else:
             reused: dict[str, Mapping[str, Any]] = {}
@@ -879,6 +879,15 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
     persist_task_contracts(life.run, [spec for spec in specs if spec.id in scope])
     pin_adapter(life.run, resolution)
     life.run.save()
+
+    if not request.controls.resume and request.board_path is not None:
+        try:
+            recorded_scope = [
+                task_id for task_id in execution_scope if task_id in life.run.tasks
+            ]
+            _reconcile_projection(life, request.board_path, by_id, recorded_scope)
+        except ExecutionError as exc:
+            return _error(f"{exc.code}: {exc}", request, run_id=life.run.run_id)
 
     # 4. Cross-process write lease for the whole run.
     pid = request.pipeline_pid if request.pipeline_pid is not None else os.getpid()

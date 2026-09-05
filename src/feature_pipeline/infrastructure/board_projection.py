@@ -18,10 +18,9 @@ The mapping (KLC-02 Requirements):
 
 :func:`project_task_state` computes both the new board text and the new task-file text in
 memory, validates both fully, and only then writes each with a replace-style
-(temp-file-plus-``os.replace``) write — a malformed board or task file, a missing or
-duplicated active-board card, or invalid evidence raises *before* either file is touched, so
-a failure never leaves a partially-updated file. Repeated calls with the same inputs produce
-byte-identical output.
+(temp-file-plus-``os.replace``) write. Missing and duplicate cards are recoverable divergence:
+they converge to one canonical card. Repeated calls with the same inputs produce byte-identical
+output.
 
 Standard library only.
 """
@@ -29,6 +28,7 @@ Standard library only.
 from __future__ import annotations
 
 import os
+import posixpath
 import re
 import tempfile
 from dataclasses import dataclass, field
@@ -60,11 +60,11 @@ class MalformedTaskError(BoardProjectionError):
 
 
 class MissingCardError(BoardProjectionError):
-    """A transition requires an existing active-board card and none was found."""
+    """Compatibility type retained for callers of pre-convergent projection."""
 
 
 class DuplicateCardError(BoardProjectionError):
-    """The same task's card appears more than once across the active board."""
+    """Compatibility type retained for callers of pre-convergent projection."""
 
 
 class InvalidEvidenceError(BoardProjectionError):
@@ -156,8 +156,7 @@ def project_task_state(
 ) -> None:
     """Project ``state`` for ``task_id``/``task_title`` onto ``board_path`` and ``task_path``.
 
-    Both files are re-rendered in memory and validated before either is written, so a
-    :class:`BoardProjectionError` never leaves a partial update on disk.
+    Both files are re-rendered and validated in memory before either replace-style write.
     """
 
     target = _target_column(state)
@@ -167,15 +166,39 @@ def project_task_state(
     elif evidence is not None:
         raise InvalidEvidenceError("completion evidence is only accepted for verified")
 
-    board_text = _read_text_preserving_newlines(board_path)
-    task_text = _read_text_preserving_newlines(task_path)
+    board_display = _display_path(board_path)
+    task_display = _display_path(task_path)
+    try:
+        board_text = _read_text_preserving_newlines(board_path)
+    except OSError as exc:
+        raise BoardProjectionError(f"read {board_display}: {exc}") from exc
+    try:
+        task_text = _read_text_preserving_newlines(task_path)
+    except OSError as exc:
+        raise BoardProjectionError(f"read {task_display}: {exc}") from exc
 
     link = _relative_link(board_path, task_path)
-    new_board_text = _apply_board_transition(board_text, task_id, task_title, link, target)
-    new_task_text = _apply_task_transition(task_text, target, evidence)
+    try:
+        new_board_text = _apply_board_transition(board_text, task_id, task_title, link, target)
+    except BoardProjectionError as exc:
+        raise exc.__class__(f"render {board_display}: {exc}") from exc
+    try:
+        new_task_text = _apply_task_transition(task_text, target, evidence)
+    except BoardProjectionError as exc:
+        raise exc.__class__(f"render {task_display}: {exc}") from exc
 
-    _replace_write(board_path, new_board_text)
-    _replace_write(task_path, new_task_text)
+    _replace_write(board_path, new_board_text, "write-board", board_display)
+    _replace_write(task_path, new_task_text, "write-task", task_display)
+
+
+def _display_path(path: Path) -> str:
+    """Return a repository-style path without exposing a host-specific absolute path."""
+
+    parts = path.parts
+    for marker in ("docs", "feature-pipeline-skill"):
+        if marker in parts:
+            return Path(*parts[parts.index(marker) :]).as_posix()
+    return path.name
 
 
 def _read_text_preserving_newlines(path: Path) -> str:
@@ -195,17 +218,19 @@ def _relative_link(board_path: Path, task_path: Path) -> str:
     return Path(relative).as_posix()
 
 
-def _replace_write(path: Path, text: str) -> None:
+def _replace_write(path: Path, text: str, operation: str, display_path: str) -> None:
     directory = path.parent
-    fd, tmp_name = tempfile.mkstemp(dir=directory, prefix=f".{path.name}.", suffix=".tmp")
     try:
+        fd, tmp_name = tempfile.mkstemp(
+            dir=directory, prefix=f".{path.name}.", suffix=".tmp"
+        )
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
             handle.write(text)
         os.replace(tmp_name, path)
-    except BaseException:
-        if os.path.exists(tmp_name):
+    except OSError as exc:
+        if "tmp_name" in locals() and os.path.exists(tmp_name):
             os.remove(tmp_name)
-        raise
+        raise BoardProjectionError(f"{operation} {display_path}: {exc}") from exc
 
 
 # ==============================================================================================
@@ -224,9 +249,20 @@ def _find_heading_once(lines: list[str], heading: str, *, after: int = 0) -> int
     return matches[0]
 
 
-def _find_card_positions(body: list[str], link: str) -> list[int]:
-    needle = f"]({link})"
-    return [i for i, line in enumerate(body) if needle in line]
+_CARD_RE = re.compile(r"^\s*- \[([^]]+)]\(([^)]+)\)")
+
+
+def _normalise_link(link: str) -> str:
+    return posixpath.normpath(link.replace("\\", "/"))
+
+
+def _is_task_card(line: str, task_id: str, link: str) -> bool:
+    match = _CARD_RE.match(line.rstrip("\r\n"))
+    if match is None:
+        return False
+    label, card_link = match.groups()
+    card_id = label.split(":", 1)[0].strip()
+    return card_id == task_id or _normalise_link(card_link) == _normalise_link(link)
 
 
 def _card_line(task_id: str, title: str, link: str, newline: str) -> str:
@@ -243,11 +279,25 @@ def _insert_card(body: list[str], card_line: str, newline: str) -> list[str]:
     return body + [card_line]
 
 
-def _remove_card(body: list[str], index: int) -> list[str]:
-    remaining = body[:index] + body[index + 1 :]
-    if not any(line.lstrip().startswith("- [") for line in remaining):
-        return []
-    return remaining
+def _upsert_column(
+    body: list[str], task_id: str, link: str, card_line: str, newline: str
+) -> list[str]:
+    """Replace all matching cards by one canonical card, retaining surrounding Markdown."""
+
+    rendered: list[str] = []
+    inserted = False
+    for line in body:
+        if _is_task_card(line, task_id, link):
+            if not inserted:
+                rendered.append(card_line)
+                inserted = True
+            continue
+        rendered.append(line)
+    return rendered if inserted else _insert_card(rendered, card_line, newline)
+
+
+def _remove_matching_cards(body: list[str], task_id: str, link: str) -> list[str]:
+    return [line for line in body if not _is_task_card(line, task_id, link)]
 
 
 def _apply_board_transition(
@@ -262,49 +312,29 @@ def _apply_board_transition(
     preamble = lines[: todo_idx + 1]
     todo_body = lines[todo_idx + 1 : in_progress_idx]
     in_progress_heading = lines[in_progress_idx : in_progress_idx + 1]
-    tail_body = lines[in_progress_idx + 1 :]
-
-    todo_hits = _find_card_positions(todo_body, link)
-    in_progress_hits = _find_card_positions(tail_body, link)
-    if len(todo_hits) + len(in_progress_hits) > 1:
-        raise DuplicateCardError(
-            f"card for {task_id!r} ({link}) appears more than once on the active board"
-        )
+    next_heading = next(
+        (i for i in range(in_progress_idx + 1, len(lines))
+         if lines[i].rstrip("\r\n").startswith("## ")),
+        len(lines),
+    )
+    in_progress_body = lines[in_progress_idx + 1 : next_heading]
+    tail = lines[next_heading:]
 
     card_line = _card_line(task_id, title, link, newline)
 
     if target == "to_do":
-        if todo_hits:
-            todo_body = todo_body[: todo_hits[0]] + [card_line] + todo_body[todo_hits[0] + 1 :]
-        elif in_progress_hits:
-            tail_body = _remove_card(tail_body, in_progress_hits[0])
-            todo_body = _insert_card(todo_body, card_line, newline)
-        else:
-            raise MissingCardError(
-                f"no active-board card for {task_id!r} ({link}) to move to To Do"
-            )
+        todo_body = _upsert_column(todo_body, task_id, link, card_line, newline)
+        in_progress_body = _remove_matching_cards(in_progress_body, task_id, link)
     elif target == "in_progress":
-        if in_progress_hits:
-            tail_body = (
-                tail_body[: in_progress_hits[0]]
-                + [card_line]
-                + tail_body[in_progress_hits[0] + 1 :]
-            )
-        elif todo_hits:
-            todo_body = _remove_card(todo_body, todo_hits[0])
-            tail_body = _insert_card(tail_body, card_line, newline)
-        else:
-            raise MissingCardError(
-                f"no active-board card for {task_id!r} ({link}) to move to In Progress"
-            )
+        todo_body = _remove_matching_cards(todo_body, task_id, link)
+        in_progress_body = _upsert_column(
+            in_progress_body, task_id, link, card_line, newline
+        )
     else:  # target == "none" (verified)
-        if todo_hits:
-            todo_body = _remove_card(todo_body, todo_hits[0])
-        elif in_progress_hits:
-            tail_body = _remove_card(tail_body, in_progress_hits[0])
-        # Already absent from both columns: idempotent no-op.
+        todo_body = _remove_matching_cards(todo_body, task_id, link)
+        in_progress_body = _remove_matching_cards(in_progress_body, task_id, link)
 
-    return "".join(preamble + todo_body + in_progress_heading + tail_body)
+    return "".join(preamble + todo_body + in_progress_heading + in_progress_body + tail)
 
 
 # ==============================================================================================
@@ -403,10 +433,13 @@ def _apply_task_transition(
         return "".join(head + lines[status_end:])
 
     assert evidence is not None  # enforced by project_task_state
-    result_idx = _find_single_heading(lines, "## Result")
     result_block = _render_result_section(evidence, newline)
+    result_indices = [
+        index for index, line in enumerate(lines)
+        if line.rstrip("\r\n") == "## Result"
+    ]
 
-    if result_idx is None:
+    if not result_indices:
         gap = lines[status_end : status_end + 1]
         if gap and gap[0].strip("\r\n") == "":
             remainder = lines[status_end + 1 :]
@@ -415,8 +448,16 @@ def _apply_task_transition(
             remainder = lines[status_end:]
         return "".join(head + gap + result_block + remainder)
 
-    if result_idx < status_end:
+    if result_indices[0] < status_end:
         raise MalformedTaskError("## Result heading precedes the ## Status block")
-    result_end = _section_end(lines, result_idx)
-    between = lines[status_end:result_idx]
-    return "".join(head + between + result_block + lines[result_end:])
+
+    result_ranges = [(index, _section_end(lines, index)) for index in result_indices]
+    rendered = head
+    cursor = status_end
+    for position, end in result_ranges:
+        rendered.extend(lines[cursor:position])
+        if position == result_indices[0]:
+            rendered.extend(result_block)
+        cursor = end
+    rendered.extend(lines[cursor:])
+    return "".join(rendered)

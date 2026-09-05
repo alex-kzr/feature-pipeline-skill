@@ -24,11 +24,9 @@ from pathlib import Path
 from feature_pipeline.infrastructure.board_projection import (
     CommandEvidence,
     CompletionEvidence,
-    DuplicateCardError,
     InvalidEvidenceError,
     MalformedBoardError,
     MalformedTaskError,
-    MissingCardError,
     project_task_state,
 )
 
@@ -322,7 +320,7 @@ class IdempotentReplayTests(unittest.TestCase):
             self.assertEqual(board.read_text(encoding="utf-8"), BOARD)
             self.assertEqual(task.read_text(encoding="utf-8"), malformed_task)
 
-    def test_missing_card_fails_when_transition_requires_one(self) -> None:
+    def test_missing_card_is_recreated_in_the_target_column(self) -> None:
         board_without_card = BOARD.replace(
             "- [ABC-01: Do the thing](plans/tasks/ABC-01_do-the-thing.md)\n", ""
         )
@@ -330,38 +328,47 @@ class IdempotentReplayTests(unittest.TestCase):
             board = _write_bytes_exact(root / "docs/kanban.md", board_without_card)
             task = _write_bytes_exact(root / "docs/plans/tasks/ABC-01_do-the-thing.md", TASK)
 
-            with self.assertRaises(MissingCardError):
-                project_task_state(
-                    board_path=board,
-                    task_path=task,
-                    task_id="ABC-01",
-                    task_title="Do the thing",
-                    state="running",
-                )
+            project_task_state(
+                board_path=board,
+                task_path=task,
+                task_id="ABC-01",
+                task_title="Do the thing",
+                state="running",
+            )
 
-            self.assertEqual(board.read_text(encoding="utf-8"), board_without_card)
-            self.assertEqual(task.read_text(encoding="utf-8"), TASK)
+            board_text = board.read_text(encoding="utf-8")
+            self.assertNotIn("ABC-01", board_text.split("## In Progress")[0])
+            self.assertEqual(
+                sum("ABC-01" in line for line in board_text.splitlines()), 1
+            )
+            self.assertIn("ABC-01", board_text.split("## In Progress")[1])
 
-    def test_duplicate_card_fails_without_writing(self) -> None:
+    def test_duplicate_cards_converge_by_task_id_or_task_link(self) -> None:
         duplicated_board = BOARD.replace(
             "## In Progress\n",
-            "## In Progress\n\n- [ABC-01: Do the thing](plans/tasks/ABC-01_do-the-thing.md)\n",
+            "## In Progress\n\n- [ABC-01: Stale title](plans/tasks/other.md)\n"
+            "- [Different ID](plans/tasks/ABC-01_do-the-thing.md)\n",
         )
         with temp_root() as root:
             board = _write_bytes_exact(root / "docs/kanban.md", duplicated_board)
             task = _write_bytes_exact(root / "docs/plans/tasks/ABC-01_do-the-thing.md", TASK)
 
-            with self.assertRaises(DuplicateCardError):
-                project_task_state(
-                    board_path=board,
-                    task_path=task,
-                    task_id="ABC-01",
-                    task_title="Do the thing",
-                    state="running",
-                )
+            project_task_state(
+                board_path=board,
+                task_path=task,
+                task_id="ABC-01",
+                task_title="Do the thing",
+                state="running",
+            )
 
-            self.assertEqual(board.read_text(encoding="utf-8"), duplicated_board)
-            self.assertEqual(task.read_text(encoding="utf-8"), TASK)
+            board_text = board.read_text(encoding="utf-8")
+            self.assertEqual(
+                sum("ABC-01" in line for line in board_text.splitlines()), 1
+            )
+            self.assertIn(
+                "- [ABC-01: Do the thing](plans/tasks/ABC-01_do-the-thing.md)",
+                board_text.split("## In Progress")[1],
+            )
 
     def test_verified_replay_when_already_removed_is_a_no_op(self) -> None:
         with temp_root() as root:

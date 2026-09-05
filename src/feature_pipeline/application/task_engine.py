@@ -30,9 +30,16 @@ from pathlib import Path
 from typing import Sequence
 
 from feature_pipeline.contracts import TaskSpec
+from feature_pipeline.infrastructure.board_projection import (
+    BoardProjectionError,
+    CommandEvidence,
+    CompletionEvidence,
+    project_task_state,
+)
 
 from pipeline_core.adapters import Adapter
 from pipeline_core.artifacts import write_json_atomic
+from pipeline_core.commands import verification_stage
 from pipeline_core.dispatch import DispatchRequest, dispatch_executor
 from pipeline_core.lifecycle import RunLifecycle
 from pipeline_core.prompt_envelope import EnvelopeAnchors
@@ -59,6 +66,7 @@ __all__ = [
     "TaskEngine",
     "TaskExecution",
     "TaskRunResult",
+    "build_completion_evidence",
 ]
 
 
@@ -91,6 +99,10 @@ class TaskExecution:
     #: Executor-claimed checks, so :func:`build_verification_evidence` can surface a claim
     #: with no runner-recorded command as a fact-only ``FAIL``.
     claimed_checks: tuple[object, ...] = ()
+    #: **KLC-03**. The Markdown active board's path (``docs/kanban.md``); ``None`` keeps this
+    #: run projection-free (boardless JSON plans). When set, ``spec.path`` — already
+    #: repository-relative for a Markdown-backed task — resolves the task file to project onto.
+    board_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -124,6 +136,45 @@ class TaskRunResult:
     def exit_code(self) -> int:
         """0 only for ``verified``; a blocked task exits non-zero (AC-4)."""
         return 0 if self.status == "verified" else 1
+
+
+def build_completion_evidence(run: Run, spec: TaskSpec) -> CompletionEvidence:
+    """Build the ``verified`` :class:`CompletionEvidence` for ``spec`` from durable run state.
+
+    **KLC-03**. Never copies untrusted executor prose — every field is either a structured
+    ``run.json`` fact (``verified_at``, ``run_id``, ``attempts``, both verdicts) or a
+    repository-relative reference to a runner-owned artifact (the declared verification
+    commands' recorded exit codes, the two verifier reports). Deterministic from ``run`` alone,
+    so a live pass (:meth:`TaskEngine.run`) and a later resume's reconciliation
+    (:func:`pipeline_core.execution.execute_run`) build byte-identical evidence for the same
+    persisted state — the ``completed_at`` field is the durable ``verified_at`` timestamp, never
+    the wall clock at call time.
+    """
+    record = run.task(spec.id)
+    gate = record.attempts + 1
+    stage = verification_stage(spec.id, attempt=gate)
+    commands = tuple(
+        CommandEvidence(
+            cwd=entry["cwd"], command=" ".join(entry["argv"]), exit_code=entry["exit_code"])
+        for entry in (run.command(cid) for cid in run.stage_command_ids(stage))
+    )
+    arts = verifier_artifacts(run.run_dir, spec.id, gate)
+    evidence_paths = tuple(
+        repo_relative(path, run.repo_root)
+        for path in (arts.task_report, arts.test_report)
+        if path.is_file()
+    )
+    return CompletionEvidence(
+        completed_at=record.verification.get("verified_at") or _utcnow(),
+        run_id=run.run_id,
+        outcome="verified",
+        repair_count=record.attempts,
+        gate_count=gate,
+        task_verdict=record.verification.get("task_verdict"),
+        test_verdict=record.verification.get("test_verdict"),
+        commands=commands,
+        evidence_paths=evidence_paths,
+    )
 
 
 class TaskEngine:
@@ -163,6 +214,9 @@ class TaskEngine:
                     life.transition(
                         task_id, "running", actor=ACTOR_RUNNER,
                         note=f"repair attempt {record.attempts}: fresh executor window")
+                # KLC-03: project the durable 'running' transition onto the Markdown board
+                # before the executor is launched — never after.
+                self._project(run, request, "running")
                 dispatch = dispatch_executor(
                     life,
                     DispatchRequest(
@@ -197,6 +251,7 @@ class TaskEngine:
                 passes.append(RepairPass(gate, "verified", repair_of, *verdict))
                 life.recompute_readiness()
                 run.save()
+                self._project(run, request, "verified", build_completion_evidence(run, spec))
                 return TaskRunResult(
                     task_id, "verified", run.task(task_id).attempts, gates, None, None,
                     tuple(passes))
@@ -308,6 +363,42 @@ class TaskEngine:
             regression_tests=regression,
         )
 
+    # -- Markdown board/task projection (KLC-03) ---------------------------------------
+
+    def _project(
+        self, run: Run, request: TaskExecution, state: str,
+        evidence: CompletionEvidence | None = None,
+    ) -> None:
+        """Render ``state`` (and, for ``verified``, ``evidence``) onto the Markdown board and
+        task file, when ``request.board_path`` names one (a boardless JSON plan leaves it
+        ``None`` and stays projection-free).
+
+        Called only *after* the durable transition it renders has already been saved to
+        ``run.json`` — see each call site. A :class:`BoardProjectionError` here (a malformed
+        board/task file, a missing or duplicate card) is re-raised as a truthful
+        :class:`ExecutionError`; ``run.json`` is already intact, so the next ``--resume``
+        repairs the human view idempotently (:func:`pipeline_core.execution.execute_run`).
+        """
+        if request.board_path is None:
+            return
+        spec = request.spec
+        # ``spec.path`` is already repository-relative for a Markdown-backed task file.
+        task_path = run.repo_root / spec.path
+        try:
+            project_task_state(
+                board_path=Path(request.board_path),
+                task_path=task_path,
+                task_id=spec.id,
+                task_title=spec.title,
+                state=state,
+                evidence=evidence,
+            )
+        except BoardProjectionError as exc:
+            raise ExecutionError(
+                f"board projection failed for {spec.id} -> {state!r}: {exc}",
+                "board-projection-failed",
+            ) from exc
+
     # -- durable block at the attempt limit / on an external block -------------------
 
     def _block(
@@ -382,6 +473,9 @@ class TaskEngine:
                 pass
 
         run.save()
+        # KLC-03: project 'blocked' back onto the Markdown board only after every durable
+        # write above (blocker, packet, ``## Blockers`` section) has already landed on disk.
+        self._project(run, request, "blocked")
         return TaskRunResult(
             task_id, "blocked", record.attempts, gates, blocker, Path(diagnostic),
             tuple(passes))
