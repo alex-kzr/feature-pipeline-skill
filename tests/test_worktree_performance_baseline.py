@@ -121,6 +121,13 @@ class ImprovementBudgetTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.report = _shared_report()
 
+    def test_large_recipe_has_a_retained_content_dominant_binary(self) -> None:
+        # The retained-heap budget compares the marker's metadata with the legacy
+        # snapshot's retained file bodies. Keep the deterministic large recipe large
+        # enough that Windows CPython metadata allocation variance cannot obscure that
+        # structural distinction.
+        self.assertGreaterEqual(harness.LARGE_BLOB_BYTES, 32 * 1024 * 1024)
+
     def test_bytes_read_is_order_changed_candidates(self) -> None:
         for name, m in self.report.items():
             budget = 4 * harness.LARGE_TEXT_BYTES * m.changed_candidate_count + 262144

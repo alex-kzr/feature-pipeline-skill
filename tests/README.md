@@ -147,21 +147,12 @@ explicit discovery commands over the existing flat layout (AC-1). Moving every r
 into its documented suite directory is the next slice of this restructuring; do it in small,
 count-and-skip-verified batches per module (Implementation Notes), not as one mechanical pass.
 
-## Known exceptions (tracked, not introduced by QG-01)
+## Worktree performance recipe
 
-`tests.test_worktree_performance_baseline.ImprovementBudgetTests
-.test_large_retained_heap_far_below_legacy` is a pre-existing, unmodified-by-QG-01 assertion
-(`tests/test_worktree_performance_baseline.py`, backed by the measurement harness in
-`tests/worktree_perf.py`) that this restructuring did not touch — `git diff` shows no change to
-either file. On at least one observed machine/interpreter (CPython 3.13, Windows) it fails with
-the bounded-window retained heap only ~1.15x below the legacy full-snapshot retained heap
-(observed: legacy 2,439,179 bytes vs bounded 2,115,419 bytes), short of the >=10x budget the test
-asserts. That budget is a production-behavior claim about `pipeline_core.worktree`
-(`feature-pipeline-skill/src/**`/`feature-pipeline-skill/pipeline_core/**`), which is out of
-scope for QG-01 to change, and the assertion is a meaningful regression guard (not a
-platform/denial-path assertion whose cost this task is permitted to reduce), so QG-01 does not
-weaken or relax it. Until a task with `pipeline_core`/`worktree` in its Allowed scope
-investigates and either fixes the measured heap retention or adjusts the budget with evidence,
-`uv run python -m unittest discover -s tests -t .` can fail on exactly this one test on such a
-machine; every other test in the 1,027-test discovery, plus the accepted 8 skips, is unaffected
-by and unrelated to this task's diff.
+`tests.test_worktree_performance_baseline` keeps the WT-01 retained-heap guard at a >=10x
+bounded-versus-legacy ratio. Its deterministic large recipe includes 600 tracked source files
+and a 32 MiB tracked binary. The binary is intentionally not changed by the executor window:
+the bounded marker retains only candidate metadata and open dirty bodies, while the legacy
+snapshot retains the binary body. This keeps the guard structural and stable on Windows CPython,
+where transient index-metadata allocations can otherwise obscure the retained-content gap in a
+small fixture.

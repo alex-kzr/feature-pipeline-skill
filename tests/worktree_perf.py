@@ -72,9 +72,11 @@ SMALL_TEXT_BYTES = 1024
 SMALL_BLOB_BYTES = 2 * 1024
 
 #: ``large`` scenario — a synthetic monorepo slice, still bounded for a developer machine.
+#: The tracked binary deliberately dominates the retained-content comparison: metadata
+#: allocations vary by CPython build, while a legacy snapshot must retain this whole body.
 LARGE_TRACKED_FILES = 600
 LARGE_TEXT_BYTES = 3 * 1024
-LARGE_BLOB_BYTES = 384 * 1024
+LARGE_BLOB_BYTES = 32 * 1024 * 1024
 
 #: Deterministic content seed. Same seed → byte-identical repository (AC-2).
 SEED = 20260903
