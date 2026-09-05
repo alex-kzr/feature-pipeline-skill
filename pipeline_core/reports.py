@@ -83,6 +83,7 @@ class LaunchArtifacts:
     implementation_manifest: Path
     implementation_diff: Path
     launch_failure: Path
+    result_protocol_invalid: Path
 
 
 def launch_artifacts(run_dir: str | Path, task_id: str, generation: int) -> LaunchArtifacts:
@@ -103,6 +104,7 @@ def launch_artifacts(run_dir: str | Path, task_id: str, generation: int) -> Laun
         implementation_manifest=directory / f"implementation-manifest-{generation}.json",
         implementation_diff=directory / f"implementation-diff-{generation}.md",
         launch_failure=directory / f"launch-failure-{generation}.json",
+        result_protocol_invalid=directory / f"result-protocol-invalid-{generation}.json",
     )
 
 

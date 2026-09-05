@@ -13,7 +13,7 @@ from pathlib import Path
 from pipeline_core.adapters import AdapterError, ClaudeAdapter, LaunchResult
 from pipeline_core.dispatch import DispatchRequest, dispatch_executor
 from pipeline_core.lifecycle import RunLifecycle
-from pipeline_core.prompt_envelope import EnvelopeAnchors
+from pipeline_core.prompt_envelope import EnvelopeAnchors, build_executor_envelope
 from pipeline_core.reports import (
     ReportError,
     launch_artifacts,
@@ -124,6 +124,25 @@ class ScriptedAdapter:
         return LaunchResult(exit_code=exit_code, stdout=text, session_id=self.session_id)
 
 
+class CodexFinalAdapter:
+    """Codex-shaped launch whose raw JSONL, not report prose, owns the terminal result."""
+
+    name = "codex"
+
+    def __init__(self, payloads: list[object], *, exit_code: int = 0) -> None:
+        self.payloads = payloads
+        self.exit_code = exit_code
+
+    def launch(self, request):  # noqa: ANN001 - test double
+        Path(request.report_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(request.report_path).write_text("# Human report\n\n- Status: implemented\n", encoding="utf-8")
+        events = [json.dumps({"type": "item.completed", "item": {
+            "type": "agent_message", "text": json.dumps(payload),
+        }}) for payload in self.payloads]
+        events.append(json.dumps({"type": "turn.completed"}))
+        return LaunchResult(self.exit_code, "# Human report\n", "", "thread-1", "\n".join(events))
+
+
 def _anchors() -> EnvelopeAnchors:
     return EnvelopeAnchors(project_root=".", agents_root=".agents")
 
@@ -215,7 +234,8 @@ class GenerationTests(unittest.TestCase):
                 life, _request(spec), ScriptedAdapter(launch_exit=1))
 
             self.assertEqual(outcome.generation, 1)
-            self.assertEqual(outcome.status, "blocked")
+            self.assertEqual(outcome.status, "retryable")
+            self.assertEqual(life.run.task(spec.id).status, "running")
             self.assertIsNone(outcome.settled_status)
             self.assertEqual(life.run.task(spec.id).next_executor_launch_generation, 2)
 
@@ -234,7 +254,8 @@ class GenerationTests(unittest.TestCase):
                                       prose_text="partial work\nstderr trace")
             outcome = dispatch_executor(life, _request(spec), adapter)
 
-            self.assertEqual(outcome.status, "blocked")
+            self.assertEqual(outcome.status, "retryable")
+            self.assertEqual(life.run.task(spec.id).status, "running")
             self.assertTrue(outcome.artifacts.launch_failure.is_file())
             saved = json.loads(outcome.artifacts.launch_failure.read_text(encoding="utf-8"))
             self.assertEqual(saved["exit_code"], 7)
@@ -243,7 +264,7 @@ class GenerationTests(unittest.TestCase):
             self.assertEqual(len(failures), 1)
             self.assertEqual(failures[0]["stage"], "executor")
 
-    def test_adapter_error_on_launch_blocks_and_records_a_failure(self) -> None:
+    def test_adapter_error_on_launch_is_retryable_and_records_a_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             spec = _spec()
@@ -251,7 +272,8 @@ class GenerationTests(unittest.TestCase):
             outcome = dispatch_executor(
                 life, _request(spec), ScriptedAdapter(raise_code="adapter-unavailable"))
 
-            self.assertEqual(outcome.status, "blocked")
+            self.assertEqual(outcome.status, "retryable")
+            self.assertEqual(life.run.task(spec.id).status, "running")
             self.assertIn("adapter-unavailable", outcome.failure or "")
             self.assertTrue(outcome.artifacts.launch_failure.is_file())
             self.assertEqual(life.run.task(spec.id).next_executor_launch_generation, 2)
@@ -364,6 +386,95 @@ class PromptEnvelopeTests(unittest.TestCase):
 
 
 class StatusSettlementTests(unittest.TestCase):
+    def test_codex_implemented_final_event_ignores_human_report_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = _spec()
+            life = _running_life(root, spec)
+            outcome = dispatch_executor(life, _request(spec), CodexFinalAdapter([{
+                "role": "executor", "task_id": spec.id, "attempt": 1,
+                "status": "implemented",
+            }]))
+            self.assertEqual(outcome.status, "implemented")
+            self.assertEqual(life.run.task(spec.id).status, "implemented")
+
+    def test_codex_multiple_or_invalid_final_events_are_retryable_not_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = _spec()
+            life = _running_life(root, spec)
+            payload = {"role": "executor", "task_id": spec.id, "attempt": 1,
+                       "status": "implemented"}
+            outcome = dispatch_executor(life, _request(spec), CodexFinalAdapter([payload, payload]))
+            self.assertEqual(outcome.status, "retryable")
+            self.assertEqual(life.run.task(spec.id).status, "running")
+            self.assertTrue(outcome.artifacts.result_protocol_invalid.is_file())
+            self.assertNotIn("executor reported blocked", life.run.task(spec.id).blocker or "")
+
+    def test_codex_contradictory_generated_envelope_retains_both_payloads(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = _spec()
+            life = _running_life(root, spec)
+            artifacts = launch_artifacts(life.run.run_dir, spec.id, 1)
+            conflicting = _envelope("blocked", spec.id)
+            artifacts.status_envelope.parent.mkdir(parents=True, exist_ok=True)
+            artifacts.status_envelope.write_text(conflicting, encoding="utf-8")
+            payload = {
+                "role": "executor", "task_id": spec.id, "attempt": 1,
+                "status": "implemented",
+            }
+
+            outcome = dispatch_executor(life, _request(spec), CodexFinalAdapter([payload]))
+
+            self.assertEqual(outcome.status, "retryable")
+            diagnostic = json.loads(
+                outcome.artifacts.result_protocol_invalid.read_text(encoding="utf-8"))
+            self.assertEqual(diagnostic["envelope_stdout"], conflicting)
+            self.assertIn('\\"status\\": \\"implemented\\"', diagnostic["stdout"])
+
+    def test_codex_equivalent_generated_envelope_is_not_a_contradiction(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = _spec()
+            life = _running_life(root, spec)
+            artifacts = launch_artifacts(life.run.run_dir, spec.id, 1)
+            artifacts.status_envelope.parent.mkdir(parents=True, exist_ok=True)
+            artifacts.status_envelope.write_text(
+                json.dumps({
+                    "status": "implemented", "attempt": 1,
+                    "task_id": spec.id, "role": "executor",
+                }, indent=2),
+                encoding="utf-8",
+            )
+
+            outcome = dispatch_executor(life, _request(spec), CodexFinalAdapter([{
+                "role": "executor", "task_id": spec.id, "attempt": 1,
+                "status": "implemented",
+            }]))
+
+            self.assertEqual(outcome.status, "implemented")
+            self.assertFalse(outcome.artifacts.result_protocol_invalid.exists())
+
+    def test_codex_blocked_final_event_preserves_its_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = _spec()
+            life = _running_life(root, spec)
+            outcome = dispatch_executor(life, _request(spec), CodexFinalAdapter([{
+                "role": "executor", "task_id": spec.id, "attempt": 1,
+                "status": "blocked", "reason": "required service is unavailable",
+            }]))
+            self.assertEqual(outcome.status, "blocked")
+            self.assertEqual(life.run.task(spec.id).blocker, "required service is unavailable")
+
+    def test_codex_prompt_uses_the_current_repair_attempt(self) -> None:
+        spec = _spec()
+        prompt = build_executor_envelope(
+            spec, anchors=_anchors(), role_grant=("read",), execution_mode="separate",
+            report_path="report.md", attempt=2,
+        )
+        self.assertIn('"attempt":2', prompt)
     def test_fresh_envelope_adapter_receives_the_runner_observed_status(self) -> None:
         class FreshEnvelopeAdapter(ScriptedAdapter):
             requires_fresh_envelope_context = True
@@ -409,7 +520,7 @@ class StatusSettlementTests(unittest.TestCase):
             drift_events = [e for e in life.run.history if e.get("note") and "envelope status" in e["note"]]
             self.assertTrue(drift_events)
 
-    def test_prose_envelope_disagreement_fails_closed_and_blocks(self) -> None:
+    def test_prose_envelope_disagreement_is_retryable_not_a_task_block(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             spec = _spec()
@@ -417,10 +528,11 @@ class StatusSettlementTests(unittest.TestCase):
             adapter = ScriptedAdapter(prose_status="implemented", envelope_status="blocked")
             outcome = dispatch_executor(life, _request(spec), adapter)
 
-            self.assertEqual(outcome.status, "blocked")
+            self.assertEqual(outcome.status, "retryable")
             self.assertIsNone(outcome.settled_status)
             self.assertIn("status-envelope-mismatch", outcome.failure or "")
-            self.assertEqual(life.run.task(spec.id).status, "blocked")
+            self.assertEqual(life.run.task(spec.id).status, "running")
+            self.assertTrue(outcome.artifacts.launch_failure.exists())
 
     def test_malformed_status_envelope_is_denied(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -430,8 +542,9 @@ class StatusSettlementTests(unittest.TestCase):
             adapter = ScriptedAdapter(envelope_text='{"role": "executor" oops')
             outcome = dispatch_executor(life, _request(spec), adapter)
 
-            self.assertEqual(outcome.status, "blocked")
+            self.assertEqual(outcome.status, "retryable")
             self.assertIn("unparseable-status-envelope", outcome.failure or "")
+            self.assertEqual(life.run.task(spec.id).status, "running")
 
     def test_executor_reported_blocked_blocks_without_a_launch_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -451,11 +564,11 @@ class StatusSettlementTests(unittest.TestCase):
 
 
 class StateAuthorityTests(unittest.TestCase):
-    def test_dispatch_only_ever_reaches_implemented_or_blocked(self) -> None:
+    def test_dispatch_reaches_implemented_blocked_or_retryable(self) -> None:
         for adapter, expected in (
             (ScriptedAdapter(), "implemented"),
             (ScriptedAdapter(prose_status="blocked", envelope_status="blocked"), "blocked"),
-            (ScriptedAdapter(launch_exit=1), "blocked"),
+            (ScriptedAdapter(launch_exit=1), "retryable"),
         ):
             with tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -463,7 +576,7 @@ class StateAuthorityTests(unittest.TestCase):
                 life = _running_life(root, spec)
                 outcome = dispatch_executor(life, _request(spec), adapter)
                 self.assertEqual(outcome.status, expected)
-                self.assertIn(outcome.status, {"implemented", "blocked"})
+                self.assertIn(outcome.status, {"implemented", "blocked", "retryable"})
 
     def test_executor_output_cannot_set_verified(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

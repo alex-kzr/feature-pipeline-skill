@@ -23,6 +23,7 @@ from pipeline_core.adapters import (
     on_disk_agent_name,
     parse_result_text,
     parse_session_id,
+    parse_codex_final_result,
 )
 from pipeline_core.adapter_resolution import (
     AdapterResolution,
@@ -305,6 +306,54 @@ class ClaudeLaunchTests(unittest.TestCase):
 
 
 class CodexLaunchTests(unittest.TestCase):
+    def test_codex_final_result_accepts_intermediate_messages_before_one_final_event(self) -> None:
+        event = json.dumps({"type": "item.completed", "item": {
+            "type": "agent_message", "text": json.dumps({
+                "role": "executor", "task_id": "VRC-04", "attempt": 1,
+                "status": "implemented",
+            }),
+        }})
+        intermediate = json.dumps({"type": "item.completed", "item": {
+            "type": "agent_message", "text": "I am still working.",
+        }})
+        completed = json.dumps({"type": "turn.completed"})
+        result = parse_codex_final_result(
+            "\n".join((intermediate, event, completed)), task_id="VRC-04", attempt=1)
+        self.assertEqual(result.status, "implemented")
+        with self.assertRaises(AdapterError) as ctx:
+            parse_codex_final_result(
+                "\n".join((event, event, completed)), task_id="VRC-04", attempt=1)
+        self.assertEqual(ctx.exception.code, "result-protocol-invalid")
+
+    def test_codex_final_result_rejects_a_message_after_the_final_event(self) -> None:
+        event = json.dumps({"type": "item.completed", "item": {
+            "type": "agent_message", "text": json.dumps({
+                "role": "executor", "task_id": "VRC-04", "attempt": 1,
+                "status": "implemented",
+            }),
+        }})
+        later = json.dumps({"type": "item.completed", "item": {
+            "type": "agent_message", "text": "One last note.",
+        }})
+        with self.assertRaises(AdapterError) as ctx:
+            parse_codex_final_result(
+                "\n".join((event, later, json.dumps({"type": "turn.completed"}))),
+                task_id="VRC-04", attempt=1)
+        self.assertEqual(ctx.exception.code, "result-protocol-invalid")
+
+    def test_codex_final_result_rejects_a_malformed_jsonl_event(self) -> None:
+        event = json.dumps({"type": "item.completed", "item": {
+            "type": "agent_message", "text": json.dumps({
+                "role": "executor", "task_id": "VRC-04", "attempt": 1,
+                "status": "implemented",
+            }),
+        }})
+
+        with self.assertRaises(AdapterError) as ctx:
+            parse_codex_final_result(
+                event + "\n{malformed event", task_id="VRC-04", attempt=1)
+
+        self.assertEqual(ctx.exception.code, "result-protocol-invalid")
     def test_launch_parses_jsonl_agent_message_and_thread_id(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             executable = _fake_executable(Path(directory), _FAKE_CODEX, "fake_codex.py")

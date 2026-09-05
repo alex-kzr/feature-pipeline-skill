@@ -26,6 +26,7 @@ Standard library only.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,6 +37,7 @@ from .adapters import (
     AdapterError,
     LaunchRequest,
     LaunchResult,
+    parse_codex_final_result,
     grant_tool_names,
 )
 from .artifacts import write_json_atomic, write_text_atomic
@@ -90,7 +92,7 @@ class DispatchOutcome:
 
     task_id: str
     generation: int
-    status: str  # 'implemented' | 'blocked'
+    status: str  # 'implemented' | 'blocked' | 'retryable'
     settled_status: str | None  # 'implemented' | 'blocked'; None when the launch never settled
     artifacts: LaunchArtifacts
     launch_result: LaunchResult
@@ -129,6 +131,7 @@ def dispatch_executor(
         role_grant=request.role_grant,
         execution_mode=request.execution_mode,
         report_path=repo_relative(artifacts.executor_report, run.repo_root),
+        attempt=request.attempt,
         plan_path=request.plan_path,
         repair_report_path=request.repair_report_path,
     )
@@ -159,7 +162,7 @@ def dispatch_executor(
     try:
         result = adapter.launch(launch_request)
     except AdapterError as exc:
-        return _block_for_failure(
+        return _retryable_failure(
             life, request, artifacts, generation,
             LaunchResult(exit_code=EXIT_ADAPTER_ERROR, stderr=str(exc)),
             None, f"adapter error ({exc.code}): {exc}",
@@ -168,15 +171,18 @@ def dispatch_executor(
     report_text = _settle_text(artifacts.executor_report, result.stdout, run)
 
     if result.exit_code != 0:
-        return _block_for_failure(
+        return _retryable_failure(
             life, request, artifacts, generation, result, None,
             f"executor launch exited with {result.exit_code}",
         )
     if not result.session_id:
-        return _block_for_failure(
+        return _retryable_failure(
             life, request, artifacts, generation, result, None,
             "executor launch returned no session id; the status envelope cannot be settled",
         )
+
+    if getattr(adapter, "name", None) == "codex":
+        return _settle_codex_final_result(life, request, artifacts, generation, result, before_snapshot)
 
     # The strict JSON status envelope: one same-session, tool-free continuation. Codex cannot
     # resume with its read-only sandbox and resolved anchor grants, so it declares that its
@@ -208,13 +214,13 @@ def dispatch_executor(
     try:
         envelope_result = adapter.launch(envelope_request)
     except AdapterError as exc:
-        return _block_for_failure(
+        return _retryable_failure(
             life, request, artifacts, generation, result, None,
             f"status envelope request failed ({exc.code}): {exc}",
         )
     envelope_text = _settle_text(artifacts.status_envelope, envelope_result.stdout, run)
     if envelope_result.exit_code != 0:
-        return _block_for_failure(
+        return _retryable_failure(
             life, request, artifacts, generation, result, envelope_result,
             f"status envelope request exited with {envelope_result.exit_code}",
         )
@@ -228,7 +234,7 @@ def dispatch_executor(
             attempt=request.attempt,
         )
     except ReportError as exc:
-        return _block_for_failure(
+        return _retryable_failure(
             life, request, artifacts, generation, result, envelope_result,
             f"{exc.code}: {exc}",
         )
@@ -285,44 +291,76 @@ def dispatch_executor(
     )
 
 
-def _block_for_failure(
-    life: RunLifecycle,
-    request: DispatchRequest,
-    artifacts: LaunchArtifacts,
-    generation: int,
-    result: LaunchResult,
-    envelope_result: LaunchResult | None,
-    reason: str,
+def _retryable_failure(
+    life: RunLifecycle, request: DispatchRequest, artifacts: LaunchArtifacts, generation: int,
+    result: LaunchResult, envelope_result: LaunchResult | None, reason: str,
+    *, protocol: bool = False, envelope_stdout: str | None = None,
 ) -> DispatchOutcome:
-    """Persist exit/stdout/stderr/session evidence for a failed launch, then block the task."""
+    """Persist a launch/protocol diagnostic without manufacturing a task outcome."""
     run = life.run
-    task_id = request.spec.id
-    write_json_atomic(
-        artifacts.launch_failure,
-        {
-            "task_id": task_id,
-            "generation": generation,
-            "attempt": request.attempt,
-            "stage": EXECUTOR_ROLE,
-            "reason": reason,
-            "exit_code": result.exit_code,
-            "session_id": result.session_id,
-            # Raw CLI wrapper (unextracted), preserved for a human debugging a failed launch —
-            # `result.stdout` itself is the extracted assistant text (RDS-07).
-            "stdout": result.raw_stdout or result.stdout,
-            "stderr": result.stderr,
-        },
-        repo_root=run.repo_root,
-    )
-    run.record_launch_failure(
-        task_id, stage=EXECUTOR_ROLE, generation=generation,
-        exit_code=result.exit_code, detail=reason,
-    )
-    life.block(task_id, f"executor launch-{generation} failed: {reason}")
-    return DispatchOutcome(
-        task_id, generation, "blocked", None, artifacts, result, envelope_result, None, None,
-        reason,
-    )
+    path = artifacts.result_protocol_invalid if protocol else artifacts.launch_failure
+    write_json_atomic(path, {
+        "task_id": request.spec.id, "generation": generation, "attempt": request.attempt,
+        "stage": EXECUTOR_ROLE, "reason": reason, "exit_code": result.exit_code,
+        "session_id": result.session_id, "stdout": result.raw_stdout or result.stdout,
+        "stderr": result.stderr,
+        "envelope_stdout": envelope_stdout if envelope_stdout is not None else (
+            (envelope_result.raw_stdout or envelope_result.stdout)
+            if envelope_result else None),
+    }, repo_root=run.repo_root)
+    run.record_launch_failure(request.spec.id, stage=EXECUTOR_ROLE, generation=generation,
+                              exit_code=result.exit_code, detail=reason)
+    run.save()
+    return DispatchOutcome(request.spec.id, generation, "retryable", None, artifacts, result,
+                           envelope_result, None, None, reason)
+
+
+def _settle_codex_final_result(
+    life: RunLifecycle, request: DispatchRequest, artifacts: LaunchArtifacts, generation: int,
+    result: LaunchResult, before_snapshot,
+) -> DispatchOutcome:
+    """Accept only Codex's one canonical event; prose never supplies a status."""
+    run = life.run
+    try:
+        final = parse_codex_final_result(result.raw_stdout or result.stdout,
+                                         task_id=request.spec.id, attempt=request.attempt)
+    except AdapterError as exc:
+        return _retryable_failure(life, request, artifacts, generation, result, None,
+                                  f"{exc.code}: {exc}", protocol=True)
+    existing = _settle_text(artifacts.status_envelope, "", run) if artifacts.status_envelope.exists() else ""
+    if existing and not _same_codex_final_payload(existing, final.raw_payload):
+        return _retryable_failure(life, request, artifacts, generation, result, None,
+                                  "result-protocol-invalid: generated envelope contradicts canonical final result",
+                                  protocol=True, envelope_stdout=existing)
+    write_text_atomic(artifacts.status_envelope, final.raw_payload, repo_root=run.repo_root)
+    report_text = _settle_text(artifacts.executor_report, result.stdout, run)
+    if final.status == "blocked":
+        life.block(request.spec.id, final.reason or "")
+        return DispatchOutcome(request.spec.id, generation, "blocked", "blocked", artifacts,
+                               result, None, report_text)
+    attribution = attribute_executor_window(
+        before_snapshot, run.repo_root, artifacts=artifacts, task_id=request.spec.id,
+        allowed_scope=request.spec.allowed_scope, attempt=request.attempt, generation=generation,
+        executor_report=artifacts.executor_report, exclude_roots=(run.run_dir,))
+    run.record_executor_evidence(request.spec.id, attempt=request.attempt, generation=generation,
+        report_path=artifacts.executor_report, session_id=result.session_id,
+        reserved_manifest=repo_relative(artifacts.implementation_manifest, run.repo_root),
+        reserved_diff=repo_relative(artifacts.implementation_diff, run.repo_root))
+    run.record_implementation_attribution(request.spec.id, generation=generation,
+        attempt=request.attempt, attribution_state=attribution.state, manifest=attribution.manifest,
+        diff=attribution.diff, changed_files=attribution.changed_files, reason=attribution.reason)
+    life.transition(request.spec.id, "implemented", actor=ACTOR_EXECUTOR,
+                    note=f"executor launch-{generation} reported implemented")
+    return DispatchOutcome(request.spec.id, generation, "implemented", "implemented", artifacts,
+                           result, None, report_text, attribution=attribution)
+
+
+def _same_codex_final_payload(generated: str, canonical: str) -> bool:
+    """Compare persisted and streamed envelopes as JSON values, never as presentation bytes."""
+    try:
+        return json.loads(generated) == json.loads(canonical)
+    except (TypeError, json.JSONDecodeError):
+        return False
 
 
 def _settle_text(path: Path, fallback_stdout: str, run) -> str:

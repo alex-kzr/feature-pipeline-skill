@@ -442,6 +442,118 @@ def parse_codex_result_text(stdout: str) -> str | None:
     return result
 
 
+@dataclass(frozen=True)
+class CodexFinalResult:
+    """One validated terminal result from a Codex JSONL launch."""
+
+    status: str
+    reason: str | None
+    raw_payload: str
+
+
+def _parse_codex_jsonl_events(stdout: str) -> list[dict]:
+    """Parse a complete Codex JSONL stream without dropping malformed events."""
+    lines = [line.strip() for line in (stdout or "").splitlines() if line.strip()]
+    if not lines:
+        raise AdapterError("Codex final-result stream is empty", "result-protocol-invalid")
+    events: list[dict] = []
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            raise AdapterError("Codex JSONL stream contains malformed event", "result-protocol-invalid") from None
+        if not isinstance(event, dict):
+            raise AdapterError("Codex JSONL event is not an object", "result-protocol-invalid")
+        events.append(event)
+    return events
+
+
+def parse_codex_final_result(stdout: str, *, task_id: str, attempt: int) -> CodexFinalResult:
+    """Parse exactly one canonical executor final-result event from ordered Codex JSONL.
+
+    Codex's human report is an artifact, not a protocol input.  The final agent message is
+    therefore required to be the one JSON object specified by the executor prompt; selecting a
+    "latest" message would make an earlier report or a later aside authoritative again.
+    """
+    events = _parse_codex_jsonl_events(stdout)
+    messages: list[tuple[int, str]] = []
+    for index, event in enumerate(events):
+        if not isinstance(event, dict) or event.get("type") != "item.completed":
+            continue
+        item = event.get("item")
+        if isinstance(item, dict) and item.get("type") == "agent_message":
+            text = item.get("text")
+            if isinstance(text, str):
+                messages.append((index, text))
+            else:
+                raise AdapterError("Codex final-result event has no text payload", "result-protocol-invalid")
+    if not messages:
+        raise AdapterError(
+            "Codex launch has no final-result agent message",
+            "result-protocol-invalid",
+        )
+    candidates: list[tuple[int, str, dict]] = []
+    for index, raw in messages:
+        try:
+            payload = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if _is_codex_terminal_schema(payload):
+            candidates.append((index, raw, payload))
+    if len(candidates) != 1:
+        raise AdapterError(
+            f"Codex launch has {len(candidates)} terminal result payloads; expected exactly one",
+            "result-protocol-invalid",
+        )
+    index, raw, payload = candidates[0]
+    if index != messages[-1][0]:
+        raise AdapterError(
+            "Codex terminal result is not the final agent message",
+            "result-protocol-invalid",
+        )
+    if not any(event.get("type") == "turn.completed" for event in events[index + 1:]):
+        raise AdapterError(
+            "Codex terminal result is not followed by turn.completed",
+            "result-protocol-invalid",
+        )
+    status = payload.get("status")
+    expected = {"role", "task_id", "attempt", "status"}
+    if status == "blocked":
+        expected.add("reason")
+    if set(payload) != expected:
+        raise AdapterError(
+            f"Codex final-result keys {sorted(payload)}, expected exactly {sorted(expected)}",
+            "result-protocol-invalid",
+        )
+    if payload.get("role") != "executor" or payload.get("task_id") != task_id:
+        raise AdapterError("Codex final-result launch identity does not match", "result-protocol-invalid")
+    if payload.get("attempt") != attempt or isinstance(payload.get("attempt"), bool):
+        raise AdapterError("Codex final-result attempt does not match", "result-protocol-invalid")
+    if status not in {"implemented", "blocked"}:
+        raise AdapterError("Codex final-result status is invalid", "result-protocol-invalid")
+    reason = payload.get("reason")
+    if status == "blocked" and (not isinstance(reason, str) or not reason.strip()):
+        raise AdapterError("Codex blocked final-result requires a non-empty reason", "result-protocol-invalid")
+    return CodexFinalResult(status=status, reason=reason if isinstance(reason, str) else None, raw_payload=raw)
+
+
+def _is_codex_terminal_schema(payload: object) -> bool:
+    """Return whether a message has the terminal-result shape before identity validation."""
+    if not isinstance(payload, dict):
+        return False
+    status = payload.get("status")
+    expected = {"role", "task_id", "attempt", "status"}
+    if status == "blocked":
+        expected.add("reason")
+    if status not in {"implemented", "blocked"} or set(payload) != expected:
+        return False
+    if not isinstance(payload.get("role"), str) or not isinstance(payload.get("task_id"), str):
+        return False
+    if not isinstance(payload.get("attempt"), int) or isinstance(payload.get("attempt"), bool):
+        return False
+    return status != "blocked" or isinstance(payload.get("reason"), str) and bool(payload["reason"].strip())
+
+
 # --- process lifetime ------------------------------------------------------------------------
 
 

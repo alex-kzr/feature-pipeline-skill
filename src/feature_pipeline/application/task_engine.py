@@ -233,6 +233,14 @@ class TaskEngine:
                     ),
                     request.adapter,
                 )
+                if dispatch.status == "retryable":
+                    return TaskRunResult(
+                        task_id, "retryable", run.task(task_id).attempts, gates,
+                        dispatch.failure, dispatch.artifacts.result_protocol_invalid
+                        if dispatch.artifacts.result_protocol_invalid.exists()
+                        else dispatch.artifacts.launch_failure,
+                        tuple(passes),
+                    )
                 if dispatch.status != "implemented":
                     passes.append(RepairPass(gate, "blocked", repair_of, None, None))
                     return self._block(
@@ -315,7 +323,7 @@ class TaskEngine:
         if record.status == "repairing":
             return (repo_relative(report, run.repo_root) if report else None), False
 
-        if record.status == "ready":
+        if record.status in {"ready", "running"}:
             repair_of = (
                 repo_relative(report, run.repo_root)
                 if record.attempts > 0 and report is not None

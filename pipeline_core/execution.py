@@ -334,7 +334,7 @@ class ExecuteRequest:
 class ExecuteResult:
     """The terminal outcome of one ``execute`` invocation."""
 
-    status: str  # 'ok' | 'gate-pending' | 'blocked' | 'error'
+    status: str  # 'ok' | 'gate-pending' | 'retryable' | 'blocked' | 'error'
     exit_code: int
     message: str
     run_dir: Path | None
@@ -938,6 +938,16 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
                 t_lease.release()
 
             results.append(outcome)
+            if outcome.status == "retryable":
+                # A launch/protocol error has no executor outcome. Preserve the non-terminal
+                # lifecycle so a later --resume obtains a fresh launch generation.
+                life.run.status = "running"
+                life.run.save()
+                return ExecuteResult(
+                    "retryable", EXIT_ERROR,
+                    f"{task_id} has a retryable orchestration failure: "
+                    f"{outcome.blocker or 'see the persisted diagnostic'}",
+                    request.run_dir, life.run.run_id, tuple(results))
             if outcome.status != "verified":
                 life.run.status = "blocked"
                 life.run.save()

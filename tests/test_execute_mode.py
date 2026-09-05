@@ -25,6 +25,7 @@ from pipeline_core.execution import (
     ExecuteRequest,
     execute_run,
 )
+from pipeline_core.adapters import LaunchResult
 from pipeline_core.lifecycle import RunLifecycle
 from pipeline_core.prompt_envelope import EnvelopeAnchors
 from pipeline_core.state import ACTOR_RUNNER, Run, pid_alive
@@ -216,6 +217,61 @@ class ResumeAndSafetyTests(unittest.TestCase):
             self.assertEqual(run.task("EX-01").attempts, 1)  # not re-counted on resume
             self.assertEqual(run.controls["adapter_resolved"]["value"], "claude")
             self.assertTrue(executor.calls[0]["is_repair"])
+
+    def test_resume_retries_codex_protocol_failure_with_a_new_generation(self) -> None:
+        class CodexSequenceExecutor:
+            name = "codex"
+
+            def __init__(self) -> None:
+                self.launches = 0
+
+            def launch(self, request):  # noqa: ANN001 - deterministic adapter double
+                payloads = (
+                    [{"not": "a final result"}],
+                    [{"role": "executor", "task_id": request.task_id, "attempt": 1,
+                      "status": "implemented"}],
+                )
+                current = payloads[self.launches]
+                self.launches += 1
+                Path(request.report_path).parent.mkdir(parents=True, exist_ok=True)
+                Path(request.report_path).write_text("# Human report\n", encoding="utf-8")
+                events = [json.dumps({"type": "item.completed", "item": {
+                    "type": "agent_message", "text": json.dumps(payload),
+                }}) for payload in current]
+                events.append(json.dumps({"type": "turn.completed"}))
+                return LaunchResult(0, "# Human report\n", "", "thread-1", "\n".join(events))
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            executor = CodexSequenceExecutor()
+            first = execute_run(_request(
+                root, _specs(("EX-01",)), executor=executor,
+                launchers=VerifierLaunchers(
+                    task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))),
+                controls=ExecuteControls(plan_approved=True, adapter="codex", adapter_explicit=True),
+                environment={"codex": True}))
+
+            self.assertEqual(first.status, "retryable")
+            run = Run.load(first.run_dir, root)
+            self.assertEqual(run.status, "running")
+            self.assertEqual(run.task("EX-01").status, "running")
+            self.assertEqual(run.task("EX-01").attempts, 0)
+            self.assertTrue(
+                (first.run_dir / "reports" / "EX-01" / "launch-1" /
+                 "result-protocol-invalid-1.json").is_file())
+
+            resumed = execute_run(_request(
+                root, _specs(("EX-01",)), executor=executor,
+                launchers=VerifierLaunchers(
+                    task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))),
+                controls=ExecuteControls(
+                    plan_approved=True, resume=True, adapter="codex", adapter_explicit=True),
+                environment={"codex": True}))
+
+            self.assertTrue(resumed.ok)
+            self.assertEqual(executor.launches, 2)
+            run = Run.load(resumed.run_dir, root)
+            self.assertEqual(run.task("EX-01").next_executor_launch_generation, 3)
 
     def test_resume_that_would_switch_the_pinned_adapter_is_a_runner_error(self) -> None:
         with TemporaryDirectory() as directory:

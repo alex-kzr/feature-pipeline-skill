@@ -44,6 +44,7 @@ def build_executor_envelope(
     role_grant: Sequence[str],
     execution_mode: str,
     report_path: str,
+    attempt: int = 1,
     plan_path: str | None = None,
     repair_report_path: str | None = None,
 ) -> str:
@@ -102,5 +103,12 @@ def build_executor_envelope(
         "- Acceptance criteria evidence:",
         "- Out-of-scope discoveries:",
         "- Blockers:",
+        "",
+        "Codex final result protocol:",
+        "- Write the human Markdown report to the Report path above.",
+        "- Your one final assistant message must be only this machine-readable JSON object:",
+        f'- {{"role":"executor","task_id":"{spec.id}","attempt":{attempt},"status":"implemented"}}',
+        "- For blocked, add a non-empty verbatim reason: "
+        f'{{"role":"executor","task_id":"{spec.id}","attempt":{attempt},"status":"blocked","reason":"<why>"}}',
     ]
     return "\n".join(lines) + "\n"
