@@ -64,6 +64,8 @@ Callers supply all anchors. The core does not infer host-specific locations or p
   [`scripts/README.md`](scripts/README.md) and
   [`fixtures/execution/README.md`](fixtures/execution/README.md).
 
+Verified dependencies are reused across runs by default only when their task path, normalized task-contract digest, status, two `PASS` verifier verdicts, and verification timestamp are eligible. `--verify-dependency-chain` opts into verifying the full closure in the current run; `--attest-dependency` remains the backward-compatible explicit source selector under the same policy. The runner persists immutable `execution_scope`, `verify_dependency_chain`, task identity, and consumer-side `reused_verification` evidence. Exact details and repository metadata rules are maintained in the parent [contracts](../docs/contracts/feature-pipeline.md) and [task metadata contract](../docs/agents/task-metadata-contract.md).
+
 ## Safety contracts
 
 - **Read-only Git is a parsed allowlist, not a denylist.** Every argv handed to `GitPort`

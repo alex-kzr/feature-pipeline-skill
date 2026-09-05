@@ -105,6 +105,23 @@ resolves the source run read-only (see `execute` mode below), so `C6` reflects t
 An invalid or unverifiable attestation fails the dry run closed with the same stable `30`-exit
 reason a real run would use, before any plan is printed.
 
+`--verify-dependency-chain` is also a dry-run control. By default an eligible independently
+verified dependency can be reused across runs; the flag disables that reuse and plans a full
+dependency-chain verification. The rendered C4/C6 view states `dependency verification chain`,
+`execution scope`, `reused sources`, and the `planned dispatch set`. The older repeatable
+`--attest-dependency DEP_ID=SOURCE_FEATURE` remains an explicit, read-only source selector and
+uses the same eligibility policy.
+
+For a focused preview, use the same selection that execute mode will persist:
+
+```text
+python scripts/run_pipeline.py ... --task KLC-03 --dry-run
+python scripts/run_pipeline.py ... --task KLC-03 --verify-dependency-chain --dry-run
+```
+
+The first command may reuse eligible KLC-02 evidence; the second must render the full closure
+with no external reuse. Neither preview dispatches an executor or changes a source run.
+
 ### `--mode release-dry-run` (stages 10–16 in the plan)
 
 `--mode release-dry-run` is a plan-only preview that reaches further than the default dry run:
@@ -160,18 +177,26 @@ or archive/purge code is reachable from `execute`.
   already-closed run `SOURCE_FEATURE` (a bare directory name under the run-storage root)
   verified it, without ever dispatching `DEP_ID` in this run. Read-only — only the source
   run's `run.json` is read, and nothing is written to it. Resolved and validated once, at run
-  creation (source exists and is readable, its `prompt_path`/`plan_path` match this run's
-  exactly, it tracks `DEP_ID` at status `verified`); a resume keeps the recorded attestations,
-  and a resume that also passes `--attest-dependency` must name exactly that set (any order).
+  creation using the same verified-reuse eligibility policy as automatic cross-run reuse:
+  task path and task-contract digest match, the task is `verified`, both verifier verdicts
+  are `PASS`, and `verified_at` is present. A resume keeps the recorded attestations, and a
+  resume that also passes `--attest-dependency` must name exactly that set (any order).
   Invalid with `--through` or an unfiltered run, with a `DEP_ID` outside the tracked task's
   own dependencies, or with a `DEP_ID` repeated across flags — each denial is a distinct,
   stable `30`-exit reason (`attestation-requires-task-scope`,
   `attestation-not-a-dependency`, `duplicate-attestation-dependency`,
-  `attestation-unsafe-source`, `attestation-source-missing`,
-  `attestation-source-identity-mismatch`, `attestation-source-dependency-absent`,
-  `attestation-source-not-verified`, `attestation-mismatch` on a mismatched resume) and
-  writes no partial state. An attested dependency never satisfies an unattested sibling
-  dependency.
+  `attestation-unsafe-source`, an ineligible-evidence diagnostic, or
+  `attestation-mismatch` on a mismatched resume) and writes no partial state. An attested
+  dependency never satisfies an unattested sibling dependency.
+- **Verified reuse and execution scope.** `execution_scope` is the immutable selected task set
+  plus its recursive dependency closure, in plan order; resume rejects a changed scope. Default
+  reuse requires the same task path and task-contract digest, status `verified`, two `PASS`
+  verifier verdicts, and `verified_at`. The task contract identity covers normalized ID,
+  dependencies, allowed/out-of-scope entries, acceptance criteria, verification commands, and
+  verification tier. One compatible digestless task-ID record is legacy-compatible; multiple
+  candidates fail closed as `evidence-legacy-ambiguous`. Reuse records immutable consumer-side
+  `reused_verification` evidence and never modifies source-run bytes. Pass
+  `--verify-dependency-chain` to verify the full closure locally instead.
 - **`--add-dir` for a shared/synced `agents_root` and a split-checkout `core_root`.** The
   dispatched executor, task-verifier, and test-verifier (one adapter instance, shared) are
   granted the fully resolved, symlink/junction-following real path of both `agents_root` and
