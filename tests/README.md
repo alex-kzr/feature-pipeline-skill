@@ -139,6 +139,19 @@ live under `tests/goldens/compatibility/` and are preserved unchanged.
 uv run python -m unittest tests.test_compatibility_goldens
 ```
 
+### documentation — executable contracts for `docs/`
+
+RMD-02: DOC-01 published the architecture, public-contracts, and migration-v3 pages with an
+acceptance criterion that their examples execute in CI (AC-3), which the original DOC-01 landing
+never added. This suite drives the doc's own CLI example through a real plan-only `--dry-run`,
+checks the documented `feature_pipeline` export list and exit-code table against the frozen
+constants they describe, and resolves the critical cross-links between the architecture,
+contracts, and migration pages (including link fragments against real headings).
+
+```
+uv run python -m unittest tests.test_documentation_contracts
+```
+
 ## Status
 
 This pass (QG-01) consolidates `tests/support/` (AC-2), adds the physically separated
