@@ -183,6 +183,30 @@ class TaskSpecBuildTests(unittest.TestCase):
         with self.assertRaises(SchemaError):
             self._complete(required_skills=("pkg/skills/testing",))
 
+    def test_documentation_impact_accepts_safe_globs_and_normalizes_posix_paths(self) -> None:
+        spec = self._complete(
+            documentation_impact=("./docs//plans/tasks/**", "docs/*.md", "docs/guide?.md")
+        )
+        self.assertEqual(
+            spec.documentation_impact,
+            ("docs/plans/tasks/**", "docs/*.md", "docs/guide?.md"),
+        )
+
+    def test_documentation_impact_rejects_unsafe_path_forms(self) -> None:
+        for bad in ("", " ", "/docs/x.md", "C:/docs/x.md", "~/docs/x.md",
+                    "docs/../x.md", "docs\\x.md"):
+            with self.subTest(bad=bad):
+                with self.assertRaisesRegex(SchemaError, "documentation_impact"):
+                    self._complete(documentation_impact=(bad,))
+
+    def test_execution_boundary_paths_remain_concrete(self) -> None:
+        with self.assertRaises(SchemaError):
+            self._complete(required_skills=(".agents/skills/**",))
+        with self.assertRaises(SchemaError):
+            self._complete(
+                verification_commands=(CommandSpec("pkg/**", ("pytest",)),),
+            )
+
     def test_negative_repair_limit_fails_closed(self) -> None:
         with self.assertRaises(SchemaError):
             self._complete(max_repair_attempts=-1)

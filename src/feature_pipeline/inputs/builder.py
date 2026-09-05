@@ -318,6 +318,11 @@ class TaskDefinitionBuilder:
         lists: dict[str, tuple[str, ...]] = {
             key: tuple(split_list(fields[key])) for key in LIST_FIELDS if key in fields
         }
+        if "documentation_impact" in fields and not is_none(fields["documentation_impact"]):
+            lists["documentation_impact"] = tuple(
+                strip_backticks(part)
+                for part in fields["documentation_impact"].split(",")
+            )
 
         max_repair = 2
         if "max_repair_attempts" in fields:

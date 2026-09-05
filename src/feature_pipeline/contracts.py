@@ -55,6 +55,21 @@ def validate_relative_path(value: object, field: str) -> str:
     return "/".join(part for part in parts if part not in ("", ".")) or "."
 
 
+def validate_documentation_impact_path(value: object, field: str) -> str:
+    """Normalize a descriptive repository-relative POSIX path or safe glob."""
+    path = _string(value, field).strip()
+    if not path:
+        raise SchemaError(f"{field} must be a non-empty string")
+    if "\\" in path:
+        raise SchemaError(f"{field} must use POSIX separators")
+    if re.match(r"^[A-Za-z]:", path) or path.startswith(("/", "~")):
+        raise SchemaError(f"{field} must be repository-relative")
+    parts = path.split("/")
+    if any(part == ".." for part in parts):
+        raise SchemaError(f"{field} must not traverse outside the repository")
+    return "/".join(part for part in parts if part not in ("", ".")) or "."
+
+
 @dataclass(frozen=True)
 class LogicalPaths:
     project: str
@@ -415,9 +430,12 @@ class CommandSpec:
     @classmethod
     def from_data(cls, data: object, *, field: str = "verification_commands") -> "CommandSpec":
         if isinstance(data, CommandSpec):
-            return data
-        value = _mapping(data, field)
+            value: Mapping[str, object] = {"cwd": data.cwd, "argv": data.argv}
+        else:
+            value = _mapping(data, field)
         cwd = validate_relative_path(value.get("cwd", "."), f"{field}.cwd")
+        if any(token in cwd for token in ("*", "?")):
+            raise SchemaError(f"{field}.cwd must be a concrete path, not a glob")
         if "argv" in value and value.get("argv") is not None:
             argv = _shell_free_argv(value.get("argv"), f"{field}.argv")
         elif value.get("command"):
@@ -471,12 +489,19 @@ def _spec_paths(value: object, field: str, *, allow_glob: bool = True,
     out: list[str] = []
     for item in _sequence_like(value, field):
         normalized = validate_relative_path(item, field)
-        if not allow_glob and "*" in normalized:
+        if not allow_glob and any(token in normalized for token in ("*", "?")):
             raise SchemaError(f"{field} entry '{item}' must be a concrete path, not a glob")
         if require_skill_md and not normalized.endswith("SKILL.md"):
             raise SchemaError(f"{field} entry '{item}' must name an exact SKILL.md")
         out.append(normalized)
     return tuple(out)
+
+
+def _documentation_impact_paths(value: object) -> tuple[str, ...]:
+    return tuple(
+        validate_documentation_impact_path(item, "documentation_impact")
+        for item in _sequence_like(value, "documentation_impact")
+    )
 
 
 def _spec_task_ids(value: object, field: str) -> tuple[str, ...]:
@@ -597,8 +622,7 @@ class TaskSpec:
             required_skills=_spec_paths(required_skills, "required_skills", allow_glob=False,
                                         require_skill_md=True),
             max_repair_attempts=max_repair_attempts,
-            documentation_impact=_spec_paths(documentation_impact, "documentation_impact",
-                                             allow_glob=False),
+            documentation_impact=_documentation_impact_paths(documentation_impact),
             verification_commands=commands,
             verification_tier=tier,
             accepts_scoped=scoped,

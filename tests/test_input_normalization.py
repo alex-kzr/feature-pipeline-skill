@@ -172,6 +172,36 @@ class BuilderEquivalenceTests(unittest.TestCase):
         self.assertEqual(js.metadata_source, "declared")
         self.assertNotEqual(md.source_format, js.source_format)
 
+    def test_documentation_impact_globs_normalize_through_markdown_and_json(self) -> None:
+        markdown = DECLARED_TASK_MD.replace(
+            "- Documentation impact: none",
+            "- Documentation impact: `./docs//plans/tasks/**`, `docs/*.md`, `docs/guide?.md`",
+        )
+        entry = dict(EQUIVALENT_JSON_ENTRY)
+        entry["documentation_impact"] = [
+            "./docs//plans/tasks/**", "docs/*.md", "docs/guide?.md"
+        ]
+        with TemporaryDirectory() as raw:
+            path = _write(Path(raw), "AB-01_normalize.md", markdown)
+            md = TaskDefinitionBuilder.from_markdown_task_file(path)
+        js = TaskDefinitionBuilder.from_json_plan_entry(entry)
+        expected = ("docs/plans/tasks/**", "docs/*.md", "docs/guide?.md")
+        self.assertEqual(md.documentation_impact, expected)
+        self.assertEqual(js.documentation_impact, expected)
+
+    def test_documentation_impact_rejects_empty_entries_from_markdown_and_json(self) -> None:
+        markdown = DECLARED_TASK_MD.replace(
+            "- Documentation impact: none", "- Documentation impact: `docs/a.md`, , `docs/b.md`"
+        )
+        with TemporaryDirectory() as raw:
+            path = _write(Path(raw), "AB-01_normalize.md", markdown)
+            with self.assertRaisesRegex(SchemaError, "documentation_impact"):
+                TaskDefinitionBuilder.from_markdown_task_file(path)
+        entry = dict(EQUIVALENT_JSON_ENTRY)
+        entry["documentation_impact"] = ["docs/a.md", "", "docs/b.md"]
+        with self.assertRaisesRegex(SchemaError, "documentation_impact"):
+            TaskDefinitionBuilder.from_json_plan_entry(entry)
+
     def test_definition_is_immutable_and_exposes_a_task_spec(self) -> None:
         md = self._markdown_definition()
         self.assertIsInstance(md.to_task_spec(), TaskSpec)
