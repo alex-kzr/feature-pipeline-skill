@@ -23,6 +23,9 @@ C3. Generated argv (shell-free):
     stage verification: content check
 
 C4. Pending delivery gates (in order):
+  dependency verification chain: false
+  execution scope: SF-04
+  reused sources: (none)
   1. plan - pending
   2. final-diff - pending
   3. commit - pending
@@ -31,6 +34,7 @@ C4. Pending delivery gates (in order):
 C5. Exit code: 30 (error)
 
 C6. Planned state transitions:
+  planned dispatch set: SF-04
   SF-04: pending -> blocked (unknown-task-type)
 
 C7. Redacted evidence manifest:

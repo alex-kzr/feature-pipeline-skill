@@ -64,6 +64,9 @@ def render_dry_run(
     post_task: bool = False,
     post_task_lines: Sequence[str] = (),
     post_task_transition_line: str | None = None,
+    verify_dependency_chain: bool = False,
+    execution_scope: Sequence[str] = (),
+    reused_sources: Mapping[str, str] | None = None,
 ) -> str:
     """Assemble the C1–C8 dry-run plan text (no redaction — the caller applies it)."""
     lines: list[str] = []
@@ -132,6 +135,12 @@ def render_dry_run(
     lines.append("")
 
     lines.append("C4. Pending delivery gates (in order):")
+    lines.append(f"  dependency verification chain: {str(verify_dependency_chain).lower()}")
+    lines.append("  execution scope: " + ", ".join(execution_scope))
+    lines.append("  reused sources: " + (
+        ", ".join(f"{task}={source}" for task, source in (reused_sources or {}).items())
+        or "(none)"
+    ))
     approved = {
         "plan": approve_plan,
         "final-diff": approve_final_diff,
@@ -156,6 +165,10 @@ def render_dry_run(
     lines.append("")
 
     lines.append("C6. Planned state transitions:")
+    lines.append("  planned dispatch set: " + ", ".join(
+        task_id for task_id in execution_scope
+        if verify_dependency_chain or task_id not in (reused_sources or {})
+    ))
     for task_id in selected_ids:
         reason = route_reason_by_id.get(task_id)
         if task_id in dep_blocked:

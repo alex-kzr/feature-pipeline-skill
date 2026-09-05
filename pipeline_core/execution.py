@@ -47,11 +47,15 @@ from feature_pipeline.application.task_engine import (
     TaskEngine,
     TaskExecution,
     TaskRunResult,
+    build_completion_evidence,
 )
 from feature_pipeline.application.verified_reuse import (
+    EvidenceEligibilityError,
+    VerifiedEvidenceStore,
     canonical_task_path,
     task_contract_digest,
 )
+from feature_pipeline.application.selection import prune_reused_ancestors
 from feature_pipeline.domain.plan import CompiledRunPlan
 from feature_pipeline.domain.stages import (
     StageContext,
@@ -62,6 +66,10 @@ from feature_pipeline.domain.stages import (
 )
 from feature_pipeline.domain.vocabulary import StageId
 from feature_pipeline.contracts import TaskSpec
+from feature_pipeline.infrastructure.board_projection import (
+    BoardProjectionError,
+    project_task_state,
+)
 
 from .adapter_resolution import (
     AdapterResolution,
@@ -80,7 +88,7 @@ from .dispatch import DispatchError
 from .lease import LeaseHeldError
 from .lifecycle import RunLifecycle
 from .prompt_envelope import EnvelopeAnchors
-from .state import ResumeError, Run, StateError, repo_relative
+from .state import ACTOR_RUNNER, ResumeError, Run, StateError, repo_relative
 from .verification import (
     VerifierAnchors,
     VerifierLaunchers,
@@ -273,6 +281,7 @@ class ExecuteControls:
     #: only alongside ``task`` — ``--through`` resolves its own dependency closure and must
     #: never trust an external attestation instead.
     attested_dependencies: tuple[tuple[str, str], ...] = ()
+    verify_dependency_chain: bool = False
 
     @property
     def gate_opened(self) -> bool:
@@ -314,6 +323,11 @@ class ExecuteRequest:
     timeout: float | None = None
     #: Injected so a test can pin the lease owner; production uses this process.
     pipeline_pid: int | None = None
+    #: **KLC-03**. The Markdown active board's path (``docs/kanban.md``); ``None`` (the
+    #: default) keeps a run entirely projection-free — every boardless JSON-plan scenario in
+    #: this module is unaffected. Set only for a Markdown-backed board plan (``bootstrap.py``);
+    #: each task's own file is resolved from its already repository-relative ``spec.path``.
+    board_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -479,6 +493,24 @@ def _ensure_attestations_match(run: Run, requested: tuple[tuple[str, str], ...])
             "attestation-mismatch")
 
 
+def _ensure_execution_controls_match(
+    run: Run, scope: Sequence[str], verify_dependency_chain: bool,
+) -> None:
+    """Reject a resume whose immutable scope or chain policy changed."""
+    recorded_scope = run.controls.get("execution_scope", {}).get("value")
+    if recorded_scope != list(scope):
+        raise ExecutionError(
+            "resume execution scope does not match the recorded scope",
+            "execution-scope-mismatch",
+        )
+    recorded_chain = run.controls.get("verify_dependency_chain", {}).get("value")
+    if recorded_chain is not verify_dependency_chain:
+        raise ExecutionError(
+            "resume dependency-chain verification control does not match the recorded value",
+            "verify-dependency-chain-mismatch",
+        )
+
+
 def _controls_map(
     controls: ExecuteControls, resolution: AdapterResolution
 ) -> dict[str, tuple[object, str]]:
@@ -508,6 +540,10 @@ def _controls_map(
         "attest_dependency": (
             (_attestation_control_value(controls), "explicit")
             if controls.attested_dependencies else ([], "default")),
+        "verify_dependency_chain": (
+            controls.verify_dependency_chain,
+            "explicit" if controls.verify_dependency_chain else "default",
+        ),
         "plan_approval": (
             "approve-plan" if controls.plan_approved
             else "unattended" if controls.unattended else "none", "explicit"),
@@ -576,6 +612,7 @@ def _plan_fingerprint(plan: CompiledRunPlan) -> dict[str, str]:
     out: dict[str, str] = {
         "selection_mode": plan.selection_mode,
         "selection": ",".join(plan.selection),
+        "execution_scope": ",".join(plan.execution_scope),
         "order": ",".join(plan.order),
         "adapter": plan.adapter,
     }
@@ -633,6 +670,45 @@ def _ensure_plan_compatible(run: Run, plan: CompiledRunPlan) -> None:
             )
 
 
+def _reconcile_projection(
+    life: RunLifecycle, board_path: Path, by_id: Mapping[str, TaskSpec],
+    selected: Sequence[str],
+) -> None:
+    """**KLC-03**. On every ``--resume``, repair the Markdown board/task files from whatever
+    ``run.json`` already recorded — before the loop below dispatches (or skips) anything.
+
+    A crash between a durable transition and its Markdown projection leaves the human view
+    stale; replaying :func:`~feature_pipeline.infrastructure.board_projection.project_task_state`
+    for each selected task's *current* persisted status repairs that view without redispatching
+    an already-``verified`` task's executor (the loop below never selects a terminal task
+    anyway — this only ever touches the human-facing files). Idempotent when nothing was
+    actually stale.
+    """
+    for task_id in selected:
+        spec = by_id.get(task_id)
+        if spec is None or not spec.path:
+            continue
+        record = life.run.task(task_id)
+        evidence = (
+            build_completion_evidence(life.run, spec) if record.status == "verified" else None
+        )
+        try:
+            project_task_state(
+                board_path=board_path,
+                task_path=life.run.repo_root / spec.path,
+                task_id=spec.id,
+                task_title=spec.title,
+                state=record.status,
+                evidence=evidence,
+            )
+        except BoardProjectionError as exc:
+            raise ExecutionError(
+                f"board projection reconciliation failed for {task_id} -> "
+                f"{record.status!r}: {exc}",
+                "board-projection-failed",
+            ) from exc
+
+
 def execute_run(request: ExecuteRequest) -> ExecuteResult:
     """Drive every selected task to ``verified`` or to a truthful non-zero terminal state.
 
@@ -667,8 +743,18 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
             # The compiled plan already resolved the selection (through
             # ``resolve_selection``); trust it and only re-run the shape checks.
             selected = list(plan.selection)
+            scope = list(plan.execution_scope or plan.selection)
         else:
             selected = _select_ids(order, request.controls.task, request.controls.through)
+            closure = set(selected)
+            pending = list(selected)
+            while pending:
+                task_id = pending.pop()
+                for dependency in spec_by_id[task_id].depends_on:
+                    if dependency not in closure:
+                        closure.add(dependency)
+                        pending.append(dependency)
+            scope = [task_id for task_id in order if task_id in closure]
         _validate_attestation_scope(request.controls, spec_by_id)
     except ExecutionError as exc:
         return _error(f"{exc.code}: {exc}", request)
@@ -703,6 +789,8 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
     specs = [by_id[tid] for tid in order]
 
     controls_map = _controls_map(request.controls, resolution)
+    execution_scope = tuple(scope)
+    controls_map["execution_scope"] = (list(execution_scope), "explicit")
     if plan is not None:
         controls_map["plan_digest"] = (plan.digest, "explicit")
         controls_map["plan_fingerprint"] = (_plan_fingerprint(plan), "explicit")
@@ -712,46 +800,83 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
     #    (AC-2's "no partial state" on a denial); a resume trusts whatever was recorded.
     try:
         if request.controls.resume:
+            recorded = Run.load(request.run_dir, request.repo_root)
+            active_scope = [task_id for task_id in execution_scope if task_id in recorded.tasks]
             life = RunLifecycle.resume(
                 request.run_dir, request.repo_root,
                 feature=request.feature, prompt_path=request.prompt_path,
                 plan_path=request.plan_path,
-                expected_tasks={spec.id: list(spec.depends_on) for spec in specs},
+                expected_tasks={
+                    spec.id: list(spec.depends_on)
+                    for spec in specs if spec.id in active_scope
+                },
             )
             ensure_pinned_adapter(life.run, resolution)
             _ensure_attestations_match(life.run, request.controls.attested_dependencies)
+            _ensure_execution_controls_match(
+                life.run, execution_scope, request.controls.verify_dependency_chain,
+            )
             if plan is not None:
                 _ensure_plan_compatible(life.run, plan)
             for name, (value, sourced) in controls_map.items():
                 if sourced == "explicit":
                     life.run.set_control(name, value, sourced=sourced)
+            if request.board_path is not None:
+                _reconcile_projection(life, request.board_path, by_id, selected)
+            scope = active_scope
         else:
-            attestations = [
-                _resolve_attestation(
-                    dep_id=dep_id, source_feature=source_feature,
-                    run_dir=request.run_dir, repo_root=request.repo_root,
-                    prompt_path=request.prompt_path, plan_path=request.plan_path)
-                for dep_id, source_feature in request.controls.attested_dependencies
-            ]
+            reused: dict[str, Mapping[str, Any]] = {}
+            store = VerifiedEvidenceStore(request.run_dir.parent, request.repo_root)
+            if not request.controls.verify_dependency_chain:
+                explicit_sources = dict(request.controls.attested_dependencies)
+                for task_id in scope:
+                    if task_id in selected:
+                        continue
+                    try:
+                        evidence = (
+                            store.find_at(
+                                _resolve_source_run_dir(request.run_dir, explicit_sources[task_id]),
+                                by_id[task_id],
+                            ) if task_id in explicit_sources else store.find(by_id[task_id])
+                        )
+                    except EvidenceEligibilityError as exc:
+                        if task_id in explicit_sources:
+                            raise ExecutionError(str(exc), exc.code) from None
+                        continue
+                    reused[task_id] = evidence
+                scope = list(prune_reused_ancestors(
+                    scope, selected, reused,
+                    {task_id: spec.depends_on for task_id, spec in by_id.items()},
+                ))
             run = Run.create(
                 request.feature, request.prompt_path, request.plan_path,
                 request.run_dir, request.repo_root)
             life = RunLifecycle.initialize(
                 run,
-                tasks=[(spec.id, list(spec.depends_on)) for spec in specs],
+                tasks=[
+                    (spec.id, [dep for dep in spec.depends_on if dep in scope])
+                    for spec in specs if spec.id in scope
+                ],
                 controls=controls_map,
                 adapter_requested=resolution.requested,
                 adapter_resolved=resolution.resolved,
             )
-            if attestations:
-                for evidence in attestations:
-                    life.run.record_attestation(
-                        request.controls.task, evidence["dep_id"], evidence)
+            if reused:
+                for task_id in scope:
+                    evidence = reused.get(task_id)
+                    if evidence is None:
+                        continue
+                    life.transition(task_id, "running", actor=ACTOR_RUNNER,
+                                    note="verified by reusable evidence")
+                    life.transition(task_id, "implemented", actor=ACTOR_RUNNER,
+                                    note="verified by reusable evidence")
+                    life.run.record_verdicts(task_id, "PASS", "PASS")
+                    life.run.record_reused_verification(task_id, evidence)
                 life.recompute_readiness()
     except (StateError, ResumeError, AdapterResolutionError, ExecutionError) as exc:
         return _error(f"{getattr(exc, 'code', 'state-error')}: {exc}", request)
 
-    persist_task_contracts(life.run, specs)
+    persist_task_contracts(life.run, [spec for spec in specs if spec.id in scope])
     pin_adapter(life.run, resolution)
     life.run.save()
 
@@ -768,7 +893,7 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
     results: list[TaskRunResult] = []
     try:
         while True:
-            task_id = _next_actionable(life, selected, order)
+            task_id = _next_actionable(life, scope, order)
             if task_id is None:
                 break
             spec = by_id[task_id]
@@ -793,6 +918,7 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
                         plan_path=request.plan_prompt_path,
                         working_root=request.working_root,
                         timeout=request.timeout,
+                        board_path=request.board_path,
                     ),
                 )
             except (ExecutionError, DispatchError) as exc:
@@ -813,13 +939,13 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
                     request.run_dir, life.run.run_id, tuple(results))
             life.recompute_readiness()
 
-        pending = [tid for tid in selected if life.run.task(tid).status != "verified"]
+        pending = [tid for tid in scope if life.run.task(tid).status != "verified"]
         if not pending:
             life.run.status = "verified"
             life.run.save()
             return ExecuteResult(
                 "ok", EXIT_OK,
-                f"execute complete: {len(selected)} selected task(s) verified. Stopped after "
+                f"execute complete: {len(scope)} scoped task(s) verified. Stopped after "
                 f"stage 9 — documentation, knowledge-graph refresh, final verification, "
                 f"release, and archive/purge are not run in execute mode.",
                 request.run_dir, life.run.run_id, tuple(results))

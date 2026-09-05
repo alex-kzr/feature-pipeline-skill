@@ -101,6 +101,7 @@ class ControlOverrides:
     diagnostic_output_byte_budget: int | None = None
     timeout_s: float | None = None
     adapter: str | None = None
+    verify_dependency_chain: bool | None = None
 
 
 #: The "no explicit control" sentinel — a frozen singleton, so it is safe as a default.
@@ -126,6 +127,8 @@ def compile_run_plan(
     # 1. Dependency correctness + deterministic order + selection, all fail-closed.
     graph = TaskGraph.from_definitions(definitions)
     selection = resolve_selection(graph, task=task, through=through)
+    closure = set(graph.required_closure(selection.task_ids)) | set(selection.task_ids)
+    execution_scope = tuple(task_id for task_id in graph.order if task_id in closure)
 
     # 2. Plan-only paths need a stable adapter identity but do not launch it. Execute paths
     #    defer availability validation until after the plan gate opens.
@@ -151,19 +154,23 @@ def compile_run_plan(
         DIAGNOSTIC_OUTPUT_BUDGET,
     )
     timeout_control = _timeout_control(overrides.timeout_s, adapter.default_timeout_s)
+    chain_control = ResolvedControl.resolve(
+        "verify_dependency_chain", overrides.verify_dependency_chain, default=False,
+    )
     run_controls: tuple[ResolvedControl[Any], ...] = (
         ResolvedControl("adapter_requested", overrides.adapter or "auto", adapter_source),
         ResolvedControl("adapter_resolved", adapter.name, adapter_source),
         routine_control,
         diagnostic_control,
         timeout_control,
+        chain_control,
     )
 
     by_id = {definition.id: definition for definition in definitions}
     resolved_tasks: list[ResolvedTask] = []
     storage_roots: dict[str, object] = {}
 
-    for task_id in selection.task_ids:
+    for task_id in execution_scope:
         definition = by_id[task_id]
         route = profile.route_for(definition.task_type)
         storage_root = profile.storage_root(route.storage_key)
@@ -218,6 +225,7 @@ def compile_run_plan(
         project=profile.project,
         selection_mode=selection.mode,
         selection=tuple(selection.task_ids),
+        execution_scope=tuple(execution_scope),
         order=graph.order,
         tasks=tuple(resolved_tasks),
         adapter=adapter.name,

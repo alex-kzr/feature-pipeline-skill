@@ -316,6 +316,25 @@ class CompileRunPlanTests(unittest.TestCase):
         self.assertEqual(through.selection, ("AA-01", "AA-02"))
         self.assertEqual(through.selection_mode, "through")
 
+    def test_focused_selection_carries_its_dependency_scope_and_chain_control(self) -> None:
+        defs = [
+            _definition("AA-01"),
+            _definition("AA-02", depends_on=("AA-01",)),
+            _definition("AA-03", depends_on=("AA-02",)),
+        ]
+
+        plan = compile_run_plan(
+            feature="demo", definitions=defs, profile=_profile(), task="AA-03",
+            overrides=ControlOverrides(verify_dependency_chain=True),
+        )
+
+        self.assertEqual(plan.selection, ("AA-03",))
+        self.assertEqual(plan.execution_scope, ("AA-01", "AA-02", "AA-03"))
+        self.assertEqual(
+            plan.control("verify_dependency_chain").as_record(),
+            {"value": True, "sourced": "explicit"},
+        )
+
     def test_current_builtin_task_types_route_through_the_default_profile(self) -> None:
         # AC-3
         profile = _profile()

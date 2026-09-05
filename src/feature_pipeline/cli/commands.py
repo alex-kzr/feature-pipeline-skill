@@ -36,6 +36,7 @@ class RunCommand:
     task: str | None
     through: str | None
     attest_dependency: list[str] = field(default_factory=list)
+    verify_dependency_chain: bool = False
     resume: bool = False
     mode: str = "plan-only"
     feature: str | None = None
@@ -73,6 +74,7 @@ class RunCommand:
             task=args.task,
             through=args.through,
             attest_dependency=list(args.attest_dependency or []),
+            verify_dependency_chain=args.verify_dependency_chain,
             resume=args.resume,
             mode=args.mode,
             feature=args.feature,

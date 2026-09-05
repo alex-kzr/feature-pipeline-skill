@@ -23,6 +23,7 @@ Standard library only.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Mapping, Sequence
 
 from feature_pipeline.domain.graph import TaskGraph, UnknownTask
 
@@ -87,10 +88,28 @@ def dependency_status(
     return DependencyStatus(task_id, not unmet, unmet)
 
 
+def prune_reused_ancestors(
+    scope: Sequence[str], selected: Sequence[str], reused: Sequence[str],
+    dependencies: Mapping[str, Sequence[str]],
+) -> tuple[str, ...]:
+    """Remove prerequisites whose reusable dependent evidence already covers them."""
+    removable: set[str] = set()
+    for task_id in reused:
+        pending = list(dependencies[task_id])
+        while pending:
+            dependency_id = pending.pop()
+            if dependency_id in removable:
+                continue
+            removable.add(dependency_id)
+            pending.extend(dependencies[dependency_id])
+    return tuple(task_id for task_id in scope if task_id not in removable or task_id in selected)
+
+
 __all__ = [
     "ResolvedSelection",
     "DependencyStatus",
     "SelectionError",
     "resolve_selection",
     "dependency_status",
+    "prune_reused_ancestors",
 ]

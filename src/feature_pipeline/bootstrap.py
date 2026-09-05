@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
 
 from feature_pipeline.application.compile_plan import (
     ControlOverrides,
@@ -15,6 +15,10 @@ from feature_pipeline.application.compile_plan import (
 )
 from feature_pipeline.application.profile_bridge import compiled_profile_from_core, route_reasons
 from feature_pipeline.application.results import PipelineResult
+from feature_pipeline.application.verified_reuse import (
+    EvidenceEligibilityError,
+    VerifiedEvidenceStore,
+)
 from feature_pipeline.cli.commands import RunCommand
 from feature_pipeline.cli.errors import CliError
 from feature_pipeline.cli.parser import EXIT_ERROR, FEATURE_RE, SOURCE_FEATURE_RE
@@ -32,7 +36,7 @@ from pipeline_core.execution import (
     ExecuteControls,
     ExecuteRequest,
     ExecutionError,
-    _resolve_attestation,
+    _resolve_source_run_dir,
     _validate_attestation_scope,
     execute_run,
 )
@@ -50,6 +54,12 @@ from pipeline_core.task_files import load_task_spec
 from pipeline_core.verification import VerifierAnchors, VerifierLaunchers
 
 ExecuteAdapters = Callable[[Path, Path, Path], tuple[object, VerifierLaunchers, dict[str, bool]]]
+
+#: **KLC-03**. The active-board file :func:`run_execute` projects lifecycle transitions onto
+#: for a Markdown-backed board plan (``--plan`` naming a ``.md`` plan beside ``tasks/*.md``
+#: task files — the same convention :mod:`pipeline_core.plan_md` reads). A boardless JSON plan
+#: never sets ``ExecuteRequest.board_path``, so it stays exactly as projection-free as before.
+BOARD_RELATIVE_PATH = "docs/kanban.md"
 
 
 @dataclass(frozen=True)
@@ -274,10 +284,12 @@ def resolve_attested_dependency_ids(
     raw_attestations: list[str] | None,
     selected_task: str | None,
     plan_tasks: Sequence[dict],
+    definitions: Mapping[str, object],
     run_dir: Path,
     repo_root: Path,
     prompt_path: Path,
     plan_path: Path,
+    resolve_sources: bool = True,
 ) -> set[str]:
     attestations = parse_attestations(raw_attestations)
     if not attestations:
@@ -286,19 +298,18 @@ def resolve_attested_dependency_ids(
     controls = ExecuteControls(task=selected_task, attested_dependencies=attestations)
     try:
         _validate_attestation_scope(controls, by_id)
+        if not resolve_sources:
+            return {dep_id for dep_id, _ in attestations}
+        store = VerifiedEvidenceStore(run_dir.parent, repo_root)
         attested_ids = set()
         for dep_id, source_feature in attestations:
-            _resolve_attestation(
-                dep_id=dep_id,
-                source_feature=source_feature,
-                run_dir=run_dir,
-                repo_root=repo_root,
-                prompt_path=prompt_path,
-                plan_path=plan_path,
+            store.find_at(
+                _resolve_source_run_dir(run_dir, source_feature),
+                definitions[dep_id],
             )
             attested_ids.add(dep_id)
         return attested_ids
-    except ExecutionError as exc:
+    except (ExecutionError, EvidenceEligibilityError) as exc:
         raise CliError(EXIT_ERROR, f"{exc.code}: {exc}") from None
 
 
@@ -398,6 +409,9 @@ def run_execute(
                 routine_output_byte_budget=command.routine_output_byte_budget,
                 diagnostic_output_byte_budget=command.diagnostic_output_byte_budget,
                 adapter=command.adapter,
+                verify_dependency_chain=(
+                    True if command.verify_dependency_chain else None
+                ),
             ),
             adapters=adapter_registry,
             task=command.task,
@@ -426,6 +440,7 @@ def run_execute(
         task=command.task,
         through=command.through,
         attested_dependencies=parse_attestations(command.attest_dependency),
+        verify_dependency_chain=command.verify_dependency_chain,
     )
     request = ExecuteRequest(
         feature=feature,
@@ -444,6 +459,9 @@ def run_execute(
         controls=controls,
         plan_prompt_path=project_relative(plan_path, project_dir),
         compiled_plan=compiled_plan,
+        board_path=(
+            project_dir / BOARD_RELATIVE_PATH if plan_path.suffix.lower() == ".md" else None
+        ),
     )
     result = execute_run(request)
     if result.status == "error":
@@ -457,6 +475,7 @@ __all__ = [
     "load_execute_specs",
     "AdapterFactory",
     "AdapterRuntime",
+    "BOARD_RELATIVE_PATH",
     "BootstrapComposition",
     "build_bootstrap",
     "codex_factory",

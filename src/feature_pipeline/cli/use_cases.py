@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 from feature_pipeline.bootstrap import (
     Anchors,
@@ -38,6 +39,7 @@ from feature_pipeline.bootstrap import (
     load_runnable_profile,
     load_tool_integration,
     make_execute_adapters,
+    load_execute_specs,
     pid_alive,
     plan_release_dry_run,
     read_lease,
@@ -55,8 +57,16 @@ from feature_pipeline.application.profile_bridge import (
     route_reasons,
 )
 from feature_pipeline.application.render_plan import render_dry_run
+from feature_pipeline.application.verified_reuse import (
+    EvidenceEligibilityError,
+    VerifiedEvidenceStore,
+)
 from feature_pipeline.application.results import Outcome, PipelineResult
-from feature_pipeline.application.selection import SelectionError, resolve_selection
+from feature_pipeline.application.selection import (
+    SelectionError,
+    prune_reused_ancestors,
+    resolve_selection,
+)
 from feature_pipeline.domain.errors import DomainError
 from feature_pipeline.domain.graph import TaskGraph
 from feature_pipeline.contracts import SchemaError, validate_relative_path
@@ -150,6 +160,33 @@ def _load_plan(path: Path) -> tuple[str | None, list[dict]]:
     if not tasks:
         raise CliError(EXIT_ERROR, "plan has no tasks")
     return (str(data["feature"]) if data.get("feature") else None), tasks
+
+
+def _dry_run_reuse_definitions(
+    plan_path: Path, feature: str, plan_tasks: list[dict],
+) -> dict[str, object]:
+    """Load exact execution contracts where available, retaining thin-preview support.
+
+    A Markdown plan (and a rich JSON plan) has the same task contracts execute uses. A
+    route-only JSON preview has no such body, so it can only match legacy task-ID evidence.
+    """
+    try:
+        _, specs = load_execute_specs(plan_path, feature)
+    except CliError:
+        return {
+            task["id"]: SimpleNamespace(
+                id=task["id"],
+                path=f"tasks/{task['id']}.md",
+                depends_on=task["depends_on"],
+                allowed_scope=(f"tasks/{task['id']}.md",),
+                out_of_scope=(),
+                acceptance_criteria=(),
+                verification_commands=(),
+                verification_tier="full",
+            )
+            for task in plan_tasks
+        }
+    return {spec.id: spec for spec in specs}
 
 
 def run_command(command: RunCommand) -> PipelineResult:
@@ -260,7 +297,12 @@ def run_command(command: RunCommand) -> PipelineResult:
                 feature=feature,
                 definitions=shallow_inputs,
                 profile=compiled_profile,
-                overrides=ControlOverrides(max_repair_attempts=command.max_repair_attempts),
+                overrides=ControlOverrides(
+                    max_repair_attempts=command.max_repair_attempts,
+                    verify_dependency_chain=(
+                        True if command.verify_dependency_chain else None
+                    ),
+                ),
                 adapters=composition.adapter_registry,
                 task=command.task,
                 through=command.through,
@@ -283,16 +325,39 @@ def run_command(command: RunCommand) -> PipelineResult:
     # checks, and the same source-run resolution, so a preview never claims success for an
     # attestation the real run would refuse (or silently ignores a bad one).
     attested_ids: set[str] = set()
+    reused_sources: dict[str, str] = {}
+    execution_scope = compiled_plan.execution_scope if compiled_plan is not None else tuple(selected_ids)
     if command.dry_run:
+        definitions = _dry_run_reuse_definitions(plan_path, feature, plan_tasks)
         attested_ids = resolve_attested_dependency_ids(
             raw_attestations=command.attest_dependency,
             selected_task=command.task,
             plan_tasks=plan_tasks,
+            definitions=definitions,
             run_dir=lease_dir,
             repo_root=project_dir,
             prompt_path=project_dir / prompt_rel,
             plan_path=plan_path,
+            resolve_sources=not command.verify_dependency_chain,
         )
+        if compiled_plan is not None and not command.verify_dependency_chain:
+            reused_sources.update(
+                dict(item.split("=", 1) for item in (command.attest_dependency or ()))
+            )
+            store = VerifiedEvidenceStore(lease_dir.parent, project_dir)
+            for task_id in compiled_plan.execution_scope:
+                if task_id in compiled_plan.selection or task_id in attested_ids:
+                    continue
+                try:
+                    evidence = store.find(definitions[task_id])
+                except EvidenceEligibilityError:
+                    continue
+                attested_ids.add(task_id)
+                reused_sources[task_id] = evidence["source_run_id"]
+            execution_scope = prune_reused_ancestors(
+                execution_scope, compiled_plan.selection, reused_sources,
+                {task_id: definition.depends_on for task_id, definition in definitions.items()},
+            )
 
     dep_blocked: dict[str, list[str]] = {}
     if command.task is not None:
@@ -301,7 +366,9 @@ def run_command(command: RunCommand) -> PipelineResult:
             if compiled_plan is not None
             else next(t["depends_on"] for t in plan_tasks if t["id"] == command.task)
         )
-        unmet = [d for d in declared if d not in verified and d not in attested_ids]
+        unmet = [] if command.verify_dependency_chain else [
+            d for d in declared if d not in verified and d not in attested_ids
+        ]
         if unmet:
             dep_blocked[command.task] = unmet
 
@@ -371,6 +438,11 @@ def run_command(command: RunCommand) -> PipelineResult:
                 post_task=post_task,
                 post_task_lines=post_task_lines,
                 post_task_transition_line=post_task_transition_line,
+                verify_dependency_chain=command.verify_dependency_chain,
+                execution_scope=(
+                    execution_scope
+                ),
+                reused_sources=reused_sources,
             ),
             build_rules(),
         )

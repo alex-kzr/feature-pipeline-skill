@@ -24,6 +24,9 @@ C3. Generated argv (shell-free):
     check lint: lint run
 
 C4. Pending delivery gates (in order):
+  dependency verification chain: false
+  execution scope: SF-01, SF-02
+  reused sources: (none)
   1. plan - pending
   2. final-diff - pending
   3. commit - pending
@@ -32,6 +35,7 @@ C4. Pending delivery gates (in order):
 C5. Exit code: 20 (blocked)
 
 C6. Planned state transitions:
+  planned dispatch set: SF-01, SF-02
   SF-02: pending -> blocked (dependency-not-satisfied: SF-01)
 
 C7. Redacted evidence manifest:

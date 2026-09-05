@@ -4,7 +4,8 @@ exit: 0
 usage: run_pipeline.py [-h] [--project-root DIR] [--agents-root DIR]
                        [--core-root DIR] [--profile REL] [--project-skill REL]
                        [--plan REL] [--task ID] [--through ID]
-                       [--attest-dependency DEP_ID=SOURCE_FEATURE] [--resume]
+                       [--attest-dependency DEP_ID=SOURCE_FEATURE]
+                       [--verify-dependency-chain] [--resume]
                        [--mode {plan-only,unattended,execute,release-dry-run}]
                        [--feature NAME] [--prompt REL] [--approve-plan]
                        [--approve-final-diff] [--commit]
@@ -47,6 +48,10 @@ run selection and scope:
                         execute and for --dry-run (both resolve and validate
                         the source run read-only), accepted as a no-op
                         otherwise
+  --verify-dependency-chain
+                        verify the selected task's full dependency closure in
+                        this run; by default eligible verified dependencies
+                        are reused
   --resume              resume a previously recorded run instead of starting
                         one
   --mode {plan-only,unattended,execute,release-dry-run}

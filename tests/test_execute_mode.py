@@ -54,6 +54,7 @@ def _request(
     launchers: VerifierLaunchers,
     controls: ExecuteControls,
     environment: dict,
+    board_path: Path | None = None,
 ) -> ExecuteRequest:
     prompt = root / "prompt.md"
     prompt.write_text("feature prompt", encoding="utf-8")
@@ -74,6 +75,7 @@ def _request(
         environment=environment,
         controls=controls,
         plan_prompt_path="fixtures/execution/plan.json",
+        board_path=board_path,
     )
 
 
@@ -317,6 +319,9 @@ class AttestDependencyTests(unittest.TestCase):
         life = RunLifecycle.initialize(run, tasks=tasks)
         for task_id in verified_ids:
             self._force_verified(life, task_id)
+        if {task_id for task_id, _ in tasks} == set(verified_ids):
+            run.status = "verified"
+            run.save()
         return run.run_dir
 
     def test_success_reaches_verified_without_dispatching_the_attested_dependency(self) -> None:
@@ -339,15 +344,37 @@ class AttestDependencyTests(unittest.TestCase):
 
             run = Run.load(result.run_dir, root)
             self.assertEqual(run.task("EX-02").status, "verified")
-            # EX-01 has no dependency of its own so it is naturally 'ready'; the point is it
-            # was never dispatched to reach that (or any later) state.
-            self.assertEqual(run.task("EX-01").status, "ready")
-            attested = run.task("EX-02").attested_dependencies
-            self.assertEqual(len(attested), 1)
-            self.assertEqual(attested[0]["dep_id"], "EX-01")
-            self.assertEqual(attested[0]["source_feature"], "source-feature")
-            self.assertEqual(attested[0]["task_verdict"], "PASS")
-            self.assertTrue(attested[0]["source_digest"].startswith("sha256:"))
+            self.assertEqual(run.task("EX-01").status, "verified")
+            reused = run.task("EX-01").reused_verification
+            self.assertEqual(len(reused), 1)
+            self.assertEqual(reused[0]["dependency_id"], "EX-01")
+            self.assertEqual(reused[0]["task_verdict"], "PASS")
+            self.assertTrue(reused[0]["source_run_digest"].startswith("sha256:"))
+
+    def test_default_reuse_prunes_ancestors_of_a_reused_dependency(self) -> None:
+        """A reusable direct dependency makes its own prerequisite irrelevant to this run."""
+        with TemporaryDirectory() as directory:
+            root, prompt, plan = self._seed(directory)
+            self._make_source_run(
+                root, "source-feature", prompt, plan,
+                tasks=(("EX-02", ()),), verified_ids=("EX-02",))
+
+            executor = sa.ScriptedExecutor(("implemented",))
+            result = execute_run(self._request(
+                root, prompt, plan, task_ids=("EX-01", "EX-02", "EX-03"),
+                executor=executor,
+                controls=ExecuteControls(plan_approved=True, task="EX-03")))
+
+            self.assertTrue(result.ok, result.message)
+            self.assertEqual([call["task_id"] for call in executor.calls], ["EX-03"])
+            run = Run.load(result.run_dir, root)
+            self.assertEqual(
+                run.controls["execution_scope"]["value"],
+                ["EX-01", "EX-02", "EX-03"],
+            )
+            self.assertNotIn("EX-01", run.tasks)
+            self.assertEqual(run.task("EX-02").status, "verified")
+            self.assertEqual(run.task("EX-03").status, "verified")
 
     def test_attesting_never_writes_to_the_source_run(self) -> None:
         with TemporaryDirectory() as directory:
@@ -436,10 +463,10 @@ class AttestDependencyTests(unittest.TestCase):
                     plan_approved=True, task="EX-02",
                     attested_dependencies=(("EX-01", "does-not-exist"),))))
             self.assertEqual(result.status, "error")
-            self.assertIn("attestation-source-missing", result.message)
+            self.assertIn("evidence-source-missing", result.message)
             self.assertFalse((root / "runs" / FEATURE / "run.json").exists())
 
-    def test_prompt_plan_identity_mismatch_is_refused(self) -> None:
+    def test_prompt_plan_identity_mismatch_accepts_eligible_reuse(self) -> None:
         with TemporaryDirectory() as directory:
             root, prompt, plan = self._seed(directory)
             other_plan = root / "plan-2.json"
@@ -453,9 +480,7 @@ class AttestDependencyTests(unittest.TestCase):
                 controls=ExecuteControls(
                     plan_approved=True, task="EX-02",
                     attested_dependencies=(("EX-01", "source-feature"),))))
-            self.assertEqual(result.status, "error")
-            self.assertIn("attestation-source-identity-mismatch", result.message)
-            self.assertFalse((root / "runs" / FEATURE / "run.json").exists())
+            self.assertTrue(result.ok, result.message)
 
     def test_source_not_tracking_the_dependency_is_refused(self) -> None:
         with TemporaryDirectory() as directory:
@@ -470,7 +495,7 @@ class AttestDependencyTests(unittest.TestCase):
                     plan_approved=True, task="EX-02",
                     attested_dependencies=(("EX-01", "source-feature"),))))
             self.assertEqual(result.status, "error")
-            self.assertIn("attestation-source-dependency-absent", result.message)
+            self.assertIn("evidence-source-task-missing", result.message)
             self.assertFalse((root / "runs" / FEATURE / "run.json").exists())
 
     def test_source_dependency_not_verified_is_refused(self) -> None:
@@ -486,7 +511,7 @@ class AttestDependencyTests(unittest.TestCase):
                     plan_approved=True, task="EX-02",
                     attested_dependencies=(("EX-01", "source-feature"),))))
             self.assertEqual(result.status, "error")
-            self.assertIn("attestation-source-not-verified", result.message)
+            self.assertIn("evidence-source-run-not-closed", result.message)
             self.assertFalse((root / "runs" / FEATURE / "run.json").exists())
 
     def test_resume_without_attest_dependency_keeps_the_recorded_set(self) -> None:
@@ -516,10 +541,6 @@ class AttestDependencyTests(unittest.TestCase):
             self._make_source_run(
                 root, "source-feature", prompt, plan,
                 tasks=(("EX-01", []),), verified_ids=("EX-01",))
-            self._make_source_run(
-                root, "other-feature", prompt, plan,
-                tasks=(("EX-01", []),), verified_ids=("EX-01",))
-
             first = execute_run(self._request(
                 root, prompt, plan, task_ids=("EX-01", "EX-02"),
                 executor=sa.ScriptedExecutor(("implemented",)),
@@ -528,6 +549,10 @@ class AttestDependencyTests(unittest.TestCase):
                     attested_dependencies=(("EX-01", "source-feature"),))))
             self.assertTrue(first.ok, first.message)
 
+            self._make_source_run(
+                root, "other-feature", prompt, plan,
+                tasks=(("EX-01", []),), verified_ids=("EX-01",))
+
             resumed = execute_run(self._request(
                 root, prompt, plan, task_ids=("EX-01", "EX-02"),
                 controls=ExecuteControls(
@@ -535,6 +560,193 @@ class AttestDependencyTests(unittest.TestCase):
                     attested_dependencies=(("EX-01", "other-feature"),))))
             self.assertEqual(resumed.status, "error")
             self.assertIn("attestation-mismatch", resumed.message)
+
+    def test_resume_rejects_dependency_chain_control_drift(self) -> None:
+        with TemporaryDirectory() as directory:
+            root, prompt, plan = self._seed(directory)
+            first = execute_run(self._request(
+                root, prompt, plan, task_ids=("EX-01", "EX-02"),
+                executor=sa.ScriptedExecutor(("implemented", "implemented")),
+                controls=ExecuteControls(plan_approved=True, task="EX-02",
+                    verify_dependency_chain=True)))
+            self.assertTrue(first.ok, first.message)
+
+            resumed = execute_run(self._request(
+                root, prompt, plan, task_ids=("EX-01", "EX-02"),
+                controls=ExecuteControls(plan_approved=True, task="EX-02", resume=True)))
+            self.assertEqual(resumed.status, "error")
+            self.assertIn("verify-dependency-chain-mismatch", resumed.message)
+
+
+class _BoardSnapshotExecutor(sa.ScriptedExecutor):
+    """A :class:`sa.ScriptedExecutor` that snapshots the board text at every real launch —
+    exactly the moment ``dispatch_executor`` hands work to the adapter — so a test can prove
+    the board already shows ``In Progress`` *before* that launch and never shows a different
+    card started (KLC-03 AC-1)."""
+
+    def __init__(self, results: tuple[str, ...], board_path: Path) -> None:
+        super().__init__(results)
+        self._board_path = board_path
+        self.board_snapshots: list[str] = []
+
+    def launch(self, request):  # noqa: ANN001 - test double
+        if not (request.no_tools or request.resume_session_id):
+            self.board_snapshots.append(self._board_path.read_text(encoding="utf-8"))
+        return super().launch(request)
+
+
+_BOARD = """# Kanban Board
+
+## To Do
+
+- [EX-01: Direct success task](../fixtures/execution/tasks/EX-01_direct-success.md)
+- [EX-02: Dependent verify task](../fixtures/execution/tasks/EX-02_dependent-verify.md)
+
+## In Progress
+"""
+
+
+def _seed_board(root: Path) -> Path:
+    """Seed a Markdown board plus the real task files it links to (copied verbatim from the
+    ``fixtures/execution/tasks`` fixtures, which already carry the ``## Status`` block
+    :mod:`feature_pipeline.infrastructure.board_projection` requires) under ``root``."""
+    board = root / "docs" / "kanban.md"
+    board.parent.mkdir(parents=True, exist_ok=True)
+    board.write_text(_BOARD, encoding="utf-8")
+    for name in ("EX-01_direct-success.md", "EX-02_dependent-verify.md"):
+        source = FIXTURES / "tasks" / name
+        dest = root / "fixtures" / "execution" / "tasks" / name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    return board
+
+
+class BoardProjectionWiringTests(unittest.TestCase):
+    """KLC-03 — execute mode projects lifecycle transitions onto a Markdown-backed board.
+
+    A boardless ``ExecuteRequest`` (every other test in this module — ``board_path`` defaults
+    to ``None``) keeps its current behavior: none of these transitions run without an explicit
+    board path (AC-3, second half).
+    """
+
+    def test_start_moves_only_the_selected_task_before_launch(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            board = _seed_board(root)
+            executor = _BoardSnapshotExecutor(("implemented", "implemented"), board)
+            result = execute_run(
+                _request(
+                    root, _specs(("EX-01", "EX-02")), executor=executor,
+                    launchers=VerifierLaunchers(
+                        task=sa.ScriptedVerifier(("PASS", "PASS")),
+                        test=sa.ScriptedVerifier(("PASS", "PASS"))),
+                    controls=ExecuteControls(plan_approved=True), environment={"claude": True},
+                    board_path=board))
+
+            self.assertTrue(result.ok, result.message)
+            self.assertEqual(len(executor.board_snapshots), 2)
+            first, second = executor.board_snapshots
+
+            # Before EX-01's launch: EX-01 in In Progress, EX-02 untouched in To Do.
+            self.assertIn("EX-01", first.split("## In Progress")[1])
+            self.assertIn("EX-02", first.split("## In Progress")[0])
+
+            # Before EX-02's launch: EX-01 already verified (no card at all), EX-02 moved.
+            self.assertNotIn("EX-01", second)
+            self.assertIn("EX-02", second.split("## In Progress")[1])
+
+    def test_verified_completion_removes_card_and_writes_a_result(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            board = _seed_board(root)
+            task_path = root / "fixtures/execution/tasks/EX-01_direct-success.md"
+            result = execute_run(
+                _request(
+                    root, _specs(("EX-01",)), executor=sa.ScriptedExecutor(("implemented",)),
+                    launchers=VerifierLaunchers(
+                        task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))),
+                    controls=ExecuteControls(plan_approved=True), environment={"claude": True},
+                    board_path=board))
+
+            self.assertTrue(result.ok, result.message)
+            board_text = board.read_text(encoding="utf-8")
+            self.assertNotIn("EX-01", board_text)
+
+            task_text = task_path.read_text(encoding="utf-8")
+            self.assertIn("- [x] Done", task_text)
+            self.assertEqual(task_text.count("## Result"), 1)
+            run = Run.load(result.run_dir, root)
+            self.assertIn(run.run_id, task_text)
+            self.assertIn("outcome: **verified**", task_text)
+
+    def test_blocked_task_returns_to_to_do_with_blockers_preserved(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            board = _seed_board(root)
+            task_path = root / "fixtures/execution/tasks/EX-01_direct-success.md"
+            result = execute_run(
+                _request(
+                    root, _specs(("EX-01",)), executor=sa.ScriptedExecutor(("implemented",)),
+                    launchers=VerifierLaunchers(
+                        task=sa.ScriptedVerifier(("FAIL",)), test=sa.ScriptedVerifier(("PASS",))),
+                    controls=ExecuteControls(plan_approved=True, max_repair_attempts=0),
+                    environment={"claude": True}, board_path=board))
+
+            self.assertEqual(result.status, "blocked")
+            board_text = board.read_text(encoding="utf-8")
+            self.assertIn("EX-01", board_text.split("## In Progress")[0])
+            self.assertNotIn("EX-01", board_text.split("## In Progress")[1])
+
+            task_text = task_path.read_text(encoding="utf-8")
+            self.assertIn("- [x] To Do", task_text)
+            self.assertIn("## Blockers", task_text)
+
+    def test_resume_reconciles_a_verified_task_without_redispatching_it(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            board = _seed_board(root)
+            task_path = root / "fixtures/execution/tasks/EX-01_direct-success.md"
+
+            # First invocation without a board path: run.json reaches 'verified' but the
+            # Markdown board/task file are never touched — simulating a crash between the
+            # durable transition and the (never-attempted) projection.
+            first = execute_run(
+                _request(
+                    root, _specs(("EX-01",)), executor=sa.ScriptedExecutor(("implemented",)),
+                    launchers=VerifierLaunchers(
+                        task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))),
+                    controls=ExecuteControls(plan_approved=True), environment={"claude": True}))
+            self.assertTrue(first.ok, first.message)
+            self.assertIn("EX-01", board.read_text(encoding="utf-8"))
+
+            # A resume that now names the board path reconciles the human view without
+            # dispatching the already-verified executor again.
+            executor = sa.ScriptedExecutor(("implemented",))
+            resumed = execute_run(
+                _request(
+                    root, _specs(("EX-01",)), executor=executor,
+                    launchers=VerifierLaunchers(
+                        task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))),
+                    controls=ExecuteControls(plan_approved=True, resume=True),
+                    environment={"claude": True}, board_path=board))
+
+            self.assertTrue(resumed.ok, resumed.message)
+            self.assertEqual(executor.launches, 0)
+            board_text = board.read_text(encoding="utf-8")
+            self.assertNotIn("EX-01", board_text)
+            self.assertIn("- [x] Done", task_path.read_text(encoding="utf-8"))
+
+    def test_boardless_execution_is_unaffected(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = execute_run(
+                _request(
+                    root, _specs(("EX-01",)), executor=sa.ScriptedExecutor(("implemented",)),
+                    launchers=VerifierLaunchers(
+                        task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))),
+                    controls=ExecuteControls(plan_approved=True), environment={"claude": True}))
+            self.assertTrue(result.ok, result.message)
+            self.assertFalse((root / "docs" / "kanban.md").exists())
 
 
 if __name__ == "__main__":

@@ -106,6 +106,8 @@ class CompiledRunPlan:
     adapter: str
     #: Every run-level operational control, each carrying its source (CP-01 AC-1).
     controls: tuple[ResolvedControl[object], ...]
+    #: Selected tasks plus their recursive dependencies, in deterministic plan order.
+    execution_scope: tuple[str, ...] = ()
 
     def __iter__(self) -> Iterator[ResolvedTask]:
         return iter(self.tasks)
@@ -178,6 +180,7 @@ def _canonical_plan(plan: CompiledRunPlan) -> dict[str, object]:
         "project": plan.project,
         "selection_mode": plan.selection_mode,
         "selection": list(plan.selection),
+        "execution_scope": list(plan.execution_scope),
         "order": list(plan.order),
         "adapter": plan.adapter,
         "controls": [_canonical_control(control) for control in plan.controls],

@@ -528,6 +528,8 @@ class DryRunAttestationTests(unittest.TestCase):
         life = RunLifecycle.initialize(run, tasks=[(dep_id, [])])
         if verified:
             self._force_verified(life, dep_id)
+            run.status = "verified"
+            run.save()
 
     def test_valid_attestation_stops_reporting_dependency_not_satisfied(self) -> None:
         with TemporaryDirectory() as directory:
@@ -557,6 +559,43 @@ class DryRunAttestationTests(unittest.TestCase):
                 (seed["project_dir"] / ".pipeline" / "runs" / "sample-feature"
                  / "run.json").exists())
             self.assertEqual(source_run_json.read_text(encoding="utf-8"), before)
+
+    def test_default_reuse_preview_reports_the_eligible_dependency_source(self) -> None:
+        """A focused preview applies the same default reuse lookup as execute."""
+        with TemporaryDirectory() as directory:
+            seed = self._seeded(directory)
+            self._make_source_run(seed["project_dir"], "source-feature", verified=True)
+            source_run_json = (
+                seed["project_dir"] / ".pipeline" / "runs" / "source-feature" / "run.json"
+            )
+            source = json.loads(source_run_json.read_text(encoding="utf-8"))
+            source["status"] = "verified"
+            source_run_json.write_text(json.dumps(source), encoding="utf-8")
+            code, out, err = _run(seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.json",
+                "--task", "T-02", "--dry-run",
+            ])
+        self.assertEqual(code, 10, err)
+        self.assertIn("dependency verification chain: false", out)
+        self.assertIn("execution scope: T-01, T-02", out)
+        self.assertIn(f"reused sources: T-01={source['run_id']}", out)
+        self.assertIn("planned dispatch set: T-02", out)
+        self.assertNotIn("T-02: pending -> blocked", out)
+
+    def test_full_chain_preview_ignores_explicit_reuse_sources(self) -> None:
+        """Full-chain dry-run must agree with execute's no-external-reuse policy."""
+        with TemporaryDirectory() as directory:
+            seed = self._seeded(directory)
+            self._make_source_run(seed["project_dir"], "source-feature", verified=True)
+            code, out, err = _run(seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.json",
+                "--task", "T-02", "--attest-dependency", "T-01=source-feature",
+                "--verify-dependency-chain", "--dry-run",
+            ])
+        self.assertEqual(code, 10, err)
+        self.assertIn("dependency verification chain: true", out)
+        self.assertIn("reused sources: (none)", out)
+        self.assertIn("planned dispatch set: T-01, T-02", out)
 
     def test_bad_syntax_fails_the_dry_run_the_same_way_a_real_run_would(self) -> None:
         with TemporaryDirectory() as directory:
@@ -608,7 +647,7 @@ class DryRunAttestationTests(unittest.TestCase):
                 "--task", "T-02", "--attest-dependency", "T-01=does-not-exist", "--dry-run",
             ])
         self.assertEqual(code, 30, err)
-        self.assertIn("attestation-source-missing", err)
+        self.assertIn("evidence-source-missing", err)
 
     def test_unverified_source_dependency_is_refused(self) -> None:
         with TemporaryDirectory() as directory:
@@ -619,7 +658,7 @@ class DryRunAttestationTests(unittest.TestCase):
                 "--task", "T-02", "--attest-dependency", "T-01=source-feature", "--dry-run",
             ])
         self.assertEqual(code, 30, err)
-        self.assertIn("attestation-source-not-verified", err)
+        self.assertIn("evidence-source-run-not-closed", err)
 
 
 RICH_EXECUTE_TASK = {

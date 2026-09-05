@@ -84,6 +84,9 @@ def build_parser() -> argparse.ArgumentParser:
                           "without dispatching it in this run. Repeatable; real control for "
                           "--mode execute and for --dry-run (both resolve and validate the "
                           "source run read-only), accepted as a no-op otherwise")
+    run.add_argument("--verify-dependency-chain", action="store_true",
+                     help="verify the selected task's full dependency closure in this run; "
+                          "by default eligible verified dependencies are reused")
     run.add_argument("--resume", action="store_true",
                      help="resume a previously recorded run instead of starting one")
     run.add_argument("--mode", default="plan-only",
