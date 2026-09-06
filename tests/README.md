@@ -24,6 +24,14 @@ truth for gate IDs, argv, required/evidence paths, and OS/Python matrices — th
 what each suite discovers and why, but no longer needs to be kept in step with the workflow YAML
 by hand.
 
+[`UGA-03`](../../docs/plans/tasks/UGA-03_explicit-root-ci-driver.md) adds the driver that executes
+that manifest: [`ci/run.py`](../ci/run.py) (`list --json`, `validate`, `run GATE_ID`) and
+[`ci/runner.py`](../ci/runner.py). Every path a gate touches — the manifest, its required paths,
+and each command's working directory — resolves only below the caller-supplied `--source-root`;
+nothing here reads the process current directory or searches for a root. `tests/test_ci_driver.py`
+covers root validation, argv execution, first-failure short-circuit, source-SHA binding, and
+byte-stable `list --json` output.
+
 ## Reusable test support (`tests/support/`)
 
 Not a test suite — imported by test suites. Consolidates what was previously duplicated,
