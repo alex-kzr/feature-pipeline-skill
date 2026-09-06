@@ -53,8 +53,8 @@ try:
 except ImportError:  # pragma: no cover - exercised only without the dev extra
     _HAS_YAML = False
 
-# Copied verbatim from tests/README.md / the QG-02 workflow: the gate argv this task
-# must preserve byte-for-byte.
+# The UGA-01 transitional workflow copied these argv into YAML. UGA-05 must keep
+# them owned exclusively by ci/gates.toml and reach them through the driver.
 EXPECTED_GATE_COMMANDS = [
     "uv run --with ruff ruff check .",
     "uv run --with mypy mypy",
@@ -68,14 +68,12 @@ EXPECTED_GATE_COMMANDS = [
     "uv run python -m unittest tests.test_worktree_performance_baseline",
 ]
 
-EXPECTED_JOBS = {"lint-and-types", "coverage", "policy-suites"}
+EXPECTED_JOBS = {"prepare-core-gates", "core-gates"}
 
-PREFLIGHT_TOKENS = (
-    "GITHUB_WORKSPACE",
-    "GITHUB_REPOSITORY",
-    "GITHUB_SHA",
-    "pyproject.toml",
-    "tests",
+EXPECTED_REQUIRED_CHECK_NAMES = (
+    "ruff + mypy (incl. complexity)",
+    "coverage (branch, ratcheted floor)",
+    "format('{0} · {1}', matrix.suite, matrix.os)",
 )
 
 
@@ -144,93 +142,26 @@ class CoreWorkflowTopologyTests(unittest.TestCase):
     def test_defines_the_expected_jobs(self) -> None:
         self.assertEqual(set(_jobs(_text())), EXPECTED_JOBS)
 
-    def test_standalone_checkout_resolves_source_root(self) -> None:
-        """AC-1: in a standalone checkout every job's source root is the checkout root."""
+    def test_core_gates_are_a_manifest_driven_adapter(self) -> None:
+        """AC-1 through AC-4: only the driver owns core gate execution."""
 
         text = _text()
-        with TemporaryDirectory() as raw:
-            root = Path(raw)
-            (root / "pyproject.toml").write_text("", encoding="utf-8")
-            tests_dir = root / "tests"
-            tests_dir.mkdir()
-            (tests_dir / "README.md").write_text("", encoding="utf-8")
-
-            for job, block in _jobs(text).items():
-                working_directory = _working_directory(block)
-                resolved = root if working_directory is None else root / working_directory
-                with self.subTest(job=job):
-                    self.assertTrue(resolved.is_dir(), resolved)
-                    self.assertTrue((resolved / "pyproject.toml").is_file())
-                    self.assertTrue((resolved / "tests").is_dir())
-
-    def test_no_repository_name_derived_working_directory(self) -> None:
-        """AC-2."""
-
-        text = _text()
-        for line in text.splitlines():
-            if line.lstrip().startswith("#"):
-                continue
-            match = re.search(r"working-directory:\s*(\S+)", line)
-            if match is None:
-                continue
-            value = match.group(1)
-            with self.subTest(value=value):
-                self.assertFalse(value.startswith("/"), value)
-                self.assertNotIn("feature-pipeline", value)
-
-    def test_every_job_preflights_before_its_first_gate(self) -> None:
-        """AC-3."""
-
-        text = _text()
-        for job, block in _jobs(text).items():
-            steps = _steps(block)
-            names = [_step_name(step) for step in steps]
-            preflight_index = next(
-                (i for i, name in enumerate(names) if "preflight" in name.lower()),
-                None,
-            )
-            gate_index = next(
-                (
-                    i
-                    for i, step in enumerate(steps)
-                    if re.search(r"run:\s*uv run ", step)
-                    and any(command in step for command in EXPECTED_GATE_COMMANDS)
-                ),
-                None,
-            )
-            with self.subTest(job=job):
-                self.assertIsNotNone(preflight_index, f"{job}: no preflight step")
-                self.assertIsNotNone(gate_index, f"{job}: no gate command step")
-                self.assertLess(preflight_index, gate_index)
-                preflight = steps[preflight_index]
-                self.assertIn("uv run python", preflight)
-                for token in PREFLIGHT_TOKENS:
-                    self.assertIn(token, preflight, token)
-
-    def test_preflight_is_identical_across_jobs(self) -> None:
-        """AC-3: the same first preflight is added to every job."""
-
-        text = _text()
-        preflights = set()
-        for block in _jobs(text).values():
-            for step in _steps(block):
-                if "preflight" in _step_name(step).lower():
-                    preflights.add(step)
-        self.assertEqual(len(preflights), 1, preflights)
-
-    def test_gate_commands_are_unchanged(self) -> None:
-        """AC-4: every original gate argv is still present, and nothing new was added."""
-
-        found = re.findall(r"^\s*run:\s*(uv run .+?)\s*$", _text(), re.M)
-        self.assertEqual(sorted(found), sorted(EXPECTED_GATE_COMMANDS))
-
-    def test_matrix_cells_are_unchanged(self) -> None:
-        """AC-4."""
-
-        text = _text()
-        self.assertIn("os: [ubuntu-latest, windows-latest]", text)
-        self.assertIn("suite: [platform, fault-injection, performance]", text)
-        self.assertEqual(text.count("runs-on: ubuntu-latest"), 2)
+        self.assertIn("ci.run list --json --group core", text)
+        self.assertIn("ci.run validate --source-root \"$GITHUB_WORKSPACE\"", text)
+        self.assertIn("needs: prepare-core-gates", text)
+        self.assertIn("fromJSON(needs.prepare-core-gates.outputs.matrix)", text)
+        for name in EXPECTED_REQUIRED_CHECK_NAMES:
+            self.assertIn(name, text)
+        self.assertIn("ci.run run ${{ matrix.gate.id }}", text)
+        for token in (
+            "--source-root \"$GITHUB_WORKSPACE\"",
+            "--expected-source-sha \"${{ github.sha }}\"",
+            "--workflow-repo \"${{ github.repository }}\"",
+            "--workflow-sha \"${{ github.sha }}\"",
+        ):
+            self.assertIn(token, text)
+        for command in EXPECTED_GATE_COMMANDS:
+            self.assertNotIn(command, text)
 
 
 # ---------------------------------------------------------------------------------------------

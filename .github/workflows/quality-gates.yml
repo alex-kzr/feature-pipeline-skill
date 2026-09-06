@@ -1,32 +1,3 @@
-# QG-02 — turn quality signals into explicit, gradual gates.
-#
-# Task: docs/plans/tasks/QG-02_quality-performance-ratchets.md
-# Plan: docs/plans/2026-09-03-feature-pipeline-refactor.md (Phase 11)
-# Doc: docs/validation/quality-gates.md (measured thresholds + mutation-test decision)
-#
-# `installed-package.yml` already proves the built wheel on the full OS/Python matrix. This
-# workflow is the rest of AC-1's list — the policies nothing in CI checked before QG-02:
-#
-#   coverage    — `coverage run` (branch mode) + `coverage report`, `fail_under` from pyproject
-#   complexity  — Ruff's `C90` (mccabe), `max-complexity` from pyproject
-#   Ruff        — the declared `select`/`ignore` policy (pyproject.toml)
-#   mypy        — the declared strict-boundary policy (pyproject.toml)
-#   platform    — tests/README.md's `platform` suite, both OSes
-#   fault       — tests/README.md's `fault-injection` suite, both OSes
-#   performance — tests/README.md's `performance` suite, both OSes
-#
-# Each suite command below is copied verbatim from `tests/README.md` (QG-01) — that file is the
-# single source of truth for what each named suite discovers; keep the two in step.
-#
-# UGA-01 (docs/plans/tasks/UGA-01_restore-standalone-quality-workflow.md): this workflow is
-# executed from the root of the *standalone* `feature-pipeline-skill` repository, so the core
-# source root is exactly the checkout workspace. The jobs previously declared
-# `working-directory: feature-pipeline-skill`, a repository-name-derived path that does not
-# exist in a standalone checkout, so every shell failed to start and no gate ran. That
-# assumption is removed; each job now runs an explicit-root preflight (identical text, both
-# operating systems) before its first quality command. The preflight is transitional — UGA-05
-# replaces it with the repository-owned CI driver.
-
 name: quality-gates
 
 on:
@@ -39,9 +10,11 @@ permissions:
   contents: read
 
 jobs:
-  lint-and-types:
-    name: ruff + mypy (incl. complexity)
+  prepare-core-gates:
+    name: prepare core gate contract
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -51,79 +24,22 @@ jobs:
         with:
           enable-cache: true
 
-      # UGA-01 transitional preflight — identical in every job, runs on Ubuntu and Windows.
-      # Resolves the core source root explicitly from the checkout workspace (never directory
-      # discovery or an "if exists" fallback) and proves the gate contract exists before any
-      # quality command starts. Portable across shells via `uv run python` with no OS-specific
-      # path concatenation. UGA-05 replaces this block with the repository-owned CI driver.
-      - name: Preflight (resolve source root, verify gate contract)
-        run: >
-          uv run python -c 'import os, sys, pathlib;
-          root = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve();
-          print("workflow repository:", os.environ.get("GITHUB_REPOSITORY"));
-          print("workflow SHA:", os.environ.get("GITHUB_SHA"));
-          print("source repository:", os.environ.get("GITHUB_REPOSITORY"));
-          print("source SHA:", os.environ.get("GITHUB_SHA"));
-          print("resolved source root:", root);
-          required = ["pyproject.toml", "tests", "tests/README.md"];
-          missing = [name for name in required if not (root / name).exists()];
-          print("verified gate contract:", ", ".join(required) if not missing else "INCOMPLETE");
-          sys.exit("missing required source-root paths: " + ", ".join(missing)) if missing else None'
+      - id: matrix
+        name: Validate and expand the core gate contract
+        shell: bash
+        run: |
+          uv run python -m ci.run validate --source-root "$GITHUB_WORKSPACE"
+          uv run python -m ci.run list --json --group core --source-root "$GITHUB_WORKSPACE" > "$RUNNER_TEMP/core-gates.json"
+          uv run python -c 'import json, sys; gates = json.load(open(sys.argv[1], encoding="utf-8"))["core"]; cells = [{"gate": gate, "suite": gate["id"], "os": os} for gate in gates for os in gate["os"]]; print("matrix=" + json.dumps({"include": cells}, separators=(",", ":")))' "$RUNNER_TEMP/core-gates.json" >> "$GITHUB_OUTPUT"
 
-      # Ruff's `C90` (mccabe) select carries the complexity ratchet; both live in [tool.ruff].
-      - name: Ruff (lint + complexity policy)
-        run: uv run --with ruff ruff check .
-
-      - name: mypy (typing-boundary policy)
-        run: uv run --with mypy mypy
-
-  coverage:
-    name: coverage (branch, ratcheted floor)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-
-      # UGA-01 transitional preflight — identical in every job, runs on Ubuntu and Windows.
-      # Resolves the core source root explicitly from the checkout workspace (never directory
-      # discovery or an "if exists" fallback) and proves the gate contract exists before any
-      # quality command starts. Portable across shells via `uv run python` with no OS-specific
-      # path concatenation. UGA-05 replaces this block with the repository-owned CI driver.
-      - name: Preflight (resolve source root, verify gate contract)
-        run: >
-          uv run python -c 'import os, sys, pathlib;
-          root = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve();
-          print("workflow repository:", os.environ.get("GITHUB_REPOSITORY"));
-          print("workflow SHA:", os.environ.get("GITHUB_SHA"));
-          print("source repository:", os.environ.get("GITHUB_REPOSITORY"));
-          print("source SHA:", os.environ.get("GITHUB_SHA"));
-          print("resolved source root:", root);
-          required = ["pyproject.toml", "tests", "tests/README.md"];
-          missing = [name for name in required if not (root / name).exists()];
-          print("verified gate contract:", ", ".join(required) if not missing else "INCOMPLETE");
-          sys.exit("missing required source-root paths: " + ", ".join(missing)) if missing else None'
-
-      - name: Full suite under coverage
-        run: uv run --with coverage coverage run -m unittest discover -s tests -t .
-
-      # `coverage report` exits non-zero on its own once total branch coverage drops below
-      # `[tool.coverage.report].fail_under` — the ratchet lives entirely in pyproject.toml.
-      - name: Coverage report (enforces the ratcheted floor)
-        run: uv run --with coverage coverage report
-
-  policy-suites:
-    name: ${{ matrix.suite }} · ${{ matrix.os }}
+  core-gates:
+    name: >-
+      ${{ matrix.gate.id == 'lint' && 'ruff + mypy (incl. complexity)' || matrix.gate.id == 'types' && 'ruff + mypy (incl. complexity)' || matrix.gate.id == 'coverage' && 'coverage (branch, ratcheted floor)' || format('{0} · {1}', matrix.suite, matrix.os) }}
+    needs: prepare-core-gates
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-        suite: [platform, fault-injection, performance]
+      matrix: ${{ fromJSON(needs.prepare-core-gates.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -133,37 +49,11 @@ jobs:
         with:
           enable-cache: true
 
-      # UGA-01 transitional preflight — identical in every job, runs on Ubuntu and Windows.
-      # Resolves the core source root explicitly from the checkout workspace (never directory
-      # discovery or an "if exists" fallback) and proves the gate contract exists before any
-      # quality command starts. Portable across shells via `uv run python` with no OS-specific
-      # path concatenation. UGA-05 replaces this block with the repository-owned CI driver.
-      - name: Preflight (resolve source root, verify gate contract)
+      - name: Run ${{ matrix.gate.id }} gate
         run: >
-          uv run python -c 'import os, sys, pathlib;
-          root = pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve();
-          print("workflow repository:", os.environ.get("GITHUB_REPOSITORY"));
-          print("workflow SHA:", os.environ.get("GITHUB_SHA"));
-          print("source repository:", os.environ.get("GITHUB_REPOSITORY"));
-          print("source SHA:", os.environ.get("GITHUB_SHA"));
-          print("resolved source root:", root);
-          required = ["pyproject.toml", "tests", "tests/README.md"];
-          missing = [name for name in required if not (root / name).exists()];
-          print("verified gate contract:", ", ".join(required) if not missing else "INCOMPLETE");
-          sys.exit("missing required source-root paths: " + ", ".join(missing)) if missing else None'
-
-      - name: platform suite
-        if: matrix.suite == 'platform'
-        run: uv run python -m unittest tests.test_process_runner tests.test_worktree tests.test_worktree_bounded_attribution
-
-      - name: fault-injection suite
-        if: matrix.suite == 'fault-injection'
-        run: uv run python -m unittest tests.test_concurrency tests.test_scope_gate tests.test_git_safety_allowlist tests.test_launch_controls tests.test_critical_behavior_characterization
-
-      # Structural/budget assertions only (docs/validation/worktree-performance-baseline.md):
-      # no CI-run wall-clock threshold. `test_large_retained_heap_far_below_legacy` is a
-      # pre-existing, environment-dependent flake on some machines (tests/README.md "Known
-      # exceptions"); out of QG-02's Allowed scope to fix or relax.
-      - name: performance suite
-        if: matrix.suite == 'performance'
-        run: uv run python -m unittest tests.test_worktree_performance_baseline
+          uv run python -m ci.run run ${{ matrix.gate.id }}
+          --source-root "$GITHUB_WORKSPACE"
+          --expected-source-sha "${{ github.sha }}"
+          --workflow-repo "${{ github.repository }}"
+          --workflow-sha "${{ github.sha }}"
+          --source-repo "${{ github.repository }}"

@@ -32,8 +32,8 @@ from ci import contract
 CORE_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = CORE_ROOT / "ci" / "gates.toml"
 
-# Copied verbatim from feature-pipeline-skill/.github/workflows/quality-gates.yml
-# (and mirrored in tests/README.md): the gate argv this manifest must preserve.
+# Gate policy is portable.  GitHub-specific checkout, setup, cache, interpreter
+# selection, and driver-validation steps belong to workflow adapters, not here.
 CORE_WORKFLOW_COMMANDS: dict[str, list[list[str]]] = {
     "lint": [["uv", "run", "--with", "ruff", "ruff", "check", "."]],
     "types": [["uv", "run", "--with", "mypy", "mypy"]],
@@ -59,9 +59,6 @@ CORE_WORKFLOW_COMMANDS: dict[str, list[list[str]]] = {
     ]],
 }
 
-# Copied from .github/workflows/installed-package.yml, with the
-# ``--python ${{ matrix.python }}`` template removed — the interpreter matrix is
-# the explicit ``python`` field on the gate, not part of the stored argv.
 CONSUMER_WORKFLOW_COMMANDS: dict[str, list[list[str]]] = {
     "installed-package": [
         ["uv", "run", "python", "-m", "unittest", "discover", "-s", "tests", "-t", "."],
@@ -124,17 +121,15 @@ class ManifestContentTests(unittest.TestCase):
         )
         self.assertEqual(len(self.contract.ids()), 8)
 
-    def test_core_workflow_commands_are_preserved(self) -> None:
+    def test_core_workflow_gate_commands_are_preserved(self) -> None:
         for gate_id, expected in CORE_WORKFLOW_COMMANDS.items():
             with self.subTest(gate=gate_id):
                 got = [list(cmd.argv) for cmd in self.contract.gate(gate_id).commands]
                 self.assertEqual(got, expected)
 
-    def test_consumer_workflow_commands_are_preserved(self) -> None:
-        for gate_id, expected in CONSUMER_WORKFLOW_COMMANDS.items():
-            with self.subTest(gate=gate_id):
-                got = [list(cmd.argv) for cmd in self.contract.gate(gate_id).commands]
-                self.assertEqual(got, expected)
+    def test_consumer_workflow_gate_commands_are_preserved(self) -> None:
+        got = [list(cmd.argv) for cmd in self.contract.gate("installed-package").commands]
+        self.assertEqual(got, CONSUMER_WORKFLOW_COMMANDS["installed-package"])
 
     def test_documentation_gate_command(self) -> None:
         got = [list(cmd.argv) for cmd in self.contract.gate("documentation").commands]
@@ -163,11 +158,16 @@ class ManifestContentTests(unittest.TestCase):
                     for token in command.argv:
                         self.assertIsInstance(token, str)
                         self.assertTrue(token)
-                        self.assertFalse(
-                            _SHELL_METACHARACTERS.intersection(token)
-                            and token != ".",
-                            token,
-                        )
+                        self.assertFalse(_SHELL_METACHARACTERS.intersection(token), token)
+
+    def test_manifest_excludes_workflow_adapter_setup(self) -> None:
+        """AC-1: setup remains a workflow-adapter concern, never a portable gate."""
+
+        for gate in self.contract.gates.values():
+            for command in gate.commands:
+                with self.subTest(gate=gate.id, command=command.argv):
+                    self.assertNotEqual(command.argv[:3], ("uv", "python", "install"))
+                    self.assertFalse(any("${{" in token for token in command.argv))
 
     def test_matrices_match_the_workflows(self) -> None:
         """AC-4: OS/Python matrices are unchanged."""
@@ -193,6 +193,13 @@ class LoaderFailClosedTests(unittest.TestCase):
         with self.assertRaises(contract.ContractError) as caught:
             _load_text("schema_version = 2\n")
         self.assertIn("schema_version", str(caught.exception))
+
+    def test_rejects_non_integer_schema_version(self) -> None:
+        for value in ("true", "1.0"):
+            with self.subTest(schema_version=value):
+                with self.assertRaises(contract.ContractError) as caught:
+                    _load_text(f"schema_version = {value}\n")
+                self.assertIn("schema_version", str(caught.exception))
 
     def test_rejects_missing_schema_version(self) -> None:
         with self.assertRaises(contract.ContractError):
@@ -230,6 +237,16 @@ class LoaderFailClosedTests(unittest.TestCase):
         )
         with self.assertRaises(contract.ContractError) as caught:
             _load_text(_manifest(block))
+        self.assertIn("shell operator", str(caught.exception))
+
+    def test_rejects_ci_expression_in_argv(self) -> None:
+        text = MANIFEST.read_text(encoding="utf-8").replace(
+            'argv = ["uv", "run", "--with", "ruff", "ruff", "check", "."]',
+            'argv = ["uv", "run", "${{ matrix.python }}"]',
+            1,
+        )
+        with self.assertRaises(contract.ContractError) as caught:
+            _load_text(text)
         self.assertIn("shell operator", str(caught.exception))
 
     def test_rejects_unsafe_required_path(self) -> None:

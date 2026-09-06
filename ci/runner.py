@@ -25,6 +25,9 @@ from ci import contract
 #: The gate manifest, relative to an explicit source root.
 MANIFEST_RELPATH = "ci/gates.toml"
 
+#: Stable anchor for relative ``--source-root`` inputs, independent of the caller's cwd.
+DRIVER_ROOT = Path(__file__).resolve().parents[1]
+
 
 class DriverError(RuntimeError):
     """A single-cause driver failure raised before any gate subprocess starts."""
@@ -66,7 +69,8 @@ def resolve_source_root(source_root: str | None) -> Path:
 
     if not source_root:
         raise DriverError("--source-root is required")
-    root = Path(source_root)
+    supplied_root = Path(source_root)
+    root = supplied_root if supplied_root.is_absolute() else DRIVER_ROOT / supplied_root
     if not root.exists():
         raise DriverError(f"--source-root does not exist: {source_root}")
     if not root.is_dir():

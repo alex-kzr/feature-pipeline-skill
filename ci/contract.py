@@ -145,7 +145,7 @@ def _build(data: Mapping[str, object]) -> Contract:
     if "schema_version" not in data:
         raise ContractError("gate manifest is missing schema_version")
     version = data["schema_version"]
-    if version != SCHEMA_VERSION:
+    if type(version) is not int or version != SCHEMA_VERSION:
         raise ContractError(
             f"unsupported schema_version: {version!r}; expected {SCHEMA_VERSION}"
         )

@@ -30,6 +30,7 @@ import shutil
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from ci import contract, run as run_cli, runner
 
@@ -279,6 +280,38 @@ class SingleCommandExecutionTests(unittest.TestCase):
 
             # Leave both temp dirs before their context managers try to remove them
             # (Windows cannot delete the process's current working directory).
+            os.chdir(original)
+
+            self.assertEqual(here.gate_calls[0][0], there.gate_calls[0][0])
+            self.assertEqual(here.gate_calls[0][1], root.resolve())
+            self.assertEqual(there.gate_calls[0][1], root.resolve())
+
+    def test_relative_source_root_is_anchored_to_driver_root(self) -> None:
+        """AC-2: a relative root is independent of the process current directory."""
+
+        original = os.getcwd()
+        self.addCleanup(os.chdir, original)
+        with TemporaryDirectory() as raw, TemporaryDirectory() as elsewhere:
+            driver_root = Path(raw)
+            root = _make_root(driver_root, name="checkout")
+
+            with patch.object(runner, "DRIVER_ROOT", driver_root):
+                os.chdir(driver_root)
+                here = FakeRunner()
+                run_cli.main(
+                    ["run", "lint", "--source-root", "checkout"],
+                    runner=here,
+                    stdout=io.StringIO(),
+                )
+
+                os.chdir(elsewhere)
+                there = FakeRunner()
+                run_cli.main(
+                    ["run", "lint", "--source-root", "checkout"],
+                    runner=there,
+                    stdout=io.StringIO(),
+                )
+
             os.chdir(original)
 
             self.assertEqual(here.gate_calls[0][0], there.gate_calls[0][0])
