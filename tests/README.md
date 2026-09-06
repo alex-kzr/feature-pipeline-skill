@@ -16,6 +16,14 @@ single source of truth for "did the whole suite pass". Every command below is a 
 *subset* of exactly that discovery, useful when iterating on one concern without paying for the
 whole suite.
 
+[`UGA-02`](../../docs/plans/tasks/UGA-02_core-gate-manifest.md) transcribes every command on this
+page, plus each workflow-only gate (`lint`, `types`, `coverage`, `installed-package`), into one
+executable manifest: [`ci/gates.toml`](../ci/gates.toml), loaded and validated fail-closed by
+[`ci/contract.py`](../ci/contract.py) (stdlib `tomllib` only). The manifest is the new source of
+truth for gate IDs, argv, required/evidence paths, and OS/Python matrices — this file still names
+what each suite discovers and why, but no longer needs to be kept in step with the workflow YAML
+by hand.
+
 ## Reusable test support (`tests/support/`)
 
 Not a test suite — imported by test suites. Consolidates what was previously duplicated,
