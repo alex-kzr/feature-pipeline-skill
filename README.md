@@ -33,6 +33,27 @@ deferred.
   performance, compatibility), each with its own deterministic discovery command, and where
   reusable test support (`tests/support/`) lives.
 
+## Continuous integration
+
+- `ci/gates.toml` is the only command/matrix authority for CI: every gate ID, `argv` array,
+  required/evidence path, and OS/Python matrix. `ci/contract.py` loads it fail-closed
+  (stdlib `tomllib`), `ci/run.py` (`list --json`, `validate`, `run GATE_ID`) is the portable
+  driver that resolves every path below an explicit `--source-root` and never the ambient
+  working directory, and `ci/workflows.py` is the topology/drift validator behind
+  `ci/run.py validate`.
+- `ci/promotion.py` is the core-owned same-SHA promotion verifier: an umbrella gitlink bump is
+  accepted only when every required producer check is successful for the exact gitlink SHA. It
+  reads only the *name* of a token environment variable, never its value.
+- `.github/workflows/quality-gates.yml` is the standalone producer adapter; the umbrella
+  `feature-pipeline` repository owns the `installed-package` consumer adapter and the
+  `core-promotion` gate. Producer, consumer, and promotion checks are separate stable
+  identities and no one substitutes for another.
+- The full operating contract — explicit-root invocation, single-cause diagnostics, ownership,
+  required-check identities, and stuck-run recovery — is
+  [`docs/validation/github-actions-universal-solution.md`](../docs/validation/github-actions-universal-solution.md);
+  the gate table is mechanically checked in [`tests/README.md`](tests/README.md). No stage in
+  this pipeline has a commit or push code path; publishing remote evidence is a human step.
+
 ## Launch contract
 
 Every launcher receives these explicit filesystem anchors:

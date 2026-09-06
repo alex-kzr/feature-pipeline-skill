@@ -14,6 +14,9 @@ from tempfile import TemporaryDirectory
 from pipeline_core import runner_cli
 from pipeline_core.execution import EXIT_BLOCKED, EXIT_ERROR, EXIT_GATE_PENDING, EXIT_OK
 
+from ci import contract as ci_contract
+from ci import promotion as ci_promotion
+
 import feature_pipeline
 
 
@@ -22,6 +25,13 @@ DOCS_ROOT = ROOT / "docs"
 ARCHITECTURE_DOC = DOCS_ROOT / "architecture" / "feature-pipeline.md"
 CONTRACTS_DOC = DOCS_ROOT / "contracts" / "feature-pipeline.md"
 MIGRATION_DOC = DOCS_ROOT / "migration" / "feature-pipeline-v3.md"
+
+CORE_ROOT = ROOT / "feature-pipeline-skill"
+GATES_MANIFEST = CORE_ROOT / "ci" / "gates.toml"
+TESTS_README = CORE_ROOT / "tests" / "README.md"
+UNIVERSAL_CI_DOC = DOCS_ROOT / "validation" / "github-actions-universal-solution.md"
+QUALITY_GATES_DOC = DOCS_ROOT / "validation" / "quality-gates.md"
+INSTALLED_PACKAGE_DOC = DOCS_ROOT / "validation" / "installed-package.md"
 
 
 def _text(path: str) -> str:
@@ -46,6 +56,48 @@ def _heading_slugs(text: str) -> set[str]:
         re.sub(r"\s+", "-", re.sub(r"[^\w\s-]", "", line.lstrip("#").strip().lower()))
         for line in text.splitlines() if line.startswith("#")
     }
+
+
+def _section(text: str, heading: str) -> str:
+    """Return a level-two Markdown section, excluding its heading."""
+
+    match = re.search(
+        rf"^## {re.escape(heading)}\r?$(?:\r?\n)(.*?)(?=^## |\Z)",
+        text,
+        re.MULTILINE | re.DOTALL,
+    )
+    if match is None:
+        raise AssertionError(f"missing section: {heading}")
+    return match.group(1)
+
+
+def _table_rows(text: str, heading: str) -> list[list[str]]:
+    """Parse the first Markdown table in a named level-two section."""
+
+    lines = _section(text, heading).splitlines()
+    table = [line for line in lines if line.startswith("|")]
+    if len(table) < 2:
+        raise AssertionError(f"missing table in section: {heading}")
+    return [
+        [cell.strip() for cell in line.strip().strip("|").split("|")]
+        for line in table[2:]
+    ]
+
+
+def _table_after_marker(text: str, marker: str) -> list[list[str]]:
+    """Parse the first Markdown table following an unambiguous document marker."""
+
+    lines = text[text.index(marker):].splitlines()
+    table_start = next(index for index, line in enumerate(lines) if line.startswith("|"))
+    table: list[str] = []
+    for line in lines[table_start:]:
+        if not line.startswith("|"):
+            break
+        table.append(line)
+    return [
+        [cell.strip() for cell in line.strip().strip("|").split("|")]
+        for line in table[2:]
+    ]
 
 
 class PublicApiSurfaceTests(unittest.TestCase):
@@ -176,6 +228,120 @@ class DocumentationContractTests(unittest.TestCase):
                 self.assertIn(token, text)
         self.assertNotIn("attestation-source-identity-mismatch", text)
         self.assertNotIn("prompt_path`/`plan_path` match this run", text)
+
+
+class UniversalCiContractDocumentationTests(unittest.TestCase):
+    """UGA-08 - the CI operating contract is documentation checked against executable data.
+
+    Every documented gate ID, command, matrix cell, and required-check identity is compared,
+    mechanically, to the loaded ``ci/gates.toml`` and to ``ci.promotion.required_core_checks``,
+    so copying a value into prose without updating the manifest is a red test, not silent drift
+    (UGA-08 AC-1, AC-3). The recovery guidance keeps single-cause diagnostics and the permanent
+    no-push rule (AC-4).
+    """
+
+    def setUp(self) -> None:
+        self.contract = ci_contract.load(GATES_MANIFEST)
+        self.readme = TESTS_README.read_text(encoding="utf-8")
+        self.solution = UNIVERSAL_CI_DOC.read_text(encoding="utf-8")
+        self.quality_gates = QUALITY_GATES_DOC.read_text(encoding="utf-8")
+        self.installed_package = INSTALLED_PACKAGE_DOC.read_text(encoding="utf-8")
+
+    def _expected_gate_rows(self, gates: tuple[ci_contract.Gate, ...]) -> set[tuple[str, ...]]:
+        return {
+            (
+                gate.id,
+                gate.group,
+                ", ".join(gate.os) if gate.os else "—",
+                ", ".join(gate.python) if gate.python else "—",
+                "; ".join(" ".join(command.argv) for command in gate.commands),
+            )
+            for gate in gates
+        }
+
+    def _documented_gate_rows(self, text: str, heading: str) -> set[tuple[str, ...]]:
+        rows = _table_rows(text, heading)
+        return {
+            (
+                row[0].strip("`"),
+                row[1],
+                row[2],
+                row[3],
+                "; ".join(re.findall(r"`([^`]+)`", row[4])),
+            )
+            for row in rows
+        }
+
+    def test_ci_gate_tables_are_exact_manifest_transcriptions(self) -> None:
+        cases = (
+            (self.readme, "CI gate contract (`ci/gates.toml`)", tuple(self.contract.gates.values())),
+            (self.quality_gates, "Current producer gate contract", self.contract.group("core")),
+            (self.installed_package, "Current consumer gate contract", self.contract.group("consumer")),
+        )
+        for text, heading, gates in cases:
+            with self.subTest(heading=heading):
+                self.assertEqual(
+                    self._documented_gate_rows(text, heading),
+                    self._expected_gate_rows(gates),
+                )
+
+    def test_docs_name_the_manifest_as_the_only_command_authority(self) -> None:
+        for text in (self.readme, self.solution):
+            self.assertIn("ci/gates.toml", text)
+            self.assertIn("the only command/matrix authority", text)
+
+    def test_solution_doc_exactly_transcribes_required_check_identities(self) -> None:
+        producer = {
+            row[0].strip("`")
+            for row in _table_after_marker(self.solution, "### Producer")
+        }
+        self.assertEqual(producer, set(ci_promotion.required_core_checks(self.contract)))
+
+        gate = self.contract.gate("installed-package")
+        consumer = {
+            row[0].strip("`")
+            for row in _table_after_marker(self.solution, "### Consumer and promotion")
+        }
+        expected_consumer = {
+            f"{image} · py{version}"
+            for image in gate.os
+            for version in gate.python
+        }
+        expected_consumer.add("same-SHA core promotion")
+        self.assertEqual(consumer, expected_consumer)
+        self.assertIn(ci_promotion.CONSUMER_CHECK_IDENTITY, self.solution)
+        self.assertIn("core-promotion", self.solution)
+
+    def test_solution_doc_covers_the_operating_contract_and_no_push_recovery(self) -> None:
+        for token in (
+            "--source-root",
+            "--expected-source-sha",
+            "resolved source root",
+            "producer",
+            "consumer",
+            "promotion",
+            "single cause",
+            "single-cause diagnostics",
+            "Stuck-run recovery",
+            "no-push rule is permanent",
+            "human",
+        ):
+            with self.subTest(token=token):
+                self.assertIn(token, self.solution)
+
+    def test_solution_doc_links_and_fragments_resolve(self) -> None:
+        doc = UNIVERSAL_CI_DOC
+        for target in re.findall(r"\]\(([^)]+)\)", doc.read_text(encoding="utf-8")):
+            if target.startswith(("http://", "https://", "#")):
+                continue
+            path_part, _, fragment = target.partition("#")
+            resolved = (doc.parent / path_part).resolve()
+            with self.subTest(target=target):
+                self.assertTrue(resolved.is_file(), f"{target} does not resolve")
+                if fragment:
+                    self.assertIn(
+                        fragment, _heading_slugs(resolved.read_text(encoding="utf-8"))
+                    )
 
 
 if __name__ == "__main__":

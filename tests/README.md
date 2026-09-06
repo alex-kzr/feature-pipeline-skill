@@ -30,7 +30,10 @@ that manifest: [`ci/run.py`](../ci/run.py) (`list --json`, `validate`, `run GATE
 and each command's working directory — resolves only below the caller-supplied `--source-root`;
 nothing here reads the process current directory or searches for a root. `tests/test_ci_driver.py`
 covers root validation, argv execution, first-failure short-circuit, source-SHA binding, and
-byte-stable `list --json` output.
+byte-stable `list --json` output. The two-repository operating contract this driver serves —
+explicit-root invocation, single-cause diagnostics, producer/consumer/promotion ownership,
+required-check identities, same-SHA promotion, and stuck-run recovery — is
+[`docs/validation/github-actions-universal-solution.md`](../../docs/validation/github-actions-universal-solution.md).
 
 [`UGA-04`](../../docs/plans/tasks/UGA-04_topology-drift-validator.md) adds the reusable topology
 and drift validator behind `ci/run.py validate`: [`ci/workflows.py`](../ci/workflows.py) rejects
@@ -47,6 +50,34 @@ guard already varies by machine. Committed fixtures live under
 are migrated topologies with arbitrarily renamed checkout directories that must pass every rule;
 `broken/feature-pipeline-skill` retains the pre-UGA-01 bug as a fixture and must still fail with
 a deterministic nonexistent-root diagnostic.
+
+## CI gate contract (`ci/gates.toml`)
+
+[`ci/gates.toml`](../ci/gates.toml) is the only command/matrix authority. The table below is a
+verbatim transcription of it — every gate ID, workflow group, OS/Python matrix, and ordered
+command `argv` — and `tests/test_documentation_contracts.py` compares each row and command to the
+loaded manifest, so it cannot drift silently. `—` means the gate declares no matrix on that
+axis. The commands are `argv` arrays run without a shell by
+[`ci/run.py`](../ci/run.py) `run GATE_ID`; a workflow never invokes them directly.
+
+| Gate ID | Group | OS matrix | Python matrix | Command(s) |
+| --- | --- | --- | --- | --- |
+| `lint` | core | ubuntu-latest | — | `uv run --with ruff ruff check .` |
+| `types` | core | ubuntu-latest | — | `uv run --with mypy mypy` |
+| `coverage` | core | ubuntu-latest | — | `uv run --with coverage coverage run -m unittest discover -s tests -t .`; `uv run --with coverage coverage report` |
+| `platform` | core | ubuntu-latest, windows-latest | — | `uv run python -m unittest tests.test_process_runner tests.test_worktree tests.test_worktree_bounded_attribution` |
+| `fault-injection` | core | ubuntu-latest, windows-latest | — | `uv run python -m unittest tests.test_concurrency tests.test_scope_gate tests.test_git_safety_allowlist tests.test_launch_controls tests.test_critical_behavior_characterization` |
+| `performance` | core | ubuntu-latest, windows-latest | — | `uv run python -m unittest tests.test_worktree_performance_baseline` |
+| `documentation` | core | — | — | `uv run python -m unittest tests.test_documentation_contracts` |
+| `installed-package` | consumer | ubuntu-latest, windows-latest | 3.11, 3.12, 3.13 | `uv run python -m unittest discover -s tests -t .`; `uv run python -m unittest -v tests.test_installed_wheel`; `uv run python -m tests.installed_wheel --json` |
+
+The `core` group is the standalone producer contract, run by
+`feature-pipeline-skill/.github/workflows/quality-gates.yml`. The `consumer` group is the nested
+installed-wheel contract, run by the umbrella `feature-pipeline` repository's
+`.github/workflows/installed-package.yml` against the exact pinned gitlink SHA. The two are
+separate required checks and neither substitutes for the other; see
+[`docs/validation/github-actions-universal-solution.md`](../../docs/validation/github-actions-universal-solution.md)
+for the required-check identities and the same-SHA promotion gate.
 
 ## Reusable test support (`tests/support/`)
 
@@ -178,7 +209,11 @@ acceptance criterion that their examples execute in CI (AC-3), which the origina
 never added. This suite drives the doc's own CLI example through a real plan-only `--dry-run`,
 checks the documented `feature_pipeline` export list and exit-code table against the frozen
 constants they describe, and resolves the critical cross-links between the architecture,
-contracts, and migration pages (including link fragments against real headings).
+contracts, and migration pages (including link fragments against real headings). UGA-08 adds the
+CI operating-contract checks: the gate table above and
+`docs/validation/github-actions-universal-solution.md` are compared, row by row, to the loaded
+`ci/gates.toml` and to `ci.promotion.required_core_checks`, so a documented gate ID, command,
+matrix, or required-check identity that drifts from executable data is a red test.
 
 ```
 uv run python -m unittest tests.test_documentation_contracts
