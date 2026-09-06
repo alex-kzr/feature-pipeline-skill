@@ -197,6 +197,19 @@ or archive/purge code is reachable from `execute`.
   candidates fail closed as `evidence-legacy-ambiguous`. Reuse records immutable consumer-side
   `reused_verification` evidence and never modifies source-run bytes. Pass
   `--verify-dependency-chain` to verify the full closure locally instead.
+- **Board projection.** For a Markdown-backed board plan the runner projects each durable task
+  transition onto `docs/kanban.md` and the task file after the transition is saved: a selected
+  task moves from `## To Do` to `## In Progress` after the durable `running` transition and
+  before the executor launches; a `blocked` task returns to `## To Do` keeping its `## Blockers`;
+  a `verified` task loses its card and gets a checked `Done` plus one `## Result` section
+  rendered from structured run/command/report evidence (there is no `Done` column or completed
+  ledger). Projection is convergent and idempotent, touches only `execution_scope` IDs, and a
+  failed projection write is reported as `board-projection-failed` with `run.json` left intact.
+  `--resume` reconciles the in-scope task files and board cards from `run.json` before selecting
+  the next task and never redispatches a `verified` task. A boardless JSON plan is
+  projection-free. Full mapping and fields: the parent
+  [board and task-local result projection](../../docs/contracts/feature-pipeline.md#board-and-task-local-result-projection)
+  contract.
 - **`--add-dir` for a shared/synced `agents_root` and a split-checkout `core_root`.** The
   dispatched executor, task-verifier, and test-verifier (one adapter instance, shared) are
   granted the fully resolved, symlink/junction-following real path of both `agents_root` and

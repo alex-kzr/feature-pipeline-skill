@@ -60,8 +60,13 @@ Callers supply all anchors. The core does not infer host-specific locations or p
   repair loop, ending each task at `verified` or at a truthful non-zero terminal state. It
   **stops before stage 10** — no documentation, Graphify, final verification, release, or
   archive/purge code runs. It refuses to dispatch the first executor until the plan gate is
-  satisfied (`--approve-plan`, or an explicit `--unattended` opt-in). See
-  [`scripts/README.md`](scripts/README.md) and
+  satisfied (`--approve-plan`, or an explicit `--unattended` opt-in). For a Markdown-backed
+  board plan it also projects each durable task transition onto `docs/kanban.md` and the task
+  file (`## Status`, and a `## Result` section on `verified`) as a convergent, durable-first
+  side effect, and reconciles that view on `--resume`; a boardless JSON plan runs
+  projection-free. The state-to-view mapping and result fields are the parent
+  [board and task-local result projection](../docs/contracts/feature-pipeline.md#board-and-task-local-result-projection)
+  contract. See [`scripts/README.md`](scripts/README.md) and
   [`fixtures/execution/README.md`](fixtures/execution/README.md).
 
 Verified dependencies are reused across runs by default only when their task path, normalized task-contract digest, status, two `PASS` verifier verdicts, and verification timestamp are eligible. `--verify-dependency-chain` opts into verifying the full closure in the current run; `--attest-dependency` remains the backward-compatible explicit source selector under the same policy. The runner persists immutable `execution_scope`, `verify_dependency_chain`, task identity, and consumer-side `reused_verification` evidence. Exact details and repository metadata rules are maintained in the parent [contracts](../docs/contracts/feature-pipeline.md) and [task metadata contract](../docs/agents/task-metadata-contract.md).
