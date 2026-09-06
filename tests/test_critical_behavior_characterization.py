@@ -56,6 +56,7 @@ from pipeline_core.state import ACTOR_RUNNER, Run
 from pipeline_core.worktree import IN_SCOPE, OUT_OF_SCOPE, STATE_KNOWN, attribute_window
 from pipeline_core import state as state_mod
 from pipeline_core import worktree as worktree_mod
+from tests.contract_lifecycle import superseded_characterization
 
 
 # --- shared fixtures -----------------------------------------------------------------------
@@ -299,15 +300,15 @@ class F03FreshRunIdentityAndOverwriteSemanticsAreUnsafe(unittest.TestCase):
 
 
 class F04OutOfScopeChangesAreNotEnforcedStructurally(unittest.TestCase):
-    """F-04 — worktree attribution *labels* a changed file ``out_of_scope`` but nothing
-    stops the task: ``dispatch_executor`` still transitions ``running -> implemented`` on a
-    trusted report and hands the decision to the LLM verifier. The CLI documents that
-    out-of-scope changes fail; the core has no deterministic gate for it.
+    """F-04 — CORRECTED by WT-02 (deterministic scope gate).
 
-    Disposition: correct through an approved ADR (BL-03) — the pipeline blocks or fails
-    immediately after attribution when executor-owned out-of-scope changes exist; verifiers
-    explain but do not decide a mechanical invariant; the runner never auto-reverts.
-    INTENDED FOLLOW-UP: WT-02 (enforce the deterministic scope gate).
+    Attribution still reports an executor-owned path outside ``Allowed scope`` as
+    ``out_of_scope``.  WT-02 turns that evidence into a mechanical gate: dispatch does not
+    transition the task to ``implemented`` and no verifier gets authority to waive it.
+    This is the replacement regression for the historical characterization; the detailed
+    scope-gate matrix lives in :mod:`tests.test_scope_gate`.
+
+    Governing decision: ``docs/adr/007-compatibility-and-versioning-policy.md`` §6.
     """
 
     def test_attribution_labels_out_of_scope_without_raising_or_downgrading_trust(self) -> None:
@@ -323,7 +324,7 @@ class F04OutOfScopeChangesAreNotEnforcedStructurally(unittest.TestCase):
         self.assertEqual(by_path["in_scope.py"], IN_SCOPE)
         self.assertEqual(by_path["secret.py"], OUT_OF_SCOPE)
 
-    def test_dispatch_reaches_implemented_with_an_out_of_scope_change_in_the_window(self) -> None:
+    def test_dispatch_does_not_implement_an_out_of_scope_executor_window(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             _init_repo(root)
@@ -343,13 +344,40 @@ class F04OutOfScopeChangesAreNotEnforcedStructurally(unittest.TestCase):
                 _ScriptedAdapter(on_launch=_leak),
             )
 
+            self.assertEqual(outcome.status, "retryable")
+            self.assertIsNone(outcome.settled_status)
+            self.assertEqual(life.run.task(spec.id).status, "running")
+
+    @superseded_characterization(
+        finding="F-04",
+        adr="docs/adr/007-compatibility-and-versioning-policy.md",
+        replacement=(
+            "tests.test_scope_gate.ScopeGateViolationTests."
+            "test_out_of_scope_change_blocks_before_verification"
+        ),
+    )
+    def test_legacy_dispatch_reaches_implemented_with_an_out_of_scope_change(self) -> None:
+        """Historical F-04 assertion retained for audit, never as a release gate."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _init_repo(root)
+            spec = _spec()
+            life = _running_life(root, spec)
+
+            def _leak() -> None:
+                (root / "secret.py").write_text("written outside scope\n", encoding="utf-8")
+
+            outcome = dispatch_executor(
+                life,
+                DispatchRequest(
+                    spec=spec, role_grant=("read", "run_checks", "write"),
+                    anchors=EnvelopeAnchors(project_root=".", agents_root=".agents"),
+                    plan_path="docs/plans/2026-09-03-feature-pipeline-refactor.md",
+                ),
+                _ScriptedAdapter(on_launch=_leak),
+            )
+
             self.assertEqual(outcome.status, "implemented")
-            self.assertEqual(life.run.task(spec.id).status, "implemented")
-            manifest = json.loads(
-                (root / outcome.attribution.manifest).read_text(encoding="utf-8"))
-            classes = {row["path"]: row["classification"]
-                       for row in manifest["changed_files"]}
-            self.assertEqual(classes.get("secret.py"), OUT_OF_SCOPE)
 
 
 def _sf(data: bytes) -> worktree_mod.SnapshotFile:
