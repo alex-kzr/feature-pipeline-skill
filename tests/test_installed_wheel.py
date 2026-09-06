@@ -133,31 +133,58 @@ class RedactedEvidence(unittest.TestCase):
 
 
 class CiMatrixContract(unittest.TestCase):
-    """AC-2 — Windows and Linux CI run the same contract off one matrix."""
+    """AC-2 / UGA-06 — Windows and Linux CI run the same contract, and both the supported
+    matrix and the gate argv are read from ``ci/gates.toml`` through the ``ci/run.py`` driver,
+    never transcribed into the umbrella workflow YAML."""
 
     def setUp(self) -> None:
         self.workflow = _REPO_ROOT / installed_wheel.CI_WORKFLOW
         if not self.workflow.is_file():
             self.fail(f"missing CI workflow {installed_wheel.CI_WORKFLOW}")
         self.text = self.workflow.read_text(encoding="utf-8")
+        self.gate = installed_wheel.manifest_consumer_gate()
 
-    def test_matrix_covers_windows_and_linux(self) -> None:
+    def test_manifest_owns_the_supported_matrix(self) -> None:
+        self.assertEqual(set(self.gate.os), {"ubuntu-latest", "windows-latest"})
+        self.assertEqual(set(self.gate.python), {"3.11", "3.12", "3.13"})
+
+    def test_supported_matrix_is_derived_from_the_manifest(self) -> None:
+        self.assertEqual(
+            SUPPORTED_MATRIX,
+            {image: list(self.gate.python) for image in self.gate.os},
+        )
         self.assertIn("windows-latest", SUPPORTED_MATRIX)
         self.assertIn("ubuntu-latest", SUPPORTED_MATRIX)
-        for image in SUPPORTED_MATRIX:
-            self.assertIn(image, self.text, f"{image} is not referenced by the workflow")
 
-    def test_every_supported_python_is_in_the_workflow(self) -> None:
-        for versions in SUPPORTED_MATRIX.values():
-            for version in versions:
-                self.assertIn(version, self.text,
-                              f"Python {version} is in SUPPORTED_MATRIX but not the workflow")
+    def test_workflow_expands_its_matrix_from_the_driver(self) -> None:
+        self.assertIn("ci.run list --json --group consumer", self.text)
+        self.assertIn(
+            "fromJSON(needs.prepare-consumer-gates.outputs.include)", self.text
+        )
 
-    def test_workflow_runs_root_discovery_and_the_isolated_install(self) -> None:
-        # Root discovery: the canonical project-root suite invocation (prompt L458).
-        self.assertIn("unittest discover -s tests -t .", self.text)
-        # Installed-package integration: the harness this module drives.
-        self.assertIn("tests.test_installed_wheel", self.text.replace("/", ".") + self.text)
+    def test_workflow_runs_the_gate_only_through_the_driver(self) -> None:
+        self.assertIn("ci.run run ${{ matrix.gate.id }}", self.text)
+        for embedded in (
+            "unittest discover -s tests -t .",
+            "unittest -v tests.test_installed_wheel",
+            "python -m tests.installed_wheel --json",
+        ):
+            self.assertNotIn(embedded, self.text)
+
+    def test_workflow_binds_the_exact_gitlink_sha(self) -> None:
+        self.assertIn("git rev-parse HEAD:feature-pipeline-skill", self.text)
+        self.assertIn(
+            '--expected-source-sha "${{ steps.gitlink.outputs.sha }}"', self.text
+        )
+
+    def test_workflow_sets_an_explicit_submodule_source_root(self) -> None:
+        self.assertIn(
+            '--source-root "$GITHUB_WORKSPACE/feature-pipeline-skill"', self.text
+        )
+        self.assertNotIn("working-directory:", self.text)
+
+    def test_evidence_is_not_collected_unconditionally(self) -> None:
+        self.assertNotIn("always()", self.text)
 
     def test_workflow_uses_uv(self) -> None:
         self.assertIn("uv", self.text)

@@ -37,10 +37,19 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from ci import workflows
+from ci import contract, workflows
 
 WORKFLOW = (
     Path(__file__).resolve().parents[1] / ".github" / "workflows" / "quality-gates.yml"
+)
+
+# UGA-06: the umbrella (``feature-pipeline``) consumer workflow lives one level above the core
+# submodule checkout, not inside it.
+UMBRELLA_WORKFLOW = (
+    Path(__file__).resolve().parents[2]
+    / ".github"
+    / "workflows"
+    / "installed-package.yml"
 )
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "ci"
@@ -469,6 +478,100 @@ class RunCliValidateIntegration(unittest.TestCase):
         exit_code = run_cli.main(["validate", "--source-root", str(root)], stdout=out)
         self.assertEqual(exit_code, 1)
         self.assertIn("workflow topology violations", out.getvalue())
+
+
+# ---------------------------------------------------------------------------------------------
+# UGA-06 - the umbrella `installed-package.yml` as a thin nested-topology adapter.
+# ---------------------------------------------------------------------------------------------
+
+
+class UmbrellaConsumerAdapterTests(unittest.TestCase):
+    """UGA-06 AC-1..AC-4: the umbrella consumer workflow is a thin adapter over the same
+    driver/contract the core workflow uses - explicit submodule source root, the exact
+    ``git rev-parse HEAD:feature-pipeline-skill`` gitlink SHA, driver-only gate execution,
+    a driver-expanded matrix, and no unconditional evidence step."""
+
+    def setUp(self) -> None:
+        if not UMBRELLA_WORKFLOW.is_file():
+            self.fail(f"missing umbrella workflow {UMBRELLA_WORKFLOW}")
+        self.text = UMBRELLA_WORKFLOW.read_text(encoding="utf-8")
+
+    def test_source_root_is_the_explicit_submodule_path(self) -> None:
+        # AC-2: the driver is told exactly where the core is; nothing is inferred from cwd.
+        self.assertIn(
+            '--source-root "$GITHUB_WORKSPACE/feature-pipeline-skill"', self.text
+        )
+
+    def test_no_repository_name_derived_working_directory(self) -> None:
+        # AC-2: renaming a checkout directory cannot change behaviour because no job or step
+        # pins one (a `working-directory: feature-pipeline-skill` is the exact UGA-01 bug).
+        self.assertNotIn("working-directory:", self.text)
+
+    def test_matrix_comes_from_the_driver_not_yaml(self) -> None:
+        # AC-4: the consumer matrix is expanded from `ci.run list --json`, not transcribed.
+        self.assertIn("ci.run list --json --group consumer", self.text)
+        self.assertIn(
+            "fromJSON(needs.prepare-consumer-gates.outputs.include)", self.text
+        )
+        self.assertIn("needs: prepare-consumer-gates", self.text)
+
+    def test_gate_runs_only_through_the_driver(self) -> None:
+        self.assertIn("ci.run run ${{ matrix.gate.id }}", self.text)
+        for embedded in (
+            "unittest discover -s tests -t .",
+            "unittest -v tests.test_installed_wheel",
+            "python -m tests.installed_wheel --json",
+        ):
+            self.assertNotIn(embedded, self.text)
+
+    def test_expected_core_sha_is_the_exact_gitlink(self) -> None:
+        # AC-1: the tested SHA is the umbrella tree's gitlink, and the actual submodule
+        # checkout SHA is printed next to it for evidence.
+        self.assertIn("git rev-parse HEAD:feature-pipeline-skill", self.text)
+        self.assertIn("git -C feature-pipeline-skill rev-parse HEAD", self.text)
+        self.assertIn(
+            '--expected-source-sha "${{ steps.gitlink.outputs.sha }}"', self.text
+        )
+
+    def test_core_branch_head_is_never_queried(self) -> None:
+        # Risks note: reading origin/main or the submodule's remote head would allow a
+        # false-green consumer result.
+        self.assertNotIn("origin/main", self.text)
+        self.assertNotIn("ls-remote", self.text)
+
+    def test_evidence_collection_is_not_unconditional(self) -> None:
+        # AC-3: nothing runs after a failed checkout/preflight, so a missing uv/tool/path
+        # cannot produce a second, misleading failure.
+        self.assertNotIn("always()", self.text)
+
+    def test_preserves_the_full_os_python_consumer_matrix(self) -> None:
+        # AC-4: ubuntu/windows x py3.11/3.12/3.13, owned by the manifest.
+        gate = contract.load(
+            Path(__file__).resolve().parents[1] / "ci" / "gates.toml"
+        ).gate("installed-package")
+        self.assertEqual(set(gate.os), {"ubuntu-latest", "windows-latest"})
+        self.assertEqual(set(gate.python), {"3.11", "3.12", "3.13"})
+
+
+@unittest.skipUnless(_HAS_YAML, "pyyaml dev dependency (uv sync --extra dev) not installed")
+class UmbrellaWorkflowValidatesInAnArbitrarilyNamedNestedCheckout(unittest.TestCase):
+    """UGA-06 AC-2: the committed umbrella workflow reports zero topology/drift violations
+    when the umbrella and its submodule are checked out under directory names that match no
+    repository this project ships under."""
+
+    def test_no_violations_in_a_renamed_nested_layout(self) -> None:
+        workflow_text = UMBRELLA_WORKFLOW.read_text(encoding="utf-8")
+        with TemporaryDirectory() as raw:
+            umbrella = Path(raw) / "arbitrary-umbrella-name"
+            (umbrella / ".github" / "workflows").mkdir(parents=True)
+            (umbrella / ".github" / "workflows" / "installed-package.yml").write_text(
+                workflow_text, encoding="utf-8"
+            )
+            # The adapter passes an explicit --source-root; the validator only needs the
+            # umbrella root itself to carry the layout markers.
+            (umbrella / "pyproject.toml").write_text("", encoding="utf-8")
+            (umbrella / "tests").mkdir()
+            self.assertEqual(workflows.validate_topology(umbrella), [])
 
 
 if __name__ == "__main__":

@@ -24,7 +24,8 @@ The heavy steps are cheap here because the runtime has **no dependencies** (``do
 ``uv build`` reuses its cached build backend and ``uv venv`` + ``uv pip install`` copy a
 single wheel. Results are cached per process so the suite builds once.
 
-Standard library only.
+Standard library only, plus the first-party ``ci.contract`` loader (itself standard-library
+only) that owns the supported consumer matrix (UGA-06).
 """
 
 from __future__ import annotations
@@ -73,13 +74,37 @@ _PUSH_DENIED_MESSAGE = "push is denied at this stage and the runner has no push 
 #: The single portable contract module run against the isolated install (AC-3).
 CONTRACT_MODULE = "test_installed_contract"
 
+#: The umbrella consumer workflow group / gate id in ``ci/gates.toml`` (UGA-06). The umbrella
+#: ``installed-package.yml`` adapter expands its matrix from this gate via the ``ci/run.py``
+#: driver, so the supported OS/Python matrix is read from the manifest here rather than kept a
+#: second time.
+CONSUMER_GROUP = "consumer"
+CONSUMER_GATE_ID = "installed-package"
+
+_MANIFEST_PATH = _CORE_ROOT / "ci" / "gates.toml"
+
+
+def manifest_consumer_gate() -> object:
+    """The ``installed-package`` gate exactly as declared in ``ci/gates.toml`` (UGA-06)."""
+
+    from ci import contract  # first-party, standard-library-only CI tooling
+
+    return contract.load(_MANIFEST_PATH).gate(CONSUMER_GATE_ID)
+
+
+def supported_matrix_from_manifest() -> dict[str, list[str]]:
+    """The consumer OS -> Python matrix, sourced from the executable gate contract (AC-4)."""
+
+    gate = manifest_consumer_gate()
+    return {image: list(gate.python) for image in gate.os}
+
+
 #: CI matrix — the OS images and interpreter versions that must run the isolated-install
 #: contract (AC-2). ``uv`` provisions each interpreter, so the list is the *supported*
 #: Python floor (``requires-python >= 3.11``, ``docs/adr/003``) through the current release.
-SUPPORTED_MATRIX: dict[str, list[str]] = {
-    "ubuntu-latest": ["3.11", "3.12", "3.13"],
-    "windows-latest": ["3.11", "3.12", "3.13"],
-}
+#: UGA-06: derived from ``ci/gates.toml`` so the workflow, this harness, and
+#: ``docs/validation/installed-package.md`` cannot drift.
+SUPPORTED_MATRIX: dict[str, list[str]] = supported_matrix_from_manifest()
 
 #: The workflow that runs :data:`SUPPORTED_MATRIX`. Logical, under the repository root.
 CI_WORKFLOW = ".github/workflows/installed-package.yml"
