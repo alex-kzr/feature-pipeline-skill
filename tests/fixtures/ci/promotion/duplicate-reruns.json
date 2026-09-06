@@ -1,0 +1,53 @@
+{
+  "total_count": 5,
+  "check_runs": [
+    {
+      "id": 601,
+      "name": "lint-and-types",
+      "head_sha": "1111111111111111111111111111111111111111",
+      "status": "completed",
+      "conclusion": "success",
+      "completed_at": "2026-09-06T10:03:00Z",
+      "html_url": "https://github.com/example/feature-pipeline-skill/runs/601"
+    },
+    {
+      "id": 602,
+      "name": "coverage",
+      "head_sha": "1111111111111111111111111111111111111111",
+      "status": "completed",
+      "conclusion": "success",
+      "completed_at": "2026-09-06T10:07:00Z",
+      "html_url": "https://github.com/example/feature-pipeline-skill/runs/602"
+    },
+    {
+      "id": 603,
+      "name": "suite-a",
+      "head_sha": "1111111111111111111111111111111111111111",
+      "status": "completed",
+      "conclusion": "failure",
+      "completed_at": "2026-09-06T09:05:00Z",
+      "html_url": "https://github.com/example/feature-pipeline-skill/runs/603"
+    },
+    {
+      "id": 604,
+      "name": "suite-a",
+      "head_sha": "1111111111111111111111111111111111111111",
+      "status": "completed",
+      "conclusion": "success",
+      "completed_at": "2026-09-06T10:30:00Z",
+      "html_url": "https://github.com/example/feature-pipeline-skill/runs/604"
+    },
+    {
+      "id": 605,
+      "name": "suite-b",
+      "head_sha": "1111111111111111111111111111111111111111",
+      "status": "completed",
+      "conclusion": "success",
+      "completed_at": "2026-09-06T10:06:00Z",
+      "html_url": "https://github.com/example/feature-pipeline-skill/runs/605"
+    }
+  ],
+  "api_urls": [
+    "https://api.github.com/repos/example/feature-pipeline-skill/commits/1111111111111111111111111111111111111111/check-runs?per_page=100"
+  ]
+}

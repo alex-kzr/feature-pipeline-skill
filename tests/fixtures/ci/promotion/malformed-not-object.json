@@ -1,0 +1,4 @@
+[
+  "this check-runs response is a JSON array, not the documented object with",
+  "total_count and check_runs keys, so the verifier must fail closed"
+]

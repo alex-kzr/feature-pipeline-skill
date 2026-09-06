@@ -1,0 +1,45 @@
+{
+  "total_count": 4,
+  "check_runs": [
+    {
+      "id": 301,
+      "name": "lint-and-types",
+      "head_sha": "1111111111111111111111111111111111111111",
+      "status": "completed",
+      "conclusion": "success",
+      "completed_at": "2026-09-06T10:03:00Z",
+      "html_url": "https://github.com/example/feature-pipeline-skill/runs/301"
+    },
+    {
+      "id": 302,
+      "name": "coverage",
+      "head_sha": "1111111111111111111111111111111111111111",
+      "status": "completed",
+      "conclusion": "success",
+      "completed_at": "2026-09-06T10:07:00Z",
+      "html_url": "https://github.com/example/feature-pipeline-skill/runs/302"
+    },
+    {
+      "id": 303,
+      "name": "suite-a",
+      "head_sha": "1111111111111111111111111111111111111111",
+      "status": "completed",
+      "conclusion": "success",
+      "completed_at": "2026-09-06T10:05:00Z",
+      "html_url": "https://github.com/example/feature-pipeline-skill/runs/303"
+    },
+    {
+      "id": 304,
+      "name": "suite-b",
+      "head_sha": "1111111111111111111111111111111111111111",
+      "status": "in_progress",
+      "conclusion": null,
+      "started_at": "2026-09-06T10:00:00Z",
+      "completed_at": null,
+      "html_url": "https://github.com/example/feature-pipeline-skill/runs/304"
+    }
+  ],
+  "api_urls": [
+    "https://api.github.com/repos/example/feature-pipeline-skill/commits/1111111111111111111111111111111111111111/check-runs?per_page=100"
+  ]
+}
