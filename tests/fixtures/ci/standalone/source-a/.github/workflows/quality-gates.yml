@@ -1,0 +1,35 @@
+# UGA-04 fixture: a fully migrated core workflow over a standalone checkout arbitrarily named
+# "source-a". No working-directory override is needed - the checkout root already is the
+# source root - and every gate runs through the UGA-03 driver with an explicit source SHA.
+name: quality-gates
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  policy-suites:
+    name: ${{ matrix.suite }} - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        suite: [platform, fault-injection, performance]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: platform
+        if: matrix.suite == 'platform'
+        run: uv run python -m ci.run run platform --source-root . --expected-source-sha ${{ github.sha }}
+
+      - name: fault-injection
+        if: matrix.suite == 'fault-injection'
+        run: uv run python -m ci.run run fault-injection --source-root . --expected-source-sha ${{ github.sha }}
+
+      - name: performance
+        if: matrix.suite == 'performance'
+        run: uv run python -m ci.run run performance --source-root . --expected-source-sha ${{ github.sha }}

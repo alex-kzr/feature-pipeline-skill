@@ -25,6 +25,7 @@ from collections.abc import Sequence
 
 from ci import contract
 from ci import runner as _runner
+from ci import workflows as _workflows
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -76,6 +77,17 @@ def _validate(args: argparse.Namespace, out) -> int:
         f"gate contract: {len(loaded.ids())} gates ({', '.join(loaded.ids())})",
         file=out,
     )
+
+    # UGA-04: topology/drift contract validation over any committed workflows below the same
+    # root. A root with no `.github/workflows` directory (every driver-test fixture) reports
+    # nothing and never imports the dev-only YAML parser.
+    violations = _workflows.validate_topology(root)
+    if violations:
+        print(f"workflow topology violations: {len(violations)}", file=out)
+        for violation in violations:
+            print(f"  - {violation.render()}", file=out)
+        return 1
+    print("workflow topology: no violations", file=out)
     return 0
 
 
@@ -105,7 +117,7 @@ def main(argv: Sequence[str] | None = None, *, runner=None, stdout=None) -> int:
             return _validate(args, out)
         if args.command == "run":
             return _run(args, out, command_runner)
-    except (_runner.DriverError, contract.ContractError) as exc:
+    except (_runner.DriverError, contract.ContractError, _workflows.YamlUnavailable) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 

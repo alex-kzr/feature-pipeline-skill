@@ -32,6 +32,22 @@ nothing here reads the process current directory or searches for a root. `tests/
 covers root validation, argv execution, first-failure short-circuit, source-SHA binding, and
 byte-stable `list --json` output.
 
+[`UGA-04`](../../docs/plans/tasks/UGA-04_topology-drift-validator.md) adds the reusable topology
+and drift validator behind `ci/run.py validate`: [`ci/workflows.py`](../ci/workflows.py) rejects
+unsafe `working-directory` values, resolves literal checkout paths against the real filesystem
+(the generalized UGA-01 regression), flags an unknown gate ID or a workflow command that bypasses
+the driver for a declared gate, and cross-checks each workflow's `strategy.matrix.suite` list
+against the manifest's multi-OS "core" gates and this file's own suite headings. It parses
+workflow YAML with PyYAML — a `dev`-only `optional-dependencies` extra, never a runtime
+dependency (docs/adr/003) — so the parser-dependent tests in `tests/test_ci_workflows.py` (every
+class beyond the original UGA-01 regression) skip deterministically without `uv sync --extra dev`
+or `uv run --with pyyaml ...`, the same way `tests.test_worktree_performance_baseline`'s heap
+guard already varies by machine. Committed fixtures live under
+[`tests/fixtures/ci/`](fixtures/ci/): `standalone/source-a` and `nested/dependency-b/source-a`
+are migrated topologies with arbitrarily renamed checkout directories that must pass every rule;
+`broken/feature-pipeline-skill` retains the pre-UGA-01 bug as a fixture and must still fail with
+a deterministic nonexistent-root diagnostic.
+
 ## Reusable test support (`tests/support/`)
 
 Not a test suite — imported by test suites. Consolidates what was previously duplicated,

@@ -1,0 +1,5 @@
+# UGA-04 fixture: the submodule source root, checked out under an umbrella repository
+# arbitrarily named "dependency-b" at a submodule path arbitrarily named "source-a" - neither
+# name matches any real repository this project ships under.
+[project]
+name = "fixture-source-a"

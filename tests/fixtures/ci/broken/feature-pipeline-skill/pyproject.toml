@@ -1,0 +1,6 @@
+# UGA-04 fixture: reproduces the pre-UGA-01 bug. This directory IS the standalone checkout
+# root (its own name happens to be "feature-pipeline-skill"), but the workflow below still
+# declares the old repository-name-derived working-directory, which both fails to resolve
+# (AC-1: nonexistent root) and is independently repository-name-derived.
+[project]
+name = "fixture-broken"

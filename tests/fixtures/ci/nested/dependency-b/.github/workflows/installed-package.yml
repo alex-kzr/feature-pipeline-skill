@@ -1,0 +1,27 @@
+# UGA-04 fixture: a fully migrated umbrella workflow. The umbrella checkout is arbitrarily
+# named "dependency-b" and its submodule checkout "source-a" - neither name matches any real
+# repository this project ships under, and "source-a" is a literal, existing path (not a
+# repository-name guess), so it is not flagged as an unsafe working-directory.
+name: installed-package
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  isolated-install:
+    name: isolated install
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: source-a
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: installed-package
+        run: uv run python -m ci.run run installed-package --source-root . --expected-source-sha ${{ github.sha }}

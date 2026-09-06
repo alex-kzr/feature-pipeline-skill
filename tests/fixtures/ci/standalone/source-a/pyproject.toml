@@ -1,0 +1,5 @@
+# UGA-04 fixture: a source root marker only. The checkout directory is deliberately named
+# "source-a" - arbitrary, unrelated to any real repository name - to prove the validator
+# resolves checkout paths from the actual filesystem rather than a hardcoded repository name.
+[project]
+name = "fixture-source-a"

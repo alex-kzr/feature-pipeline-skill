@@ -40,6 +40,10 @@ dev = [
     "ruff>=0.6",
     "mypy>=1.11",
     "coverage>=7.6",
+    # UGA-04: the topology/drift workflow validator parses committed YAML with a maintained
+    # parser. Dev-only — never imported by `src/feature_pipeline` or `pipeline_core`
+    # (docs/adr/003 stays intact; this rides the same exemption as ruff/mypy/coverage above).
+    "pyyaml>=6.0.3",
 ]
 
 [project.scripts]

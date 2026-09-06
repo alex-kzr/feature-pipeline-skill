@@ -1,0 +1,21 @@
+# UGA-04 fixture: the original UGA-01 bug. `working-directory: feature-pipeline-skill` assumes
+# the checkout is nested one level below a directory of that name, but this fixture root IS the
+# standalone checkout - so the declared path does not exist under it.
+name: quality-gates
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  lint-and-types:
+    name: ruff + mypy
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: feature-pipeline-skill
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ruff
+        run: uv run --with ruff ruff check .

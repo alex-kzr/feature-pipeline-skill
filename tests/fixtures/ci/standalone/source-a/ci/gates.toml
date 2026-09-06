@@ -1,0 +1,115 @@
+# UGA-02 — the core-owned CI gate manifest.
+#
+# Task:  docs/plans/tasks/UGA-02_core-gate-manifest.md
+# Plan:  docs/plans/2026-09-06-universal-github-actions-contract.md (Phase 2)
+# Design: .prompts/github-actions-universal-solution.md (component A)
+#
+# One executable source of truth for every CI gate and its supported matrix. The
+# commands below are transcribed verbatim from the workflows and tests/README.md
+# that run them today — this manifest changes no threshold, suite membership, or
+# package behaviour:
+#
+#   quality-gates.yml     -> group "core":    lint, types, coverage, platform,
+#                                             fault-injection, performance
+#   installed-package.yml -> group "consumer": installed-package
+#   tests/README.md       -> group "core":    documentation (no workflow yet)
+#
+# Rules enforced by ci/contract.py: schema_version must be 1; the eight gate IDs
+# below are exhaustive (no more, no fewer, no duplicates); every command is an
+# ordered argv array with no shell operator; required/evidence paths are plain
+# repository-relative paths; os/python matrices only name supported values.
+#
+# The `installed-package` argv omit the workflow's `--python ${{ matrix.python }}`
+# selector: the interpreter matrix is the explicit `python` field on that gate,
+# not a shell-templated token (UGA-02 Implementation Notes; YAGNI on templating).
+
+schema_version = 1
+
+# --- group "core" — feature-pipeline-skill/.github/workflows/quality-gates.yml ---
+
+[[gates]]
+id = "lint"
+group = "core"
+description = "Ruff lint + mccabe complexity policy ([tool.ruff] in pyproject.toml)."
+commands = [
+    { argv = ["uv", "run", "--with", "ruff", "ruff", "check", "."] },
+]
+required_paths = ["pyproject.toml"]
+os = ["ubuntu-latest"]
+
+[[gates]]
+id = "types"
+group = "core"
+description = "mypy gradual-typing boundary policy ([tool.mypy] in pyproject.toml)."
+commands = [
+    { argv = ["uv", "run", "--with", "mypy", "mypy"] },
+]
+required_paths = ["pyproject.toml"]
+os = ["ubuntu-latest"]
+
+[[gates]]
+id = "coverage"
+group = "core"
+description = "Full suite under branch coverage; report enforces the ratcheted fail_under floor."
+commands = [
+    { argv = ["uv", "run", "--with", "coverage", "coverage", "run", "-m", "unittest", "discover", "-s", "tests", "-t", "."] },
+    { argv = ["uv", "run", "--with", "coverage", "coverage", "report"] },
+]
+required_paths = ["pyproject.toml", "tests", "tests/README.md"]
+evidence_paths = ["docs/validation/quality-gates.md"]
+os = ["ubuntu-latest"]
+
+[[gates]]
+id = "platform"
+group = "core"
+description = "tests/README.md `platform` suite — OS-sensitive process/worktree behaviour."
+commands = [
+    { argv = ["uv", "run", "python", "-m", "unittest", "tests.test_process_runner", "tests.test_worktree", "tests.test_worktree_bounded_attribution"] },
+]
+required_paths = ["pyproject.toml", "tests", "tests/README.md"]
+os = ["ubuntu-latest", "windows-latest"]
+
+[[gates]]
+id = "fault-injection"
+group = "core"
+description = "tests/README.md `fault-injection` suite — adversarial, denial, and contention paths."
+commands = [
+    { argv = ["uv", "run", "python", "-m", "unittest", "tests.test_concurrency", "tests.test_scope_gate", "tests.test_git_safety_allowlist", "tests.test_launch_controls", "tests.test_critical_behavior_characterization"] },
+]
+required_paths = ["pyproject.toml", "tests", "tests/README.md"]
+os = ["ubuntu-latest", "windows-latest"]
+
+[[gates]]
+id = "performance"
+group = "core"
+description = "tests/README.md `performance` suite — bounded worktree inspector budget assertions."
+commands = [
+    { argv = ["uv", "run", "python", "-m", "unittest", "tests.test_worktree_performance_baseline"] },
+]
+required_paths = ["pyproject.toml", "tests", "tests/README.md"]
+os = ["ubuntu-latest", "windows-latest"]
+
+[[gates]]
+id = "documentation"
+group = "core"
+description = "tests/README.md `documentation` suite — executable contracts for docs/ (not yet wired into a workflow)."
+commands = [
+    { argv = ["uv", "run", "python", "-m", "unittest", "tests.test_documentation_contracts"] },
+]
+required_paths = ["pyproject.toml", "tests", "tests/README.md", "tests/test_documentation_contracts.py"]
+
+# --- group "consumer" — .github/workflows/installed-package.yml -------------------
+
+[[gates]]
+id = "installed-package"
+group = "consumer"
+description = "Built wheel installed in isolation: root discovery, isolated-wheel contract, acceptance evidence."
+commands = [
+    { argv = ["uv", "run", "python", "-m", "unittest", "discover", "-s", "tests", "-t", "."] },
+    { argv = ["uv", "run", "python", "-m", "unittest", "-v", "tests.test_installed_wheel"] },
+    { argv = ["uv", "run", "python", "-m", "tests.installed_wheel", "--json"] },
+]
+required_paths = ["pyproject.toml", "tests", "tests/installed_wheel.py"]
+evidence_paths = ["docs/validation/installed-package.md"]
+os = ["ubuntu-latest", "windows-latest"]
+python = ["3.11", "3.12", "3.13"]
