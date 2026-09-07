@@ -23,6 +23,12 @@ from pipeline_core.plan_md import (
     load_markdown_plan,
     load_markdown_plan_specs,
 )
+from pipeline_core.supersession import (
+    Supersession,
+    SupersessionError,
+    SupersessionGraph,
+    parse_supersedes,
+)
 from pipeline_core.task_files import TaskDefaults
 from feature_pipeline.contracts import CommandSpec, SchemaError
 
@@ -77,8 +83,8 @@ class LoadMarkdownPlanTests(unittest.TestCase):
         self.assertEqual(
             tasks,
             [
-                {"id": "SF-01", "type": "docs", "depends_on": []},
-                {"id": "SF-02", "type": "docs", "depends_on": ["SF-01"]},
+                {"id": "SF-01", "type": "docs", "depends_on": [], "supersedes": []},
+                {"id": "SF-02", "type": "docs", "depends_on": ["SF-01"], "supersedes": []},
             ],
         )
 
@@ -164,8 +170,8 @@ class HeadingsAndTaskFilesTests(unittest.TestCase):
             feature, tasks = load_markdown_plan(root / "2026-08-23-doc-thing.md")
         self.assertEqual(feature, "doc-thing")
         self.assertEqual(tasks, [
-            {"id": "DA-01", "type": "docs", "depends_on": []},
-            {"id": "DA-02", "type": "research", "depends_on": ["DA-01"]},
+            {"id": "DA-01", "type": "docs", "depends_on": [], "supersedes": []},
+            {"id": "DA-02", "type": "research", "depends_on": ["DA-01"], "supersedes": []},
         ])
 
     def test_missing_task_file_fails_closed(self) -> None:
@@ -313,6 +319,181 @@ class LoadMarkdownPlanSpecsTests(unittest.TestCase):
         with TemporaryDirectory() as raw:
             plan = self._plan(Path(raw), _historical_task_file())
             with self.assertRaises(SchemaError):
+                load_markdown_plan_specs(plan)
+
+
+SUPERSESSION_PLAN_MD = """\
+# Feature: Supersession Thing
+
+## Phase 1
+
+### SS-01 The blocked predecessor
+→ [tasks/SS-01_pred.md](tasks/SS-01_pred.md)
+
+### SS-02 An unrelated task
+→ [tasks/SS-02_other.md](tasks/SS-02_other.md)
+
+### SS-03 The verified replacement
+→ [tasks/SS-03_repl.md](tasks/SS-03_repl.md)
+"""
+
+
+def _supersession_task_file(tid: str, *, depends: str = "none", supersedes: str = "") -> str:
+    body = (
+        f"# {tid} - x\n\n## Status\n- [ ] To Do\n\n## Execution Metadata\n"
+        "- Type: docs\n- Executor: docs-maintainer\n"
+        f"- Depends on: {depends}\n"
+        "- Allowed scope: `docs/x.md`\n- Out of scope: none\n- Required skills: none\n"
+        "- Documentation impact: none\n- Verification commands:\n"
+        "  - `pkg` -> `python -m unittest discover -s tests -t .`\n"
+    )
+    if supersedes:
+        body += f"\n## Supersession\n- Supersedes: {supersedes}\n"
+    body += "\n## Purpose\nx\n"
+    return body
+
+
+class SupersessionModelTests(unittest.TestCase):
+    """UEI-04 — the pure ``pipeline_core.supersession`` model."""
+
+    def test_parse_supersedes_splits_ids_and_treats_none_tokens_as_empty(self) -> None:
+        self.assertEqual(parse_supersedes("SS-01, `SS-02` SS-03"), ("SS-01", "SS-02", "SS-03"))
+        for empty in (None, "", "none", "(none)", "-", "  —  "):
+            self.assertEqual(parse_supersedes(empty), ())
+
+    def test_verified_replacement_satisfies_a_superseded_dependency(self) -> None:
+        graph = SupersessionGraph(
+            [Supersession(replacement="SS-03", superseded="SS-01")],
+            known_ids=["SS-01", "SS-02", "SS-03"],
+        )
+        statuses = {"SS-01": "blocked", "SS-02": "verified", "SS-03": "verified"}
+        self.assertTrue(graph.is_satisfied("SS-01", statuses))
+        self.assertEqual(graph.satisfied_by("SS-01", statuses), "SS-03")
+        self.assertEqual(graph.replacement_for("SS-01"), "SS-03")
+        self.assertEqual(graph.unmet_dependencies(["SS-01", "SS-02"], statuses), ())
+
+    def test_blocked_predecessor_stays_blocked_and_is_never_marked_verified(self) -> None:
+        graph = SupersessionGraph(
+            [Supersession("SS-03", "SS-01")], known_ids=["SS-01", "SS-03"]
+        )
+        statuses = {"SS-01": "blocked", "SS-03": "verified"}
+        graph.is_satisfied("SS-01", statuses)
+        self.assertEqual(statuses["SS-01"], "blocked")  # the status map is only read
+        self.assertNotEqual(statuses["SS-01"], "verified")
+
+    def test_an_unverified_replacement_does_not_satisfy_the_dependency(self) -> None:
+        graph = SupersessionGraph(
+            [Supersession("SS-03", "SS-01")], known_ids=["SS-01", "SS-03"]
+        )
+        statuses = {"SS-01": "blocked", "SS-03": "implemented"}
+        self.assertFalse(graph.is_satisfied("SS-01", statuses))
+        self.assertEqual(graph.unmet_dependencies(["SS-01"], statuses), ("SS-01",))
+
+    def test_a_chain_of_supersession_follows_to_the_first_verified_replacement(self) -> None:
+        graph = SupersessionGraph(
+            [Supersession("SS-02", "SS-01"), Supersession("SS-03", "SS-02")],
+            known_ids=["SS-01", "SS-02", "SS-03"],
+        )
+        statuses = {"SS-01": "blocked", "SS-02": "blocked", "SS-03": "verified"}
+        self.assertEqual(graph.satisfied_by("SS-01", statuses), "SS-03")
+
+    def test_unknown_self_cyclic_and_ambiguous_declarations_fail_closed(self) -> None:
+        with self.assertRaises(SupersessionError) as unknown:
+            SupersessionGraph([Supersession("A-02", "Z-99")], known_ids=["A-01", "A-02"])
+        self.assertEqual(unknown.exception.code, "supersession-unknown-task")
+
+        with self.assertRaises(SupersessionError) as itself:
+            SupersessionGraph([Supersession("A-01", "A-01")], known_ids=["A-01"])
+        self.assertEqual(itself.exception.code, "supersession-self")
+
+        with self.assertRaises(SupersessionError) as cyclic:
+            SupersessionGraph(
+                [Supersession("A-01", "A-02"), Supersession("A-02", "A-01")],
+                known_ids=["A-01", "A-02"],
+            )
+        self.assertEqual(cyclic.exception.code, "supersession-cycle")
+
+        with self.assertRaises(SupersessionError) as ambiguous:
+            SupersessionGraph(
+                [Supersession("A-02", "A-01"), Supersession("A-03", "A-01")],
+                known_ids=["A-01", "A-02", "A-03"],
+            )
+        self.assertEqual(ambiguous.exception.code, "supersession-ambiguous")
+
+    def test_a_replacement_that_still_depends_on_what_it_supersedes_is_a_cycle(self) -> None:
+        with self.assertRaises(SupersessionError) as caught:
+            SupersessionGraph.from_tasks([
+                {"id": "A-01", "depends_on": [], "supersedes": []},
+                {"id": "A-02", "depends_on": ["A-01"], "supersedes": ["A-01"]},
+            ])
+        self.assertEqual(caught.exception.code, "supersession-cycle")
+
+
+class PlanSupersessionTests(unittest.TestCase):
+    """UEI-04 — ``load_markdown_plan`` reads and validates the ``## Supersession`` section."""
+
+    def _plan(self, root: Path, *, ss02_supersedes: str = "", ss03_supersedes: str = "SS-01",
+              ss01_supersedes: str = "", ss03_depends: str = "none") -> Path:
+        (root / "tasks").mkdir()
+        (root / "plan.md").write_text(SUPERSESSION_PLAN_MD, encoding="utf-8")
+        (root / "tasks" / "SS-01_pred.md").write_text(
+            _supersession_task_file("SS-01", supersedes=ss01_supersedes), encoding="utf-8")
+        (root / "tasks" / "SS-02_other.md").write_text(
+            _supersession_task_file("SS-02", supersedes=ss02_supersedes), encoding="utf-8")
+        (root / "tasks" / "SS-03_repl.md").write_text(
+            _supersession_task_file("SS-03", depends=ss03_depends, supersedes=ss03_supersedes),
+            encoding="utf-8")
+        return root / "plan.md"
+
+    def test_supersession_section_is_read_onto_the_task_graph(self) -> None:
+        with TemporaryDirectory() as raw:
+            plan = self._plan(Path(raw))
+            _feature, tasks = load_markdown_plan(plan)
+        by_id = {t["id"]: t for t in tasks}
+        self.assertEqual(by_id["SS-03"]["supersedes"], ["SS-01"])
+        self.assertEqual(by_id["SS-01"]["supersedes"], [])
+        self.assertEqual(by_id["SS-02"]["supersedes"], [])
+
+    def test_a_table_supersedes_column_is_optional_and_parsed(self) -> None:
+        body = (
+            "| ID | Type | Depends on | Supersedes |\n|---|---|---|---|\n"
+            "| A-01 | docs | - | - |\n"
+            "| A-02 | docs | - | A-01 |\n"
+        )
+        with TemporaryDirectory() as raw:
+            _feature, tasks = load_markdown_plan(_write(Path(raw), "plan.md", body))
+        by_id = {t["id"]: t for t in tasks}
+        self.assertEqual(by_id["A-01"]["supersedes"], [])
+        self.assertEqual(by_id["A-02"]["supersedes"], ["A-01"])
+
+    def test_unknown_supersession_target_fails_closed(self) -> None:
+        with TemporaryDirectory() as raw:
+            plan = self._plan(Path(raw), ss03_supersedes="ZZ-99")
+            with self.assertRaises(MarkdownPlanError):
+                load_markdown_plan(plan)
+
+    def test_ambiguous_supersession_fails_closed(self) -> None:
+        with TemporaryDirectory() as raw:
+            plan = self._plan(Path(raw), ss02_supersedes="SS-01", ss03_supersedes="SS-01")
+            with self.assertRaises(MarkdownPlanError):
+                load_markdown_plan(plan)
+
+    def test_cyclic_supersession_fails_closed(self) -> None:
+        with TemporaryDirectory() as raw:
+            plan = self._plan(Path(raw), ss01_supersedes="SS-03", ss03_supersedes="SS-01")
+            with self.assertRaises(MarkdownPlanError):
+                load_markdown_plan(plan)
+
+    def test_a_replacement_still_depending_on_its_predecessor_fails_closed(self) -> None:
+        with TemporaryDirectory() as raw:
+            plan = self._plan(Path(raw), ss03_supersedes="SS-01", ss03_depends="SS-01")
+            with self.assertRaises(MarkdownPlanError):
+                load_markdown_plan(plan)
+
+    def test_load_markdown_plan_specs_also_fails_closed_on_an_invalid_declaration(self) -> None:
+        with TemporaryDirectory() as raw:
+            plan = self._plan(Path(raw), ss03_supersedes="ZZ-99")
+            with self.assertRaises(MarkdownPlanError):
                 load_markdown_plan_specs(plan)
 
 

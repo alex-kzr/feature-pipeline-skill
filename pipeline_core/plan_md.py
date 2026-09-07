@@ -23,9 +23,15 @@ into dependency IDs. The feature name is the plan filename stem with a leading
 ``YYYY-MM-DD-`` stripped, else a slug of the first ``# Feature: <name>`` heading;
 ``--feature`` still overrides it.
 
+Convention 2 also reads an optional ``## Supersession`` section from each task file (a bare
+``Supersedes`` column is honoured in a convention-1 table): the task IDs a task declares it
+supersedes. A verified replacement can then satisfy a dependency on the blocked predecessor
+without that predecessor being rewritten. See :mod:`pipeline_core.supersession`.
+
 Fails closed with :class:`MarkdownPlanError` on: neither convention yielding a task, a task
 missing an ID or a Type, a missing or unreadable task file (convention 2), a duplicate task
-ID, a dependency naming an ID absent from the plan, or a task that depends on itself.
+ID, a dependency naming an ID absent from the plan, a task that depends on itself, or an
+invalid, cyclic, or ambiguous supersession declaration.
 
 Standard library only.
 """
@@ -37,6 +43,7 @@ from pathlib import Path
 
 from feature_pipeline.contracts import TaskSpec
 
+from .supersession import Supersession, SupersessionError, SupersessionGraph
 from .task_files import TaskDefaults, load_task_spec
 
 __all__ = ["MarkdownPlanError", "load_markdown_plan", "load_markdown_plan_specs"]
@@ -58,6 +65,10 @@ _NONE_TOKENS = {"", "-", "—", "–", "(none)", "none", "n/a"}
 _ID_HEADERS = {"id", "task", "task id"}
 _TYPE_HEADERS = {"type", "task type"}
 _DEP_HEADERS = {"depends on", "depends_on", "dependencies", "dependency", "depends"}
+_SUPERSEDE_HEADERS = {"supersedes", "supersede", "supersession", "supersedes_ids"}
+
+_SUPERSEDES_FIELD_RE = re.compile(r"^-\s*supersedes\s*:\s*(?P<value>.*)$", re.IGNORECASE)
+_SUPERSEDES_BULLET_RE = re.compile(r"^-\s*(?P<id>[A-Za-z]{2,6}-\d{1,4})\b")
 
 
 def _cells(line: str) -> list[str]:
@@ -124,6 +135,8 @@ def _table_tasks(lines: list[str]) -> list[dict] | None:
                 found.setdefault("type", position)
             elif name in _DEP_HEADERS:
                 found.setdefault("depends_on", position)
+            elif name in _SUPERSEDE_HEADERS:
+                found.setdefault("supersedes", position)
         if "id" in found and "type" in found:
             header_index, columns = index, found
             break
@@ -150,7 +163,8 @@ def _table_tasks(lines: list[str]) -> list[dict] | None:
                 f"a task row is missing an ID or a Type: {line.strip()!r}"
             )
         tasks.append({"id": task_id, "type": task_type,
-                      "depends_on": _split_deps(value("depends_on"))})
+                      "depends_on": _split_deps(value("depends_on")),
+                      "supersedes": _split_deps(value("supersedes"))})
     return tasks
 
 
@@ -173,6 +187,35 @@ def _meta_block(task_file: Path) -> dict[str, str]:
         if match:
             fields[match.group("key").strip().lower()] = match.group("value").strip()
     return fields
+
+
+def _supersession_ids(task_file: Path) -> list[str]:
+    """Task IDs from a task file's dedicated ``## Supersession`` section.
+
+    This section is owned by the portable core alone (like ``## Blockers``); it is *not* an
+    ``## Execution Metadata`` field, so a task that supersedes a blocked predecessor never
+    rewrites that predecessor and never widens the closed metadata vocabulary. Accepts either
+    a ``- Supersedes: <ids>`` line or a bullet list of bare IDs.
+    """
+    out: list[str] = []
+    in_block = False
+    for line in task_file.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            in_block = stripped.lower() == "## supersession"
+            continue
+        if not in_block or not stripped:
+            continue
+        field = _SUPERSEDES_FIELD_RE.match(stripped)
+        if field:
+            for token in _split_deps(field.group("value")):
+                if token not in out:
+                    out.append(token)
+            continue
+        bullet = _SUPERSEDES_BULLET_RE.match(stripped)
+        if bullet and bullet.group("id") not in out:
+            out.append(bullet.group("id"))
+    return out
 
 
 def _heading_tasks(lines: list[str], plan_path: Path) -> list[dict] | None:
@@ -199,7 +242,8 @@ def _heading_tasks(lines: list[str], plan_path: Path) -> list[dict] | None:
                 f"{task_id}: task file has no 'Type' in its '## Execution Metadata' block"
             )
         tasks.append({"id": task_id, "type": task_type,
-                      "depends_on": _split_deps(fields.get("depends on", ""))})
+                      "depends_on": _split_deps(fields.get("depends on", "")),
+                      "supersedes": _supersession_ids(matches[0])})
     return tasks
 
 
@@ -241,6 +285,13 @@ def load_markdown_plan(path: Path) -> tuple[str, list[dict]]:
                     f"{task['id']} depends on '{dependency}', which is not a task in the plan"
                 )
 
+    for task in tasks:
+        task.setdefault("supersedes", [])
+    try:
+        SupersessionGraph.from_tasks(tasks)
+    except SupersessionError as exc:
+        raise MarkdownPlanError(str(exc)) from None
+
     return _feature_name(path, text), tasks
 
 
@@ -278,6 +329,7 @@ def load_markdown_plan_specs(
     tasks_dir = path.parent / "tasks"
 
     specs: list[TaskSpec] = []
+    supersedes_by_id: dict[str, list[str]] = {}
     for task_id in ids:
         matches = sorted(tasks_dir.glob(f"{task_id}_*.md"))
         if not matches:
@@ -286,6 +338,7 @@ def load_markdown_plan_specs(
                 f"execution metadata from"
             )
         specs.append(load_task_spec(matches[0], defaults=defaults))
+        supersedes_by_id[task_id] = _supersession_ids(matches[0])
 
     known = {spec.id for spec in specs}
     for spec in specs:
@@ -296,5 +349,18 @@ def load_markdown_plan_specs(
                 raise MarkdownPlanError(
                     f"{spec.id} depends on '{dependency}', which is not a task in the plan"
                 )
+
+    try:
+        SupersessionGraph(
+            [
+                Supersession(replacement=spec.id, superseded=superseded)
+                for spec in specs
+                for superseded in supersedes_by_id.get(spec.id, ())
+            ],
+            known_ids=[spec.id for spec in specs],
+            dependencies={spec.id: list(spec.depends_on) for spec in specs},
+        )
+    except SupersessionError as exc:
+        raise MarkdownPlanError(str(exc)) from None
 
     return feature, tuple(specs)
