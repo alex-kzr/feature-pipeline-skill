@@ -28,9 +28,11 @@ from typing import Mapping, Sequence
 
 from feature_pipeline.contracts import (
     AcceptanceCriterionSpec,
+    Precondition,
     SchemaError,
     TaskSpec,
     validate_acceptance_criteria,
+    validate_preconditions,
 )
 from feature_pipeline.domain.models import (
     JSON_PLAN_ENTRY,
@@ -47,6 +49,7 @@ from .metadata import (
     split_list,
     strip_backticks,
 )
+from pipeline_core.preconditions import parse_preconditions
 
 __all__ = ["SourceDefaults", "TaskDefinitionBuilder"]
 
@@ -99,6 +102,7 @@ class _Resolved:
     deferred_verification_commands: tuple[object, ...]
     runner_evidence: str | None
     blocking_conditions: str | None
+    preconditions: tuple[Precondition, ...]
     acceptance_criteria: tuple[AcceptanceCriterionSpec, ...]
     metadata_source: str
     defaults_applied: tuple[str, ...]
@@ -213,6 +217,7 @@ class TaskDefinitionBuilder:
 
         criteria_source = raw.get("acceptance_criteria")
         try:
+            preconditions = validate_preconditions(raw.get("preconditions", ()))
             if criteria_source is not None:
                 criteria = validate_acceptance_criteria(
                     criteria_source  # type: ignore[arg-type]
@@ -249,6 +254,7 @@ class TaskDefinitionBuilder:
             runner_evidence=(None if raw.get("runner_evidence") is None else
                              str(raw["runner_evidence"])),
             blocking_conditions=blocking,
+            preconditions=preconditions,
             acceptance_criteria=criteria,
             metadata_source="declared" if has_metadata else "defaults",
             defaults_applied=tuple(applied),
@@ -270,6 +276,10 @@ class TaskDefinitionBuilder:
         task_id, title = cls._identity(lines, filename, error)
         raw = parse_markdown_metadata_block(text, error=error)
         criteria, synthesized = cls._acceptance_criteria(lines, error)
+        try:
+            preconditions = parse_preconditions(text)
+        except SchemaError as exc:
+            raise error(f"{rel}: {exc}") from None
 
         if raw is None:
             if defaults is None:
@@ -306,6 +316,7 @@ class TaskDefinitionBuilder:
                 deferred_verification_commands=(),
                 runner_evidence=None,
                 blocking_conditions=None,
+                preconditions=preconditions,
                 acceptance_criteria=criteria,
                 metadata_source="defaults",
                 defaults_applied=tuple(applied),
@@ -370,6 +381,7 @@ class TaskDefinitionBuilder:
             runner_evidence=(None if "runner_evidence" not in fields else
                              strip_backticks(fields["runner_evidence"])),
             blocking_conditions=blocking,
+            preconditions=preconditions,
             acceptance_criteria=criteria,
             metadata_source="declared",
             defaults_applied=(),
@@ -405,6 +417,7 @@ class TaskDefinitionBuilder:
                 ),
                 runner_evidence=resolved.runner_evidence,
                 blocking_conditions=resolved.blocking_conditions,
+                preconditions=resolved.preconditions,
                 acceptance_criteria=resolved.acceptance_criteria,
                 metadata_source=resolved.metadata_source,
                 defaults_applied=resolved.defaults_applied,

@@ -5,7 +5,8 @@ usage: run_pipeline.py [-h] [--project-root DIR] [--agents-root DIR]
                        [--core-root DIR] [--profile REL] [--project-skill REL]
                        [--plan REL] [--task ID] [--through ID]
                        [--attest-dependency DEP_ID=SOURCE_FEATURE]
-                       [--verify-dependency-chain] [--resume]
+                       [--verify-dependency-chain] [--resume] [--grant GRANT]
+                       [--approve APPROVE] [--published-ref SOURCE=REF]
                        [--mode {plan-only,unattended,execute,release-dry-run}]
                        [--feature NAME] [--prompt REL] [--approve-plan]
                        [--approve-final-diff] [--commit]
@@ -54,6 +55,11 @@ run selection and scope:
                         are reused
   --resume              resume a previously recorded run instead of starting
                         one
+  --grant GRANT         assert an operator capability
+  --approve APPROVE     assert a named human approval
+  --published-ref SOURCE=REF
+                        bind a ref-published precondition to refs/heads/* or
+                        refs/tags/*
   --mode {plan-only,unattended,execute,release-dry-run}
                         run mode (default: plan-only). 'execute' runs stages
                         5-9 — executor dispatch, independent verification, and

@@ -162,9 +162,20 @@ class ForbiddenTransitionTableTests(unittest.TestCase):
         self.assertEqual(states.TERMINAL_TASK_STATES, frozenset({TaskStatus.VERIFIED}))
         self.assertTrue(_one(TaskStatus.VERIFIED).task("T-1").is_terminal)
         for dst in _ALL_STATUSES:
+            if dst is TaskStatus.BLOCKED:
+                continue
             with self.subTest(dst=dst):
                 with self.assertRaises(IllegalTransition):
                     apply(_one(TaskStatus.VERIFIED), Transition("T-1", dst))
+
+    def test_only_runner_can_revoke_verified_eligibility(self) -> None:
+        before = _one(TaskStatus.VERIFIED)
+        after = apply(before, Transition("T-1", TaskStatus.BLOCKED, actor=Actor.RUNNER))
+        self.assertEqual(after.task("T-1").status, TaskStatus.BLOCKED)
+        self.assertEqual(before.task("T-1").status, TaskStatus.VERIFIED)
+        for actor in (Actor.EXECUTOR, Actor.HUMAN):
+            with self.assertRaises(UnauthorizedTransition):
+                apply(before, Transition("T-1", TaskStatus.BLOCKED, actor=actor))
 
     def test_unknown_task_fails_closed(self) -> None:
         with self.assertRaises(UnknownTask) as caught:

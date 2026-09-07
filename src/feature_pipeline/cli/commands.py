@@ -41,6 +41,9 @@ class RunCommand:
     mode: str = "plan-only"
     feature: str | None = None
     prompt: str | None = None
+    grants: list[str] = field(default_factory=list)
+    approvals: list[str] = field(default_factory=list)
+    published_refs: list[str] = field(default_factory=list)
 
     # Delivery gates.
     approve_plan: bool = False
@@ -79,6 +82,8 @@ class RunCommand:
             mode=args.mode,
             feature=args.feature,
             prompt=args.prompt,
+            grants=list(args.grant or []), approvals=list(args.approve or []),
+            published_refs=list(args.published_ref or []),
             approve_plan=args.approve_plan,
             approve_final_diff=args.approve_final_diff,
             commit=args.commit,

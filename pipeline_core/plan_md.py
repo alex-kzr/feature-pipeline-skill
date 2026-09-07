@@ -41,10 +41,11 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from feature_pipeline.contracts import TaskSpec
+from feature_pipeline.contracts import SchemaError, TaskSpec
 
 from .supersession import Supersession, SupersessionError, SupersessionGraph
 from .task_files import TaskDefaults, load_task_spec
+from .preconditions import parse_preconditions
 
 __all__ = ["MarkdownPlanError", "load_markdown_plan", "load_markdown_plan_specs"]
 
@@ -271,6 +272,14 @@ def load_markdown_plan(path: Path) -> tuple[str, list[dict]]:
 
     seen: set[str] = set()
     for task in tasks:
+        matches = sorted((path.parent / "tasks").glob(f"{task['id']}_*.md"))
+        if matches:
+            try:
+                predicates = parse_preconditions(matches[0].read_text(encoding="utf-8"))
+            except SchemaError as exc:
+                raise MarkdownPlanError(f"{task['id']}: {exc}") from None
+            if predicates:
+                task["preconditions"] = predicates
         if task["id"] in seen:
             raise MarkdownPlanError(f"duplicate task id in plan: {task['id']}")
         seen.add(task["id"])
@@ -337,6 +346,10 @@ def load_markdown_plan_specs(
                 f"{task_id}: no task file '{task_id}_*.md' under {tasks_dir.name}/ to load "
                 f"execution metadata from"
             )
+        try:
+            parse_preconditions(matches[0].read_text(encoding="utf-8"))
+        except SchemaError as exc:
+            raise MarkdownPlanError(f"{task_id}: {exc}") from None
         specs.append(load_task_spec(matches[0], defaults=defaults))
         supersedes_by_id[task_id] = _supersession_ids(matches[0])
 

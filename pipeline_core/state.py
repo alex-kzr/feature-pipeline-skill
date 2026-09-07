@@ -27,7 +27,9 @@ TASK_TRANSITIONS = {
     # ``repairing -> running`` lets the runner reopen a consumed repair attempt as a fresh
     # executor window so the one dispatch path — which owns launch generations, status
     # settlement, and diff attribution — is reused unchanged for a repair redispatch.
-    "repairing": {"implemented", "blocked", "running"}, "verified": set(),
+    "repairing": {"implemented", "blocked", "running"},
+    # Fresh precondition observations can revoke eligibility; old verification evidence stays.
+    "verified": {"blocked"},
     "blocked": {"ready", "implemented"},
 }
 
@@ -318,6 +320,8 @@ class Run:
             raise TransitionError("only an executor or runner may mark implemented", "unauthorized-transition")
         if to == "verified" and actor != ACTOR_RUNNER:
             raise TransitionError("only the runner may mark verified", "unauthorized-transition")
+        if record.status == "verified" and actor != ACTOR_RUNNER:
+            raise TransitionError("only the runner may revoke verified eligibility", "unauthorized-transition")
         if record.status == "blocked" and actor != ACTOR_HUMAN:
             raise TransitionError("only a human may unblock a task", "unauthorized-transition")
         previous = record.status

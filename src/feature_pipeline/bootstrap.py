@@ -441,6 +441,7 @@ def run_execute(
                     tuple(s.allowed_scope),
                     tuple(s.out_of_scope),
                     s.max_repair_attempts,
+                    s.preconditions,
                 )
                 for s in specs
             ],
@@ -482,6 +483,8 @@ def run_execute(
         through=command.through,
         attested_dependencies=parse_attestations(command.attest_dependency),
         verify_dependency_chain=command.verify_dependency_chain,
+        grants=tuple(command.grants), approvals=tuple(command.approvals),
+        published_refs=tuple(_published_refs(command.published_refs)),
     )
     request = ExecuteRequest(
         feature=feature,
@@ -503,6 +506,7 @@ def run_execute(
         board_path=(
             project_dir / BOARD_RELATIVE_PATH if plan_path.suffix.lower() == ".md" else None
         ),
+        core_root=anchors.core_root,
     )
     result = execute_run(request)
     if result.status == "error":
@@ -510,6 +514,20 @@ def run_execute(
     return result_factory(
         redact_text(result.message.rstrip("\n") + "\n", build_rules()), result.exit_code
     )
+
+
+def _published_refs(raw: Sequence[str]) -> list[tuple[str, str]]:
+    result: list[tuple[str, str]] = []
+    for item in raw:
+        if "=" not in item:
+            raise CliError(EXIT_ERROR, f"--published-ref must be SOURCE=REF: '{item}'")
+        source, ref = item.split("=", 1)
+        if source not in {"parent-head", "core-gitlink"} or not (ref.startswith("refs/heads/") or ref.startswith("refs/tags/")):
+            raise CliError(EXIT_ERROR, f"invalid --published-ref '{item}'")
+        if source in dict(result):
+            raise CliError(EXIT_ERROR, f"duplicate --published-ref source '{source}'")
+        result.append((source, ref))
+    return result
 
 
 __all__ = [

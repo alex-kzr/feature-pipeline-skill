@@ -23,7 +23,7 @@ class EvidenceEligibilityError(Exception):
 
 def canonical_task_contract(definition: TaskDefinition | TaskSpec) -> dict[str, object]:
     """Return the input-neutral fields that define reusable task evidence."""
-    return {
+    contract = {
         "id": definition.id,
         "depends_on": sorted(definition.depends_on),
         "allowed_scope": sorted(definition.allowed_scope),
@@ -38,6 +38,12 @@ def canonical_task_contract(definition: TaskDefinition | TaskSpec) -> dict[str, 
         ],
         "verification_tier": definition.verification_tier,
     }
+    preconditions = getattr(definition, "preconditions", ())
+    if preconditions:
+        contract["preconditions"] = [
+            {"kind": item.kind, "value": item.value} for item in preconditions
+        ]
+    return contract
 
 
 def task_contract_digest(definition: TaskDefinition | TaskSpec) -> str:
@@ -90,6 +96,10 @@ class VerifiedEvidenceStore:
                 digest = task.get("task_contract_digest")
                 task_path = task.get("task_path")
                 if digest is None:
+                    if getattr(definition, "preconditions", ()):
+                        raise EvidenceEligibilityError(
+                            "legacy evidence has no precondition contract", "evidence-contract-digest-mismatch"
+                        )
                     legacy.append(self._evidence(path, raw, data, task, definition.id, "legacy-task-id"))
                 elif task_path != expected_path:
                     raise EvidenceEligibilityError(
@@ -130,6 +140,10 @@ class VerifiedEvidenceStore:
         task = self._eligible_task(data, definition.id)
         digest = task.get("task_contract_digest")
         if digest is None:
+            if getattr(definition, "preconditions", ()):
+                raise EvidenceEligibilityError(
+                    "legacy evidence has no precondition contract", "evidence-contract-digest-mismatch"
+                )
             legacy_matches = 0
             for _, _, candidate in self._sources():
                 try:

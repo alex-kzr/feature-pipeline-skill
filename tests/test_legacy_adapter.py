@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import unittest
 
+from feature_pipeline.contracts import Precondition
 from pipeline_core.legacy_adapter import (
     AcceptanceCriterion,
     AdaptedTask,
@@ -112,6 +113,38 @@ class DeclaredMetadataTests(unittest.TestCase):
         self.assertEqual(
             adapt_legacy_task(raw, DEFAULTS).blocking_conditions, "needs a provisioned database"
         )
+
+    def test_predicates_survive_both_legacy_mapping_shapes_without_mutation(self) -> None:
+        for raw in (self._declared(), {"id": "LT-07", "affected_files": ["tools/**"]}):
+            with self.subTest(declared=raw.get("has_metadata", False)):
+                self.assertEqual(adapt_legacy_task(raw, DEFAULTS).preconditions, ())
+                raw["preconditions"] = [
+                    {"kind": "approval", "value": "review"},
+                    Precondition("ref-published", "core-gitlink"),
+                ]
+                original = copy.deepcopy(raw)
+                adapted = adapt_legacy_task(raw, DEFAULTS)
+                self.assertEqual(adapted.preconditions, (
+                    Precondition("approval", "review"), Precondition("ref-published", "core-gitlink"),
+                ))
+                self.assertEqual(raw, original)
+
+    def test_invalid_predicates_fail_at_the_legacy_boundary(self) -> None:
+        invalid = (
+            [{"kind": "unknown", "value": "review"}],
+            [{"kind": "ref-published", "value": "unknown"}],
+            [{"kind": "approval", "value": ""}],
+            [{"kind": "approval", "value": 123}],
+            [{"kind": "approval", "value": "review", "extra": True}],
+            [Precondition("approval", "review")] * 2,
+            {"kind": "approval", "value": "review"},
+            "approval: review", None, 123,
+        )
+        for raw in (self._declared(), {"id": "LT-07", "affected_files": ["tools/**"]}):
+            for predicates in invalid:
+                with self.subTest(declared=raw.get("has_metadata", False), predicates=predicates):
+                    with self.assertRaisesRegex(LegacyAdapterError, "precondition|ref-published"):
+                        adapt_legacy_task({**raw, "preconditions": predicates}, DEFAULTS)
 
 
 if __name__ == "__main__":

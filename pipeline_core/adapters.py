@@ -166,6 +166,11 @@ _ON_DISK_VERIFIER_AGENTS: dict[str, str] = {
     "test_verifier": "test-verifier",
 }
 
+# https://code.claude.com/docs/en/sub-agents#built-in-subagents
+_CLAUDE_BUILTIN_AGENTS = frozenset({
+    "general-purpose", "Explore", "Plan", "claude", "statusline-setup", "claude-code-guide",
+})
+
 
 def on_disk_agent_name(role: str) -> str:
     """The exact on-disk agent name the CLI's ``--agent`` flag expects for ``role``.
@@ -699,6 +704,23 @@ class ClaudeAdapter:
 
     def available(self) -> bool:
         return self.resolved_executable() is not None
+
+    def can_resolve_executor(self, role: str, *, working_root: str = ".") -> bool:
+        """Resolve custom or enabled built-in agents before opening an executor window."""
+        name = on_disk_agent_name(role)
+        if not name or Path(name).name != name or "/" in name or "\\" in name:
+            return False
+        directory = ((self._working_root or Path.cwd()) / working_root).resolve()
+        roots = (directory, *directory.parents, Path.home())
+        if any((root / ".claude" / "agents" / f"{name}.md").is_file() for root in roots):
+            return True
+        env = os.environ if self._env is None else self._env
+        if env.get("CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS") == "1":
+            return False
+        if (name in {"Explore", "Plan"}
+                and env.get("CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS") == "1"):
+            return False
+        return name in _CLAUDE_BUILTIN_AGENTS
 
     def plan(self, request: LaunchRequest) -> list[str]:
         """The argv this request would run — used by a dry run and by the tests, so what is

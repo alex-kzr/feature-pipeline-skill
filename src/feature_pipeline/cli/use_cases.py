@@ -21,7 +21,6 @@ Standard library only.
 from __future__ import annotations
 
 import json
-import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -69,7 +68,7 @@ from feature_pipeline.application.selection import (
 )
 from feature_pipeline.domain.errors import DomainError
 from feature_pipeline.domain.graph import TaskGraph
-from feature_pipeline.contracts import SchemaError, validate_relative_path
+from feature_pipeline.contracts import SchemaError, validate_preconditions, validate_relative_path
 
 from .commands import RunCommand
 from .errors import CliError
@@ -146,7 +145,7 @@ def _load_plan(path: Path) -> tuple[str | None, list[dict]]:
     tasks: list[dict] = []
     seen: set[str] = set()
     for entry in data["tasks"]:
-        if not isinstance(entry, dict) or not entry.get("id") or not entry.get("type"):
+        if not isinstance(entry, dict) or not entry.get("id") or not (entry.get("type") or entry.get("task_type")):
             raise CliError(EXIT_ERROR, "every plan task needs an 'id' and a 'type'")
         tid = str(entry["id"])
         if tid in seen:
@@ -155,7 +154,7 @@ def _load_plan(path: Path) -> tuple[str | None, list[dict]]:
         depends_on = entry.get("depends_on", [])
         if not isinstance(depends_on, list):
             raise CliError(EXIT_ERROR, f"{tid}: depends_on must be a list")
-        tasks.append({"id": tid, "type": str(entry["type"]),
+        tasks.append({**entry, "id": tid, "type": str(entry.get("type") or entry["task_type"]),
                       "depends_on": [str(d) for d in depends_on]})
     if not tasks:
         raise CliError(EXIT_ERROR, "plan has no tasks")
@@ -170,9 +169,18 @@ def _dry_run_reuse_definitions(
     A Markdown plan (and a rich JSON plan) has the same task contracts execute uses. A
     route-only JSON preview has no such body, so it can only match legacy task-ID evidence.
     """
-    try:
-        _, specs = load_execute_specs(plan_path, feature)
-    except CliError:
+    if plan_path.suffix.lower() == ".md":
+        thin = not any((plan_path.parent / "tasks").glob("*.md"))
+    else:
+        thin = all(not (set(task) & {"executor", "allowed_scope", "acceptance_criteria"})
+                   for task in plan_tasks)
+    if thin:
+        predicates = {}
+        for task in plan_tasks:
+            try:
+                predicates[task["id"]] = validate_preconditions(task.get("preconditions", ()))
+            except SchemaError as exc:
+                raise CliError(EXIT_ERROR, str(exc)) from None
         return {
             task["id"]: SimpleNamespace(
                 id=task["id"],
@@ -183,9 +191,11 @@ def _dry_run_reuse_definitions(
                 acceptance_criteria=(),
                 verification_commands=(),
                 verification_tier="full",
+                preconditions=predicates[task["id"]],
             )
             for task in plan_tasks
         }
+    _, specs = load_execute_specs(plan_path, feature)
     return {spec.id: spec for spec in specs}
 
 
@@ -257,9 +267,13 @@ def run_command(command: RunCommand) -> PipelineResult:
         raise CliError(EXIT_ERROR, "feature name must be a single [A-Za-z0-9._-] token")
 
     verified: set[str] = set()  # a fresh run has verified nothing
+    definitions = _dry_run_reuse_definitions(plan_path, feature, plan_tasks)
     type_by_id = {t["id"]: t["type"] for t in plan_tasks}
     shallow_inputs = [
-        ShallowTaskInput(t["id"], t["type"], tuple(t["depends_on"])) for t in plan_tasks
+        ShallowTaskInput(t["id"], t["type"], tuple(t["depends_on"]),
+                         executor=getattr(definitions[t["id"]], "executor", ""),
+                         preconditions=definitions[t["id"]].preconditions)
+        for t in plan_tasks
     ]
 
     # One selection for the whole preview, through the same domain entry point the execute
@@ -328,7 +342,6 @@ def run_command(command: RunCommand) -> PipelineResult:
     reused_sources: dict[str, str] = {}
     execution_scope = compiled_plan.execution_scope if compiled_plan is not None else tuple(selected_ids)
     if command.dry_run:
-        definitions = _dry_run_reuse_definitions(plan_path, feature, plan_tasks)
         attested_ids = resolve_attested_dependency_ids(
             raw_attestations=command.attest_dependency,
             selected_task=command.task,
@@ -446,8 +459,12 @@ def run_command(command: RunCommand) -> PipelineResult:
             ),
             build_rules(),
         )
-        # A dry run persists nothing: the temporary directory is created and discarded.
-        tempfile.mkdtemp(prefix="pipeline-dry-run-")
+        predicate_lines = [
+            f"  {task_id}: {p.identifier} — unresolved (execute-time evaluation required)"
+            for task_id in execution_scope for p in definitions[task_id].preconditions
+        ]
+        if predicate_lines:
+            text += redact_text("\nPreconditions:\n" + "\n".join(predicate_lines) + "\n", build_rules())
         return _result(text, exit_code)
 
     return _result(

@@ -24,7 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Mapping, Sequence
 
-from feature_pipeline.contracts import SchemaError, TaskSpec
+from feature_pipeline.contracts import Precondition, SchemaError, TaskSpec
 from feature_pipeline.inputs import SourceDefaults, TaskDefinitionBuilder
 
 
@@ -73,6 +73,7 @@ class AdaptedTask:
     blocking_conditions: str | None
     metadata_source: str
     defaults_applied: tuple[str, ...] = field(default_factory=tuple)
+    preconditions: tuple[Precondition, ...] = ()
 
 
 def synthesize_acceptance_criteria(items: Sequence[object]) -> tuple[AcceptanceCriterion, ...]:
@@ -137,6 +138,7 @@ def adapt_legacy_task(raw: Mapping[str, object], defaults: LegacyDefaults) -> Ad
         blocking_conditions=resolved.blocking_conditions,
         metadata_source=resolved.metadata_source,
         defaults_applied=tuple(resolved.defaults_applied),
+        preconditions=resolved.preconditions,
     )
 
 

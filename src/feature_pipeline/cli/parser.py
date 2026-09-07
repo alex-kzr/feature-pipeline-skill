@@ -89,6 +89,10 @@ def build_parser() -> argparse.ArgumentParser:
                           "by default eligible verified dependencies are reused")
     run.add_argument("--resume", action="store_true",
                      help="resume a previously recorded run instead of starting one")
+    run.add_argument("--grant", action="append", default=[], help="assert an operator capability")
+    run.add_argument("--approve", action="append", default=[], help="assert a named human approval")
+    run.add_argument("--published-ref", action="append", default=[], metavar="SOURCE=REF",
+                     help="bind a ref-published precondition to refs/heads/* or refs/tags/*")
     run.add_argument("--mode", default="plan-only",
                      choices=["plan-only", "unattended", "execute", POST_TASK_MODE],
                      help="run mode (default: plan-only). 'execute' runs stages 5-9 — executor "

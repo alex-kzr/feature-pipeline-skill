@@ -516,6 +516,42 @@ def _spec_task_ids(value: object, field: str) -> tuple[str, ...]:
 
 
 @dataclass(frozen=True)
+class Precondition:
+    """A pure, validated task prerequisite shared by every input path."""
+
+    kind: str
+    value: str
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"ref-published", "capability", "approval"} or not self.value.strip():
+            raise SchemaError("unknown or invalid precondition")
+        if self.kind == "ref-published" and self.value not in {"parent-head", "core-gitlink"}:
+            raise SchemaError(f"unknown ref-published source: {self.value}")
+
+    @property
+    def identifier(self) -> str:
+        return f"{self.kind}: {self.value}"
+
+
+def validate_preconditions(values: Sequence[object]) -> tuple[Precondition, ...]:
+    predicates: list[Precondition] = []
+    if isinstance(values, (str, bytes)) or not isinstance(values, (list, tuple)):
+        raise SchemaError("preconditions must be a list")
+    for item in values:
+        if isinstance(item, Precondition):
+            predicate = item
+        elif (isinstance(item, dict) and set(item) == {"kind", "value"}
+              and isinstance(item["kind"], str) and isinstance(item["value"], str)):
+            predicate = Precondition(item["kind"], item["value"])
+        else:
+            raise SchemaError("unknown or invalid precondition")
+        if predicate in predicates:
+            raise SchemaError("duplicate precondition")
+        predicates.append(predicate)
+    return tuple(predicates)
+
+
+@dataclass(frozen=True)
 class TaskSpec:
     """A validated, project-neutral executable task. Immutable; build via :meth:`build`."""
 
@@ -536,6 +572,7 @@ class TaskSpec:
     deferred_verification_commands: tuple[CommandSpec, ...]
     runner_evidence: str | None
     blocking_conditions: str | None
+    preconditions: tuple[Precondition, ...]
     acceptance_criteria: tuple[AcceptanceCriterionSpec, ...]
     metadata_source: str
     defaults_applied: tuple[str, ...]
@@ -561,6 +598,7 @@ class TaskSpec:
         deferred_verification_commands: Sequence[object] = (),
         runner_evidence: object = None,
         blocking_conditions: object = None,
+        preconditions: Sequence[object] = (),
         acceptance_criteria: Sequence[object] = (),
         metadata_source: str = "declared",
         defaults_applied: Sequence[object] = (),
@@ -616,6 +654,7 @@ class TaskSpec:
 
         blocking = None if blocking_conditions is None else _string(blocking_conditions,
                                                                     "blocking_conditions")
+        predicates = validate_preconditions(preconditions)
 
         return cls(
             id=task_id,
@@ -636,6 +675,7 @@ class TaskSpec:
             deferred_verification_commands=deferred,
             runner_evidence=evidence,
             blocking_conditions=blocking,
+            preconditions=predicates,
             acceptance_criteria=validate_acceptance_criteria(acceptance_criteria),
             metadata_source=str(metadata_source or "declared"),
             defaults_applied=tuple(_string(item, "defaults_applied")

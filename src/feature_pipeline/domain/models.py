@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from feature_pipeline.contracts import (
     AcceptanceCriterionSpec,
     CommandSpec,
+    Precondition,
     TaskSpec,
 )
 
@@ -56,6 +57,7 @@ _SEMANTIC_FIELDS: tuple[str, ...] = (
     "accepts_scoped",
     "deferred_verification_commands",
     "blocking_conditions",
+    "preconditions",
     "acceptance_criteria",
     "metadata_source",
 )
@@ -135,6 +137,10 @@ class TaskDefinition:
     @property
     def blocking_conditions(self) -> str | None:
         return self.spec.blocking_conditions
+
+    @property
+    def preconditions(self) -> tuple[Precondition, ...]:
+        return self.spec.preconditions
 
     @property
     def acceptance_criteria(self) -> tuple[AcceptanceCriterionSpec, ...]:

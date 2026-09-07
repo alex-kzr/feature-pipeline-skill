@@ -27,7 +27,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 from feature_pipeline.contracts import TaskSpec
 from feature_pipeline.infrastructure.board_projection import (
@@ -103,6 +103,7 @@ class TaskExecution:
     #: run projection-free (boardless JSON plans). When set, ``spec.path`` — already
     #: repository-relative for a Markdown-backed task — resolves the task file to project onto.
     board_path: Path | None = None
+    pre_dispatch: Callable[[], str | None] | None = None
 
 
 @dataclass(frozen=True)
@@ -210,6 +211,11 @@ class TaskEngine:
             gate = record.attempts + 1
 
             if not skip_executor:
+                if request.pre_dispatch is not None:
+                    blocker = request.pre_dispatch()
+                    if blocker:
+                        return TaskRunResult(task_id, "blocked", record.attempts, gates,
+                                             blocker, None, tuple(passes))
                 if record.status == "repairing":
                     life.transition(
                         task_id, "running", actor=ACTOR_RUNNER,

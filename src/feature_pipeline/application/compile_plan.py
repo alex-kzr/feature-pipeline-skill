@@ -42,6 +42,7 @@ from feature_pipeline.domain.plan import (
 from feature_pipeline.domain.repair import DEFAULT_MAX_REPAIR_ATTEMPTS, RepairBound
 from feature_pipeline.inputs.profile import CompiledProfile
 from feature_pipeline.ports.adapters import AdapterRegistry
+from feature_pipeline.contracts import Precondition
 
 #: Mirrors :data:`pipeline_core.commands.ROUTINE_OUTPUT_BUDGET` /
 #: :data:`pipeline_core.commands.DIAGNOSTIC_OUTPUT_BUDGET`.
@@ -55,6 +56,7 @@ DEFAULT_ROLE_GRANT = ("read", "run_checks", "write")
 #: The single executor role every synthesised route dispatches (``project_profile._EXECUTOR``).
 EXECUTOR_ROLE = "executor"
 
+
 #: This umbrella repository has no compiled-language build tool, so nothing is serialized
 #: behind the cross-process write mutex (``pipeline_core.concurrency``). A project that ships
 #: one declares its basename; the compiler would carry it here.
@@ -65,12 +67,8 @@ SERIALIZED_PROGRAMS: tuple[str, ...] = ()
 class ShallowTaskInput:
     """A route-only task input: id, type and dependency edges, nothing from the task body.
 
-    The dry-run preview never loads task files — it routes an ``id`` + ``type`` (+
-    ``depends_on``) plan. That is not enough to build a :class:`TaskDefinition` (its wrapped
-    :class:`~feature_pipeline.contracts.TaskSpec` requires an allowed scope), so the preview
-    feeds these instead. Execute mode always passes full :class:`TaskDefinition` values.
-    None of the dry-run plan's C1–C8 sections displays a task-body field, so the shallow
-    input drives the preview completely.
+    A route-only preview need not supply an execution scope. Full task contracts also
+    project into this shape, preserving declared prerequisites for preview and execution.
     """
 
     id: str
@@ -80,6 +78,7 @@ class ShallowTaskInput:
     allowed_scope: tuple[str, ...] = ()
     out_of_scope: tuple[str, ...] = ()
     max_repair_attempts: int = DEFAULT_MAX_REPAIR_ATTEMPTS
+    preconditions: tuple[Precondition, ...] = ()
 
 
 #: What :func:`compile_run_plan` accepts per task — a fully normalized definition (execute)
@@ -210,6 +209,7 @@ def compile_run_plan(
                     RelativeGlob.parse(entry) for entry in definition.out_of_scope
                 ),
                 controls=(repair_control,),
+                preconditions=definition.preconditions,
             )
         )
 

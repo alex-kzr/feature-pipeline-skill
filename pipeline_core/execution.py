@@ -31,6 +31,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import subprocess
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -89,6 +90,8 @@ from .lease import LeaseHeldError
 from .lifecycle import RunLifecycle
 from .prompt_envelope import EnvelopeAnchors
 from .state import ACTOR_RUNNER, ResumeError, Run, StateError, repo_relative
+from .preconditions import GitRunner, bind_refs, evaluate_preconditions
+from .task_files import upsert_blockers_section
 from .verification import (
     VerifierAnchors,
     VerifierLaunchers,
@@ -282,6 +285,9 @@ class ExecuteControls:
     #: never trust an external attestation instead.
     attested_dependencies: tuple[tuple[str, str], ...] = ()
     verify_dependency_chain: bool = False
+    grants: tuple[str, ...] = ()
+    approvals: tuple[str, ...] = ()
+    published_refs: tuple[tuple[str, str], ...] = ()
 
     @property
     def gate_opened(self) -> bool:
@@ -328,6 +334,8 @@ class ExecuteRequest:
     #: this module is unaffected. Set only for a Markdown-backed board plan (``bootstrap.py``);
     #: each task's own file is resolved from its already repository-relative ``spec.path``.
     board_path: Path | None = None
+    core_root: Path | None = None
+    precondition_runner: GitRunner = subprocess.run
 
 
 @dataclass(frozen=True)
@@ -511,6 +519,84 @@ def _ensure_execution_controls_match(
         )
 
 
+def _ensure_precondition_contracts_match(run: Run, specs: Sequence[TaskSpec]) -> None:
+    for spec in specs:
+        if spec.id not in run.tasks:
+            continue
+        digest = run.task(spec.id).task_contract_digest
+        if (digest is not None or spec.preconditions) and digest != task_contract_digest(spec):
+            raise ExecutionError(
+                f"resume task contract changed for {spec.id}; start a fresh reviewed run",
+                "task-contract-mismatch",
+            )
+
+
+def _check_preconditions(life: RunLifecycle, request: ExecuteRequest, spec: TaskSpec,
+                         bindings: dict[str, str]) -> str | None:
+    """Record this consumer's observations and durably block on the first failure."""
+    if life.run.task(spec.id).status == "blocked":
+        return life.run.task(spec.id).blocker or "explicit human recovery required"
+    for predicate in spec.preconditions:
+        failed = evaluate_preconditions(
+            (predicate,), repo_root=request.repo_root, core_root=request.core_root,
+            grants=request.controls.grants, approvals=request.controls.approvals,
+            published_refs=dict(request.controls.published_refs), expected_refs=bindings,
+            run=request.precondition_runner,
+        )
+        observed = failed[1] if failed else (
+            bindings[predicate.value] if predicate.kind == "ref-published" else "asserted"
+        )
+        observations = list(life.run.controls.get("precondition_observations", {}).get("value") or [])
+        observations.append({"task_id": spec.id, "predicate": predicate.identifier,
+                             "observed": observed, "passed": failed is None})
+        life.run.set_control("precondition_observations", observations)
+        if failed:
+            reason = f"precondition-unmet: {predicate.identifier}; observed: {observed}"
+            life.run.status = "blocked"
+            life.block(spec.id, reason)
+            if spec.path and (request.repo_root / spec.path).is_file():
+                upsert_blockers_section(request.repo_root / spec.path, "precondition-unmet", reason,
+                                        fields={"predicate": predicate.identifier, "observed": observed})
+            if request.board_path is not None:
+                _reconcile_projection(life, request.board_path, {spec.id: spec}, [spec.id])
+            return reason
+        life.run.save()
+    return None
+
+
+def _task_working_root(request: ExecuteRequest, spec: TaskSpec) -> str:
+    """Use one working directory for role resolution and every executor dispatch."""
+    if request.compiled_plan is not None:
+        return str(request.compiled_plan.task(spec.id).working_root)
+    return request.working_root
+
+
+def _resolve_executor(request: ExecuteRequest, spec: TaskSpec) -> None:
+    resolver = getattr(request.adapter, "can_resolve_executor", None)
+    if resolver is not None and not resolver(
+        spec.executor, working_root=_task_working_root(request, spec),
+    ):
+        raise ExecutionError(
+            f"{spec.id}: executor '{spec.executor}' has no available adapter or agent",
+            "unresolved-executor",
+        )
+
+
+def _prepare_executor(life: RunLifecycle, request: ExecuteRequest, spec: TaskSpec,
+                      bindings: dict[str, str]) -> str | None:
+    """Recheck gates and role availability before an initial or repair dispatch."""
+    reason = _check_preconditions(life, request, spec, bindings)
+    if reason:
+        return reason
+    try:
+        _resolve_executor(request, spec)
+    except ExecutionError as exc:
+        life.run.status = "blocked"
+        life.block(spec.id, f"{exc.code}: {exc}")
+        raise
+    return None
+
+
 def _controls_map(
     controls: ExecuteControls, resolution: AdapterResolution
 ) -> dict[str, tuple[object, str]]:
@@ -544,6 +630,8 @@ def _controls_map(
             controls.verify_dependency_chain,
             "explicit" if controls.verify_dependency_chain else "default",
         ),
+        "preconditions": ({"grants": list(controls.grants), "approvals": list(controls.approvals),
+                            "published_refs": list(controls.published_refs)}, "explicit"),
         "plan_approval": (
             "approve-plan" if controls.plan_approved
             else "unattended" if controls.unattended else "none", "explicit"),
@@ -633,6 +721,8 @@ def _plan_fingerprint(plan: CompiledRunPlan) -> dict[str, str]:
         out[f"{prefix}.diagnostic_output_budget"] = repr(task.diagnostic_output_budget)
         out[f"{prefix}.repair_bound"] = repr(int(task.repair_bound))
         out[f"{prefix}.depends_on"] = ",".join(task.depends_on)
+        if task.preconditions:
+            out[f"{prefix}.preconditions"] = repr(task.preconditions)
         for control in task.controls:
             out[f"{prefix}.control.{control.name}"] = (
                 f"{control.value!r} ({control.source})"
@@ -791,6 +881,21 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
     controls_map = _controls_map(request.controls, resolution)
     execution_scope = tuple(scope)
     controls_map["execution_scope"] = (list(execution_scope), "explicit")
+    declarations = {
+        task_id: [{"kind": p.kind, "value": p.value} for p in by_id[task_id].preconditions]
+        for task_id in execution_scope if by_id[task_id].preconditions
+    }
+    if declarations:
+        controls_map["task_preconditions"] = (declarations, "explicit")
+    try:
+        bindings = bind_refs(
+            (p for task_id in execution_scope for p in by_id[task_id].preconditions),
+            repo_root=request.repo_root, core_root=request.core_root,
+            run=request.precondition_runner,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        return _error(f"precondition-binding-failed: {exc}", request)
+    controls_map["precondition_bindings"] = (bindings, "explicit")
     if plan is not None:
         controls_map["plan_digest"] = (plan.digest, "explicit")
         controls_map["plan_fingerprint"] = (_plan_fingerprint(plan), "explicit")
@@ -802,6 +907,19 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
         if request.controls.resume:
             recorded = Run.load(request.run_dir, request.repo_root)
             active_scope = [task_id for task_id in execution_scope if task_id in recorded.tasks]
+            _ensure_execution_controls_match(
+                recorded, execution_scope, request.controls.verify_dependency_chain,
+            )
+            _ensure_precondition_contracts_match(recorded, specs)
+            recorded_bindings = recorded.controls.get("precondition_bindings", {}).get("value") or {}
+            recorded_refs = (recorded.controls.get("preconditions", {}).get("value") or {}).get("published_refs", [])
+            if recorded_bindings != bindings or dict(recorded_refs) != dict(request.controls.published_refs):
+                raise ExecutionError(
+                    "resume precondition bindings do not match the recorded run",
+                    "precondition-binding-mismatch",
+                )
+            if plan is not None:
+                _ensure_plan_compatible(recorded, plan)
             life = RunLifecycle.resume(
                 request.run_dir, request.repo_root,
                 feature=request.feature, prompt_path=request.prompt_path,
@@ -813,11 +931,6 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
             )
             ensure_pinned_adapter(life.run, resolution)
             _ensure_attestations_match(life.run, request.controls.attested_dependencies)
-            _ensure_execution_controls_match(
-                life.run, execution_scope, request.controls.verify_dependency_chain,
-            )
-            if plan is not None:
-                _ensure_plan_compatible(life.run, plan)
             for name, (value, sourced) in controls_map.items():
                 if sourced == "explicit":
                     life.run.set_control(name, value, sourced=sourced)
@@ -866,6 +979,11 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
                     evidence = reused.get(task_id)
                     if evidence is None:
                         continue
+                    reason = _check_preconditions(life, request, by_id[task_id], bindings)
+                    if reason:
+                        persist_task_contracts(life.run, [by_id[tid] for tid in scope])
+                        life.run.save()
+                        return ExecuteResult("blocked", EXIT_BLOCKED, reason, request.run_dir, life.run.run_id)
                     life.transition(task_id, "running", actor=ACTOR_RUNNER,
                                     note="verified by reusable evidence")
                     life.transition(task_id, "implemented", actor=ACTOR_RUNNER,
@@ -879,6 +997,15 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
     persist_task_contracts(life.run, [spec for spec in specs if spec.id in scope])
     pin_adapter(life.run, resolution)
     life.run.save()
+
+    for task_id in scope:
+        record = life.run.task(task_id)
+        if record.status != "verified" or not request.controls.resume:
+            continue
+        spec = by_id[task_id]
+        reason = _check_preconditions(life, request, spec, bindings)
+        if reason:
+            return ExecuteResult("blocked", EXIT_BLOCKED, reason, request.run_dir, life.run.run_id)
 
     if not request.controls.resume and request.board_path is not None:
         try:
@@ -906,6 +1033,13 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
             if task_id is None:
                 break
             spec = by_id[task_id]
+            try:
+                reason = _prepare_executor(life, request, spec, bindings)
+            except ExecutionError as exc:
+                return _error(f"{exc.code}: {exc}", request, tuple(results), life.run.run_id)
+            if reason:
+                return ExecuteResult("blocked", EXIT_BLOCKED, reason, request.run_dir,
+                                     life.run.run_id, tuple(results))
             t_lease = task_lease(request.repo_root, life.run.run_id, task_id, pid)
             try:
                 t_lease.acquire(task_id)
@@ -925,9 +1059,10 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
                         role_grant=tuple(request.role_grant),
                         execution_mode=request.execution_mode,
                         plan_path=request.plan_prompt_path,
-                        working_root=request.working_root,
+                        working_root=_task_working_root(request, spec),
                         timeout=request.timeout,
                         board_path=request.board_path,
+                        pre_dispatch=lambda: _prepare_executor(life, request, spec, bindings),
                     ),
                 )
             except (ExecutionError, DispatchError) as exc:

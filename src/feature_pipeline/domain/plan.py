@@ -25,6 +25,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from typing import Iterator
+from feature_pipeline.contracts import Precondition
 
 from .controls import ResolvedControl
 from .errors import DomainError
@@ -84,6 +85,7 @@ class ResolvedTask:
     out_of_scope: tuple[RelativeGlob, ...]
     #: Every per-task operational control, each carrying its source (CP-01 AC-1).
     controls: tuple[ResolvedControl[object], ...]
+    preconditions: tuple[Precondition, ...] = ()
 
     def control(self, name: str) -> ResolvedControl[object]:
         """The per-task control named ``name`` (``KeyError`` if this task has no such control)."""
@@ -152,6 +154,8 @@ def _canonical_check(check: ResolvedCheck) -> dict[str, object]:
 
 def _canonical_task(task: ResolvedTask) -> dict[str, object]:
     return {
+        **({"preconditions": [{"kind": p.kind, "value": p.value} for p in task.preconditions]}
+           if task.preconditions else {}),
         "task_id": task.task_id,
         "task_type": task.task_type,
         "executor": task.executor,

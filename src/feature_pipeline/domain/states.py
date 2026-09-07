@@ -48,8 +48,8 @@ from .vocabulary import Actor, RunStatus, TaskStatus, Verdict
 # Policy — re-declared here, parity-pinned against ``pipeline_core.state`` in the tests.
 # ==========================================================================================
 
-#: The only task transitions the lifecycle allows. ``verified`` is terminal: it has no
-#: outgoing edge. Mirrors ``pipeline_core.state.TASK_TRANSITIONS``.
+#: Mirrors ``pipeline_core.state.TASK_TRANSITIONS``. The runner may revoke verified
+#: eligibility when a fresh precondition observation fails.
 TASK_TRANSITIONS: Mapping[TaskStatus, frozenset[TaskStatus]] = {
     TaskStatus.PENDING: frozenset({TaskStatus.READY, TaskStatus.BLOCKED}),
     TaskStatus.READY: frozenset({TaskStatus.RUNNING, TaskStatus.BLOCKED}),
@@ -63,14 +63,12 @@ TASK_TRANSITIONS: Mapping[TaskStatus, frozenset[TaskStatus]] = {
     TaskStatus.REPAIRING: frozenset(
         {TaskStatus.IMPLEMENTED, TaskStatus.BLOCKED, TaskStatus.RUNNING}
     ),
-    TaskStatus.VERIFIED: frozenset(),
+    TaskStatus.VERIFIED: frozenset({TaskStatus.BLOCKED}),
     TaskStatus.BLOCKED: frozenset({TaskStatus.READY, TaskStatus.IMPLEMENTED}),
 }
 
-#: Terminal task states — no transition leaves them.
-TERMINAL_TASK_STATES: frozenset[TaskStatus] = frozenset(
-    status for status, targets in TASK_TRANSITIONS.items() if not targets
-)
+#: Completed work is terminal for dispatch until prerequisite eligibility is revoked.
+TERMINAL_TASK_STATES: frozenset[TaskStatus] = frozenset({TaskStatus.VERIFIED})
 
 #: Interrupted non-terminal states rolled back on resume. Mirrors
 #: ``pipeline_core.state.RESUME_ROLLBACKS``: a ``running`` task lost its executor window and
@@ -446,6 +444,8 @@ def _check_transition(task: TaskState, to: TaskStatus, actor: Actor) -> None:
         raise UnauthorizedTransition("only an executor or runner may mark implemented")
     if to is TaskStatus.VERIFIED and actor is not Actor.RUNNER:
         raise UnauthorizedTransition("only the runner may mark verified")
+    if task.status is TaskStatus.VERIFIED and actor is not Actor.RUNNER:
+        raise UnauthorizedTransition("only the runner may revoke verified eligibility")
     if task.status is TaskStatus.BLOCKED and actor is not Actor.HUMAN:
         raise UnauthorizedTransition("only a human may unblock a task")
 
