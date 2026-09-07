@@ -1,0 +1,14 @@
+{
+  "total_count": 2,
+  "check_runs": [
+    {
+      "id": 4001,
+      "name": "ruff + mypy (incl. complexity)",
+      "head_sha": "1111111111111111111111111111111111111111",
+      "status": "completed",
+      "conclusion": "success",
+      "completed_at": "2026-09-07T12:00:00Z",
+      "html_url": "https://github.com/example/feature-pipeline-skill/runs/4001"
+    }
+  ]
+}

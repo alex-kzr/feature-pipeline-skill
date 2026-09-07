@@ -1,0 +1,375 @@
+{
+  "schema_version": 1,
+  "repositories": {
+    "producer": "example/feature-pipeline-skill",
+    "consumer": "example/feature-pipeline"
+  },
+  "reviewed_shas": {
+    "core": "1111111111111111111111111111111111111111",
+    "umbrella": "abcabcabcabcabcabcabcabcabcabcabcabcabcab"
+  },
+  "dispatch": {
+    "producer_ref": "refs/heads/main",
+    "consumer_ref": "refs/heads/main",
+    "promotion_ref": "refs/heads/main"
+  },
+  "pagination": {
+    "complete": true,
+    "pages": 1,
+    "total_count": 15
+  },
+  "targets": [
+    {
+      "repository": "example/feature-pipeline-skill",
+      "role": "producer",
+      "default_branch": "main",
+      "ruleset_name": "core-required-checks",
+      "enforcement": "active",
+      "check_provider_id": 15368
+    },
+    {
+      "repository": "example/feature-pipeline",
+      "role": "consumer",
+      "default_branch": "main",
+      "ruleset_name": "umbrella-required-checks",
+      "enforcement": "active",
+      "check_provider_id": 15368
+    }
+  ],
+  "policy_preimages": {
+    "example/feature-pipeline-skill": {
+      "rulesets": [],
+      "note": "no managed ruleset existed before apply; raw readback retained verbatim"
+    },
+    "example/feature-pipeline": {
+      "rulesets": [],
+      "note": "no managed ruleset existed before apply; raw readback retained verbatim"
+    }
+  },
+  "runs": [
+    {
+      "check_name": "ruff + mypy (incl. complexity)",
+      "role": "producer",
+      "repository": "example/feature-pipeline-skill",
+      "app_id": 15368,
+      "head_sha": "1111111111111111111111111111111111111111",
+      "umbrella_gitlink_sha": null,
+      "status": "completed",
+      "conclusion": "success",
+      "observed_at": "2026-09-07T12:00:00Z",
+      "html_url": "https://github.com/example/feature-pipeline-skill/runs/4001",
+      "dispatch_ref": "refs/heads/main",
+      "workflow_run": {"id": 4001, "run_attempt": 1, "html_url": "https://github.com/example/feature-pipeline-skill/actions/runs/4001/attempts/1"},
+      "steps": [
+        {"name": "ruff", "number": 1, "started_at": "2026-09-07T11:59:00Z", "conclusion": "success", "command": "uv run --with ruff ruff check ."},
+        {"name": "mypy", "number": 2, "started_at": "2026-09-07T11:59:30Z", "conclusion": "success", "command": "uv run --with mypy mypy"}
+      ]
+    },
+    {
+      "check_name": "coverage (branch, ratcheted floor)",
+      "role": "producer",
+      "repository": "example/feature-pipeline-skill",
+      "app_id": 15368,
+      "head_sha": "1111111111111111111111111111111111111111",
+      "umbrella_gitlink_sha": null,
+      "status": "completed",
+      "conclusion": "success",
+      "observed_at": "2026-09-07T12:00:00Z",
+      "html_url": "https://github.com/example/feature-pipeline-skill/runs/4002",
+      "dispatch_ref": "refs/heads/main",
+      "workflow_run": {"id": 4002, "run_attempt": 1, "html_url": "https://github.com/example/feature-pipeline-skill/actions/runs/4002/attempts/1"},
+      "steps": [
+        {"name": "coverage run", "number": 1, "started_at": "2026-09-07T11:59:00Z", "conclusion": "success", "command": "uv run --with coverage coverage run -m unittest discover -s tests -t ."},
+        {"name": "coverage report", "number": 2, "started_at": "2026-09-07T11:59:40Z", "conclusion": "success", "command": "uv run --with coverage coverage report"}
+      ]
+    },
+    {
+      "check_name": "platform · ubuntu-latest",
+      "role": "producer",
+      "repository": "example/feature-pipeline-skill",
+      "app_id": 15368,
+      "head_sha": "1111111111111111111111111111111111111111",
+      "umbrella_gitlink_sha": null,
+      "status": "completed",
+      "conclusion": "success",
+      "observed_at": "2026-09-07T12:00:00Z",
+      "html_url": "https://github.com/example/feature-pipeline-skill/runs/4003",
+      "dispatch_ref": "refs/heads/main",
+      "workflow_run": {"id": 4003, "run_attempt": 1, "html_url": "https://github.com/example/feature-pipeline-skill/actions/runs/4003/attempts/1"},
+      "steps": [
+        {"name": "platform", "number": 1, "started_at": "2026-09-07T11:59:00Z", "conclusion": "success", "command": "uv run python -m unittest tests.test_process_runner tests.test_worktree tests.test_worktree_bounded_attribution"}
+      ]
+    },
+    {
+      "check_name": "platform · windows-latest",
+      "role": "producer",
+      "repository": "example/feature-pipeline-skill",
+      "app_id": 15368,
+      "head_sha": "1111111111111111111111111111111111111111",
+      "umbrella_gitlink_sha": null,
+      "status": "completed",
+      "conclusion": "success",
+      "observed_at": "2026-09-07T12:00:00Z",
+      "html_url": "https://github.com/example/feature-pipeline-skill/runs/4004",
+      "dispatch_ref": "refs/heads/main",
+      "workflow_run": {"id": 4004, "run_attempt": 1, "html_url": "https://github.com/example/feature-pipeline-skill/actions/runs/4004/attempts/1"},
+      "steps": [
+        {"name": "platform", "number": 1, "started_at": "2026-09-07T11:59:00Z", "conclusion": "success", "command": "uv run python -m unittest tests.test_process_runner tests.test_worktree tests.test_worktree_bounded_attribution"}
+      ]
+    },
+    {
+      "check_name": "fault-injection · ubuntu-latest",
+      "role": "producer",
+      "repository": "example/feature-pipeline-skill",
+      "app_id": 15368,
+      "head_sha": "1111111111111111111111111111111111111111",
+      "umbrella_gitlink_sha": null,
+      "status": "completed",
+      "conclusion": "success",
+      "observed_at": "2026-09-07T12:00:00Z",
+      "html_url": "https://github.com/example/feature-pipeline-skill/runs/4005",
+      "dispatch_ref": "refs/heads/main",
+      "workflow_run": {"id": 4005, "run_attempt": 1, "html_url": "https://github.com/example/feature-pipeline-skill/actions/runs/4005/attempts/1"},
+      "steps": [
+        {"name": "fault-injection", "number": 1, "started_at": "2026-09-07T11:59:00Z", "conclusion": "success", "command": "uv run python -m unittest tests.test_concurrency tests.test_scope_gate tests.test_git_safety_allowlist tests.test_launch_controls tests.test_critical_behavior_characterization"}
+      ]
+    },
+    {
+      "check_name": "fault-injection · windows-latest",
+      "role": "producer",
+      "repository": "example/feature-pipeline-skill",
+      "app_id": 15368,
+      "head_sha": "1111111111111111111111111111111111111111",
+      "umbrella_gitlink_sha": null,
+      "status": "completed",
+      "conclusion": "success",
+      "observed_at": "2026-09-07T12:00:00Z",
+      "html_url": "https://github.com/example/feature-pipeline-skill/runs/4006",
+      "dispatch_ref": "refs/heads/main",
+      "workflow_run": {"id": 4006, "run_attempt": 1, "html_url": "https://github.com/example/feature-pipeline-skill/actions/runs/4006/attempts/1"},
+      "steps": [
+        {"name": "fault-injection", "number": 1, "started_at": "2026-09-07T11:59:00Z", "conclusion": "success", "command": "uv run python -m unittest tests.test_concurrency tests.test_scope_gate tests.test_git_safety_allowlist tests.test_launch_controls tests.test_critical_behavior_characterization"}
+      ]
+    },
+    {
+      "check_name": "performance · ubuntu-latest",
+      "role": "producer",
+      "repository": "example/feature-pipeline-skill",
+      "app_id": 15368,
+      "head_sha": "1111111111111111111111111111111111111111",
+      "umbrella_gitlink_sha": null,
+      "status": "completed",
+      "conclusion": "success",
+      "observed_at": "2026-09-07T12:00:00Z",
+      "html_url": "https://github.com/example/feature-pipeline-skill/runs/4007",
+      "dispatch_ref": "refs/heads/main",
+      "workflow_run": {"id": 4007, "run_attempt": 1, "html_url": "https://github.com/example/feature-pipeline-skill/actions/runs/4007/attempts/1"},
+      "steps": [
+        {"name": "performance", "number": 1, "started_at": "2026-09-07T11:59:00Z", "conclusion": "success", "command": "uv run python -m unittest tests.test_worktree_performance_baseline"}
+      ]
+    },
+    {
+      "check_name": "performance · windows-latest",
+      "role": "producer",
+      "repository": "example/feature-pipeline-skill",
+      "app_id": 15368,
+      "head_sha": "1111111111111111111111111111111111111111",
+      "umbrella_gitlink_sha": null,
+      "status": "completed",
+      "conclusion": "success",
+      "observed_at": "2026-09-07T12:00:00Z",
+      "html_url": "https://github.com/example/feature-pipeline-skill/runs/4008",
+      "dispatch_ref": "refs/heads/main",
+      "workflow_run": {"id": 4008, "run_attempt": 1, "html_url": "https://github.com/example/feature-pipeline-skill/actions/runs/4008/attempts/1"},
+      "steps": [
+        {"name": "performance", "number": 1, "started_at": "2026-09-07T11:59:00Z", "conclusion": "success", "command": "uv run python -m unittest tests.test_worktree_performance_baseline"}
+      ]
+    },
+    {
+      "check_name": "ubuntu-latest · py3.11",
+      "role": "consumer",
+      "repository": "example/feature-pipeline",
+      "app_id": 15368,
+      "head_sha": "abcabcabcabcabcabcabcabcabcabcabcabcabcab",
+      "umbrella_gitlink_sha": "1111111111111111111111111111111111111111",
+      "status": "completed",
+      "conclusion": "success",
+      "observed_at": "2026-09-07T12:00:00Z",
+      "html_url": "https://github.com/example/feature-pipeline/runs/4009",
+      "dispatch_ref": "refs/heads/main",
+      "workflow_run": {"id": 4009, "run_attempt": 1, "html_url": "https://github.com/example/feature-pipeline/actions/runs/4009/attempts/1"},
+      "steps": [
+        {"name": "discover", "number": 1, "started_at": "2026-09-07T11:59:00Z", "conclusion": "success", "command": "uv run python -m unittest discover -s tests -t ."},
+        {"name": "installed wheel", "number": 2, "started_at": "2026-09-07T11:59:20Z", "conclusion": "success", "command": "uv run python -m unittest -v tests.test_installed_wheel"},
+        {"name": "acceptance evidence", "number": 3, "started_at": "2026-09-07T11:59:40Z", "conclusion": "success", "command": "uv run python -m tests.installed_wheel --json"}
+      ]
+    },
+    {
+      "check_name": "ubuntu-latest · py3.12",
+      "role": "consumer",
+      "repository": "example/feature-pipeline",
+      "app_id": 15368,
+      "head_sha": "abcabcabcabcabcabcabcabcabcabcabcabcabcab",
+      "umbrella_gitlink_sha": "1111111111111111111111111111111111111111",
+      "status": "completed",
+      "conclusion": "success",
+      "observed_at": "2026-09-07T12:00:00Z",
+      "html_url": "https://github.com/example/feature-pipeline/runs/4010",
+      "dispatch_ref": "refs/heads/main",
+      "workflow_run": {"id": 4010, "run_attempt": 1, "html_url": "https://github.com/example/feature-pipeline/actions/runs/4010/attempts/1"},
+      "steps": [
+        {"name": "discover", "number": 1, "started_at": "2026-09-07T11:59:00Z", "conclusion": "success", "command": "uv run python -m unittest discover -s tests -t ."},
+        {"name": "installed wheel", "number": 2, "started_at": "2026-09-07T11:59:20Z", "conclusion": "success", "command": "uv run python -m unittest -v tests.test_installed_wheel"},
+        {"name": "acceptance evidence", "number": 3, "started_at": "2026-09-07T11:59:40Z", "conclusion": "success", "command": "uv run python -m tests.installed_wheel --json"}
+      ]
+    },
+    {
+      "check_name": "ubuntu-latest · py3.13",
+      "role": "consumer",
+      "repository": "example/feature-pipeline",
+      "app_id": 15368,
+      "head_sha": "abcabcabcabcabcabcabcabcabcabcabcabcabcab",
+      "umbrella_gitlink_sha": "1111111111111111111111111111111111111111",
+      "status": "completed",
+      "conclusion": "success",
+      "observed_at": "2026-09-07T12:00:00Z",
+      "html_url": "https://github.com/example/feature-pipeline/runs/4011",
+      "dispatch_ref": "refs/heads/main",
+      "workflow_run": {"id": 4011, "run_attempt": 1, "html_url": "https://github.com/example/feature-pipeline/actions/runs/4011/attempts/1"},
+      "steps": [
+        {"name": "discover", "number": 1, "started_at": "2026-09-07T11:59:00Z", "conclusion": "success", "command": "uv run python -m unittest discover -s tests -t ."},
+        {"name": "installed wheel", "number": 2, "started_at": "2026-09-07T11:59:20Z", "conclusion": "success", "command": "uv run python -m unittest -v tests.test_installed_wheel"},
+        {"name": "acceptance evidence", "number": 3, "started_at": "2026-09-07T11:59:40Z", "conclusion": "success", "command": "uv run python -m tests.installed_wheel --json"}
+      ]
+    },
+    {
+      "check_name": "windows-latest · py3.11",
+      "role": "consumer",
+      "repository": "example/feature-pipeline",
+      "app_id": 15368,
+      "head_sha": "abcabcabcabcabcabcabcabcabcabcabcabcabcab",
+      "umbrella_gitlink_sha": "1111111111111111111111111111111111111111",
+      "status": "completed",
+      "conclusion": "success",
+      "observed_at": "2026-09-07T12:00:00Z",
+      "html_url": "https://github.com/example/feature-pipeline/runs/4012",
+      "dispatch_ref": "refs/heads/main",
+      "workflow_run": {"id": 4012, "run_attempt": 1, "html_url": "https://github.com/example/feature-pipeline/actions/runs/4012/attempts/1"},
+      "steps": [
+        {"name": "discover", "number": 1, "started_at": "2026-09-07T11:59:00Z", "conclusion": "success", "command": "uv run python -m unittest discover -s tests -t ."},
+        {"name": "installed wheel", "number": 2, "started_at": "2026-09-07T11:59:20Z", "conclusion": "success", "command": "uv run python -m unittest -v tests.test_installed_wheel"},
+        {"name": "acceptance evidence", "number": 3, "started_at": "2026-09-07T11:59:40Z", "conclusion": "success", "command": "uv run python -m tests.installed_wheel --json"}
+      ]
+    },
+    {
+      "check_name": "windows-latest · py3.12",
+      "role": "consumer",
+      "repository": "example/feature-pipeline",
+      "app_id": 15368,
+      "head_sha": "abcabcabcabcabcabcabcabcabcabcabcabcabcab",
+      "umbrella_gitlink_sha": "1111111111111111111111111111111111111111",
+      "status": "completed",
+      "conclusion": "success",
+      "observed_at": "2026-09-07T12:00:00Z",
+      "html_url": "https://github.com/example/feature-pipeline/runs/4013",
+      "dispatch_ref": "refs/heads/main",
+      "workflow_run": {"id": 4013, "run_attempt": 1, "html_url": "https://github.com/example/feature-pipeline/actions/runs/4013/attempts/1"},
+      "steps": [
+        {"name": "discover", "number": 1, "started_at": "2026-09-07T11:59:00Z", "conclusion": "success", "command": "uv run python -m unittest discover -s tests -t ."},
+        {"name": "installed wheel", "number": 2, "started_at": "2026-09-07T11:59:20Z", "conclusion": "success", "command": "uv run python -m unittest -v tests.test_installed_wheel"},
+        {"name": "acceptance evidence", "number": 3, "started_at": "2026-09-07T11:59:40Z", "conclusion": "success", "command": "uv run python -m tests.installed_wheel --json"}
+      ]
+    },
+    {
+      "check_name": "windows-latest · py3.13",
+      "role": "consumer",
+      "repository": "example/feature-pipeline",
+      "app_id": 15368,
+      "head_sha": "abcabcabcabcabcabcabcabcabcabcabcabcabcab",
+      "umbrella_gitlink_sha": "1111111111111111111111111111111111111111",
+      "status": "completed",
+      "conclusion": "success",
+      "observed_at": "2026-09-07T12:00:00Z",
+      "html_url": "https://github.com/example/feature-pipeline/runs/4014",
+      "dispatch_ref": "refs/heads/main",
+      "workflow_run": {"id": 4014, "run_attempt": 1, "html_url": "https://github.com/example/feature-pipeline/actions/runs/4014/attempts/1"},
+      "steps": [
+        {"name": "discover", "number": 1, "started_at": "2026-09-07T11:59:00Z", "conclusion": "success", "command": "uv run python -m unittest discover -s tests -t ."},
+        {"name": "installed wheel", "number": 2, "started_at": "2026-09-07T11:59:20Z", "conclusion": "success", "command": "uv run python -m unittest -v tests.test_installed_wheel"},
+        {"name": "acceptance evidence", "number": 3, "started_at": "2026-09-07T11:59:40Z", "conclusion": "success", "command": "uv run python -m tests.installed_wheel --json"}
+      ]
+    },
+    {
+      "check_name": "same-SHA core promotion",
+      "role": "promotion",
+      "repository": "example/feature-pipeline",
+      "app_id": 15368,
+      "head_sha": "abcabcabcabcabcabcabcabcabcabcabcabcabcab",
+      "umbrella_gitlink_sha": "1111111111111111111111111111111111111111",
+      "status": "completed",
+      "conclusion": "success",
+      "observed_at": "2026-09-07T12:00:00Z",
+      "html_url": "https://github.com/example/feature-pipeline/runs/4015",
+      "dispatch_ref": "refs/heads/main",
+      "workflow_run": {"id": 4015, "run_attempt": 1, "html_url": "https://github.com/example/feature-pipeline/actions/runs/4015/attempts/1"},
+      "steps": [
+        {"name": "same-SHA core promotion", "number": 1, "started_at": "2026-09-07T11:59:00Z", "conclusion": "success", "command": null}
+      ]
+    }
+  ],
+  "applied_rulesets": {
+    "producer": {
+      "name": "core-required-checks",
+      "target": "branch",
+      "enforcement": "active",
+      "conditions": {"ref_name": {"include": ["refs/heads/main"], "exclude": []}},
+      "rules": [
+        {
+          "type": "required_status_checks",
+          "parameters": {
+            "strict_required_status_checks_policy": true,
+            "do_not_enforce_on_create": false,
+            "required_status_checks": [
+              {"context": "ruff + mypy (incl. complexity)", "integration_id": 15368},
+              {"context": "coverage (branch, ratcheted floor)", "integration_id": 15368},
+              {"context": "platform · ubuntu-latest", "integration_id": 15368},
+              {"context": "platform · windows-latest", "integration_id": 15368},
+              {"context": "fault-injection · ubuntu-latest", "integration_id": 15368},
+              {"context": "fault-injection · windows-latest", "integration_id": 15368},
+              {"context": "performance · ubuntu-latest", "integration_id": 15368},
+              {"context": "performance · windows-latest", "integration_id": 15368}
+            ]
+          }
+        }
+      ],
+      "_repository": "example/feature-pipeline-skill",
+      "_role": "producer"
+    },
+    "consumer": {
+      "name": "umbrella-required-checks",
+      "target": "branch",
+      "enforcement": "active",
+      "conditions": {"ref_name": {"include": ["refs/heads/main"], "exclude": []}},
+      "rules": [
+        {
+          "type": "required_status_checks",
+          "parameters": {
+            "strict_required_status_checks_policy": true,
+            "do_not_enforce_on_create": false,
+            "required_status_checks": [
+              {"context": "ubuntu-latest · py3.11", "integration_id": 15368},
+              {"context": "ubuntu-latest · py3.12", "integration_id": 15368},
+              {"context": "ubuntu-latest · py3.13", "integration_id": 15368},
+              {"context": "windows-latest · py3.11", "integration_id": 15368},
+              {"context": "windows-latest · py3.12", "integration_id": 15368},
+              {"context": "windows-latest · py3.13", "integration_id": 15368},
+              {"context": "same-SHA core promotion", "integration_id": 15368}
+            ]
+          }
+        }
+      ],
+      "_repository": "example/feature-pipeline",
+      "_role": "consumer"
+    }
+  }
+}
