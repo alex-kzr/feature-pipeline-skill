@@ -212,8 +212,11 @@ constants they describe, and resolves the critical cross-links between the archi
 contracts, and migration pages (including link fragments against real headings). UGA-08 adds the
 CI operating-contract checks: the gate table above and
 `docs/validation/github-actions-universal-solution.md` are compared, row by row, to the loaded
-`ci/gates.toml` and to `ci.promotion.required_core_checks`, so a documented gate ID, command,
-matrix, or required-check identity that drifts from executable data is a red test.
+`ci/gates.toml` and to the versioned `ci.promotion.required_check_contract` API, including the
+installed-package page's explanatory command and supported-version tables. The API derives the
+producer, consumer, and promotion required-check identities without parsing workflow YAML, so a
+documented gate ID, command, matrix, or required-check identity that drifts from executable data
+is a red test.
 
 ```
 uv run python -m unittest tests.test_documentation_contracts

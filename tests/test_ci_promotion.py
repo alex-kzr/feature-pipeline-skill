@@ -298,6 +298,24 @@ class RequiredChecksComeFromTheManifest(unittest.TestCase):
         self.assertNotIn(promotion.CONSUMER_CHECK_IDENTITY, required)
         self.assertEqual(promotion.CONSUMER_CHECK_IDENTITY, "installed-package")
 
+    def test_versioned_contract_exposes_every_required_check_identity(self) -> None:
+        required = promotion.required_check_contract(contract.load())
+        self.assertEqual(required.version, 1)
+        self.assertEqual(required.producer, promotion.required_core_checks(contract.load()))
+        self.assertEqual(
+            required.consumer,
+            (
+                "ubuntu-latest · py3.11",
+                "ubuntu-latest · py3.12",
+                "ubuntu-latest · py3.13",
+                "windows-latest · py3.11",
+                "windows-latest · py3.12",
+                "windows-latest · py3.13",
+            ),
+        )
+        self.assertEqual(required.promotion, "same-SHA core promotion")
+        self.assertEqual(required.all()[-1], required.promotion)
+
 
 class PromotionWorkflowAdapter(unittest.TestCase):
     def setUp(self) -> None:

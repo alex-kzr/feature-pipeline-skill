@@ -44,10 +44,15 @@ from ci import contract
 #: GitHub REST API root; overridable so tests never touch the network.
 GITHUB_API_ROOT = "https://api.github.com"
 
-#: The umbrella ``installed-package`` consumer check identity. The promotion gate proves
-#: *producer* status only; this identity is required by the separate downstream workflow and
-#: must never be folded into the producer set (AC-3).
+#: The umbrella ``installed-package`` consumer workflow identity. The required check identities
+#: expand this across its OS/Python matrix below.
 CONSUMER_CHECK_IDENTITY = "installed-package"
+
+#: The stable required-check name rendered by the umbrella promotion workflow.
+PROMOTION_CHECK_IDENTITY = "same-SHA core promotion"
+
+#: Public compatibility version for :func:`required_check_contract` consumers.
+REQUIRED_CHECK_CONTRACT_VERSION = 1
 
 #: The core ``quality-gates`` workflow's stable check-name for the ``lint`` and ``types`` gates.
 _LINT_TYPES_CHECK = "ruff + mypy (incl. complexity)"
@@ -115,6 +120,21 @@ class PromotionResult:
         }
 
 
+@dataclass(frozen=True)
+class RequiredCheckContract:
+    """All required-check identities, from one versioned executable contract."""
+
+    version: int
+    producer: tuple[str, ...]
+    consumer: tuple[str, ...]
+    promotion: str
+
+    def all(self) -> tuple[str, ...]:
+        """Return every required-check identity in stable display order."""
+
+        return (*self.producer, *self.consumer, self.promotion)
+
+
 def required_core_checks(loaded: contract.Contract) -> tuple[str, ...]:
     """The required producer check identities, derived from ``ci/gates.toml``.
 
@@ -137,6 +157,23 @@ def required_core_checks(loaded: contract.Contract) -> tuple[str, ...]:
             for image in gate.os:
                 names.append(f"{gate.id} · {image}")
     return tuple(names)
+
+
+def required_check_contract(loaded: contract.Contract) -> RequiredCheckContract:
+    """Build the required-check contract without parsing workflow YAML or calling GitHub."""
+
+    consumer_gate = loaded.gate(CONSUMER_CHECK_IDENTITY)
+    consumer = tuple(
+        f"{image} · py{version}"
+        for image in consumer_gate.os
+        for version in consumer_gate.python
+    )
+    return RequiredCheckContract(
+        version=REQUIRED_CHECK_CONTRACT_VERSION,
+        producer=required_core_checks(loaded),
+        consumer=consumer,
+        promotion=PROMOTION_CHECK_IDENTITY,
+    )
 
 
 def _extract_api_urls(payload: object) -> tuple[str, ...]:

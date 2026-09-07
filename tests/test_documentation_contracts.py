@@ -8,6 +8,7 @@ import re
 import shlex
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -285,32 +286,53 @@ class UniversalCiContractDocumentationTests(unittest.TestCase):
                     self._expected_gate_rows(gates),
                 )
 
+    def test_installed_package_supporting_tables_match_the_consumer_gate(self) -> None:
+        """Keep the consumer proof's explanatory commands and matrix in lockstep."""
+
+        gate = self.contract.gate("installed-package")
+        tested_rows = _table_rows(self.installed_package, "What is tested")
+        self.assertEqual(
+            [re.findall(r"`([^`]+)`", row[1]) for row in tested_rows],
+            [
+                [" ".join(gate.commands[0].argv)],
+                [" ".join(gate.commands[1].argv)],
+            ],
+        )
+
+        supported_rows = _table_rows(self.installed_package, "Supported version matrix")
+        self.assertEqual(
+            {(row[0].strip("`"), row[1]) for row in supported_rows},
+            {(image, ", ".join(gate.python)) for image in gate.os},
+        )
+
     def test_docs_name_the_manifest_as_the_only_command_authority(self) -> None:
         for text in (self.readme, self.solution):
             self.assertIn("ci/gates.toml", text)
             self.assertIn("the only command/matrix authority", text)
 
     def test_solution_doc_exactly_transcribes_required_check_identities(self) -> None:
+        required = ci_promotion.required_check_contract(self.contract)
         producer = {
             row[0].strip("`")
             for row in _table_after_marker(self.solution, "### Producer")
         }
-        self.assertEqual(producer, set(ci_promotion.required_core_checks(self.contract)))
-
-        gate = self.contract.gate("installed-package")
+        self.assertEqual(producer, set(required.producer))
         consumer = {
             row[0].strip("`")
             for row in _table_after_marker(self.solution, "### Consumer and promotion")
         }
-        expected_consumer = {
-            f"{image} · py{version}"
-            for image in gate.os
-            for version in gate.python
-        }
-        expected_consumer.add("same-SHA core promotion")
-        self.assertEqual(consumer, expected_consumer)
+        self.assertEqual(consumer, set((*required.consumer, required.promotion)))
         self.assertIn(ci_promotion.CONSUMER_CHECK_IDENTITY, self.solution)
-        self.assertIn("core-promotion", self.solution)
+        self.assertIn(required.promotion, self.solution)
+
+    def test_promotion_identity_drift_is_detected(self) -> None:
+        required = ci_promotion.required_check_contract(self.contract)
+        documented = {
+            row[0].strip("`")
+            for row in _table_after_marker(self.solution, "### Consumer and promotion")
+        }
+        drifted = replace(required, promotion="renamed promotion check")
+        self.assertNotEqual(documented, set((*drifted.consumer, drifted.promotion)))
 
     def test_solution_doc_covers_the_operating_contract_and_no_push_recovery(self) -> None:
         for token in (
