@@ -1,0 +1,134 @@
+{
+  "consumer": {
+    "_repository": "alex-kzr/feature-pipeline",
+    "_role": "consumer",
+    "conditions": {
+      "ref_name": {
+        "exclude": [],
+        "include": [
+          "refs/heads/main"
+        ]
+      }
+    },
+    "enforcement": "active",
+    "name": "umbrella-required-checks",
+    "rules": [
+      {
+        "parameters": {
+          "do_not_enforce_on_create": false,
+          "required_status_checks": [
+            {
+              "context": "ubuntu-latest · py3.11",
+              "integration_id": 15368
+            },
+            {
+              "context": "ubuntu-latest · py3.12",
+              "integration_id": 15368
+            },
+            {
+              "context": "ubuntu-latest · py3.13",
+              "integration_id": 15368
+            },
+            {
+              "context": "windows-latest · py3.11",
+              "integration_id": 15368
+            },
+            {
+              "context": "windows-latest · py3.12",
+              "integration_id": 15368
+            },
+            {
+              "context": "windows-latest · py3.13",
+              "integration_id": 15368
+            },
+            {
+              "context": "same-SHA core promotion",
+              "integration_id": 15368
+            }
+          ],
+          "strict_required_status_checks_policy": true
+        },
+        "type": "required_status_checks"
+      }
+    ],
+    "target": "branch"
+  },
+  "note": "UGA-13 offline snapshot; regenerate with: uv run python -m tests.desired_rulesets --write  # cwd: feature-pipeline-skill",
+  "producer": {
+    "_repository": "alex-kzr/feature-pipeline-skill",
+    "_role": "producer",
+    "conditions": {
+      "ref_name": {
+        "exclude": [],
+        "include": [
+          "refs/heads/main"
+        ]
+      }
+    },
+    "enforcement": "active",
+    "name": "core-required-checks",
+    "rules": [
+      {
+        "parameters": {
+          "do_not_enforce_on_create": false,
+          "required_status_checks": [
+            {
+              "context": "ruff + mypy (incl. complexity)",
+              "integration_id": 15368
+            },
+            {
+              "context": "coverage (branch, ratcheted floor)",
+              "integration_id": 15368
+            },
+            {
+              "context": "platform · ubuntu-latest",
+              "integration_id": 15368
+            },
+            {
+              "context": "platform · windows-latest",
+              "integration_id": 15368
+            },
+            {
+              "context": "fault-injection · ubuntu-latest",
+              "integration_id": 15368
+            },
+            {
+              "context": "fault-injection · windows-latest",
+              "integration_id": 15368
+            },
+            {
+              "context": "performance · ubuntu-latest",
+              "integration_id": 15368
+            },
+            {
+              "context": "performance · windows-latest",
+              "integration_id": 15368
+            }
+          ],
+          "strict_required_status_checks_policy": true
+        },
+        "type": "required_status_checks"
+      }
+    ],
+    "target": "branch"
+  },
+  "schema": 1,
+  "targets": [
+    {
+      "check_provider_id": 15368,
+      "default_branch": "main",
+      "enforcement": "active",
+      "repository": "alex-kzr/feature-pipeline-skill",
+      "role": "producer",
+      "ruleset_name": "core-required-checks"
+    },
+    {
+      "check_provider_id": 15368,
+      "default_branch": "main",
+      "enforcement": "active",
+      "repository": "alex-kzr/feature-pipeline",
+      "role": "consumer",
+      "ruleset_name": "umbrella-required-checks"
+    }
+  ]
+}
