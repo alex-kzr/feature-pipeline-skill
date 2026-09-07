@@ -45,6 +45,7 @@ from feature_pipeline.ports.process import ProcessError, ProcessSpec
 from .artifacts import write_text_atomic
 from .concurrency import is_serialized_program, write_mutex
 from .redaction import output_rules, redact_text
+from .snapshot import require_verification_snapshot
 from .state import EXIT_LAUNCH_FAILED, EXIT_NOT_FOUND, EXIT_TIMEOUT, Run, repo_relative
 
 ROUTINE_OUTPUT_BUDGET = 16 * 1024
@@ -256,6 +257,11 @@ class VerificationRun:
     records: tuple[dict, ...]
     unrun: tuple[tuple[str, tuple[str, ...]], ...] = ()
     stopped_reason: str | None = None
+    #: The immutable identity of the worktree snapshot these commands ran against
+    #: (:class:`pipeline_core.snapshot.SnapshotIdentity` as a dict), or ``None`` when the
+    #: caller did not request an isolated snapshot. Every command record also carries the
+    #: identity's ``token`` under ``"snapshot"``.
+    snapshot: dict | None = None
 
     @property
     def complete(self) -> bool:
@@ -271,6 +277,7 @@ def run_verification_commands(
     attempt: int | None = None,
     timeout: float | None = None,
     serialized_programs: Sequence[str] = (),
+    allowed_scope: Sequence[str] = (),
 ) -> VerificationRun:
     """Execute every declared verification command in order as runner-owned evidence.
 
@@ -283,8 +290,23 @@ def run_verification_commands(
 
     ``serialized_programs`` is forwarded verbatim to :func:`run_command` — the caller's set of
     program basenames to hold the write mutex around.
+
+    ``allowed_scope`` opts the pass into an isolated verification snapshot: before any command
+    runs, the immutable identity of the tree the commands will see is captured
+    (:func:`pipeline_core.snapshot.require_verification_snapshot`, scoped to ``allowed_scope``
+    and excluding the run directory). It fails closed — a working root with no Git boundary,
+    or any failing Git query, raises :class:`~pipeline_core.snapshot.SnapshotError` and no
+    command runs. The identity's ``token`` is stamped on every command record and the whole
+    identity is carried on the returned :class:`VerificationRun`.
     """
     declared = [_declared_cwd_argv(command) for command in commands]
+    snapshot = (
+        require_verification_snapshot(
+            run.repo_root, allowed_scope=allowed_scope, exclude_roots=(run.run_dir,)
+        ).as_dict()
+        if allowed_scope
+        else None
+    )
     records: list[dict] = []
     for index, (cwd, argv) in enumerate(declared, start=1):
         record = run_command(
@@ -295,6 +317,8 @@ def run_verification_commands(
             record["task_id"] = task_id
         if attempt is not None:
             record["attempt"] = attempt
+        if snapshot is not None:
+            record["snapshot"] = snapshot["token"]
         records.append(record)
         if record.get("disposition") == DISPOSITION_BLOCKED:
             reason = record.get("reason") or "declared verification command could not be run"
@@ -302,8 +326,9 @@ def run_verification_commands(
                 tuple(records),
                 tuple(declared[index:]),
                 f"{' '.join(argv)}: {reason}",
+                snapshot=snapshot,
             )
-    return VerificationRun(tuple(records))
+    return VerificationRun(tuple(records), snapshot=snapshot)
 
 
 def outcome_of(record: dict) -> CommandOutcome:

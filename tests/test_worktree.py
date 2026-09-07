@@ -12,6 +12,12 @@ import unittest
 from pathlib import Path
 
 from pipeline_core.reports import launch_artifacts
+from pipeline_core.snapshot import (
+    SnapshotError,
+    SnapshotIdentity,
+    capture_verification_snapshot,
+    require_verification_snapshot,
+)
 from pipeline_core.state import Run
 from pipeline_core.worktree import (
     STATE_KNOWN,
@@ -284,6 +290,75 @@ class AttributeExecutorWindowTests(unittest.TestCase):
             self.assertTrue(
                 implementation["manifest"].endswith("implementation-manifest-1.json"))
             self.assertEqual(run.task("RDS-05").changed_files, ["a.py"])
+
+
+# --- isolated verification snapshot identity (UEI-02) --------------------------------------
+
+
+class VerificationSnapshotIdentityTests(unittest.TestCase):
+    def test_identity_is_deterministic_for_an_unchanged_tree(self) -> None:  # AC-3
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _init_repo(root)
+
+            first = capture_verification_snapshot(root, allowed_scope=("a.py",))
+            second = capture_verification_snapshot(root, allowed_scope=("a.py",))
+
+            self.assertTrue(first.available)
+            self.assertIsInstance(first, SnapshotIdentity)
+            self.assertTrue(first.token.startswith("snapshot:"))
+            self.assertEqual(first.token, second.token)
+
+    def test_an_unrelated_worktree_edit_does_not_move_a_task_scoped_identity(self) -> None:
+        # AC-2: 'b.py' is outside the task's declared scope; editing it (or adding an
+        # untracked file) leaves the recorded snapshot identity byte-identical.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _init_repo(root)
+            before = capture_verification_snapshot(root, allowed_scope=("a.py",))
+
+            (root / "b.py").write_text("unrelated edit\n", encoding="utf-8")
+            (root / "untracked.py").write_text("noise\n", encoding="utf-8")
+
+            after = capture_verification_snapshot(root, allowed_scope=("a.py",))
+            self.assertEqual(after.token, before.token)
+
+            # An edit *inside* the declared scope does move the identity.
+            (root / "a.py").write_text("alpha changed\n", encoding="utf-8")
+            in_scope = capture_verification_snapshot(root, allowed_scope=("a.py",))
+            self.assertNotEqual(in_scope.token, before.token)
+
+    def test_runner_owned_run_directory_churn_is_excluded(self) -> None:  # AC-2
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _init_repo(root)
+            run_dir = root / "runs" / "r1"
+            run_dir.mkdir(parents=True)
+            before = capture_verification_snapshot(
+                root, exclude_roots=(run_dir,))
+
+            (run_dir / "run.json").write_text("{}", encoding="utf-8")
+            after = capture_verification_snapshot(root, exclude_roots=(run_dir,))
+
+            self.assertEqual(after.token, before.token)
+
+    def test_missing_repository_boundary_fails_closed(self) -> None:  # AC-3
+        with tempfile.TemporaryDirectory() as directory:
+            identity = capture_verification_snapshot(Path(directory))
+            self.assertFalse(identity.available)
+            self.assertIn("no Git repository boundary", identity.reason or "")
+
+            with self.assertRaises(SnapshotError) as ctx:
+                require_verification_snapshot(Path(directory))
+            self.assertEqual(ctx.exception.code, "snapshot-unavailable")
+
+    def test_identity_records_every_repository_boundary_head(self) -> None:  # AC-1
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _init_repo(root)
+            identity = require_verification_snapshot(root)
+            self.assertEqual([name for name, _ in identity.boundaries], ["."])
+            self.assertEqual(len(identity.boundaries[0][1]), 40)
 
 
 if __name__ == "__main__":

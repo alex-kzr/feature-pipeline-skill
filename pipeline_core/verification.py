@@ -60,6 +60,7 @@ _DIAGNOSTICS = DiagnosticService()
 _COMMAND_REFERENCE_KEYS = (
     "id", "stage", "cwd", "argv", "exit_code", "disposition", "duration",
     "stdout_log", "stderr_log", "reason", "command_index", "task_id", "attempt",
+    "snapshot",
 )
 
 
@@ -138,6 +139,11 @@ class VerificationEvidence:
     missing_evidence: tuple[Mapping[str, object], ...] = ()
     unrun_commands: tuple[Mapping[str, object], ...] = ()
     external_blocker: str | None = None
+    #: The immutable identity of the isolated worktree snapshot the recorded commands ran
+    #: against (:class:`pipeline_core.snapshot.SnapshotIdentity` as a dict), or ``None`` when
+    #: the pass was not run against an isolated snapshot. An unrelated later worktree edit
+    #: cannot move this value — it is a frozen field over a captured content digest.
+    snapshot: Mapping[str, object] | None = None
 
     @property
     def complete(self) -> bool:
@@ -158,6 +164,7 @@ class VerificationEvidence:
             "missing_evidence": [dict(entry) for entry in self.missing_evidence],
             "unrun_commands": [dict(entry) for entry in self.unrun_commands],
             "external_blocker": self.external_blocker,
+            "snapshot": dict(self.snapshot) if self.snapshot is not None else None,
             "complete": self.complete,
         }
 
@@ -206,6 +213,7 @@ def build_verification_evidence(
         missing_evidence=missing_command_evidence(claimed_checks, commands_run.records),
         unrun_commands=unrun,
         external_blocker=commands_run.stopped_reason,
+        snapshot=commands_run.snapshot,
     )
 
 

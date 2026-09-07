@@ -16,6 +16,7 @@ The tests cover the four properties the contract names:
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -27,20 +28,27 @@ from pipeline_core.adapters import (
     LaunchResult,
     build_claude_argv,
 )
+from pipeline_core.commands import (
+    VerificationRun,
+    run_verification_commands,
+    verification_stage,
+)
 from pipeline_core.reports import build_verdict_envelope_prompt, verifier_artifacts
+from pipeline_core.snapshot import SnapshotError
 from pipeline_core.state import Run, StateError
 from pipeline_core.verification import (
     VerificationError,
     VerificationEvidence,
     VerifierAnchors,
     VerifierLaunchers,
+    build_verification_evidence,
     build_verifier_prompt,
     combine_verdict_status,
     evidence_forces_fail,
     missing_command_evidence,
     orchestrate_verification,
 )
-from feature_pipeline.contracts import TaskSpec
+from feature_pipeline.contracts import CommandSpec, TaskSpec
 
 ANCHORS = VerifierAnchors(project_root="/repo", agents_root="/repo/.agents")
 
@@ -537,6 +545,101 @@ class PersistenceTests(unittest.TestCase):
             self.assertIsNotNone(recorded["verified_at"])
             self.assertEqual(reloaded.task("VR-02").status, "verified")
             self.assertEqual(outcome.verdict_record, artifacts.verdict_record)
+
+
+class IsolatedVerificationSnapshotTests(unittest.TestCase):
+    """UEI-02 — the runner binds a task's verification evidence to an immutable identity of
+    the tree the commands ran against, and refuses to verify against an unknown tree."""
+
+    def _git(self, root: Path, *argv: str) -> None:
+        subprocess.run(
+            ["git", *argv], cwd=root, check=True, capture_output=True, text=True
+        )
+
+    def _repo_run(self, root: Path) -> Run:
+        self._git(root, "init", "-q")
+        self._git(root, "config", "user.email", "t@example.com")
+        self._git(root, "config", "user.name", "Test")
+        (root / "pkg.py").write_text("source\n", encoding="utf-8")
+        (root / "unrelated.py").write_text("other\n", encoding="utf-8")
+        self._git(root, "add", "-A")
+        self._git(root, "commit", "-qm", "base")
+        prompt = root / "prompt.md"
+        prompt.write_text("feature prompt", encoding="utf-8")
+        run = Run.create("verify", prompt, None, root / "runs" / "verify", root)
+        run.add_task("VR-02")
+        return run
+
+    def _command(self) -> CommandSpec:
+        return CommandSpec(".", (sys.executable, "-c", "print('ok')"))
+
+    def test_every_command_record_carries_the_immutable_snapshot_identity(self) -> None:  # AC-1
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = self._repo_run(root)
+            stage = verification_stage("VR-02", attempt=1)
+
+            result = run_verification_commands(
+                run, (self._command(), self._command()), stage=stage,
+                task_id="VR-02", attempt=1, allowed_scope=("pkg.py",))
+
+            self.assertIsInstance(result, VerificationRun)
+            token = result.snapshot["token"]
+            self.assertTrue(token.startswith("snapshot:"))
+            self.assertEqual(
+                [record["snapshot"] for record in result.records], [token, token])
+
+    def test_evidence_carries_the_snapshot_and_survives_an_unrelated_edit(self) -> None:  # AC-2
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = self._repo_run(root)
+            stage = verification_stage("VR-02", attempt=1)
+            result = run_verification_commands(
+                run, (self._command(),), stage=stage, task_id="VR-02", attempt=1,
+                allowed_scope=("pkg.py",))
+
+            evidence = build_verification_evidence(
+                run, "VR-02", attempt=1, commands_run=result)
+            self.assertEqual(evidence.snapshot["token"], result.snapshot["token"])
+            self.assertIn(result.snapshot["token"], evidence.serialized())
+            self.assertEqual(
+                evidence.as_dict()["snapshot"]["token"], result.snapshot["token"])
+
+            before = evidence.serialized()
+            # An unrelated worktree edit after the fact cannot move the recorded evidence.
+            (root / "unrelated.py").write_text("changed later\n", encoding="utf-8")
+            (root / "brand-new.py").write_text("noise\n", encoding="utf-8")
+            self.assertEqual(evidence.serialized(), before)
+            self.assertEqual(
+                build_verification_evidence(
+                    run, "VR-02", attempt=1, commands_run=result).serialized(),
+                before,
+            )
+
+    def test_verification_fails_closed_when_no_snapshot_can_be_recorded(self) -> None:  # AC-3
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)  # not a Git work tree
+            prompt = root / "prompt.md"
+            prompt.write_text("feature prompt", encoding="utf-8")
+            run = Run.create("verify", prompt, None, root / "runs" / "verify", root)
+            run.add_task("VR-02")
+            stage = verification_stage("VR-02", attempt=1)
+
+            with self.assertRaises(SnapshotError):
+                run_verification_commands(
+                    run, (self._command(),), stage=stage, task_id="VR-02", attempt=1,
+                    allowed_scope=("pkg.py",))
+            self.assertEqual(run.stage_command_ids(stage), [])
+
+    def test_no_snapshot_is_recorded_when_not_requested(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = self._repo_run(root)
+            stage = verification_stage("VR-02", attempt=1)
+            result = run_verification_commands(
+                run, (self._command(),), stage=stage, task_id="VR-02", attempt=1)
+            self.assertIsNone(result.snapshot)
+            self.assertNotIn("snapshot", result.records[0])
 
 
 if __name__ == "__main__":
