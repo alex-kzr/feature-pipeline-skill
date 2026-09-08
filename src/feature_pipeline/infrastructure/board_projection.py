@@ -366,11 +366,14 @@ def _section_end(lines: list[str], start: int) -> int:
 def _parse_status_block(lines: list[str], start: int) -> int:
     """Return the index just past the three ``## Status`` checkbox lines."""
 
-    if start + 3 > len(lines):
+    checkbox_start = start
+    if checkbox_start < len(lines) and lines[checkbox_start].strip("\r\n") == "":
+        checkbox_start += 1
+    if checkbox_start + 3 > len(lines):
         raise MalformedTaskError("## Status block is truncated")
     labels: list[str] = []
     for offset in range(3):
-        stripped = lines[start + offset].rstrip("\r\n")
+        stripped = lines[checkbox_start + offset].rstrip("\r\n")
         match = _CHECKBOX_RE.match(stripped)
         if match is None:
             raise MalformedTaskError(f"unexpected ## Status line: {stripped!r}")
@@ -379,7 +382,7 @@ def _parse_status_block(lines: list[str], start: int) -> int:
         raise MalformedTaskError(
             f"## Status checkboxes must read {_STATUS_LABELS}, got {tuple(labels)}"
         )
-    return start + 3
+    return checkbox_start + 3
 
 
 def _render_status_block(lines: list[str], start: int, target_label: str) -> list[str]:
@@ -428,8 +431,12 @@ def _apply_task_transition(
     status_idx = _find_single_heading(lines, "## Status")
     if status_idx is None:
         raise MalformedTaskError("missing ## Status heading")
-    status_end = _parse_status_block(lines, status_idx + 1)
-    new_status_lines = _render_status_block(lines, status_idx + 1, _COLUMN_LABELS[target])
+    status_start = status_idx + 1
+    status_end = _parse_status_block(lines, status_start)
+    checkbox_start = status_start + 1 if status_end == status_start + 4 else status_start
+    new_status_lines = lines[status_start:checkbox_start] + _render_status_block(
+        lines, checkbox_start, _COLUMN_LABELS[target]
+    )
 
     head = lines[: status_idx + 1] + new_status_lines
 

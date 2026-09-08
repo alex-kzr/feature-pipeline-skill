@@ -89,6 +89,27 @@ def _evidence(**overrides: object) -> CompletionEvidence:
 class StartTransitionTests(unittest.TestCase):
     """AC-1."""
 
+    def test_start_accepts_one_blank_line_after_status_heading(self) -> None:
+        task_with_status_gap = TASK.replace("## Status\n", "## Status\n\n")
+        with temp_root() as root:
+            board = _write_bytes_exact(root / "docs/kanban.md", BOARD)
+            task = _write_bytes_exact(
+                root / "docs/plans/tasks/ABC-01_do-the-thing.md", task_with_status_gap
+            )
+
+            project_task_state(
+                board_path=board,
+                task_path=task,
+                task_id="ABC-01",
+                task_title="Do the thing",
+                state="running",
+            )
+
+            task_text = task.read_text(encoding="utf-8")
+            self.assertIn("- [ ] To Do\n", task_text)
+            self.assertIn("- [x] In Progress\n", task_text)
+            self.assertIn("- [ ] Done\n", task_text)
+
     def test_start_moves_card_and_checks_only_in_progress(self) -> None:
         with temp_root() as root:
             board = _write_bytes_exact(root / "docs/kanban.md", BOARD)
