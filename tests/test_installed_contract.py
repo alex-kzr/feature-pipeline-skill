@@ -87,9 +87,10 @@ class InstalledConsoleContract(unittest.TestCase):
     def test_help_runs_without_a_path_hack(self) -> None:
         # ``-I`` == isolated: no PYTHONPATH, no user site, cwd not on sys.path. The console
         # module can only be found through the install (AC-1).
+        # Isolation ignores PYTHONUTF8, so select the same encoding on both pipe ends.
         done = subprocess.run(
-            [sys.executable, "-I", "-m", "pipeline_core.runner_cli", "--help"],
-            capture_output=True, text=True, cwd=str(Path(sys.prefix)),
+            [sys.executable, "-I", "-X", "utf8", "-m", "pipeline_core.runner_cli", "--help"],
+            capture_output=True, text=True, encoding="utf-8", cwd=str(Path(sys.prefix)),
         )
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("usage", done.stdout.lower())
