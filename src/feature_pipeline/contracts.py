@@ -533,7 +533,7 @@ class Precondition:
         return f"{self.kind}: {self.value}"
 
 
-def validate_preconditions(values: Sequence[object]) -> tuple[Precondition, ...]:
+def validate_preconditions(values: object) -> tuple[Precondition, ...]:
     predicates: list[Precondition] = []
     if isinstance(values, (str, bytes)) or not isinstance(values, (list, tuple)):
         raise SchemaError("preconditions must be a list")

@@ -74,7 +74,9 @@ def path_variants(path: Path) -> tuple[Path, ...]:
     if os.name == "nt":
         import ctypes
 
-        for function in (ctypes.windll.kernel32.GetLongPathNameW, ctypes.windll.kernel32.GetShortPathNameW):
+        # ``ctypes.windll`` exists only on Windows; this branch is guarded by ``os.name``.
+        windll = ctypes.windll  # type: ignore[attr-defined]
+        for function in (windll.kernel32.GetLongPathNameW, windll.kernel32.GetShortPathNameW):
             buffer = ctypes.create_unicode_buffer(32768)
             if function(str(path), buffer, len(buffer)):
                 variants.append(Path(buffer.value))

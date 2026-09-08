@@ -50,6 +50,7 @@ jobs:
           enable-cache: true
 
       - name: Run ${{ matrix.gate.id }} gate
+        shell: bash
         run: >
           uv run python -m ci.run run ${{ matrix.gate.id }}
           --source-root "$GITHUB_WORKSPACE"

@@ -23,7 +23,7 @@ class EvidenceEligibilityError(Exception):
 
 def canonical_task_contract(definition: TaskDefinition | TaskSpec) -> dict[str, object]:
     """Return the input-neutral fields that define reusable task evidence."""
-    contract = {
+    contract: dict[str, object] = {
         "id": definition.id,
         "depends_on": sorted(definition.depends_on),
         "allowed_scope": sorted(definition.allowed_scope),

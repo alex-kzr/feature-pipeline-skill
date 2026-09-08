@@ -27,8 +27,8 @@ Standard library only.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Iterable, Mapping
 
 __all__ = [
     "Supersession",
@@ -40,6 +40,24 @@ __all__ = [
 _SPLIT_RE = re.compile(r"[,\s]+")
 _NONE_TOKENS = {"", "-", "—", "–", "(none)", "none", "n/a"}
 _VERIFIED = "verified"
+
+
+def _id_sequence(value: object) -> list[str]:
+    """Coerce a task-dict list field (``depends_on`` / ``supersedes``) to task IDs.
+
+    The ``load_markdown_plan`` task shape types these values as ``object``. A
+    missing or empty field yields no IDs; a bare string or any other non-iterable
+    is a malformed task dict and fails closed, consistent with the rest of this
+    module.
+    """
+    if not value:
+        return []
+    if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
+        raise SupersessionError(
+            f"task list field must be an iterable of IDs, got {type(value).__name__}",
+            "supersession-malformed-task",
+        )
+    return [str(item) for item in value]
 
 
 class SupersessionError(Exception):
@@ -150,13 +168,13 @@ class SupersessionGraph:
         task_list = list(tasks)
         known = [str(task["id"]) for task in task_list]
         dependencies = {
-            str(task["id"]): [str(dep) for dep in (task.get("depends_on") or ())]
+            str(task["id"]): _id_sequence(task.get("depends_on"))
             for task in task_list
         }
         edges = [
-            Supersession(replacement=str(task["id"]), superseded=str(superseded))
+            Supersession(replacement=str(task["id"]), superseded=superseded)
             for task in task_list
-            for superseded in (task.get("supersedes") or ())
+            for superseded in _id_sequence(task.get("supersedes"))
         ]
         return cls(edges, known_ids=known, dependencies=dependencies)
 

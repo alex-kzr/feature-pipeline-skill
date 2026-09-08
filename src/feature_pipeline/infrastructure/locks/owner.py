@@ -42,12 +42,14 @@ def pid_alive(pid: int | None) -> bool:
     if os.name == "nt":
         import ctypes
 
-        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+        # ``ctypes.windll`` exists only on Windows; this branch is guarded by ``os.name``.
+        windll = ctypes.windll  # type: ignore[attr-defined]
+        handle = windll.kernel32.OpenProcess(0x1000, False, pid)
         if not handle:
             return False
         code = ctypes.c_ulong()
-        ok = ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
-        ctypes.windll.kernel32.CloseHandle(handle)
+        ok = windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+        windll.kernel32.CloseHandle(handle)
         return bool(ok) and code.value == 259
     try:
         os.kill(pid, 0)

@@ -59,8 +59,10 @@ class LocalProcessRunner:
         if not argv:
             raise ProcessError("refusing to run an empty argv", "empty-argv")
 
+        # ``CREATE_NEW_PROCESS_GROUP`` is defined only in the Windows ``subprocess``;
+        # ``getattr`` keeps this import-safe (and correctly typed) on POSIX.
         creationflags = (
-            subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
         )
         start = time.monotonic()
         try:
