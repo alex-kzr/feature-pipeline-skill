@@ -21,6 +21,12 @@ Used                                         Evidence
                                              strictest mode that still lets a role finish
 ``--tools`` / ``--allowed-tools`` /          the tool policy — an empty ``--tools`` grants
 ``--disallowed-tools``                        nothing regardless of the role
+``--agents <json>`` + ``--agent <name>``      the role is defined *inline* and selected by name,
+                                             so a launch never depends on an on-disk
+                                             ``.claude/agents/<name>.md`` in the target project;
+                                             the universal runner operates arbitrary projects
+                                             that carry no pipeline agent files (RDS-06). An
+                                             on-disk definition, when present, still wins.
 ``--setting-sources user,project``           a machine-local settings file cannot loosen
                                              the grant
 ``--strict-mcp-config`` (no ``--mcp-config``) no MCP server is reachable at all
@@ -183,6 +189,60 @@ def on_disk_agent_name(role: str) -> str:
     — keep it the only one so an underscored spelling can never reach the CLI again (RDS-14).
     """
     return _ON_DISK_VERIFIER_AGENTS.get(normalize_role(role), role)
+
+
+#: One-line, shell-free charter per pipeline role. It is only the ``--agents`` *definition* the
+#: CLI needs so ``--agent <name>`` resolves without an on-disk file — the actual task
+#: instructions still travel on stdin. Any ``*-executor`` role (``python-executor``,
+#: ``rust-executor``, …) shares the executor charter; anything unrecognized gets the generic one.
+_ROLE_CHARTER: dict[str, str] = {
+    "executor": (
+        "Feature-pipeline executor. Implement only the selected task's allowed scope, run the "
+        "declared verification commands, and report the required status envelope. Do not verify "
+        "your own work and do not tick acceptance checkboxes."
+    ),
+    "task_verifier": (
+        "Feature-pipeline task verifier. Read-only: never edit files. Judge the task's "
+        "acceptance criteria against the actual implementation and report a PASS or FAIL verdict."
+    ),
+    "test_verifier": (
+        "Feature-pipeline test verifier. Read-only apart from running the declared checks. "
+        "Confirm the recorded verification commands genuinely pass and report a PASS or FAIL "
+        "verdict."
+    ),
+}
+_GENERIC_CHARTER = (
+    "Feature-pipeline worker. Follow the instructions provided on stdin, stay within the stated "
+    "allowed scope and tool policy, and report the required envelope."
+)
+
+
+def _role_charter(role: str, *, read_only: bool) -> str:
+    normalized = normalize_role(role)
+    charter = _ROLE_CHARTER.get(normalized)
+    if charter is None:
+        charter = _ROLE_CHARTER["executor"] if normalized.endswith("executor") else _GENERIC_CHARTER
+    if read_only and "read-only" not in charter.lower():
+        charter += " This session is read-only. Never modify the working tree or push."
+    return charter
+
+
+def inline_agents_json(request: LaunchRequest, *, read_only: bool) -> str:
+    """The ``--agents`` value: an inline definition of exactly the role being launched.
+
+    Selected by the ``--agent <name>`` that follows it. This is what makes a launch independent
+    of whatever ``.claude/agents`` files the target project happens to carry (RDS-06); the CLI
+    still prefers an on-disk definition of the same name when one exists. Compact, ASCII-only,
+    and free of shell metacharacters so :func:`_assert_shell_free` stays satisfied.
+    """
+    name = on_disk_agent_name(request.role)
+    definition = {
+        name: {
+            "description": f"Feature-pipeline {name} role, defined inline for target-project independence",
+            "prompt": _role_charter(request.role, read_only=read_only),
+        }
+    }
+    return json.dumps(definition, ensure_ascii=True, separators=(",", ":"))
 
 
 def request_is_read_only(request: LaunchRequest) -> bool:
@@ -367,6 +427,7 @@ def build_claude_argv(
             disallowed.append(PUSH_DENY_TOOL)
         argv += ["--disallowed-tools", ",".join(disallowed)]
 
+    argv += ["--agents", inline_agents_json(request, read_only=read_only)]
     argv += ["--agent", on_disk_agent_name(request.role)]
 
     for directory in add_dirs:
