@@ -63,6 +63,39 @@ class ArtifactCharacterizationTests(unittest.TestCase):
                 read_json(target)
             self.assertEqual(caught.exception.code, "invalid-json")
 
+    def test_os_path_is_a_noop_off_windows_and_for_short_paths(self) -> None:
+        from pipeline_core.artifacts import _os_path
+
+        self.assertEqual(_os_path("reports/result.json"), "reports/result.json")
+        if os.name == "nt":
+            self.assertEqual(_os_path(r"C:\short\result.json"), r"C:\short\result.json")
+
+    @unittest.skipUnless(os.name == "nt", "extended-length prefix is Windows-only")
+    def test_os_path_lifts_the_max_path_limit_for_a_deep_target(self) -> None:
+        from pipeline_core.artifacts import _os_path
+
+        deep = "C:\\" + "\\".join(f"segment_{i:03d}" for i in range(30)) + "\\manifest.json.tmp"
+        self.assertGreaterEqual(len(deep), 240)
+        self.assertEqual(_os_path(deep), "\\\\?\\" + deep)
+        self.assertEqual(_os_path("\\\\?\\" + deep), "\\\\?\\" + deep)  # already-prefixed is untouched
+
+    def test_atomic_write_succeeds_under_a_deep_parent_directory(self) -> None:
+        # A run directory nested well past MAX_PATH (260) below a long scratch/CI root must not
+        # make the manifest write fail with FileNotFoundError on its own .tmp file.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
+            deep = Path(directory)
+            for i in range(24):
+                deep = deep / f"reports_segment_{i:02d}"
+            target = deep / "implementation-manifest-1.json"
+            self.assertGreater(len(str(target)), 260)
+            write_json_atomic(target, {"attribution_state": "known-empty"})
+            from pipeline_core.artifacts import _os_path, read_json
+            self.assertEqual(
+                read_json(_os_path(target)),
+                {"attribution_state": "known-empty"},
+            )
+            self.assertFalse(os.path.exists(_os_path(target.with_name(target.name + ".tmp"))))
+
 
 class StateCharacterizationTests(unittest.TestCase):
     def _run(self, root: Path) -> Run:

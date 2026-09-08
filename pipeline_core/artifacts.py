@@ -26,6 +26,27 @@ class ArtifactSchemaError(ArtifactError):
     """Raised when a parsed artifact fails a caller schema."""
 
 
+def _os_path(path: str | Path) -> str:
+    r"""A filesystem string safe to pass to ``os``/``pathlib`` on this host.
+
+    On Windows the classic Win32 API caps a path at ``MAX_PATH`` (260) unless it is given in
+    extended-length form, so a deep run directory under a long parent (a temp/scratch root, a
+    CI workspace) makes an otherwise valid ``…/implementation-manifest-1.json.tmp`` write fail
+    with ``FileNotFoundError`` even though its parent exists. Prefixing ``\\?\`` lifts the limit;
+    it requires a fully-qualified, backslash-separated path with no ``.``/``..`` segments, which
+    ``os.path.abspath`` already produces. A strict no-op off Windows and for short paths.
+    """
+    text = os.fspath(path)
+    if os.name != "nt":
+        return text
+    absolute = os.path.abspath(text)
+    if absolute.startswith("\\\\?\\") or len(absolute) < 240:
+        return text
+    if absolute.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + absolute[2:]
+    return "\\\\?\\" + absolute
+
+
 def read_json(path: str | Path, *, schema: Callable[[Any], Any] | None = None) -> Any:
     """Read JSON and normalize I/O and schema failures to stable errors."""
     target = Path(path)
@@ -49,14 +70,16 @@ def write_json_atomic(path: str | Path, payload: Any, *, repo_root: str | Path |
     """Serialize before touching disk, then replace the target atomically."""
     text = json.dumps(redact(payload, build_rules(repo_root)), indent=2, ensure_ascii=False) + "\n"
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
+    os.makedirs(_os_path(target.parent), exist_ok=True)
     temporary = target.with_name(f"{target.name}.tmp")
+    tmp_os, target_os = _os_path(temporary), _os_path(target)
     try:
-        temporary.write_text(text, encoding="utf-8")
-        os.replace(temporary, target)
+        with open(tmp_os, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp_os, target_os)
     finally:
-        if temporary.exists():
-            temporary.unlink()
+        if os.path.exists(tmp_os):
+            os.unlink(tmp_os)
     return target
 
 
@@ -69,12 +92,14 @@ def write_text_atomic(path: str | Path, text: str, *, repo_root: str | Path | No
     """
     redacted = redact_text(text, output_rules(repo_root))
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
+    os.makedirs(_os_path(target.parent), exist_ok=True)
     temporary = target.with_name(f"{target.name}.tmp")
+    tmp_os, target_os = _os_path(temporary), _os_path(target)
     try:
-        temporary.write_text(redacted, encoding="utf-8")
-        os.replace(temporary, target)
+        with open(tmp_os, "w", encoding="utf-8") as handle:
+            handle.write(redacted)
+        os.replace(tmp_os, target_os)
     finally:
-        if temporary.exists():
-            temporary.unlink()
+        if os.path.exists(tmp_os):
+            os.unlink(tmp_os)
     return target
