@@ -801,6 +801,20 @@ def _plan_request() -> LaunchRequest:
     )
 
 
+def _scoped_executor_request() -> LaunchRequest:
+    """A writing executor whose allowed scope names the external roots.
+
+    ``--add-dir`` only ever widens a *writing* sandbox (``scoped_add_dirs`` returns nothing
+    for a read-only role by design), so the resolved real-path grant an external root gets
+    is exercised through a writing request whose ``allowed_scope`` selects the ``.agents``
+    and ``core`` logical roots.
+    """
+    return LaunchRequest(
+        role="executor", task_id="T-1", prompt="", report_path=Path("report.md"),
+        role_grant=("read", "write"), allowed_scope=(".agents", "core"),
+    )
+
+
 class MakeExecuteAdaptersTests(unittest.TestCase):
     """RDS-10 / RDS-17: the production ``ClaudeAdapter`` (shared by executor, task-verifier,
     and test-verifier — one instance, `VerifierLaunchers(task=executor, test=executor)`) must
@@ -824,7 +838,7 @@ class MakeExecuteAdaptersTests(unittest.TestCase):
 
             executor, _launchers, _environment = runner_cli.make_execute_adapters(
                 project_dir, symlinked_agents_root, project_dir)
-            argv = executor.plan(_plan_request())
+            argv = executor.plan(_scoped_executor_request())
 
             self.assertIn(str(real_agents_root.resolve()), argv)
             self.assertNotIn(str(symlinked_agents_root), argv)
@@ -871,7 +885,7 @@ class MakeExecuteAdaptersTests(unittest.TestCase):
                 symlinked_agents_root / "skills" / "software-development" / "feature-pipeline")
             executor, _launchers, _environment = runner_cli.make_execute_adapters(
                 project_dir, symlinked_agents_root, logical_core_root)
-            argv = executor.plan(_plan_request())
+            argv = executor.plan(_scoped_executor_request())
 
             self.assertIn(str(real_agents_root.resolve()), argv)
             self.assertIn(str(real_core_root.resolve()), argv)
@@ -902,7 +916,7 @@ class MakeExecuteAdaptersTests(unittest.TestCase):
                 symlinked_agents_root / "skills" / "software-development" / "core")
             executor, _launchers, _environment = runner_cli.make_execute_adapters(
                 project_dir, symlinked_agents_root, logical_core_root)
-            argv = executor.plan(_plan_request())
+            argv = executor.plan(_scoped_executor_request())
 
             self.assertEqual(argv.count("--add-dir"), 1)
             self.assertIn(str(real_agents_root.resolve()), argv)

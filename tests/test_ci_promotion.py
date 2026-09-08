@@ -34,9 +34,11 @@ from unittest import mock
 
 from ci import contract, promotion
 
+from tests._umbrella import require_umbrella, umbrella_root
+
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "ci" / "promotion"
 PROMOTION_WORKFLOW = (
-    Path(__file__).resolve().parents[2] / ".github" / "workflows" / "core-promotion.yml"
+    umbrella_root() / ".github" / "workflows" / "core-promotion.yml"
 )
 
 CORE_SHA = "1111111111111111111111111111111111111111"
@@ -319,6 +321,9 @@ class RequiredChecksComeFromTheManifest(unittest.TestCase):
 
 class PromotionWorkflowAdapter(unittest.TestCase):
     def setUp(self) -> None:
+        # core-promotion.yml lives in the umbrella (feature-pipeline) repo, never in a
+        # standalone feature-pipeline-skill checkout.
+        require_umbrella(".github/workflows/core-promotion.yml")
         if not PROMOTION_WORKFLOW.is_file():
             self.fail(f"missing promotion workflow {PROMOTION_WORKFLOW}")
         self.text = PROMOTION_WORKFLOW.read_text(encoding="utf-8")

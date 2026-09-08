@@ -799,6 +799,199 @@ def _reconcile_projection(
             ) from exc
 
 
+def _resolve_selection_and_scope(
+    request: ExecuteRequest,
+    plan: CompiledRunPlan | None,
+    order: Sequence[str],
+    spec_by_id: Mapping[str, TaskSpec],
+) -> tuple[list[str], list[str]]:
+    """The selected task ids and the dependency-closure execution scope, in plan order.
+
+    A compiled plan (the real CLI path) already resolved selection through
+    ``resolve_selection``; trust it. Without one, mirror the CLI's ``--task`` / ``--through``
+    selection and walk the declared dependencies to the closure.
+    """
+    if plan is not None:
+        return list(plan.selection), list(plan.execution_scope or plan.selection)
+    selected = _select_ids(order, request.controls.task, request.controls.through)
+    closure = set(selected)
+    pending = list(selected)
+    while pending:
+        task_id = pending.pop()
+        for dependency in spec_by_id[task_id].depends_on:
+            if dependency not in closure:
+                closure.add(dependency)
+                pending.append(dependency)
+    return selected, [task_id for task_id in order if task_id in closure]
+
+
+def _resume_open_run(
+    request: ExecuteRequest,
+    resolution: AdapterResolution,
+    controls_map: Mapping[str, tuple[object, str]],
+    specs: Sequence[TaskSpec],
+    execution_scope: Sequence[str],
+    by_id: Mapping[str, TaskSpec],
+    bindings: dict[str, str],
+    plan: CompiledRunPlan | None,
+) -> tuple[RunLifecycle, list[str]]:
+    """Reconcile the persisted run for a ``--resume`` and return ``(lifecycle, active scope)``."""
+    recorded = Run.load(request.run_dir, request.repo_root)
+    active_scope = [task_id for task_id in execution_scope if task_id in recorded.tasks]
+    _ensure_execution_controls_match(
+        recorded, execution_scope, request.controls.verify_dependency_chain,
+    )
+    _ensure_precondition_contracts_match(recorded, specs)
+    recorded_bindings = recorded.controls.get("precondition_bindings", {}).get("value") or {}
+    recorded_refs = (recorded.controls.get("preconditions", {}).get("value") or {}).get("published_refs", [])
+    if recorded_bindings != bindings or dict(recorded_refs) != dict(request.controls.published_refs):
+        raise ExecutionError(
+            "resume precondition bindings do not match the recorded run",
+            "precondition-binding-mismatch",
+        )
+    if plan is not None:
+        _ensure_plan_compatible(recorded, plan)
+    life = RunLifecycle.resume(
+        request.run_dir, request.repo_root,
+        feature=request.feature, prompt_path=request.prompt_path,
+        plan_path=request.plan_path,
+        expected_tasks={
+            spec.id: list(spec.depends_on)
+            for spec in specs if spec.id in active_scope
+        },
+    )
+    ensure_pinned_adapter(life.run, resolution)
+    _ensure_attestations_match(life.run, request.controls.attested_dependencies)
+    for name, (value, sourced) in controls_map.items():
+        if sourced == "explicit":
+            life.run.set_control(name, value, sourced=sourced)
+    if request.board_path is not None:
+        _reconcile_projection(life, request.board_path, by_id, active_scope)
+    return life, active_scope
+
+
+def _collect_reusable_evidence(
+    request: ExecuteRequest,
+    scope: Sequence[str],
+    selected: Sequence[str],
+    by_id: Mapping[str, TaskSpec],
+) -> tuple[dict[str, Mapping[str, Any]], list[str]]:
+    """Resolve reusable verified evidence for out-of-selection scope tasks, then prune the
+    ancestors that reuse makes unnecessary. Returns ``(reused, pruned scope)``."""
+    reused: dict[str, Mapping[str, Any]] = {}
+    if request.controls.verify_dependency_chain:
+        return reused, list(scope)
+    store = VerifiedEvidenceStore(request.run_dir.parent, request.repo_root)
+    explicit_sources = dict(request.controls.attested_dependencies)
+    for task_id in scope:
+        if task_id in selected:
+            continue
+        try:
+            evidence = (
+                store.find_at(
+                    _resolve_source_run_dir(request.run_dir, explicit_sources[task_id]),
+                    by_id[task_id],
+                ) if task_id in explicit_sources else store.find(by_id[task_id])
+            )
+        except EvidenceEligibilityError as exc:
+            if task_id in explicit_sources:
+                raise ExecutionError(str(exc), exc.code) from None
+            continue
+        reused[task_id] = evidence
+    pruned = list(prune_reused_ancestors(
+        scope, selected, reused,
+        {task_id: spec.depends_on for task_id, spec in by_id.items()},
+    ))
+    return reused, pruned
+
+
+def _fresh_open_run(
+    request: ExecuteRequest,
+    resolution: AdapterResolution,
+    controls_map: Mapping[str, tuple[object, str]],
+    specs: Sequence[TaskSpec],
+    selected: Sequence[str],
+    scope: list[str],
+    by_id: Mapping[str, TaskSpec],
+    bindings: dict[str, str],
+) -> tuple[RunLifecycle, list[str]] | ExecuteResult:
+    """Create a fresh run, fast-forward every reuse-eligible task, and return
+    ``(lifecycle, scope)`` — or a terminal :class:`ExecuteResult` when a reused task's
+    preconditions block the run."""
+    reused, scope = _collect_reusable_evidence(request, scope, selected, by_id)
+    run = Run.create(
+        request.feature, request.prompt_path, request.plan_path,
+        request.run_dir, request.repo_root)
+    life = RunLifecycle.initialize(
+        run,
+        tasks=[
+            (spec.id, [dep for dep in spec.depends_on if dep in scope])
+            for spec in specs if spec.id in scope
+        ],
+        controls=controls_map,
+        adapter_requested=resolution.requested,
+        adapter_resolved=resolution.resolved,
+    )
+    if reused:
+        for task_id in scope:
+            evidence = reused.get(task_id)
+            if evidence is None:
+                continue
+            reason = _check_preconditions(life, request, by_id[task_id], bindings)
+            if reason:
+                persist_task_contracts(life.run, [by_id[tid] for tid in scope])
+                life.run.save()
+                return ExecuteResult("blocked", EXIT_BLOCKED, reason, request.run_dir, life.run.run_id)
+            life.transition(task_id, "running", actor=ACTOR_RUNNER,
+                            note="verified by reusable evidence")
+            life.transition(task_id, "implemented", actor=ACTOR_RUNNER,
+                            note="verified by reusable evidence")
+            life.run.record_verdicts(task_id, "PASS", "PASS")
+            life.run.record_reused_verification(task_id, evidence)
+        life.recompute_readiness()
+    return life, scope
+
+
+def _open_run(
+    request: ExecuteRequest,
+    resolution: AdapterResolution,
+    controls_map: Mapping[str, tuple[object, str]],
+    specs: Sequence[TaskSpec],
+    selected: Sequence[str],
+    scope: list[str],
+    execution_scope: Sequence[str],
+    by_id: Mapping[str, TaskSpec],
+    bindings: dict[str, str],
+    plan: CompiledRunPlan | None,
+) -> tuple[RunLifecycle, list[str]] | ExecuteResult:
+    """Initialize a fresh durable run or reconcile a resumed one.
+
+    Returns ``(lifecycle, scope)`` on success (with task contracts persisted and the adapter
+    pinned), or a terminal :class:`ExecuteResult` when the run cannot open or a reused task's
+    preconditions block it.
+    """
+    try:
+        if request.controls.resume:
+            life, scope = _resume_open_run(
+                request, resolution, controls_map, specs, execution_scope, by_id, bindings,
+                plan,
+            )
+        else:
+            opened = _fresh_open_run(
+                request, resolution, controls_map, specs, selected, scope, by_id, bindings,
+            )
+            if isinstance(opened, ExecuteResult):
+                return opened
+            life, scope = opened
+    except (StateError, ResumeError, AdapterResolutionError, ExecutionError) as exc:
+        return _error(f"{getattr(exc, 'code', 'state-error')}: {exc}", request)
+
+    persist_task_contracts(life.run, [spec for spec in specs if spec.id in scope])
+    pin_adapter(life.run, resolution)
+    life.run.save()
+    return life, scope
+
+
 def execute_run(request: ExecuteRequest) -> ExecuteResult:
     """Drive every selected task to ``verified`` or to a truthful non-zero terminal state.
 
@@ -829,22 +1022,7 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
     plan = request.compiled_plan
 
     try:
-        if plan is not None:
-            # The compiled plan already resolved the selection (through
-            # ``resolve_selection``); trust it and only re-run the shape checks.
-            selected = list(plan.selection)
-            scope = list(plan.execution_scope or plan.selection)
-        else:
-            selected = _select_ids(order, request.controls.task, request.controls.through)
-            closure = set(selected)
-            pending = list(selected)
-            while pending:
-                task_id = pending.pop()
-                for dependency in spec_by_id[task_id].depends_on:
-                    if dependency not in closure:
-                        closure.add(dependency)
-                        pending.append(dependency)
-            scope = [task_id for task_id in order if task_id in closure]
+        selected, scope = _resolve_selection_and_scope(request, plan, order, spec_by_id)
         _validate_attestation_scope(request.controls, spec_by_id)
     except ExecutionError as exc:
         return _error(f"{exc.code}: {exc}", request)
@@ -903,100 +1081,13 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
     # 3. Durable lifecycle: initialize a fresh run, or resume the persisted one. A fresh run's
     #    attestations are resolved against their source runs before any run.json exists
     #    (AC-2's "no partial state" on a denial); a resume trusts whatever was recorded.
-    try:
-        if request.controls.resume:
-            recorded = Run.load(request.run_dir, request.repo_root)
-            active_scope = [task_id for task_id in execution_scope if task_id in recorded.tasks]
-            _ensure_execution_controls_match(
-                recorded, execution_scope, request.controls.verify_dependency_chain,
-            )
-            _ensure_precondition_contracts_match(recorded, specs)
-            recorded_bindings = recorded.controls.get("precondition_bindings", {}).get("value") or {}
-            recorded_refs = (recorded.controls.get("preconditions", {}).get("value") or {}).get("published_refs", [])
-            if recorded_bindings != bindings or dict(recorded_refs) != dict(request.controls.published_refs):
-                raise ExecutionError(
-                    "resume precondition bindings do not match the recorded run",
-                    "precondition-binding-mismatch",
-                )
-            if plan is not None:
-                _ensure_plan_compatible(recorded, plan)
-            life = RunLifecycle.resume(
-                request.run_dir, request.repo_root,
-                feature=request.feature, prompt_path=request.prompt_path,
-                plan_path=request.plan_path,
-                expected_tasks={
-                    spec.id: list(spec.depends_on)
-                    for spec in specs if spec.id in active_scope
-                },
-            )
-            ensure_pinned_adapter(life.run, resolution)
-            _ensure_attestations_match(life.run, request.controls.attested_dependencies)
-            for name, (value, sourced) in controls_map.items():
-                if sourced == "explicit":
-                    life.run.set_control(name, value, sourced=sourced)
-            if request.board_path is not None:
-                _reconcile_projection(life, request.board_path, by_id, active_scope)
-            scope = active_scope
-        else:
-            reused: dict[str, Mapping[str, Any]] = {}
-            store = VerifiedEvidenceStore(request.run_dir.parent, request.repo_root)
-            if not request.controls.verify_dependency_chain:
-                explicit_sources = dict(request.controls.attested_dependencies)
-                for task_id in scope:
-                    if task_id in selected:
-                        continue
-                    try:
-                        evidence = (
-                            store.find_at(
-                                _resolve_source_run_dir(request.run_dir, explicit_sources[task_id]),
-                                by_id[task_id],
-                            ) if task_id in explicit_sources else store.find(by_id[task_id])
-                        )
-                    except EvidenceEligibilityError as exc:
-                        if task_id in explicit_sources:
-                            raise ExecutionError(str(exc), exc.code) from None
-                        continue
-                    reused[task_id] = evidence
-                scope = list(prune_reused_ancestors(
-                    scope, selected, reused,
-                    {task_id: spec.depends_on for task_id, spec in by_id.items()},
-                ))
-            run = Run.create(
-                request.feature, request.prompt_path, request.plan_path,
-                request.run_dir, request.repo_root)
-            life = RunLifecycle.initialize(
-                run,
-                tasks=[
-                    (spec.id, [dep for dep in spec.depends_on if dep in scope])
-                    for spec in specs if spec.id in scope
-                ],
-                controls=controls_map,
-                adapter_requested=resolution.requested,
-                adapter_resolved=resolution.resolved,
-            )
-            if reused:
-                for task_id in scope:
-                    evidence = reused.get(task_id)
-                    if evidence is None:
-                        continue
-                    reason = _check_preconditions(life, request, by_id[task_id], bindings)
-                    if reason:
-                        persist_task_contracts(life.run, [by_id[tid] for tid in scope])
-                        life.run.save()
-                        return ExecuteResult("blocked", EXIT_BLOCKED, reason, request.run_dir, life.run.run_id)
-                    life.transition(task_id, "running", actor=ACTOR_RUNNER,
-                                    note="verified by reusable evidence")
-                    life.transition(task_id, "implemented", actor=ACTOR_RUNNER,
-                                    note="verified by reusable evidence")
-                    life.run.record_verdicts(task_id, "PASS", "PASS")
-                    life.run.record_reused_verification(task_id, evidence)
-                life.recompute_readiness()
-    except (StateError, ResumeError, AdapterResolutionError, ExecutionError) as exc:
-        return _error(f"{getattr(exc, 'code', 'state-error')}: {exc}", request)
-
-    persist_task_contracts(life.run, [spec for spec in specs if spec.id in scope])
-    pin_adapter(life.run, resolution)
-    life.run.save()
+    opened = _open_run(
+        request, resolution, controls_map, specs, selected, scope, execution_scope,
+        by_id, bindings, plan,
+    )
+    if isinstance(opened, ExecuteResult):
+        return opened
+    life, scope = opened
 
     for task_id in scope:
         record = life.run.task(task_id)

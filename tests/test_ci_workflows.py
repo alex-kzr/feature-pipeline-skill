@@ -39,6 +39,8 @@ from tempfile import TemporaryDirectory
 
 from ci import contract, workflows
 
+from tests._umbrella import require_umbrella, umbrella_root
+
 WORKFLOW = (
     Path(__file__).resolve().parents[1] / ".github" / "workflows" / "quality-gates.yml"
 )
@@ -46,7 +48,7 @@ WORKFLOW = (
 # UGA-06: the umbrella (``feature-pipeline``) consumer workflow lives one level above the core
 # submodule checkout, not inside it.
 UMBRELLA_WORKFLOW = (
-    Path(__file__).resolve().parents[2]
+    umbrella_root()
     / ".github"
     / "workflows"
     / "installed-package.yml"
@@ -573,6 +575,9 @@ class UmbrellaConsumerAdapterTests(unittest.TestCase):
     a driver-expanded matrix, and no unconditional evidence step."""
 
     def setUp(self) -> None:
+        # installed-package.yml lives in the umbrella (feature-pipeline) repo, never in a
+        # standalone feature-pipeline-skill checkout.
+        require_umbrella(".github/workflows/installed-package.yml")
         if not UMBRELLA_WORKFLOW.is_file():
             self.fail(f"missing umbrella workflow {UMBRELLA_WORKFLOW}")
         self.text = UMBRELLA_WORKFLOW.read_text(encoding="utf-8")
@@ -641,6 +646,7 @@ class UmbrellaWorkflowValidatesInAnArbitrarilyNamedNestedCheckout(unittest.TestC
     repository this project ships under."""
 
     def test_no_violations_in_a_renamed_nested_layout(self) -> None:
+        require_umbrella(".github/workflows/installed-package.yml")
         workflow_text = UMBRELLA_WORKFLOW.read_text(encoding="utf-8")
         with TemporaryDirectory() as raw:
             umbrella = Path(raw) / "arbitrary-umbrella-name"

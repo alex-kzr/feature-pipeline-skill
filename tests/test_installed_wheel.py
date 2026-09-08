@@ -35,8 +35,9 @@ from tests.installed_wheel import (
     collect_evidence,
     uv_available,
 )
+from tests._umbrella import require_umbrella, umbrella_root
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+_REPO_ROOT = umbrella_root()
 
 # Build + install once for the whole module — the recipe is deterministic and the runtime
 # has no dependencies, but a venv per test method is still wasteful.
@@ -138,6 +139,9 @@ class CiMatrixContract(unittest.TestCase):
     never transcribed into the umbrella workflow YAML."""
 
     def setUp(self) -> None:
+        # installed-package.yml is an umbrella-repo workflow; a standalone
+        # feature-pipeline-skill checkout never carries it.
+        require_umbrella(installed_wheel.CI_WORKFLOW)
         self.workflow = _REPO_ROOT / installed_wheel.CI_WORKFLOW
         if not self.workflow.is_file():
             self.fail(f"missing CI workflow {installed_wheel.CI_WORKFLOW}")

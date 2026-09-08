@@ -199,6 +199,68 @@ def _dry_run_reuse_definitions(
     return {spec.id: spec for spec in specs}
 
 
+def _load_profile(profile_path: Path):
+    """Load the runnable profile, translating every load failure to a typed ``CliError``."""
+    try:
+        return load_runnable_profile(profile_path)
+    except FileNotFoundError:
+        raise CliError(EXIT_ERROR, "profile file not found") from None
+    except SchemaError as exc:
+        raise CliError(EXIT_ERROR, f"profile is invalid: {exc}") from None
+    except json.JSONDecodeError:
+        raise CliError(EXIT_ERROR, "profile file is not valid JSON") from None
+
+
+def _load_post_task_config(
+    profile_path: Path, post_task: bool
+) -> tuple[ReleasePolicy | None, str | None, int]:
+    """``release-dry-run`` consumes the project's post-task contract as-is: the
+    tool-integration block and the release policy declared beside the profile. Returns
+    ``(release_policy, wrapper_dir, expected_output_count)``; a plain run gets the neutral
+    ``(None, None, 0)``. Loading is fail-closed."""
+    if not post_task:
+        return None, None, 0
+    config_dir = profile_path.parent
+    try:
+        integration = load_tool_integration(config_dir / "integrations.json")
+        release_policy = load_release_policy(config_dir / "release.json")
+    except FileNotFoundError:
+        raise CliError(
+            EXIT_ERROR,
+            "release-dry-run needs an integrations.json and a release.json beside the "
+            "profile") from None
+    except SchemaError as exc:
+        raise CliError(EXIT_ERROR, f"post-task config is invalid: {exc}") from None
+    except json.JSONDecodeError:
+        raise CliError(EXIT_ERROR, "post-task config is not valid JSON") from None
+    return release_policy, integration.wrapper_dir, len(integration.expected_outputs)
+
+
+def _preview_exit_code(
+    *,
+    dep_blocked: dict[str, list[str]],
+    lease_blocked: bool,
+    resume: bool,
+    unresolved: bool,
+    lease_dir: Path,
+    project_dir: Path,
+    feature: str,
+) -> int:
+    """The frozen ``EXIT_*`` outcome for a status / dry-run / plan-only preview."""
+    if dep_blocked:
+        return EXIT_BLOCKED
+    if lease_blocked:
+        return EXIT_BLOCKED
+    if resume:
+        return _resume_exit(lease_dir, project_dir, feature)
+    if unresolved:
+        return EXIT_ERROR
+    # A non-blocked run - dry or real - stops with a delivery gate still pending.
+    # The legacy runner and the MI-01 exit-code table ("10 ... preserve") return
+    # EXIT_GATE_PENDING for every non-blocked --dry-run; the core preserves that.
+    return EXIT_GATE_PENDING
+
+
 def run_command(command: RunCommand) -> PipelineResult:
     """Resolve anchors and profile, then dispatch to status, dry-run, or execute."""
     project_root = Path(_require(command.project_root, "--project-root"))
@@ -219,36 +281,9 @@ def run_command(command: RunCommand) -> PipelineResult:
         project_skill_rel = _logical_relative(command.project_skill, "--project-skill")
         _resolve_under(agents_root, project_skill_rel, "--project-skill")
 
-    try:
-        profile = load_runnable_profile(profile_path)
-    except FileNotFoundError:
-        raise CliError(EXIT_ERROR, "profile file not found") from None
-    except SchemaError as exc:
-        raise CliError(EXIT_ERROR, f"profile is invalid: {exc}") from None
-    except json.JSONDecodeError:
-        raise CliError(EXIT_ERROR, "profile file is not valid JSON") from None
+    profile = _load_profile(profile_path)
 
-    # ``release-dry-run`` consumes the project's post-task contract as-is: the tool-integration
-    # block and the release policy declared beside the profile. Loading is fail-closed.
-    release_policy: ReleasePolicy | None = None
-    wrapper_dir: str | None = None
-    output_count = 0
-    if post_task:
-        config_dir = profile_path.parent
-        try:
-            integration = load_tool_integration(config_dir / "integrations.json")
-            release_policy = load_release_policy(config_dir / "release.json")
-        except FileNotFoundError:
-            raise CliError(
-                EXIT_ERROR,
-                "release-dry-run needs an integrations.json and a release.json beside the "
-                "profile") from None
-        except SchemaError as exc:
-            raise CliError(EXIT_ERROR, f"post-task config is invalid: {exc}") from None
-        except json.JSONDecodeError:
-            raise CliError(EXIT_ERROR, "post-task config is not valid JSON") from None
-        wrapper_dir = integration.wrapper_dir
-        output_count = len(integration.expected_outputs)
+    release_policy, wrapper_dir, output_count = _load_post_task_config(profile_path, post_task)
 
     project_dir = _resolve_under(project_root, profile.logical_paths.project, "project path")
     composition = build_bootstrap(project_dir, agents_root, core_root)
@@ -395,19 +430,15 @@ def run_command(command: RunCommand) -> PipelineResult:
 
     unresolved = bool(route_reason_by_id)
 
-    if dep_blocked:
-        exit_code = EXIT_BLOCKED
-    elif lease_blocked:
-        exit_code = EXIT_BLOCKED
-    elif command.resume:
-        exit_code = _resume_exit(lease_dir, project_dir, feature)
-    elif unresolved:
-        exit_code = EXIT_ERROR
-    else:
-        # A non-blocked run - dry or real - stops with a delivery gate still pending.
-        # The legacy runner and the MI-01 exit-code table ("10 ... preserve") return
-        # EXIT_GATE_PENDING for every non-blocked --dry-run; the core preserves that.
-        exit_code = EXIT_GATE_PENDING
+    exit_code = _preview_exit_code(
+        dep_blocked=dep_blocked,
+        lease_blocked=lease_blocked,
+        resume=command.resume,
+        unresolved=unresolved,
+        lease_dir=lease_dir,
+        project_dir=project_dir,
+        feature=feature,
+    )
 
     mode = "unattended" if command.unattended else command.mode
 

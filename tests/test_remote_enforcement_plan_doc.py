@@ -24,9 +24,17 @@ from ci import promotion
 from ci import required_checks as rc
 
 from tests import desired_rulesets as ds
+from tests._umbrella import require_umbrella, umbrella_root
+
+
+def setUpModule() -> None:
+    # docs/validation/github-actions-remote-enforcement-plan.md ships only in the umbrella
+    # working tree; a standalone feature-pipeline-skill checkout carries no docs/.
+    require_umbrella("docs/validation/github-actions-remote-enforcement-plan.md")
+
 
 DOC = (
-    Path(__file__).resolve().parents[2]
+    umbrella_root()
     / "docs"
     / "validation"
     / "github-actions-remote-enforcement-plan.md"

@@ -62,7 +62,16 @@ from feature_pipeline.contracts import TaskSpec
 from pipeline_core.profiles import Anchors, resolve_route
 from pipeline_core.project_profile import load_runnable_profile
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+from tests._umbrella import require_umbrella, umbrella_root
+
+
+def setUpModule() -> None:
+    # The shipped profile (tools/feature-pipeline/config/pipeline.profile.json) exists only
+    # in the umbrella working tree; a standalone core checkout never carries it.
+    require_umbrella("tools/feature-pipeline/config/pipeline.profile.json")
+
+
+_REPO_ROOT = umbrella_root()
 _PROFILE_PATH = _REPO_ROOT / "tools" / "feature-pipeline" / "config" / "pipeline.profile.json"
 
 

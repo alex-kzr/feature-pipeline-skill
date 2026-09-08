@@ -130,6 +130,24 @@ def _init_repo(root: Path) -> None:
     _git(root, "commit", "-qm", "base")
 
 
+def _execute_run_family_src() -> str:
+    """``execute_run`` plus the cohesive helpers it delegates to.
+
+    UGA-18 dropped ``execute_run``'s mccabe complexity below the gate ceiling by extracting
+    ``_resolve_selection_and_scope`` / ``_open_run`` / ``_resume_open_run`` /
+    ``_fresh_open_run`` / ``_collect_reusable_evidence``. The selection read, the resume
+    plan-compatibility guard and the ``RunLifecycle`` construction now live in those helpers
+    rather than inline, so the source-shape characterizations below look at the whole family.
+    """
+    parts = [inspect.getsource(execution_mod.execute_run)]
+    for name in (
+        "_resolve_selection_and_scope", "_open_run", "_resume_open_run",
+        "_fresh_open_run", "_collect_reusable_evidence",
+    ):
+        parts.append(inspect.getsource(getattr(execution_mod, name)))
+    return "\n".join(parts)
+
+
 # --- F-01 --------------------------------------------------------------------------------------
 
 
@@ -153,10 +171,10 @@ class F01DryRunAndExecuteCompileDifferentPipelines(unittest.TestCase):
         for scattered in ("route", "resolved_route", "stack", "checks", "subagents",
                           "storage", "root"):
             self.assertNotIn(scattered, request_fields)
-        # ``execute_run`` reads the selection, per-task repair bound and the resume guard
-        # off that plan instead of re-deriving them.
-        exec_src = inspect.getsource(execution_mod.execute_run)
-        self.assertIn("plan = request.compiled_plan", exec_src)
+        # ``execute_run`` (with its extracted helpers) reads the selection, per-task repair
+        # bound and the resume guard off that plan instead of re-deriving them.
+        exec_src = _execute_run_family_src()
+        self.assertIn("plan = request.compiled_plan", inspect.getsource(execution_mod.execute_run))
         self.assertIn("plan.selection", exec_src)
         self.assertIn("plan.task(tid).repair_bound", exec_src)
 
@@ -176,8 +194,9 @@ class F01DryRunAndExecuteCompileDifferentPipelines(unittest.TestCase):
         self.assertIn("compiled_plan=compiled_plan", src)
         self.assertIn("route_reasons(", src)
         self.assertNotIn("storage_dir = resolved.storage", src)
-        # ``execute_run`` takes its selection, repair bound and resume guard from the plan.
-        exec_src = inspect.getsource(execution_mod.execute_run)
+        # ``execute_run`` (with its extracted helpers) takes its selection, repair bound and
+        # resume guard from the plan.
+        exec_src = _execute_run_family_src()
         self.assertIn("request.compiled_plan", exec_src)
         self.assertIn("_ensure_plan_compatible", exec_src)
 
@@ -582,12 +601,17 @@ class F08ControlValidationCanOccurTooLate(unittest.TestCase):
     def test_the_override_is_not_validated_before_state_or_launch(self) -> None:
         # execute_run applies the bound (step 2) before it initializes the durable lifecycle
         # or acquires the write lease (steps 3-4); the value itself is never validated here.
+        # UGA-18 moved the ``RunLifecycle`` construction into ``_open_run`` (called at step 3);
+        # the ordering guarantee is unchanged — the bound is applied before ``_open_run`` and
+        # before the lease, and nothing builds the lifecycle earlier.
         src = inspect.getsource(execution_mod.execute_run)
         apply_at = src.index("_apply_repair_bound(")
-        lifecycle_at = src.index("RunLifecycle.")
+        open_at = src.index("_open_run(")
         lease_at = src.index("pipeline_lease(")
-        self.assertLess(apply_at, lifecycle_at)
+        self.assertLess(apply_at, open_at)
         self.assertLess(apply_at, lease_at)
+        self.assertNotIn("RunLifecycle.", src[:open_at])
+        self.assertIn("RunLifecycle.", _execute_run_family_src())
         apply_src = inspect.getsource(execution_mod._apply_repair_bound)
         self.assertNotIn("SchemaError", apply_src)
         self.assertNotIn("< 0", apply_src)

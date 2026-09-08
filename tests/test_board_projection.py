@@ -224,6 +224,24 @@ class VerifiedTransitionTests(unittest.TestCase):
         with self.assertRaises(InvalidEvidenceError):
             _evidence(evidence_paths=("/etc/passwd",))
 
+    def test_evidence_rejects_windows_absolute_path_on_posix(self) -> None:
+        """UGA-18 item 3 — ``os.path.splitdrive`` never reports a drive on a POSIX
+        runner, so a Windows-style absolute path must be rejected by an explicit
+        drive-letter check on every OS, not only on Windows."""
+        import posixpath
+        from unittest import mock
+
+        # Simulate a Linux runner: ``splitdrive`` finds no drive in ``"C:/..."``.
+        with mock.patch(
+            "feature_pipeline.infrastructure.board_projection.os.path.splitdrive",
+            posixpath.splitdrive,
+        ):
+            self.assertEqual(posixpath.splitdrive("C:/Users/me/report.md")[0], "")
+            with self.assertRaises(InvalidEvidenceError):
+                _evidence(evidence_paths=("C:/Users/me/report.md",))
+            with self.assertRaises(InvalidEvidenceError):
+                _evidence(evidence_paths=("d:/tmp/x.md",))
+
 
 class IdempotentReplayTests(unittest.TestCase):
     """AC-3."""

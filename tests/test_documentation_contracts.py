@@ -20,8 +20,16 @@ from ci import promotion as ci_promotion
 
 import feature_pipeline
 
+from tests._umbrella import require_umbrella, umbrella_root
 
-ROOT = Path(__file__).resolve().parents[2]
+
+def setUpModule() -> None:
+    # Every assertion below reads a file that ships only in the umbrella working tree
+    # (docs/**, ci/gates.toml is core-local but the docs it is compared against are not).
+    require_umbrella("docs/architecture|contracts|migration|validation/*.md")
+
+
+ROOT = umbrella_root()
 DOCS_ROOT = ROOT / "docs"
 ARCHITECTURE_DOC = DOCS_ROOT / "architecture" / "feature-pipeline.md"
 CONTRACTS_DOC = DOCS_ROOT / "contracts" / "feature-pipeline.md"

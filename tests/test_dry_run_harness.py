@@ -21,6 +21,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import dry_run_harness as harness  # noqa: E402
 
+from tests._umbrella import require_umbrella, umbrella_root
+
+
+def setUpModule() -> None:
+    # The canonical fixture and docs/acceptance tree this module compares against ship only
+    # in the umbrella working tree; a standalone feature-pipeline-skill checkout has neither.
+    require_umbrella("docs/acceptance/fixtures/shared-project/")
+
 
 ALL_SCENARIOS = ("S1", "S2", "S3", "S4", "S5", "S6", "S7")
 
@@ -29,7 +37,7 @@ VENDORED_FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "shared-pr
 #: The canonical fixture in the parent repo (present in the umbrella checkout, absent in a
 #: standalone child checkout).
 CANONICAL_FIXTURE = (
-    Path(__file__).resolve().parents[2]
+    umbrella_root()
     / "docs" / "acceptance" / "fixtures" / "shared-project"
 )
 CORE_INPUT_FILES = ("profile.json", "plan.json", "plan-s5.json")

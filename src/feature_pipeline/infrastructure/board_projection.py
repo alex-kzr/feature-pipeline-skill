@@ -112,8 +112,12 @@ def _require_repo_relative(path: str) -> None:
         raise InvalidEvidenceError(f"evidence path must be repository-relative: {path!r}")
     if "\\" in path:
         raise InvalidEvidenceError(f"evidence path must use forward slashes: {path!r}")
-    drive, _ = os.path.splitdrive(path)
-    if drive:
+    # ``os.path.splitdrive`` only recognises a Windows drive on ``ntpath`` (i.e. on Windows);
+    # on a POSIX runner it never reports one, so a Windows-style absolute path such as
+    # ``"C:/Users/me/report.md"`` would otherwise slip through. Match a drive letter
+    # explicitly so the rejection is identical on every OS (mirrors
+    # ``pipeline_core.state``'s check).
+    if re.match(r"^[A-Za-z]:[\\/]", path) or os.path.splitdrive(path)[0]:
         raise InvalidEvidenceError(f"evidence path must be repository-relative: {path!r}")
 
 

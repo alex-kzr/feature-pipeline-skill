@@ -212,7 +212,11 @@ class DispatchPreconditionsTests(unittest.TestCase):
         from feature_pipeline.application.compile_plan import compile_run_plan
         from feature_pipeline.domain.models import MARKDOWN_TASK_FILE, TaskDefinition
         from feature_pipeline.domain.paths import RelativePath
+        from tests._umbrella import require_umbrella
         from tests.test_execution_plan_compiler import _profile
+
+        # _profile() reads the umbrella-only shipped profile.
+        require_umbrella("tools/feature-pipeline/config/pipeline.profile.json")
 
         for compiled in (False, True):
             with self.subTest(compiled=compiled), TemporaryDirectory() as directory:
@@ -518,9 +522,13 @@ class PreconditionContractTests(unittest.TestCase):
                     TaskDefinitionBuilder.from_markdown_task_file(task)
 
     def test_compiled_predicates_change_resume_identity(self):
+        from tests._umbrella import require_umbrella
         from tests.test_execution_plan_compiler import _profile, _definition
         from feature_pipeline.application.compile_plan import compile_run_plan
         from pipeline_core.execution import _ensure_plan_compatible, _plan_fingerprint, ExecutionError
+
+        # _profile() reads the umbrella-only shipped profile.
+        require_umbrella("tools/feature-pipeline/config/pipeline.profile.json")
         definition = _definition("AB-01")
         original = compile_run_plan(feature="sample", definitions=(definition,), profile=_profile())
         changed = replace(definition, spec=replace(definition.spec, preconditions=(Precondition("approval", "review"),)))
