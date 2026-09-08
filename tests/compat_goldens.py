@@ -76,9 +76,13 @@ _DURATION_SUFFIX_RE = re.compile(r"\(\d+\.\d+s\)")
 #: The recorded interpreter path inside a diagnostic's "Recent commands" line has already
 #: had its home prefix redacted to ``<home>`` by the time it reaches this harness, so the
 #: raw ``sys.executable`` replacement below no longer matches it — collapse whatever remains
-#: up to ``python``/``python.exe`` to ``<python>`` (uv-managed interpreter paths have no
-#: spaces).
-_INTERPRETER_RE = re.compile(r"<(?:home|workdir|project_root)>[^\s`]*python(?:\.exe)?")
+#: up to ``python`` to ``<python>`` (uv-managed interpreter paths have no spaces). The
+#: trailing ``.exe`` (Windows) or a version suffix such as ``3`` / ``3.13`` (a POSIX
+#: ``python3`` / ``python3.13`` ``sys.executable``) is consumed too, so the token is
+#: ``<python>`` on every platform.
+_INTERPRETER_RE = re.compile(
+    r"<(?:home|workdir|project_root)>[^\s`]*python(?:\.exe|\d+(?:\.\d+)*)?"
+)
 
 
 def _spellings(path: Path) -> list[str]:
