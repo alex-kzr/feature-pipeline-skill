@@ -182,6 +182,21 @@ class VerifyAcceptanceEvidence(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertTrue(any("SHA" in reason for reason in result.reasons))
 
+    def test_duplicate_run_with_same_workflow_evidence_and_second_sha_fails_closed(self) -> None:
+        evidence = _load_pass_evidence()
+        original = next(run for run in evidence["runs"] if run["role"] == "producer")
+        duplicate = json.loads(json.dumps(original))
+        # Preserve the workflow-run object to prove that duplicate IDs/attempts cannot hide a
+        # second SHA behind the first entry.
+        duplicate["head_sha"] = OTHER_SHA
+        evidence["runs"].append(duplicate)
+
+        result = rc.verify_acceptance_evidence(evidence, _contract(), _targets())
+
+        self.assertFalse(result.ok)
+        self.assertTrue(any("exactly one" in reason for reason in result.reasons))
+        self.assertTrue(any("SHA" in reason for reason in result.reasons))
+
     def test_shell_start_failure_in_a_gate_step_fails_closed(self) -> None:
         evidence = _load_pass_evidence()
         producer_run = next(r for r in evidence["runs"] if r["role"] == "producer")

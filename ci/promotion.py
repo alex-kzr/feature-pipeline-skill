@@ -34,6 +34,7 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -114,8 +115,10 @@ class PromotionResult:
             "gitlink_sha": self.core_sha,
             "upstream_repo": self.upstream_repo,
             "required_checks": list(self.required_checks),
-            "conclusions": [c.as_dict() for c in self.conclusions],
-            "api_urls": list(self.api_urls),
+            "conclusions": [
+                {**c.as_dict(), "url": _redact_url(c.url)} for c in self.conclusions
+            ],
+            "api_urls": [_redact_url(url) for url in self.api_urls],
             "reasons": list(self.reasons),
         }
 
@@ -133,6 +136,17 @@ class RequiredCheckContract:
         """Return every required-check identity in stable display order."""
 
         return (*self.producer, *self.consumer, self.promotion)
+
+
+def _redact_url(url: str) -> str:
+    """Keep a URL's public location while dropping credentials and query values."""
+
+    parsed = urllib.parse.urlsplit(url)
+    netloc = parsed.hostname or ""
+    if parsed.port:
+        netloc = f"{netloc}:{parsed.port}"
+    query = "&".join(f"{key}=***" for key, _ in urllib.parse.parse_qsl(parsed.query))
+    return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, query, ""))
 
 
 def required_core_checks(loaded: contract.Contract) -> tuple[str, ...]:

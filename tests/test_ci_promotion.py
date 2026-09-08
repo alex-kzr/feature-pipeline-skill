@@ -182,6 +182,24 @@ class RedactedEvidence(unittest.TestCase):
         self.assertNotIn("SEKRET", out.getvalue())
         self.assertIn("***", out.getvalue())
 
+    def test_evidence_redacts_credentials_embedded_in_api_urls(self) -> None:
+        body = _payload("success.json")
+        body["api_urls"] = [
+            "https://token:secret@api.github.com/repos/example/feature-pipeline-skill/"
+            "check-runs?access_token=other-secret"
+        ]
+        result = promotion.verify_promotion(
+            upstream_repo=UPSTREAM,
+            core_sha=CORE_SHA,
+            required_checks=SYNTH_CHECKS,
+            payload=body,
+            umbrella_sha=UMBRELLA_SHA,
+        )
+        rendered = json.dumps(result.evidence())
+        self.assertNotIn("token:secret", rendered)
+        self.assertNotIn("other-secret", rendered)
+        self.assertIn("***", rendered)
+
 
 class CliExitCodes(unittest.TestCase):
     def _run(self, *args: str) -> tuple[int, str]:
