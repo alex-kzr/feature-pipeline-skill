@@ -412,24 +412,25 @@ def verify_acceptance_evidence(
             )
             continue
         if len(matches) > 1:
-            distinct = {
-                json.dumps(run.get("workflow_run"), sort_keys=True) for run in matches
-            }
-            if len(distinct) > 1:
-                reasons.append(
-                    f"required check {identity!r} has ambiguous, conflicting run attempts"
-                )
-        _check_run(
-            matches[0],
-            identity,
-            role,
-            target,
-            expected_head,
-            core_sha,
-            dispatch,
-            loaded,
-            reasons,
-        )
+            reasons.append(
+                f"required check {identity!r} has ambiguous, conflicting run evidence "
+                f"({len(matches)} matching runs; exactly one is required)"
+            )
+        # Validate every matching entry, even duplicate entries that report the same workflow
+        # run ID/attempt. Otherwise a second run for another SHA could be hidden behind the
+        # first matching entry and make the single-SHA contract appear to pass.
+        for run in matches:
+            _check_run(
+                run,
+                identity,
+                role,
+                target,
+                expected_head,
+                core_sha,
+                dispatch,
+                loaded,
+                reasons,
+            )
 
     applied = evidence.get("applied_rulesets")
     if not isinstance(applied, Mapping):
