@@ -10,6 +10,9 @@ The authoritative user-facing documentation is maintained in the umbrella reposi
 concise implementation map; it does not promise a feature that the linked contracts mark as
 deferred.
 
+Hermes operators launching this core through an external worker should use the portable
+[Hermes operator guide](docs/hermes-operator.md).
+
 ## Layout
 
 - `pipeline_core/` — importable core package. `pipeline_core/runner_cli.py` is the public CLI

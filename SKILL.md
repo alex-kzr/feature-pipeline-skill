@@ -16,3 +16,8 @@ Launchers are called with explicit anchors:
 - `--core-root <path>` identifies this repository.
 
 The core uses these anchors rather than assuming a checkout layout or host-specific paths.
+
+## Hermes operation
+
+For Hermes-initiated work through an external Codex or Claude worker, follow the complete
+project-neutral procedure in [the Hermes operator guide](docs/hermes-operator.md).
