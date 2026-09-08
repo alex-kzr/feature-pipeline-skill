@@ -350,10 +350,15 @@ def validate_topology(
             violations.append(Violation("unparseable-yaml", path.name, None, None, str(exc)))
             continue
 
-        jobs = document.get("jobs") or {}
+        jobs = document.get("jobs")
+        if not isinstance(jobs, Mapping):
+            jobs = {}
         workflow_suites: set[str] = set()
         for job_name, job in jobs.items():
-            job = job or {}
+            # A ``job`` value that is not a mapping (``null``, or a bare ``${{ ... }}``
+            # expression) carries no working-directory, matrix, or steps to inspect.
+            if not isinstance(job, Mapping):
+                continue
             job_working_directory = ((job.get("defaults") or {}).get("run") or {}).get(
                 "working-directory"
             )
@@ -380,16 +385,32 @@ def validate_topology(
                     Violation("checkout-path-drift", path.name, job_name, None, problem)
                 )
 
-            matrix = (job.get("strategy") or {}).get("matrix") or {}
-            suite_values = matrix.get("suite") or []
-            workflow_suites.update(str(value) for value in suite_values)
+            # ``strategy``/``matrix`` may each be a run-time-resolved ``${{ ... }}``
+            # expression string rather than a literal mapping (``quality-gates.yml`` sets
+            # ``matrix: ${{ fromJSON(needs.prepare-core-gates.outputs.matrix) }}``). Only a
+            # literal ``matrix.suite`` list can be compared against the manifest and README;
+            # anything else (an expression, ``matrix.include``, an absent matrix) simply
+            # contributes no suites for this job instead of raising.
+            strategy = job.get("strategy")
+            matrix = strategy.get("matrix") if isinstance(strategy, Mapping) else None
+            if isinstance(matrix, Mapping):
+                suite_values = matrix.get("suite")
+                if isinstance(suite_values, Sequence) and not isinstance(
+                    suite_values, (str, bytes)
+                ):
+                    workflow_suites.update(str(value) for value in suite_values)
 
-            for step in job.get("steps") or []:
+            steps = job.get("steps")
+            if not isinstance(steps, Sequence) or isinstance(steps, (str, bytes)):
+                steps = ()
+            for step in steps:
+                if not isinstance(step, Mapping):
+                    continue
                 violations.extend(
                     _step_violations(
                         workflow_name=path.name,
                         job_name=job_name,
-                        step=step or {},
+                        step=step,
                         source_root=source_root,
                         repository_names=repository_names,
                         gate_commands=gate_commands,

@@ -481,6 +481,87 @@ class RunCliValidateIntegration(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------------------------
+# UGA-16 - `strategy.matrix` / `matrix.include` may be a GitHub Actions expression string.
+# ---------------------------------------------------------------------------------------------
+
+
+@unittest.skipUnless(_HAS_YAML, "pyyaml dev dependency (uv sync --extra dev) not installed")
+class ExpressionValuedMatrixRule(unittest.TestCase):
+    """UGA-16 AC-2 - a job whose ``strategy.matrix`` (or ``matrix.include``) is a
+    ``${{ ... }}`` expression string, resolved only at run time, must not raise and must
+    not emit a spurious matrix/documentation drift violation. Jobs that still declare a
+    literal mapping keep their drift checks (AC-3)."""
+
+    def _root(self, tmp: Path, workflow_text: str) -> Path:
+        (tmp / "pyproject.toml").write_text("", encoding="utf-8")
+        (tmp / "tests").mkdir()
+        workflow_dir = tmp / ".github" / "workflows"
+        workflow_dir.mkdir(parents=True)
+        (workflow_dir / "quality-gates.yml").write_text(workflow_text, encoding="utf-8")
+        return tmp
+
+    def test_expression_valued_matrix_does_not_raise_or_drift(self) -> None:
+        workflow = """
+jobs:
+  core-gates:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare-core-gates.outputs.matrix) }}
+    steps:
+      - name: run it
+        run: uv run python -m ci.run run lint --source-root . --expected-source-sha x
+"""
+        with TemporaryDirectory() as raw:
+            root = self._root(Path(raw), workflow)
+            violations = workflows.validate_topology(root)
+        self.assertEqual(
+            [v for v in violations if v.rule in ("matrix-drift", "documentation-drift")],
+            [],
+            violations,
+        )
+
+    def test_expression_valued_matrix_include_does_not_raise(self) -> None:
+        workflow = """
+jobs:
+  isolated:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include: ${{ fromJSON(needs.prepare-consumer-gates.outputs.include) }}
+    steps:
+      - name: run it
+        run: uv run python -m ci.run run installed-package --source-root . --expected-source-sha x
+"""
+        with TemporaryDirectory() as raw:
+            root = self._root(Path(raw), workflow)
+            violations = workflows.validate_topology(root)
+        self.assertNotIn(
+            "matrix-drift", {v.rule for v in violations}, violations
+        )
+
+    def test_literal_matrix_drift_is_still_reported(self) -> None:
+        workflow = """
+jobs:
+  core-gates:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        suite: [made-up-suite]
+    steps:
+      - name: run it
+        run: uv run python -m ci.run run lint --source-root . --expected-source-sha x
+"""
+        with TemporaryDirectory() as raw:
+            root = self._root(Path(raw), workflow)
+            violations = workflows.validate_topology(root)
+        self.assertTrue(
+            any("made-up-suite" in v.detail for v in violations if v.rule == "matrix-drift"),
+            violations,
+        )
+
+
+# ---------------------------------------------------------------------------------------------
 # UGA-06 - the umbrella `installed-package.yml` as a thin nested-topology adapter.
 # ---------------------------------------------------------------------------------------------
 

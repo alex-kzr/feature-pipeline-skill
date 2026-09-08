@@ -28,7 +28,7 @@ jobs:
         name: Validate and expand the core gate contract
         shell: bash
         run: |
-          uv run python -m ci.run validate --source-root "$GITHUB_WORKSPACE"
+          uv run --with pyyaml python -m ci.run validate --source-root "$GITHUB_WORKSPACE"
           uv run python -m ci.run list --json --group core --source-root "$GITHUB_WORKSPACE" > "$RUNNER_TEMP/core-gates.json"
           uv run python -c 'import json, sys; gates = json.load(open(sys.argv[1], encoding="utf-8"))["core"]; cells = [{"gate": gate, "suite": gate["id"], "os": os} for gate in gates for os in gate["os"]]; print("matrix=" + json.dumps({"include": cells}, separators=(",", ":")))' "$RUNNER_TEMP/core-gates.json" >> "$GITHUB_OUTPUT"
 
