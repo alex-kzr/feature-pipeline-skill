@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "project": "routing-baseline",
+  "anchors": {"agents_root": "shared", "core_root": "core"},
+  "task_routing": [
+    {"task_type": "python", "working_root": "packages/python"},
+    {"task_type": "rust", "working_root": "packages/rust"},
+    {"task_type": "docs", "working_root": "docs"}
+  ],
+  "run_state_path": "runs",
+  "roles": [
+    {"role": "executor", "min_grants": ["read", "write", "run_checks"]},
+    {"role": "task_verifier", "min_grants": ["read"]},
+    {"role": "test_verifier", "min_grants": ["read"]}
+  ]
+}
