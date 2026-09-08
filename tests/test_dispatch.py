@@ -816,6 +816,27 @@ class DispatchAttributionTests(unittest.TestCase):
                 "known-empty",
                 outcome.artifacts.implementation_diff.read_text(encoding="utf-8"))
 
+    def test_runner_records_commit_and_tag_created_inside_executor_window(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _init_repo(root)
+            spec = _spec(allowed_scope=("src.py",))
+            life = _running_life(root, spec)
+
+            def mutate() -> None:
+                (root / "src.py").write_text("print('committed by executor')\n", encoding="utf-8")
+                _git(root, "add", "src.py")
+                _git(root, "commit", "-qm", "executor commit")
+                _git(root, "tag", "executor-tag")
+
+            outcome = dispatch_executor(
+                life, _request(spec), ScriptedAdapter(on_launch=mutate))
+
+            self.assertEqual(outcome.attribution.state, "known-empty")
+            actions = life.run.task(spec.id).execution_evidence["external_actions"]
+            self.assertIn("commit", [action["action"] for action in actions])
+            self.assertIn("tag", [action["action"] for action in actions])
+
     def test_runner_owned_run_dir_churn_is_never_attributed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

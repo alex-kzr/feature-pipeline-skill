@@ -345,6 +345,7 @@ class Run:
         session_id: str | None = None,
         reserved_manifest: str | None = None,
         reserved_diff: str | None = None,
+        external_actions: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Record a trusted executor report as this task's execution evidence.
 
@@ -359,6 +360,9 @@ class Run:
             "attempt": attempt,
             "launch_generation": generation,
             "executor_report": repo_relative(report_path, self.repo_root),
+            # These are captured by the runner from the executor window, never inferred
+            # from an executor report or from history that predates the window.
+            "external_actions": list(external_actions or ()),
             "implementation": {
                 "state": "pending-attribution",
                 "changed_files": [],

@@ -54,11 +54,77 @@ from .reports import (
 )
 from .state import ACTOR_EXECUTOR, repo_relative
 from .worktree import AttributionResult, attribute_executor_window, capture_snapshot
+from .git_port import GitPort, GitSafetyError
 
 EXECUTOR_ROLE = "executor"
 
 #: Recorded as the exit code when the adapter refuses to build or start a launch at all.
 EXIT_ADAPTER_ERROR = "adapter-error"
+
+
+@dataclass(frozen=True)
+class _GitMutationBoundary:
+    """Read-only Git state at one edge of an executor window.
+
+    Ref names and object IDs are sufficient to identify commits and tags made during the
+    window without treating the repository's earlier history as executor activity.
+    """
+
+    head: str | None
+    refs: dict[str, str]
+
+
+def _capture_git_mutation_boundary(repo_root: str | Path) -> _GitMutationBoundary | None:
+    """Capture the local HEAD and refs using the portable read-only Git port."""
+    port = GitPort(repo_root)
+    try:
+        head_result = port.run(("rev-parse", "--verify", "HEAD"))
+        refs_result = port.run(("for-each-ref", "--format=%(refname)%09%(objectname)"))
+    except (GitSafetyError, OSError):
+        return None
+    if refs_result.returncode != 0:
+        return None
+    refs: dict[str, str] = {}
+    for line in refs_result.stdout.splitlines():
+        ref, separator, object_id = line.partition("\t")
+        if separator and ref and object_id:
+            refs[ref] = object_id
+    return _GitMutationBoundary(
+        head=head_result.stdout.strip() if head_result.returncode == 0 else None,
+        refs=refs,
+    )
+
+
+def _git_mutation_actions(
+    before: _GitMutationBoundary | None, after: _GitMutationBoundary | None,
+) -> list[dict[str, str]]:
+    """Describe only ref changes between two runner-captured window boundaries."""
+    if before is None or after is None:
+        return []
+    actions: list[dict[str, str]] = []
+    if before.head != after.head:
+        actions.append({
+            "action": "commit",
+            "before": before.head or "<unborn>",
+            "after": after.head or "<unborn>",
+        })
+    for ref in sorted(set(before.refs) | set(after.refs)):
+        previous, current = before.refs.get(ref), after.refs.get(ref)
+        if previous == current:
+            continue
+        if ref.startswith("refs/tags/"):
+            action = "tag"
+        elif ref.startswith("refs/remotes/"):
+            action = "remote-ref-mutation"
+        else:
+            action = "git-ref-mutation"
+        actions.append({
+            "action": action,
+            "ref": ref,
+            "before": previous or "<absent>",
+            "after": current or "<deleted>",
+        })
+    return actions
 
 
 class DispatchError(RuntimeError):
@@ -169,6 +235,7 @@ def dispatch_executor(
     # after the launch attributes exactly this generation's changes, independent of both
     # executor claims and pre-existing workspace dirt.
     before_snapshot = capture_snapshot(run.repo_root, exclude_roots=(run.run_dir,))
+    git_boundary = _capture_git_mutation_boundary(run.repo_root)
 
     try:
         result = adapter.launch(launch_request)
@@ -197,7 +264,8 @@ def dispatch_executor(
         )
 
     if getattr(adapter, "name", None) == "codex":
-        return _settle_codex_final_result(life, request, artifacts, generation, result, before_snapshot)
+        return _settle_codex_final_result(
+            life, request, artifacts, generation, result, before_snapshot, git_boundary)
 
     # The strict JSON status envelope: one same-session, tool-free continuation. Codex cannot
     # resume with its read-only sandbox and resolved anchor grants, so it declares that its
@@ -282,6 +350,8 @@ def dispatch_executor(
         session_id=result.session_id,
         reserved_manifest=repo_relative(artifacts.implementation_manifest, run.repo_root),
         reserved_diff=repo_relative(artifacts.implementation_diff, run.repo_root),
+        external_actions=_git_mutation_actions(
+            git_boundary, _capture_git_mutation_boundary(run.repo_root)),
     )
     run.record_implementation_attribution(
         task_id,
@@ -332,7 +402,7 @@ def _retryable_failure(
 
 def _settle_codex_final_result(
     life: RunLifecycle, request: DispatchRequest, artifacts: LaunchArtifacts, generation: int,
-    result: LaunchResult, before_snapshot,
+    result: LaunchResult, before_snapshot, git_boundary: _GitMutationBoundary | None,
 ) -> DispatchOutcome:
     """Accept only Codex's one canonical event; prose never supplies a status."""
     run = life.run
@@ -366,7 +436,9 @@ def _settle_codex_final_result(
     run.record_executor_evidence(request.spec.id, attempt=request.attempt, generation=generation,
         report_path=artifacts.executor_report, session_id=result.session_id,
         reserved_manifest=repo_relative(artifacts.implementation_manifest, run.repo_root),
-        reserved_diff=repo_relative(artifacts.implementation_diff, run.repo_root))
+        reserved_diff=repo_relative(artifacts.implementation_diff, run.repo_root),
+        external_actions=_git_mutation_actions(
+            git_boundary, _capture_git_mutation_boundary(run.repo_root)))
     run.record_implementation_attribution(request.spec.id, generation=generation,
         attempt=request.attempt, attribution_state=attribution.state, manifest=attribution.manifest,
         diff=attribution.diff, changed_files=attribution.changed_files, reason=attribution.reason)

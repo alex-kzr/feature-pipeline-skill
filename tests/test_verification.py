@@ -41,9 +41,11 @@ from pipeline_core.verification import (
     VerificationEvidence,
     VerifierAnchors,
     VerifierLaunchers,
+    _current_run_marker,
     build_verification_evidence,
     build_verifier_prompt,
     combine_verdict_status,
+    current_run_mutation_reason,
     evidence_forces_fail,
     missing_command_evidence,
     orchestrate_verification,
@@ -396,6 +398,85 @@ class FreshReadOnlyToollessTests(unittest.TestCase):
             evidence_payload="{}", attempt=1)
         self.assertIn("no tools", prompt.lower())
         self.assertIn("no matching runner-recorded command is a FAIL", prompt)
+
+
+class CurrentRunMutationEvidenceTests(unittest.TestCase):
+    """UGA-15: no-mutation criteria must not inherit historical task evidence."""
+
+    def _run_scoped_spec(self) -> TaskSpec:
+        return _spec(acceptance_criteria=(
+            "Run-scoped: must not create commits, tags, pushes, workflow changes, or remote mutations.",
+        ))
+
+    def test_current_run_marker_recognizes_all_run_scoped_wording(self) -> None:
+        for criterion in (
+            "This run must not mutate the remote.",
+            "Current run must not mutate the remote.",
+            "Run-scoped: must not mutate the remote.",
+            "[CURRENT-RUN ONLY] must not mutate the remote.",
+        ):
+            self.assertEqual(_current_run_marker(criterion), " [CURRENT-RUN ONLY]")
+
+    def test_historical_result_does_not_contaminate_an_empty_current_run_boundary(self) -> None:
+        historical_result = "## Result\n- Created commit deadbeef and pushed it.\n"
+        evidence = _evidence(
+            implementation_manifest=None,
+            implementation_diff=None,
+            changed_files=(),
+            external_actions=(),
+        )
+        prompt = build_verifier_prompt(
+            "task_verifier", self._run_scoped_spec(), anchors=ANCHORS,
+            feature_prompt="prompt.md", evidence_payload=evidence.serialized(), attempt=1,
+        )
+
+        self.assertNotIn(historical_result, evidence.serialized())
+        self.assertIn("[CURRENT-RUN ONLY]", prompt)
+        self.assertIn("Ignore historical ## Result sections", prompt)
+        boundary = json.loads(evidence.serialized())["current_run_boundary"]
+        self.assertIsNone(boundary["implementation"]["manifest"])
+        self.assertEqual(boundary["external_actions"], [])
+
+    def test_current_run_mutation_evidence_remains_inside_the_boundary(self) -> None:
+        evidence = _evidence(
+            changed_files=({"path": ".github/workflows/quality.yml", "status": "modified"},),
+            external_actions=({"action": "push", "ref": "refs/heads/main"},),
+        )
+        prompt = build_verifier_prompt(
+            "task_verifier", self._run_scoped_spec(), anchors=ANCHORS,
+            feature_prompt="prompt.md", evidence_payload=evidence.serialized(), attempt=1,
+        )
+
+        boundary = json.loads(evidence.serialized())["current_run_boundary"]
+        self.assertEqual(
+            boundary["implementation"]["changed_files"][0]["path"],
+            ".github/workflows/quality.yml",
+        )
+        self.assertEqual(boundary["external_actions"][0]["action"], "push")
+        self.assertIn("workflow change, ruleset mutation, or recorded external action", prompt)
+
+    def test_runner_captured_current_run_commit_fails_a_scoped_no_mutation_criterion(self) -> None:
+        evidence = _evidence(external_actions=({"action": "commit", "after": "deadbeef"},))
+
+        self.assertEqual(
+            current_run_mutation_reason(self._run_scoped_spec(), evidence),
+            "runner captured current-run external action: commit",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            run = _implemented_run(Path(directory))
+            outcome = _orchestrate(
+                run, self._run_scoped_spec(), FakeVerifier(), FakeVerifier(),
+                evidence_kw={"external_actions": ({"action": "commit", "after": "deadbeef"},)},
+            )
+
+        self.assertEqual(outcome.status, "verification_failed")
+        self.assertEqual(outcome.task_verdict, "FAIL")
+        self.assertEqual(outcome.test_verdict, "FAIL")
+        self.assertEqual(
+            outcome.forced_fail_reason,
+            "runner captured current-run external action: commit",
+        )
 
 
 class ProseEnvelopeSettlementTests(unittest.TestCase):

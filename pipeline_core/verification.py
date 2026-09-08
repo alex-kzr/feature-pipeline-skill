@@ -136,6 +136,10 @@ class VerificationEvidence:
     implementation_manifest: str | None = None
     implementation_diff: str | None = None
     changed_files: tuple[Mapping[str, object], ...] = ()
+    #: Runner-recorded actions performed outside the local implementation window (for
+    #: example a push, tag, or remote-ruleset mutation).  It is deliberately explicit
+    #: even when empty: task history and ambient Git state are not substitutes for it.
+    external_actions: tuple[Mapping[str, object], ...] = ()
     missing_evidence: tuple[Mapping[str, object], ...] = ()
     unrun_commands: tuple[Mapping[str, object], ...] = ()
     external_blocker: str | None = None
@@ -161,10 +165,21 @@ class VerificationEvidence:
                 "changed_files": [dict(entry) for entry in self.changed_files],
             },
             "commands": [dict(entry) for entry in self.commands],
+            "external_actions": [dict(entry) for entry in self.external_actions],
             "missing_evidence": [dict(entry) for entry in self.missing_evidence],
             "unrun_commands": [dict(entry) for entry in self.unrun_commands],
             "external_blocker": self.external_blocker,
             "snapshot": dict(self.snapshot) if self.snapshot is not None else None,
+            "current_run_boundary": {
+                "verification_snapshot": dict(self.snapshot) if self.snapshot is not None else None,
+                "implementation": {
+                    "manifest": self.implementation_manifest,
+                    "diff": self.implementation_diff,
+                    "changed_files": [dict(entry) for entry in self.changed_files],
+                },
+                "captured_commands": [dict(entry) for entry in self.commands],
+                "external_actions": [dict(entry) for entry in self.external_actions],
+            },
             "complete": self.complete,
         }
 
@@ -210,6 +225,9 @@ def build_verification_evidence(
         implementation_manifest=implementation.get("manifest"),
         implementation_diff=implementation.get("diff"),
         changed_files=tuple(dict(entry) for entry in implementation.get("changed_files") or ()),
+        external_actions=tuple(
+            dict(entry) for entry in execution.get("external_actions") or ()
+        ),
         missing_evidence=missing_command_evidence(claimed_checks, commands_run.records),
         unrun_commands=unrun,
         external_blocker=commands_run.stopped_reason,
@@ -235,6 +253,30 @@ def evidence_forces_fail(evidence: VerificationEvidence) -> str | None:
         f"claimed check '{first.get('cwd', '.')} -> {argv}' has no runner-recorded command; "
         f"an unbacked claim is a FAIL"
     )
+
+
+def current_run_mutation_reason(spec: object, evidence: VerificationEvidence) -> str | None:
+    """Return a runner-fact failure for an explicit current-run no-mutation criterion.
+
+    Ordinary criteria stay with the independent verifiers. A task author must both scope a
+    criterion to this/current run and phrase it as a prohibition before captured mutations
+    settle it.
+    """
+    criteria = getattr(spec, "acceptance_criteria", ()) or ()
+    scoped_prohibition = any(
+        _current_run_marker(text) and "must not" in str(text).casefold()
+        for text in criteria
+    )
+    if not scoped_prohibition:
+        return None
+    if evidence.external_actions:
+        return "runner captured current-run external action: " + str(
+            evidence.external_actions[0].get("action", "mutation"))
+    for changed in evidence.changed_files:
+        path = str(changed.get("path", "")).replace("\\", "/")
+        if path.startswith(".github/workflows/") or ".github/workflows/" in path:
+            return f"runner captured current-run workflow change: {path}"
+    return None
 
 
 def combine_verdict_status(task_verdict: str, test_verdict: str) -> str:
@@ -350,6 +392,13 @@ _VERIFIER_RULES: dict[str, tuple[str, ...]] = {
         "You may read the worktree; you may not modify anything and you may not run the "
         "verification commands — their outcomes are the runner-owned evidence below.",
         "Do not tick acceptance-criteria checkboxes.",
+        "For an acceptance criterion marked CURRENT-RUN ONLY, assess mutations only from "
+        "the current_run_boundary in the runner-owned evidence: its verification snapshot, "
+        "implementation manifest/diff and changed files, captured commands, and external "
+        "actions. Ignore historical ## Result sections, pre-existing commits/tags/pushes, "
+        "and any other ambient worktree or remote history for that criterion. A current-run "
+        "commit, tag, push, workflow change, ruleset mutation, or recorded external action "
+        "inside that boundary remains evidence against it.",
     ),
     "test_verifier": (
         "You have no tools. Interpret only the runner-owned evidence below; run nothing.",
@@ -365,7 +414,24 @@ def _acceptance_block(spec: object) -> str:
     criteria = getattr(spec, "acceptance_criteria", ()) or ()
     if not criteria:
         return "  none declared"
-    return "\n".join(f"  - {ac.id}: {ac.text}" for ac in criteria)
+    return "\n".join(
+        f"  - {ac.id}: {ac.text}{_current_run_marker(ac.text)}" for ac in criteria
+    )
+
+
+def _current_run_marker(text: object) -> str:
+    """Label criteria whose wording deliberately limits their evidence to this run.
+
+    The verifier still evaluates ordinary criteria exactly as before.  This marker merely
+    makes the task author's explicit ``this run``, ``current run``, ``run-scoped``, or
+    ``CURRENT-RUN ONLY`` boundary executable in the prompt, rather than leaving a historical
+    task result to redefine that scope.
+    """
+    words = str(text).casefold().replace("-", " ")
+    markers = ("this run", "current run", "run scoped", "current run only")
+    if any(marker in words for marker in markers):
+        return " [CURRENT-RUN ONLY]"
+    return ""
 
 
 def _commands_block(spec: object) -> str:
@@ -650,10 +716,18 @@ def orchestrate_verification(
 
     task_verdict = task_settled.token
     test_verdict = test_settled.token
-    forced = evidence_forces_fail(evidence)
+    mutation_forced = current_run_mutation_reason(spec, evidence)
+    test_forced = evidence_forces_fail(evidence)
     forced_reason: str | None = None
-    if forced and test_verdict != "FAIL":
-        forced_reason = forced
+    if mutation_forced and (task_verdict != "FAIL" or test_verdict != "FAIL"):
+        forced_reason = mutation_forced
+        task_verdict = "FAIL"
+        test_verdict = "FAIL"
+    elif test_forced and test_verdict != "FAIL":
+        # An executor's unbacked verification claim is evidence only for the
+        # tool-less test verifier.  It must not alter the task verifier's
+        # ordinary acceptance-criteria verdict.
+        forced_reason = test_forced
         test_verdict = "FAIL"
 
     status = run.record_verdicts(task_id, task_verdict, test_verdict)
