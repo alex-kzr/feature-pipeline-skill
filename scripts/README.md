@@ -46,12 +46,13 @@ has no commit code path. `--push` is refused before any run artifact exists, wit
 `1` and the message
 `push is denied at this stage and the runner has no push code path.`
 
-Exit codes: `10` ok / a delivery gate is pending — **every non-blocked run, including a
-`--dry-run`, returns `10`** (the legacy dry-run contract and the MI-01 exit-code table:
-"`10` … preserve"); `20` blocked (unmet dependency, held lease); `30` error (invalid anchor
-or profile, unroutable task); `1` `--push` refused (outside the `{0,10,20,30}` baseline set
-on purpose — the MI-02 record shows `Exit 1`). `0` is not returned by a run; it appears only
-for the read-only `--status` inspector.
+Exit codes are mode-specific. Planning previews (`plan-only`, `unattended`, and
+`release-dry-run`) return `10` when their delivery gate is pending. In `execute` mode, `0`
+means every selected task verified, `10` means the plan gate is pending, `20` means a task is
+blocked, and `30` means a runner error. Parser failures are separate command-line errors; a
+`--push` request is separately refused with exit `1` before any run artifact exists. A
+successful outer Hermes process is not evidence of an execute result. Execute ends after stage
+9; documentation and later lifecycle stages are distinct.
 
 ### Plan file
 

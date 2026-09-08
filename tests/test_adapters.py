@@ -212,6 +212,44 @@ class ClaudeArgvTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("--tools") + 1], "")
         self.assertNotIn("--allowed-tools", argv)
 
+    def test_inline_agents_definition_is_emitted_and_matches_the_selected_agent(self) -> None:
+        # RDS-06: the role is defined inline so a launch needs no on-disk .claude/agents file
+        # in the target project. --agents carries exactly the name --agent then selects.
+        for role, on_disk in (
+            ("executor", "executor"),
+            ("python-executor", "python-executor"),
+            ("task_verifier", "task-verifier"),
+            ("test-verifier", "test-verifier"),
+        ):
+            with self.subTest(role=role):
+                argv = build_claude_argv(
+                    _request(role, read_only="verifier" in role, no_tools="verifier" in role,
+                             role_grant=("read",)))
+                self.assertIn("--agents", argv)
+                self.assertLess(argv.index("--agents"), argv.index("--agent"))
+                definition = json.loads(argv[argv.index("--agents") + 1])
+                self.assertEqual(list(definition), [on_disk])
+                self.assertEqual(argv[argv.index("--agent") + 1], on_disk)
+                self.assertIn("description", definition[on_disk])
+                self.assertTrue(definition[on_disk]["prompt"].strip())
+
+    def test_inline_agents_json_is_shell_free_and_ascii(self) -> None:
+        argv = build_claude_argv(_request("task_verifier", read_only=True, no_tools=True,
+                                          role_grant=("read",)))
+        payload = argv[argv.index("--agents") + 1]
+        self.assertTrue(payload.isascii())
+        for bad in ("|", "&", ";", "<", ">", "`", "$(", "\n", "\r"):
+            self.assertNotIn(bad, payload)
+        # a verifier's inline charter states the read-only posture
+        definition = json.loads(payload)
+        self.assertIn("read-only", definition["task-verifier"]["prompt"].lower())
+
+    def test_inline_agent_charter_covers_unknown_executor_roles(self) -> None:
+        argv = build_claude_argv(_request("frontend-executor", role_grant=("read", "write"),
+                                          tools=("Read", "Edit")))
+        definition = json.loads(argv[argv.index("--agents") + 1])
+        self.assertIn("executor", definition["frontend-executor"]["prompt"].lower())
+
 
 class CodexArgvTests(unittest.TestCase):
     def test_write_launch_grants_only_the_external_root_named_by_allowed_scope(self) -> None:
