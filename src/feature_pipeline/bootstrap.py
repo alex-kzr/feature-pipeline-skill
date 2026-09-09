@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable, Mapping, Sequence
@@ -32,12 +32,15 @@ from feature_pipeline.ports.adapters import (
 from feature_pipeline.contracts import SchemaError, TaskSpec
 
 from pipeline_core.adapters import (
+    REQUIRED_INPUT_INVALID,
     Adapter,
     AdapterError,
     ClaudeAdapter,
     CodexAdapter,
     ContextEntry,
     ExecutorContextBundle,
+    RequiredInput,
+    derive_required_input_dirs,
 )
 from pipeline_core.execution import (
     ExecuteControls,
@@ -80,6 +83,9 @@ class AdapterRuntime:
     #: Runner-owned immutable executor context, keyed by task id. Empty unless a caller
     #: (``run_execute``) built bundles for the selected tasks.
     executor_contexts: Mapping[str, ExecutorContextBundle] = field(default_factory=dict)
+    #: Runner-owned minimal mandatory-input directory grants, keyed by task id (REC-05).
+    #: Empty unless ``run_execute`` derived them for a nested-root task.
+    required_input_dirs: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -116,6 +122,7 @@ class BootstrapComposition:
     factories: tuple[AdapterFactory, ...]
     adapter_registry: AdapterRegistry
     executor_contexts: Mapping[str, ExecutorContextBundle] = field(default_factory=dict)
+    required_input_dirs: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
     def make_execute_adapters(
         self, adapter_name: str | None = None
@@ -133,6 +140,7 @@ class BootstrapComposition:
                 dict(self.logical_scope_roots),
             ),
             executor_contexts=self.executor_contexts,
+            required_input_dirs=self.required_input_dirs,
         )
         factory = next(factory for factory in self.factories if factory.name == resolved.name)
         executor = factory.create(runtime)
@@ -152,6 +160,7 @@ def codex_factory(
             resolver=resolver,
             working_root=runtime.project_dir,
             scope_roots=runtime.scope_roots,
+            required_input_dirs=runtime.required_input_dirs,
         )
 
     def codex_available() -> bool:
@@ -173,6 +182,7 @@ def _production_factories() -> tuple[AdapterFactory, ...]:
             working_root=str(runtime.project_dir),
             scope_roots=runtime.scope_roots,
             executor_contexts=runtime.executor_contexts,
+            required_input_dirs=runtime.required_input_dirs,
         )
 
     def claude_available() -> bool:
@@ -199,6 +209,7 @@ def build_bootstrap(
     *,
     logical_paths: Mapping[str, str] | None = None,
     executor_contexts: Mapping[str, ExecutorContextBundle] | None = None,
+    required_input_dirs: Mapping[str, Sequence[str]] | None = None,
 ) -> BootstrapComposition:
     registered_factories = tuple(factories) if factories is not None else _production_factories()
     paths = logical_paths or {"agents": ".agents", "core": "core"}
@@ -210,6 +221,7 @@ def build_bootstrap(
         registered_factories,
         AdapterRegistry(tuple(factory.capabilities() for factory in registered_factories)),
         dict(executor_contexts or {}),
+        {key: tuple(value) for key, value in dict(required_input_dirs or {}).items()},
     )
 
 
@@ -447,6 +459,171 @@ def build_executor_context_bundles(
     return bundles
 
 
+def _compiled_working_root(compiled_plan: object, task_id: str) -> str:
+    """The nested working root the compiler routed ``task_id`` to, or ``"."`` if unknown."""
+    try:
+        return str(compiled_plan.task(task_id).working_root)  # type: ignore[union-attr]
+    except Exception:  # pragma: no cover - defensive: a plan without this task
+        return "."
+
+
+def _resolve_required_skill(
+    skill_rel: str,
+    *,
+    project_dir: Path,
+    agents_root: Path,
+    agents_logical_prefix: str,
+) -> RequiredInput | None:
+    """Resolve one task-declared required-skill path to a validated :class:`RequiredInput`.
+
+    The repository's logical ``.agents/`` prefix (``agents_logical_prefix``) is normalized to
+    the physical external agents anchor, so a skill declared as
+    ``.agents/skills/.../SKILL.md`` resolves against the real shared-agents tree instead of
+    silently escaping the project anchor when ``.agents`` is a symlink out of the workspace
+    (REC-08).
+
+    Returns ``None`` only for an input this derivation does not grant a directory for: an
+    absolute path (the runner-supplied context bundle carries it) or a bare anchor-root file
+    with no directory component. Anything else that cannot be resolved to a readable file
+    under the project or the agents anchor fails closed with :class:`AdapterError` rather than
+    being dropped from the grant set.
+    """
+    skill_path = Path(skill_rel)
+    if skill_path.is_absolute():
+        return None
+    posix = skill_path.as_posix().lstrip("/")
+    prefix = agents_logical_prefix.strip("/") if agents_logical_prefix else ""
+    if prefix and (posix == prefix or posix.startswith(f"{prefix}/")):
+        agents_rel = posix[len(prefix):].strip("/")
+        if "/" in agents_rel and (agents_root / agents_rel).is_file():
+            return RequiredInput("skill", "agents", agents_rel)
+        raise AdapterError(
+            f"required skill {skill_rel!r} is declared under the {agents_logical_prefix!r} "
+            f"agents prefix but names no readable file in the external agents anchor",
+            REQUIRED_INPUT_INVALID,
+        )
+    if "/" not in posix:
+        return None
+    if (project_dir / posix).is_file():
+        return RequiredInput("skill", "project", posix)
+    if (agents_root / posix).is_file():
+        return RequiredInput("skill", "agents", posix)
+    raise AdapterError(
+        f"required skill {skill_rel!r} could not be resolved to a readable file under the "
+        f"project or the agents anchor",
+        REQUIRED_INPUT_INVALID,
+    )
+
+
+def _project_required_input(
+    kind: str,
+    logical_source: str | None,
+    *,
+    project_dir: Path,
+    reachable: Sequence[Path],
+) -> RequiredInput | None:
+    """A project-anchored :class:`RequiredInput` for a mandatory task / plan / prompt file, or
+    ``None`` when no minimal directory grant is needed for it (REC-08).
+
+    ``None`` is returned when the worker's own working root already reaches the file, or when
+    the declared path is a bare anchor-root artifact such as ``plan.json`` that exists but
+    names no sub-anchor directory to grant. Widening the grant to the whole project anchor is
+    never acceptable, and such a mandatory file's content still reaches the worker through the
+    runner-composed executor context bundle, so this is not a silent omission of required-input
+    context — it keeps the pre-existing project-root execute flows green instead of aborting
+    them. A path that *does* name a sub-anchor directory is returned as a
+    :class:`RequiredInput`; a bare anchor-root path that cannot even be resolved to a readable
+    file still fails closed with :class:`AdapterError`.
+    """
+    if not logical_source:
+        return None
+    posix = Path(logical_source).as_posix().lstrip("/")
+    target = (project_dir / posix).resolve()
+    grant = target.parent
+    if any(grant == root or root in grant.parents for root in reachable):
+        return None
+    if "/" not in posix:
+        if not target.is_file():
+            raise AdapterError(
+                f"required input {posix!r} names no directory to grant under the project "
+                f"anchor and could not be resolved to a readable file",
+                REQUIRED_INPUT_INVALID,
+            )
+        return None
+    return RequiredInput(kind, "project", posix)
+
+
+def build_required_input_dirs(
+    specs: Sequence[TaskSpec],
+    *,
+    project_dir: Path,
+    agents_root: Path,
+    plan_path: Path,
+    prompt_path: Path,
+    working_root_by_id: Mapping[str, str] | None = None,
+    task_ids: Sequence[str] | None = None,
+    agents_logical_prefix: str = ".agents",
+) -> dict[str, tuple[str, ...]]:
+    """Derive each selected task's minimal mandatory-input directory grants (REC-05 / REC-08).
+
+    For every task this returns the smallest physical directory set a worker in that task's
+    (possibly nested) working root needs in order to read its declared task file, the plan and
+    prompt files, and each required skill — resolved under the project anchor, or the external
+    agents anchor (including the repository's logical ``agents_logical_prefix``) for a skill
+    that only exists there. The grants are always distinct from ``allowed_scope`` and never
+    widen a write capability.
+
+    Fail-closed: a declared mandatory input that cannot be validated, resolved, or reduced to a
+    safe minimal directory raises :class:`AdapterError` rather than yielding a task with a
+    silently truncated (or absent) grant set. A task whose working root already reaches
+    everything legitimately gets no entry.
+    """
+    project_dir = Path(project_dir)
+    agents_root = Path(agents_root)
+    working_roots = dict(working_root_by_id or {})
+    wanted = set(task_ids) if task_ids is not None else {spec.id for spec in specs}
+    plan_rel = project_relative(plan_path, project_dir)
+    prompt_rel = project_relative(prompt_path, project_dir)
+    grants: dict[str, tuple[str, ...]] = {}
+    for spec in specs:
+        if spec.id not in wanted or not spec.path:
+            continue
+        # Everything under the task's own working root is already reachable; a worker routed
+        # to the project root therefore needs no extra grant at all.
+        reachable: tuple[Path, ...] = (
+            (project_dir / working_roots.get(spec.id, ".")).resolve(),
+        )
+        inputs: list[RequiredInput] = []
+        for kind, rel in (
+            ("task", Path(spec.path).as_posix().lstrip("/")),
+            ("plan", plan_rel),
+            ("prompt", prompt_rel if prompt_rel != plan_rel else None),
+        ):
+            required = _project_required_input(
+                kind, rel, project_dir=project_dir, reachable=reachable
+            )
+            if required is not None:
+                inputs.append(required)
+        for skill_rel in spec.required_skills:
+            skill_input = _resolve_required_skill(
+                skill_rel,
+                project_dir=project_dir,
+                agents_root=agents_root,
+                agents_logical_prefix=agents_logical_prefix,
+            )
+            if skill_input is not None:
+                inputs.append(skill_input)
+        dirs = derive_required_input_dirs(
+            inputs,
+            project_root=project_dir,
+            agents_root=agents_root,
+            reachable_roots=reachable,
+        )
+        if dirs:
+            grants[spec.id] = dirs
+    return grants
+
+
 def make_execute_adapters(
     project_dir: Path,
     agents_root: Path,
@@ -563,6 +740,22 @@ def run_execute(
         (project_dir / storage_rel) if storage_rel else project_dir / ".pipeline" / "runs"
     ) / feature
 
+    try:
+        required_input_dirs = build_required_input_dirs(
+            specs,
+            project_dir=project_dir,
+            agents_root=agents_root,
+            plan_path=plan_path,
+            prompt_path=project_dir / prompt_rel,
+            working_root_by_id={
+                spec.id: _compiled_working_root(compiled_plan, spec.id) for spec in specs
+            },
+            agents_logical_prefix=profile.logical_paths.agents,
+        )
+    except AdapterError as exc:
+        raise CliError(EXIT_ERROR, f"{exc.code}: {exc}") from None
+    composition = replace(composition, required_input_dirs=required_input_dirs)
+
     if executor is None or launchers is None or environment is None:
         executor, launchers, environment = composition.make_execute_adapters(command.adapter)
     controls = ExecuteControls(
@@ -633,6 +826,7 @@ __all__ = [
     "BootstrapComposition",
     "build_bootstrap",
     "build_executor_context_bundles",
+    "build_required_input_dirs",
     "codex_factory",
     "load_markdown_plan",
     "MarkdownPlanError",
