@@ -52,6 +52,17 @@ feature-pipeline = "pipeline_core.runner_cli:main"
 [project.urls]
 Documentation = "https://example.invalid/feature-pipeline/docs/agents/README.md"
 
+[tool.hatch.build]
+# REC-01 (docs/plans/tasks/REC-01_executor-context-and-catalog-recovery.md): the versioned
+# task-kind catalog is packaged JSON + a generated Markdown inventory under
+# `src/feature_pipeline/catalogs/**`. Declaring them as artifacts keeps a wheel and an sdist
+# carrying the exact committed revision without a source checkout (loaded through
+# `importlib.resources` by `feature_pipeline.domain.task_kinds`).
+artifacts = [
+    "src/feature_pipeline/catalogs/**/*.json",
+    "src/feature_pipeline/catalogs/**/*.md",
+]
+
 [tool.hatch.build.targets.wheel]
 # PKG-02 (docs/adr/002): the migration target `src/feature_pipeline` is the canonical
 # package; `pipeline_core` (implementation, migrating one group at a time) ships alongside

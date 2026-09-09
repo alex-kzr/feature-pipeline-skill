@@ -192,9 +192,16 @@ class VerifiedEvidenceStore:
             )
         return path, raw, data
 
-    @staticmethod
-    def _eligible_task(data: Mapping[str, Any], task_id: str) -> Mapping[str, Any]:
-        if data.get("status") != "verified":
+    #: Terminal run states whose per-task evidence may still be reused. ``verified`` is a
+    #: globally closed run; ``blocked`` is a terminal run that could not be globally closed
+    #: (e.g. a sibling task needs human recovery). Reuse from a ``blocked`` source is only
+    #: ever granted when the *named task itself* clears every check below — the run is never
+    #: treated as successful and its bytes are never touched.
+    _TERMINAL_RUN_STATES = ("verified", "blocked")
+
+    @classmethod
+    def _eligible_task(cls, data: Mapping[str, Any], task_id: str) -> Mapping[str, Any]:
+        if data.get("status") not in cls._TERMINAL_RUN_STATES:
             raise EvidenceEligibilityError("source run is not closed", "evidence-source-run-not-closed")
         tasks = data.get("tasks")
         if not isinstance(tasks, list):

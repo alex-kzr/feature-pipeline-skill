@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable, Mapping, Sequence
@@ -31,7 +31,14 @@ from feature_pipeline.ports.adapters import (
 )
 from feature_pipeline.contracts import SchemaError, TaskSpec
 
-from pipeline_core.adapters import Adapter, ClaudeAdapter, CodexAdapter
+from pipeline_core.adapters import (
+    Adapter,
+    AdapterError,
+    ClaudeAdapter,
+    CodexAdapter,
+    ContextEntry,
+    ExecutorContextBundle,
+)
 from pipeline_core.execution import (
     ExecuteControls,
     ExecuteRequest,
@@ -70,6 +77,9 @@ class AdapterRuntime:
     agents_root: Path
     core_root: Path
     scope_roots: tuple[tuple[str, Path], ...]
+    #: Runner-owned immutable executor context, keyed by task id. Empty unless a caller
+    #: (``run_execute``) built bundles for the selected tasks.
+    executor_contexts: Mapping[str, ExecutorContextBundle] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -105,6 +115,7 @@ class BootstrapComposition:
     logical_scope_roots: tuple[tuple[str, str], ...]
     factories: tuple[AdapterFactory, ...]
     adapter_registry: AdapterRegistry
+    executor_contexts: Mapping[str, ExecutorContextBundle] = field(default_factory=dict)
 
     def make_execute_adapters(
         self, adapter_name: str | None = None
@@ -121,6 +132,7 @@ class BootstrapComposition:
                 self.core_root,
                 dict(self.logical_scope_roots),
             ),
+            executor_contexts=self.executor_contexts,
         )
         factory = next(factory for factory in self.factories if factory.name == resolved.name)
         executor = factory.create(runtime)
@@ -160,6 +172,7 @@ def _production_factories() -> tuple[AdapterFactory, ...]:
         return ClaudeAdapter(
             working_root=str(runtime.project_dir),
             scope_roots=runtime.scope_roots,
+            executor_contexts=runtime.executor_contexts,
         )
 
     def claude_available() -> bool:
@@ -185,6 +198,7 @@ def build_bootstrap(
     factories: Sequence[AdapterFactory] | None = None,
     *,
     logical_paths: Mapping[str, str] | None = None,
+    executor_contexts: Mapping[str, ExecutorContextBundle] | None = None,
 ) -> BootstrapComposition:
     registered_factories = tuple(factories) if factories is not None else _production_factories()
     paths = logical_paths or {"agents": ".agents", "core": "core"}
@@ -195,6 +209,7 @@ def build_bootstrap(
         tuple((name, paths[name]) for name in ("agents", "core")),
         registered_factories,
         AdapterRegistry(tuple(factory.capabilities() for factory in registered_factories)),
+        dict(executor_contexts or {}),
     )
 
 
@@ -359,6 +374,79 @@ def resolve_scope_roots(
     return tuple(roots)
 
 
+def _redacted_logical_entry(
+    kind: str, base: Path, rel: str, rules
+) -> ContextEntry | None:
+    """Read ``base/rel``, redact known host roots, and return a digest-bound entry.
+
+    Returns ``None`` when the file cannot be read or the declared path is not a safe logical
+    source — the caller keeps the rest of the bundle rather than failing the run.
+    """
+    rel_posix = Path(rel).as_posix().lstrip("/")
+    try:
+        raw = (base / rel).read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return None
+    try:
+        return ContextEntry.of(kind, rel_posix, redact_text(raw, rules))
+    except AdapterError:
+        return None
+
+
+def build_executor_context_bundles(
+    specs: Sequence[TaskSpec],
+    *,
+    project_dir: Path,
+    agents_root: Path,
+    plan_path: Path,
+    prompt_path: Path,
+    task_ids: Sequence[str] | None = None,
+) -> dict[str, ExecutorContextBundle]:
+    """Assemble one runner-owned immutable context bundle per selected task.
+
+    Each bundle carries the task's canonical contract plus the plan, prompt, and required-skill
+    content it needs — every entry redacted of known host roots, then bound to a safe
+    project/agents-root logical source and a SHA-256 digest. Building is best-effort: a file the
+    runner cannot read here is omitted, and a task whose own contract file is unreadable gets
+    no bundle (the adapter then launches with the plain envelope, exactly as before). Every
+    entry that *is* built is validated and fails closed on a bad digest or unsafe source.
+    """
+    rules = build_rules(project_dir)
+    wanted = set(task_ids) if task_ids is not None else {spec.id for spec in specs}
+    plan_rel = project_relative(plan_path, project_dir) or plan_path.name
+    plan_entry = _redacted_logical_entry("plan", project_dir, plan_rel, rules)
+    prompt_rel = project_relative(prompt_path, project_dir)
+    prompt_entry = (
+        _redacted_logical_entry("prompt", project_dir, prompt_rel, rules)
+        if prompt_rel else None
+    )
+    bundles: dict[str, ExecutorContextBundle] = {}
+    for spec in specs:
+        if spec.id not in wanted or not spec.path:
+            continue
+        task_entry = _redacted_logical_entry("task", project_dir, spec.path, rules)
+        if task_entry is None:
+            continue
+        entries: list[ContextEntry] = [task_entry]
+        if plan_entry is not None:
+            entries.append(plan_entry)
+        if prompt_entry is not None:
+            entries.append(prompt_entry)
+        for skill_rel in spec.required_skills:
+            skill_entry = _redacted_logical_entry("skill", project_dir, skill_rel, rules)
+            if skill_entry is None and not Path(skill_rel).is_absolute():
+                skill_entry = _redacted_logical_entry("skill", agents_root, skill_rel, rules)
+            if skill_entry is not None:
+                entries.append(skill_entry)
+        try:
+            bundle = ExecutorContextBundle(spec.id, tuple(entries))
+            bundle.validate()
+        except AdapterError:
+            continue
+        bundles[spec.id] = bundle
+    return bundles
+
+
 def make_execute_adapters(
     project_dir: Path,
     agents_root: Path,
@@ -419,6 +507,13 @@ def run_execute(
             "agents": profile.logical_paths.agents,
             "core": profile.logical_paths.core,
         },
+        executor_contexts=build_executor_context_bundles(
+            specs,
+            project_dir=project_dir,
+            agents_root=agents_root,
+            plan_path=plan_path,
+            prompt_path=project_dir / prompt_rel,
+        ),
     )
     executor = None
     launchers = None
@@ -537,6 +632,7 @@ __all__ = [
     "BOARD_RELATIVE_PATH",
     "BootstrapComposition",
     "build_bootstrap",
+    "build_executor_context_bundles",
     "codex_factory",
     "load_markdown_plan",
     "MarkdownPlanError",

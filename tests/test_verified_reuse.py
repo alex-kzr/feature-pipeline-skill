@@ -38,12 +38,13 @@ def _definition(
 
 
 def _source(root: Path, *, run_id: str, definition: TaskDefinition, status: str = "verified",
-            task_verdict: str = "PASS", test_verdict: str = "PASS", digest: str | None = None) -> Path:
+            task_verdict: str = "PASS", test_verdict: str = "PASS", digest: str | None = None,
+            run_status: str = "verified") -> Path:
     path = root / "runs" / run_id / "run.json"
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps({
         "schema_version": 2, "feature": "source", "prompt_path": "other.md", "plan_path": "other.json",
-        "run_id": run_id, "status": "verified", "tasks": [{
+        "run_id": run_id, "status": run_status, "tasks": [{
             "id": definition.id, "status": status, "task_path": definition.source_path,
             "task_contract_digest": task_contract_digest(definition) if digest is None else digest,
             "verification": {"task_verdict": task_verdict, "test_verdict": test_verdict,
@@ -150,6 +151,77 @@ class VerifiedEvidenceStoreTests(unittest.TestCase):
             with self.assertRaises(EvidenceEligibilityError) as ambiguous:
                 VerifiedEvidenceStore(root / "runs", root).find(definition)
             self.assertEqual(ambiguous.exception.code, "evidence-legacy-ambiguous")
+
+
+class TerminalBlockedSourceReuseTests(unittest.TestCase):
+    """A terminal ``blocked`` source run may still lend one fully-verified task's evidence."""
+
+    def test_terminal_blocked_source_run_lends_a_fully_verified_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            definition = _definition()
+            source = _source(
+                root, run_id="blocked-src", definition=definition, run_status="blocked")
+            before = source.read_bytes()
+
+            evidence = VerifiedEvidenceStore(root / "runs", root).find(definition)
+
+            self.assertEqual(evidence["evidence_identity"], "task-path-and-contract-digest")
+            self.assertEqual(evidence["task_verdict"], "PASS")
+            self.assertEqual(evidence["test_verdict"], "PASS")
+            self.assertEqual(source.read_bytes(), before)
+
+    def test_explicit_terminal_blocked_source_run_uses_the_same_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            definition = _definition()
+            source = _source(
+                root, run_id="selected", definition=definition, run_status="blocked")
+            evidence = VerifiedEvidenceStore(root / "runs", root).find_at(source.parent, definition)
+            self.assertEqual(evidence["source_run_id"], "selected")
+
+    def test_blocked_source_run_with_an_unverified_task_is_denied(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            definition = _definition()
+            _source(
+                root, run_id="blocked-src", definition=definition,
+                run_status="blocked", status="implemented")
+            with self.assertRaises(EvidenceEligibilityError) as denied:
+                VerifiedEvidenceStore(root / "runs", root).find(definition)
+            self.assertEqual(denied.exception.code, "evidence-source-task-not-verified")
+
+    def test_blocked_source_run_with_a_failed_verdict_is_denied(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            definition = _definition()
+            _source(
+                root, run_id="blocked-src", definition=definition,
+                run_status="blocked", test_verdict="FAIL")
+            with self.assertRaises(EvidenceEligibilityError) as denied:
+                VerifiedEvidenceStore(root / "runs", root).find(definition)
+            self.assertEqual(denied.exception.code, "evidence-test-verdict-not-pass")
+
+    def test_blocked_source_run_with_a_mismatched_contract_is_denied(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            definition = _definition()
+            _source(
+                root, run_id="blocked-src", definition=definition,
+                run_status="blocked", digest="sha256:changed")
+            with self.assertRaises(EvidenceEligibilityError) as denied:
+                VerifiedEvidenceStore(root / "runs", root).find(definition)
+            self.assertEqual(denied.exception.code, "evidence-contract-digest-mismatch")
+
+    def test_non_terminal_source_run_is_still_rejected_as_not_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            definition = _definition()
+            _source(
+                root, run_id="running-src", definition=definition, run_status="running")
+            with self.assertRaises(EvidenceEligibilityError) as denied:
+                VerifiedEvidenceStore(root / "runs", root).find(definition)
+            self.assertEqual(denied.exception.code, "evidence-source-run-not-closed")
 
 
 class ContractPersistenceTests(unittest.TestCase):

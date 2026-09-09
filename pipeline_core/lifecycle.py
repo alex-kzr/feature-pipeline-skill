@@ -46,6 +46,13 @@ CORE_VERSION = "0.1.0"
 
 _BLOCKED_BY_PREFIX = "blocked_by: "
 
+#: Persisted states a task may hold while being *absent* from a compatible resume's selection
+#: scope without that absence being a task-set mismatch. A ``blocked`` predecessor whose work a
+#: later task supersedes, and an already-``verified`` upstream task kept for history, are both
+#: legitimately out of a narrower resume scope (REC-01: ``TC-01 -> TC-02 -> TC-03 -> REC-01``
+#: leaves the blocked ``TC-04`` out of scope). Any other state means live work would be dropped.
+_RESUME_ABSENT_OK_STATES = frozenset({"blocked", "verified"})
+
 
 def _environment(*, adapter_requested: str | None, adapter_resolved: str | None) -> dict[str, Any]:
     """A portable, secret-free environment record (platform, Python, core, adapter fields)."""
@@ -190,12 +197,33 @@ class RunLifecycle:
     # -- internals --------------------------------------------------------------------
 
     def _check_task_set(self, expected: Mapping[str, Sequence[str]]) -> None:
+        """Reject an incompatible task-set change while tolerating a narrower resume scope.
+
+        ``expected`` is the resume's selection closure (``task_id -> depends_on``). A task in
+        ``expected`` that the run never recorded is always a mismatch. A *persisted* task that
+        ``expected`` omits is a mismatch only when it still holds live work — a ``blocked``
+        predecessor a later task supersedes, or an already-``verified`` upstream task, is
+        legitimately outside a narrower scope and must not synthesise a mismatch. Dependency
+        edges are compared within the resumed scope only, mirroring how
+        :meth:`initialize` persists ``[dep for dep in depends_on if dep in scope]``.
+        """
         persisted = {tid: list(rec.depends_on) for tid, rec in self.run.tasks.items()}
-        if set(expected) != set(persisted):
+        unknown = set(expected) - set(persisted)
+        if unknown:
             raise ResumeError(
-                "resume task set does not match the persisted run", "task-set-mismatch")
+                f"resume introduces task(s) the run never recorded: {', '.join(sorted(unknown))}",
+                "task-set-mismatch")
+        for tid in set(persisted) - set(expected):
+            if self.run.tasks[tid].status not in _RESUME_ABSENT_OK_STATES:
+                raise ResumeError(
+                    f"resume scope drops {tid}, which still holds live work "
+                    f"({self.run.tasks[tid].status})",
+                    "task-set-mismatch")
+        scope = set(expected)
         for tid, depends_on in expected.items():
-            if list(depends_on) != persisted[tid]:
+            recorded_edges = [dep for dep in persisted[tid] if dep in scope]
+            resumed_edges = [dep for dep in depends_on if dep in scope]
+            if resumed_edges != recorded_edges:
                 raise ResumeError(
                     f"dependency edges for {tid} changed since the run was recorded",
                     "task-set-mismatch")

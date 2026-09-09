@@ -9,7 +9,13 @@ import unittest
 from pathlib import Path
 
 from pipeline_core.lifecycle import CORE_VERSION, RunLifecycle
-from pipeline_core.state import ACTOR_EXECUTOR, ACTOR_RUNNER, ResumeError, Run
+from pipeline_core.state import (
+    ACTOR_EXECUTOR,
+    ACTOR_HUMAN,
+    ACTOR_RUNNER,
+    ResumeError,
+    Run,
+)
 
 
 def _run(root: Path, *, feature: str = "durable", plan: str | None = None) -> Run:
@@ -183,6 +189,67 @@ class ResumeReconciliationTests(unittest.TestCase):
                     prompt_path=root / "prompts" / "feature.md",
                     plan_path=root / "plan.md",
                     expected_tasks={"A-1": [], "A-2": []})
+            self.assertEqual(caught.exception.code, "task-set-mismatch")
+
+    def _superseded_chain(self, root: Path) -> Run:
+        """TC-01 -> TC-02 -> TC-03 verified, TC-04 blocked (its work superseded by REC-01)."""
+        run = _run(root, plan="plan.md")
+        life = RunLifecycle.initialize(
+            run,
+            tasks=[("TC-01", []), ("TC-02", ["TC-01"]), ("TC-03", ["TC-02"]),
+                   ("TC-04", ["TC-03"])],
+        )
+        for task_id in ("TC-01", "TC-02", "TC-03"):
+            if life.run.task(task_id).status == "pending":
+                life.transition(task_id, "ready", actor=ACTOR_RUNNER)
+            life.transition(task_id, "running", actor=ACTOR_RUNNER)
+            life.transition(task_id, "implemented", actor=ACTOR_EXECUTOR)
+            life.transition(task_id, "verified", actor=ACTOR_RUNNER)
+            life.recompute_readiness()
+        life.transition("TC-04", "running", actor=ACTOR_RUNNER)
+        life.block("TC-04", "max-repair-attempts-exhausted")
+        return run
+
+    def test_resume_tolerates_a_blocked_superseded_predecessor_out_of_scope(self) -> None:
+        # A compatible resume of TC-01 -> TC-02 -> TC-03 -> REC-01 selects the scope closure
+        # for REC-01; TC-04 (blocked, superseded) is simply not in that scope and must not
+        # provoke a synthetic task-set mismatch.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = self._superseded_chain(root)
+            life = RunLifecycle.resume(
+                run.run_dir, root, feature="durable",
+                prompt_path=root / "prompts" / "feature.md", plan_path=root / "plan.md",
+                expected_tasks={"TC-01": [], "TC-02": ["TC-01"], "TC-03": ["TC-02"]})
+            self.assertEqual(life.run.task("TC-03").status, "verified")
+            self.assertEqual(life.run.task("TC-04").status, "blocked")
+
+    def test_resume_still_rejects_a_non_terminal_task_dropped_from_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = self._superseded_chain(root)
+            # A human reopens TC-04 for redispatch, so its work is *not* settled; dropping it
+            # from the resume scope is a real mismatch, not a recovered predecessor.
+            reopened = RunLifecycle(Run.load(run.run_dir, root))
+            reopened.transition("TC-04", "ready", actor=ACTOR_HUMAN)
+            with self.assertRaises(ResumeError) as caught:
+                RunLifecycle.resume(
+                    run.run_dir, root, feature="durable",
+                    prompt_path=root / "prompts" / "feature.md",
+                    plan_path=root / "plan.md",
+                    expected_tasks={"TC-01": [], "TC-02": ["TC-01"], "TC-03": ["TC-02"]})
+            self.assertEqual(caught.exception.code, "task-set-mismatch")
+
+    def test_resume_still_rejects_an_edge_change_inside_the_resumed_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = self._superseded_chain(root)
+            with self.assertRaises(ResumeError) as caught:
+                RunLifecycle.resume(
+                    run.run_dir, root, feature="durable",
+                    prompt_path=root / "prompts" / "feature.md",
+                    plan_path=root / "plan.md",
+                    expected_tasks={"TC-01": [], "TC-02": [], "TC-03": ["TC-02"]})
             self.assertEqual(caught.exception.code, "task-set-mismatch")
 
 

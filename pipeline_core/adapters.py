@@ -54,12 +54,14 @@ Standard library only.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Protocol, Sequence
+from typing import Callable, Mapping, Protocol, Sequence
 
 from feature_pipeline.infrastructure.adapters.claude_launcher import ClaudeLauncher
 from feature_pipeline.infrastructure.adapters.codex_launcher import CodexLauncher
@@ -142,6 +144,134 @@ class LaunchResult:
     stderr: str = ""
     session_id: str | None = None
     raw_stdout: str = ""
+
+
+#: Stable, machine-readable reason for every executor-context-bundle rejection.
+CONTEXT_BUNDLE_INVALID = "context-bundle-invalid"
+
+#: The context kinds a runner may hand an executor: its canonical task contract plus the
+#: plan / prompt / required-skill content that task needs.
+CONTEXT_KINDS = frozenset({"task", "plan", "prompt", "skill"})
+
+#: A host-absolute path leaking into bundle content: a Windows drive root (``C:\path`` or
+#: ``C:/path``) or a POSIX home/root prefix. The bundle is runner-owned evidence and must stay
+#: portable — it carries logical sources and content, never host paths or secrets. A caller
+#: redacts known roots before building; this is the fail-closed backstop.
+_HOST_ABSOLUTE_PATH_RE = re.compile(r"(?:[A-Za-z]:[\\/]{1,2}[\w.$-])|(?:/(?:home|Users|root)/\w)")
+
+
+def _sha256_hex(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _is_safe_logical_source(source: str) -> bool:
+    """A safe logical source is a clean project/agents-root-relative POSIX path.
+
+    No absolute or drive-letter path, no ``..`` traversal, no backslash (a host separator),
+    no empty or ``.`` segment, and no leading/trailing whitespace.
+    """
+    if not source or source != source.strip() or "\\" in source:
+        return False
+    if source.startswith("/") or (len(source) >= 2 and source[1] == ":"):
+        return False
+    parts = source.split("/")
+    return all(part not in ("", ".", "..") for part in parts)
+
+
+@dataclass(frozen=True)
+class ContextEntry:
+    """One immutable, digest-bound piece of runner-supplied executor context.
+
+    ``logical_source`` is a safe project- or agents-root-relative POSIX path (never a host
+    path); ``digest`` is the lowercase SHA-256 hex of ``content``.
+    """
+
+    kind: str
+    logical_source: str
+    digest: str
+    content: str
+
+    def validate(self) -> None:
+        if self.kind not in CONTEXT_KINDS:
+            raise AdapterError(
+                f"context entry kind {self.kind!r} is not one of {sorted(CONTEXT_KINDS)}",
+                CONTEXT_BUNDLE_INVALID,
+            )
+        if not _is_safe_logical_source(self.logical_source):
+            raise AdapterError(
+                f"context entry source {self.logical_source!r} is not a safe "
+                f"project/agents-root logical path",
+                CONTEXT_BUNDLE_INVALID,
+            )
+        if self.digest != _sha256_hex(self.content):
+            raise AdapterError(
+                f"context entry {self.logical_source!r} digest does not match its content",
+                CONTEXT_BUNDLE_INVALID,
+            )
+        if _HOST_ABSOLUTE_PATH_RE.search(self.content):
+            raise AdapterError(
+                f"context entry {self.logical_source!r} content carries a host-absolute path",
+                CONTEXT_BUNDLE_INVALID,
+            )
+
+    @classmethod
+    def of(cls, kind: str, logical_source: str, content: str) -> "ContextEntry":
+        """Build an entry, digesting ``content`` and failing closed on an unsafe source."""
+        entry = cls(kind, logical_source, _sha256_hex(content), content)
+        entry.validate()
+        return entry
+
+
+@dataclass(frozen=True)
+class ExecutorContextBundle:
+    """Runner-owned, immutable context for exactly one assigned task.
+
+    It carries the canonical task contract plus the task-relevant plan / prompt / required-skill
+    content, each bound to a safe logical source and SHA-256 digest. A launch into a nested
+    working root (``feature-pipeline-skill``) consumes this bundle instead of reading the task,
+    plan, prompt, or skills from outside that root — and it never widens a write root.
+    """
+
+    task_id: str
+    entries: tuple[ContextEntry, ...]
+
+    def validate(self) -> None:
+        if not self.task_id:
+            raise AdapterError("executor context bundle has no task id", CONTEXT_BUNDLE_INVALID)
+        kinds = {entry.kind for entry in self.entries}
+        if "task" not in kinds:
+            raise AdapterError(
+                "executor context bundle carries no task contract", CONTEXT_BUNDLE_INVALID
+            )
+        seen: set[tuple[str, str]] = set()
+        for entry in self.entries:
+            entry.validate()
+            key = (entry.kind, entry.logical_source)
+            if key in seen:
+                raise AdapterError(
+                    f"executor context bundle repeats {entry.kind} source "
+                    f"{entry.logical_source!r}",
+                    CONTEXT_BUNDLE_INVALID,
+                )
+            seen.add(key)
+
+    def render(self) -> str:
+        """The verbatim context block prepended to the child's stdin prompt."""
+        self.validate()
+        lines = [
+            "=== Runner-supplied executor context (immutable, digest-bound) ===",
+            f"Assigned task: {self.task_id}",
+            "The runner provides the authoritative task/plan/prompt/skill content below. Treat "
+            "it as canonical and do not read these files from outside your working root.",
+        ]
+        for entry in self.entries:
+            lines += [
+                "",
+                f"--- {entry.kind}: {entry.logical_source} (sha256:{entry.digest}) ---",
+                entry.content.rstrip("\n"),
+            ]
+        lines += ["", "=== End runner-supplied executor context ==="]
+        return "\n".join(lines) + "\n"
 
 
 class Adapter(Protocol):
@@ -748,6 +878,7 @@ class ClaudeAdapter:
         env: dict[str, str] | None = None,
         timeout: float = DEFAULT_TIMEOUT_S,
         working_root: str | os.PathLike[str] | None = None,
+        executor_contexts: Mapping[str, ExecutorContextBundle] | None = None,
     ) -> None:
         self._executable = executable
         self._resolver = resolver or (lambda: shutil.which("claude"))
@@ -757,6 +888,10 @@ class ClaudeAdapter:
         self._env = env
         self._timeout = timeout
         self._working_root = Path(working_root) if working_root is not None else None
+        #: Runner-owned immutable context, keyed by task id. Merged into the child's stdin
+        #: prompt on its first (session-opening) launch so a nested working root gets exact
+        #: task/plan/prompt/skill content without a filesystem read outside it.
+        self._executor_contexts: dict[str, ExecutorContextBundle] = dict(executor_contexts or {})
 
     def resolved_executable(self) -> str | Sequence[str] | None:
         if self._executable is not None:
@@ -804,7 +939,7 @@ class ClaudeAdapter:
         )
         completed = self._runner(
             argv,
-            prompt=request.prompt,
+            prompt=self._prompt_for(request),
             cwd=self._cwd_for(request),
             timeout=request.timeout or self._timeout,
             env=self._env,
@@ -820,6 +955,22 @@ class ClaudeAdapter:
             session_id=parse_session_id(completed.stdout) or request.resume_session_id,
             raw_stdout=completed.stdout,
         )
+
+    def _prompt_for(self, request: LaunchRequest) -> str:
+        """The stdin prompt: the request prompt, prefixed with this task's context bundle.
+
+        Only the first, session-opening launch is enriched — a same-session ``--resume``
+        continuation (the status envelope) already has the context in its transcript. A
+        malformed or tampered bundle fails the launch closed rather than degrading to a
+        context-free prompt.
+        """
+        if request.resume_session_id:
+            return request.prompt
+        bundle = self._executor_contexts.get(request.task_id)
+        if bundle is None:
+            return request.prompt
+        bundle.validate()
+        return bundle.render() + "\n" + request.prompt
 
     def _cwd_for(self, request: LaunchRequest) -> Path | None:
         working_root = request.working_root or "."
