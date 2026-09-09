@@ -293,6 +293,20 @@ def is_verifier_role(role: str) -> bool:
     return normalize_role(role) in VERIFIER_ROLES
 
 
+def is_executor_role(role: str) -> bool:
+    """Whether ``role`` is a concrete executor the adapter can define and select inline.
+
+    Any ``*-executor`` role (``python-executor``, ``tooling-executor``, …) — and the bare
+    ``executor`` charter name — shares the inline executor charter (:func:`_role_charter`), so
+    :func:`build_claude_argv` always renders a matching ``--agents`` definition and selects it
+    by its exact name with ``--agent``. Such a launch therefore never depends on an on-disk
+    ``.claude/agents/<role>.md`` in the target project (RDS-06); availability resolution must
+    agree with that contract rather than demand an ambient agent file. A verifier role is not
+    an executor even though ``test_verifier`` ends in a non-``executor`` word.
+    """
+    return normalize_role(role).endswith("executor")
+
+
 #: The exact on-disk Claude CLI agent name for each normalized verifier role. The CLI's
 #: ``--agent`` flag needs the hyphenated on-disk spelling; :func:`normalize_role`'s underscored
 #: output exists only so ``"task-verifier"`` and ``"task_verifier"`` *compare* equal for an
@@ -902,13 +916,21 @@ class ClaudeAdapter:
         return self.resolved_executable() is not None
 
     def can_resolve_executor(self, role: str, *, working_root: str = ".") -> bool:
-        """Resolve custom or enabled built-in agents before opening an executor window."""
+        """Resolve custom or enabled built-in agents before opening an executor window.
+
+        A concrete ``*-executor`` role (:func:`is_executor_role`) resolves through the adapter's
+        own inline ``--agents``/``--agent`` definition, so it needs no project-local agent file
+        and no built-in entry; an on-disk definition still wins when present. Every other custom
+        role stays fail-closed unless an on-disk or enabled built-in agent backs it.
+        """
         name = on_disk_agent_name(role)
         if not name or Path(name).name != name or "/" in name or "\\" in name:
             return False
         directory = ((self._working_root or Path.cwd()) / working_root).resolve()
         roots = (directory, *directory.parents, Path.home())
         if any((root / ".claude" / "agents" / f"{name}.md").is_file() for root in roots):
+            return True
+        if is_executor_role(role):
             return True
         env = os.environ if self._env is None else self._env
         if env.get("CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS") == "1":

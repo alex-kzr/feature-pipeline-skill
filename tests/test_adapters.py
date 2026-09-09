@@ -251,6 +251,60 @@ class ClaudeArgvTests(unittest.TestCase):
         self.assertIn("executor", definition["frontend-executor"]["prompt"].lower())
 
 
+class ClaudeExecutorResolutionTests(unittest.TestCase):
+    """REC-07: availability resolution must honor the inline ``--agents`` launch contract, so a
+    concrete ``*-executor`` role the adapter already defines inline resolves without an ambient
+    ``.claude/agents/<role>.md`` file — while a custom non-executor role still fails closed."""
+
+    def test_custom_concrete_executor_resolves_without_a_project_local_agent_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with unittest.mock.patch("pathlib.Path.home", return_value=root):
+                adapter = ClaudeAdapter(executable="claude", working_root=root, env={})
+                self.assertTrue(adapter.can_resolve_executor("tooling-executor"))
+                self.assertTrue(adapter.can_resolve_executor("python-executor"))
+
+    def test_resolved_inline_executor_argv_keeps_the_exact_role_and_stays_shell_free(self) -> None:
+        argv = build_claude_argv(
+            _request("tooling-executor", role_grant=("read", "run_checks", "write"),
+                     tools=("Read", "Bash", "Edit")),
+            executable="claude",
+        )
+        self.assertEqual(argv[argv.index("--agent") + 1], "tooling-executor")
+        self.assertLess(argv.index("--agents"), argv.index("--agent"))
+        definition = json.loads(argv[argv.index("--agents") + 1])
+        self.assertEqual(list(definition), ["tooling-executor"])
+        self.assertIn("executor", definition["tooling-executor"]["prompt"].lower())
+        for token in argv:
+            for bad in ("|", "&", ";", "<", ">", "`", "$(", "\n", "\r"):
+                self.assertNotIn(bad, token)
+
+    def test_custom_non_executor_role_without_an_agent_file_stays_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with unittest.mock.patch("pathlib.Path.home", return_value=root):
+                adapter = ClaudeAdapter(executable="claude", working_root=root, env={})
+                self.assertFalse(adapter.can_resolve_executor("tooling-maintainer"))
+                self.assertFalse(adapter.can_resolve_executor("release-manager"))
+
+    def test_inline_executor_resolution_ignores_builtin_disable_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with unittest.mock.patch("pathlib.Path.home", return_value=root):
+                adapter = ClaudeAdapter(
+                    executable="claude", working_root=root,
+                    env={"CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS": "1"})
+                self.assertTrue(adapter.can_resolve_executor("tooling-executor"))
+
+    def test_a_verifier_role_is_not_treated_as_a_concrete_executor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with unittest.mock.patch("pathlib.Path.home", return_value=root):
+                adapter = ClaudeAdapter(executable="claude", working_root=root, env={})
+                self.assertFalse(adapter.can_resolve_executor("task-verifier"))
+                self.assertFalse(adapter.can_resolve_executor("test_verifier"))
+
+
 class CodexArgvTests(unittest.TestCase):
     def test_write_launch_grants_only_the_external_root_named_by_allowed_scope(self) -> None:
         adapter = CodexAdapter(
