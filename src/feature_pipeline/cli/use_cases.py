@@ -274,6 +274,11 @@ def run_command(command: RunCommand) -> PipelineResult:
     if post_task:
         command.dry_run = True
 
+    if (command.recovery_source_feature or command.recovery_task) and (
+        command.mode != "execute" or command.dry_run
+    ):
+        raise CliError(EXIT_ERROR, "recovery selectors are valid only for --mode execute")
+
     profile_rel = _logical_relative(_require(command.profile, "--profile"), "--profile")
     profile_path = _resolve_under(project_root, profile_rel, "--profile")
     project_skill_rel = None

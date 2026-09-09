@@ -29,6 +29,7 @@ Standard library only.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import subprocess
@@ -84,7 +85,7 @@ from .commands import (
     DIAGNOSTIC_OUTPUT_BUDGET,
     ROUTINE_OUTPUT_BUDGET,
 )
-from .concurrency import pipeline_lease, task_lease
+from .concurrency import pipeline_lease, pipeline_lock_path, task_lease, task_lock_path
 from .dispatch import DispatchError
 from .lease import LeaseHeldError
 from .lifecycle import RunLifecycle
@@ -127,6 +128,8 @@ __all__ = [
     "TaskRunResult",
     "execute_run",
     "persist_task_contracts",
+    "recovery_provenance",
+    "replacement_feature",
     "run_task",
 ]
 
@@ -288,6 +291,8 @@ class ExecuteControls:
     grants: tuple[str, ...] = ()
     approvals: tuple[str, ...] = ()
     published_refs: tuple[tuple[str, str], ...] = ()
+    recovery_source_feature: str | None = None
+    recovery_task: str | None = None
 
     @property
     def gate_opened(self) -> bool:
@@ -511,6 +516,194 @@ def _ensure_execution_controls_match(
             "resume execution scope does not match the recorded scope",
             "execution-scope-mismatch",
         )
+    recorded_chain = bool(
+        (run.controls.get("verify_dependency_chain", {}) or {}).get("value", False)
+    )
+    if recorded_chain != verify_dependency_chain:
+        raise ExecutionError(
+            "resume verify-dependency-chain control does not match the recorded run",
+            "verify-dependency-chain-mismatch",
+        )
+
+
+def replacement_feature(source_feature: str, target_adapter: str) -> str:
+    """Return the deterministic identity of one linked replacement run."""
+    _validate_source_feature(source_feature)
+    if target_adapter != "codex":
+        raise ExecutionError("recovery requires the Codex target adapter", "recovery-invalid-controls")
+    return f"{source_feature}-recovery-{target_adapter}"
+
+
+def _validate_launch_failure_artifacts(
+    source_dir: Path, task_id: str, failure: Mapping[str, Any],
+) -> None:
+    """Require precisely the diagnostic owned by one recorded executor launch failure."""
+    generation = failure.get("generation")
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
+        raise ExecutionError("recovery source has an invalid executor launch failure", "recovery-launch-failure-invalid")
+    source_root = source_dir.resolve()
+    launch_dir = source_dir / "reports" / task_id / f"launch-{generation}"
+    diagnostic = launch_dir / f"launch-failure-{generation}.json"
+    prompt_envelope = launch_dir / f"executor-prompt-{generation}.md"
+    try:
+        diagnostic_relative = diagnostic.resolve().relative_to(source_root).as_posix()
+        prompt_relative = prompt_envelope.resolve().relative_to(source_root).as_posix()
+    except ValueError:
+        raise ExecutionError("recovery source launch-failure path escapes its run", "recovery-artifact-evidence") from None
+    expected = {"run.json", prompt_relative, diagnostic_relative}
+    entries = tuple(source_dir.rglob("*"))
+    if any(path.is_symlink() for path in entries):
+        raise ExecutionError("recovery source contains escaped execution artifacts", "recovery-artifact-evidence")
+    actual = {
+        path.relative_to(source_dir).as_posix()
+        for path in entries
+        if path.is_file()
+    }
+    if actual != expected:
+        raise ExecutionError("recovery source contains retained execution artifacts", "recovery-artifact-evidence")
+    try:
+        diagnostic_payload = json.loads(diagnostic.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raise ExecutionError("recovery source launch-failure diagnostic is unreadable", "recovery-artifact-evidence") from None
+    if not isinstance(diagnostic_payload, dict) or any(
+        diagnostic_payload.get(name) != expected_value
+        for name, expected_value in (
+            ("task_id", task_id),
+            ("generation", generation),
+            ("stage", "executor"),
+            ("exit_code", failure.get("exit_code")),
+            ("reason", failure.get("detail")),
+            ("source_run_id", failure.get("source_run_id")),
+        )
+    ):
+        raise ExecutionError("recovery source launch-failure diagnostic does not match its record", "recovery-artifact-evidence")
+
+
+def recovery_provenance(
+    *, controls: ExecuteControls, run_dir: Path, repo_root: Path,
+    specs: Sequence[TaskSpec], replacement_identity: str | None = None,
+) -> dict[str, str] | None:
+    """Validate one dead pre-implementation source run without modifying it.
+
+    This deliberately accepts no inference: the operator supplies both source feature and
+    task, chooses a concrete target adapter, and the source contributes only evidence.
+    """
+    source_feature = controls.recovery_source_feature
+    source_task_id = controls.recovery_task
+    if source_feature is None and source_task_id is None:
+        return None
+    if not source_feature or not source_task_id:
+        raise ExecutionError(
+            "recovery requires both a source feature and a source task",
+            "recovery-selector-incomplete",
+        )
+    if controls.resume or controls.adapter != "codex" or not controls.adapter_explicit:
+        raise ExecutionError(
+            "recovery requires a fresh run and the explicit Codex target adapter",
+            "recovery-invalid-controls",
+        )
+    if controls.task != source_task_id or controls.through is not None:
+        raise ExecutionError(
+            "recovery requires --task to select exactly the recovered task",
+            "recovery-selector-mismatch",
+        )
+    derived_replacement = replacement_feature(source_feature, controls.adapter or "")
+    expected_run_dir = (run_dir.parent / derived_replacement).resolve()
+    if run_dir.resolve() != expected_run_dir:
+        raise ExecutionError(
+            "recovery replacement identity must use the deterministic replacement run path",
+            "recovery-identity-mismatch",
+        )
+    if replacement_identity is not None and replacement_identity != derived_replacement:
+        raise ExecutionError(
+            "recovery replacement identity must use the deterministic derived feature",
+            "recovery-identity-mismatch",
+        )
+    if run_dir.exists():
+        raise ExecutionError(
+            "recovery replacement identity is already occupied",
+            "recovery-identity-collision",
+        )
+    if source_task_id not in {spec.id for spec in specs}:
+        raise ExecutionError("recovery task is absent from the replacement plan", "recovery-task-mismatch")
+    source_dir = _resolve_source_run_dir(run_dir, source_feature)
+    source_json = source_dir / "run.json"
+    if not source_json.is_file():
+        raise ExecutionError("recovery source run is missing or unreadable", "recovery-source-missing")
+    try:
+        source = Run.load(source_dir, repo_root)
+        source_task = source.task(source_task_id)
+    except StateError as exc:
+        raise ExecutionError("recovery source task is missing or unreadable", "recovery-source-missing") from exc
+    if source.status != "running":
+        raise ExecutionError(
+            "recovery source has a terminal run state",
+            "recovery-terminal-run-state",
+        )
+    if source_task.status != "running":
+        raise ExecutionError(
+            "recovery source is not at the pre-implementation launch-failure boundary",
+            "recovery-terminal-task-state",
+        )
+    if (
+        source.current_task is not None
+        or pipeline_lock_path(repo_root).exists()
+        or task_lock_path(repo_root, source_task_id).exists()
+    ):
+        raise ExecutionError("recovery source has a live or unreconciled writer lease", "recovery-lease-held")
+    if source.commands:
+        raise ExecutionError("recovery source contains runner command evidence", "recovery-command-evidence")
+    if source.stages:
+        raise ExecutionError(
+            "recovery source contains pre-implementation stage evidence",
+            "recovery-stage-evidence",
+        )
+    if source.artifacts:
+        raise ExecutionError(
+            "recovery source contains retained execution artifacts",
+            "recovery-artifact-evidence",
+        )
+    if source.recovery is not None:
+        raise ExecutionError(
+            "recovery source already has recovery provenance",
+            "recovery-prior-provenance",
+        )
+    implementation = source_task.execution_evidence.get("implementation", {})
+    if (
+        source_task.execution_evidence.get("executor_report")
+        or source_task.session_id
+        or source_task.changed_files
+        or implementation.get("state") != "not-attempted"
+        or implementation.get("changed_files")
+        or implementation.get("manifest")
+        or implementation.get("diff")
+    ):
+        raise ExecutionError("recovery source contains implementation evidence", "recovery-implementation-evidence")
+    if any(source_task.verification.get(name) is not None for name in ("task_verdict", "test_verdict", "verified_at")):
+        raise ExecutionError("recovery source contains verifier evidence", "recovery-verifier-evidence")
+    failures = source_task.external_launch_failures
+    if len(failures) != 1 or failures[0].get("stage") != "executor":
+        raise ExecutionError("recovery source has no unique executor launch failure", "recovery-launch-failure-missing")
+    failure = failures[0]
+    _validate_launch_failure_artifacts(source_dir, source_task_id, failure)
+    for candidate in run_dir.parent.glob("*/run.json"):
+        if candidate.resolve() == source_json.resolve():
+            continue
+        try:
+            existing = Run.load(candidate.parent, repo_root)
+        except StateError:
+            continue
+        if existing.recovery and existing.recovery.get("source_feature") == source_feature and existing.recovery.get("source_task") == source_task_id:
+            raise ExecutionError("recovery source already has a replacement run", "recovery-duplicate")
+    digest = hashlib.sha256(json.dumps(failure, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return {
+        "policy_version": "preimplementation-recovery-v1",
+        "source_feature": source_feature,
+        "source_run_id": source.run_id,
+        "source_task": source_task_id,
+        "launch_failure_digest": f"sha256:{digest}",
+        "target_adapter": controls.adapter,
+    }
     recorded_chain = run.controls.get("verify_dependency_chain", {}).get("value")
     if recorded_chain is not verify_dependency_chain:
         raise ExecutionError(
@@ -914,6 +1107,7 @@ def _fresh_open_run(
     scope: list[str],
     by_id: Mapping[str, TaskSpec],
     bindings: dict[str, str],
+    recovery: Mapping[str, str] | None = None,
 ) -> tuple[RunLifecycle, list[str]] | ExecuteResult:
     """Create a fresh run, fast-forward every reuse-eligible task, and return
     ``(lifecycle, scope)`` — or a terminal :class:`ExecuteResult` when a reused task's
@@ -922,6 +1116,8 @@ def _fresh_open_run(
     run = Run.create(
         request.feature, request.prompt_path, request.plan_path,
         request.run_dir, request.repo_root)
+    if recovery is not None:
+        run.recovery = dict(recovery)
     life = RunLifecycle.initialize(
         run,
         tasks=[
@@ -963,6 +1159,7 @@ def _open_run(
     by_id: Mapping[str, TaskSpec],
     bindings: dict[str, str],
     plan: CompiledRunPlan | None,
+    recovery: Mapping[str, str] | None = None,
 ) -> tuple[RunLifecycle, list[str]] | ExecuteResult:
     """Initialize a fresh durable run or reconcile a resumed one.
 
@@ -979,6 +1176,7 @@ def _open_run(
         else:
             opened = _fresh_open_run(
                 request, resolution, controls_map, specs, selected, scope, by_id, bindings,
+                recovery,
             )
             if isinstance(opened, ExecuteResult):
                 return opened
@@ -1024,6 +1222,10 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
     try:
         selected, scope = _resolve_selection_and_scope(request, plan, order, spec_by_id)
         _validate_attestation_scope(request.controls, spec_by_id)
+        recovery = recovery_provenance(
+            controls=request.controls, run_dir=request.run_dir, repo_root=request.repo_root,
+            specs=specs, replacement_identity=request.feature,
+        )
     except ExecutionError as exc:
         return _error(f"{exc.code}: {exc}", request)
 
@@ -1083,7 +1285,7 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
     #    (AC-2's "no partial state" on a denial); a resume trusts whatever was recorded.
     opened = _open_run(
         request, resolution, controls_map, specs, selected, scope, execution_scope,
-        by_id, bindings, plan,
+        by_id, bindings, plan, recovery,
     )
     if isinstance(opened, ExecuteResult):
         return opened

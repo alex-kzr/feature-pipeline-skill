@@ -89,6 +89,11 @@ def build_parser() -> argparse.ArgumentParser:
                           "by default eligible verified dependencies are reused")
     run.add_argument("--resume", action="store_true",
                      help="resume a previously recorded run instead of starting one")
+    run.add_argument("--recover-source", metavar="FEATURE",
+                     dest="recovery_source_feature",
+                     help="execute-only: create a fresh linked replacement from this failed source run")
+    run.add_argument("--recover-task", metavar="ID", dest="recovery_task",
+                     help="execute-only: selected pre-implementation task in --recover-source")
     run.add_argument("--grant", action="append", default=[], help="assert an operator capability")
     run.add_argument("--approve", action="append", default=[], help="assert a named human approval")
     run.add_argument("--published-ref", action="append", default=[], metavar="SOURCE=REF",

@@ -21,6 +21,7 @@ result and interprets verdicts — it never launches a command itself.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
@@ -512,6 +513,17 @@ class _SettledVerifier:
     diagnostic: Path | None
 
 
+_EXPLICIT_REPORT_VERDICT = re.compile(
+    r"(?im)^\s*(?:[-*]\s*)?(?:Verdict|Вердикт)\s*:\s*(?:[*_]\s*)*"
+    r"(PASS|FAIL|BLOCKED)\b"
+)
+
+
+def _explicit_report_verdicts(text: str) -> frozenset[str]:
+    """Return every labelled, normalized verdict stated in a verifier report."""
+    return frozenset(match.group(1).upper() for match in _EXPLICIT_REPORT_VERDICT.finditer(text))
+
+
 def _settle_text(path: Path, fallback_stdout: str, run: Run) -> str:
     """Read the artifact the adapter wrote (or fall back to its stdout), redact it, return it —
     so the committed artifact and the text the runner reasons about are the same bytes."""
@@ -644,6 +656,14 @@ def _run_one_verifier(
         return _diagnose(
             run, spec, artifacts, role=normalized, attempt=attempt,
             reason=f"{exc.code}: {exc}",
+            result=result, envelope_result=envelope_result, report_text=report_text)
+
+    explicit_verdicts = _explicit_report_verdicts(report_text)
+    if explicit_verdicts and explicit_verdicts != {resolution.token}:
+        return _diagnose(
+            run, spec, artifacts, role=normalized, attempt=attempt,
+            reason=(f"verdict-envelope-mismatch: {normalized} report explicitly reported "
+                    f"{sorted(explicit_verdicts)!r}, envelope reported {resolution.token!r}"),
             result=result, envelope_result=envelope_result, report_text=report_text)
 
     return _SettledVerifier(

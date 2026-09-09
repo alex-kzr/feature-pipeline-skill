@@ -49,6 +49,7 @@ from pipeline_core.execution import (
     _resolve_source_run_dir,
     _validate_attestation_scope,
     execute_run,
+    replacement_feature,
 )
 from pipeline_core.integrations import load_tool_integration
 from pipeline_core.plan_md import MarkdownPlanError, load_markdown_plan
@@ -230,6 +231,26 @@ def project_relative(path: Path, project_dir: Path) -> str | None:
         return path.resolve().relative_to(project_dir.resolve()).as_posix()
     except ValueError:
         return None
+
+
+def _project_logical_source(path: str | Path, project_dir: Path) -> str:
+    """Normalize one resolved mandatory input to a project-relative logical source.
+
+    Task specs may have passed through a loader that resolves their path already.  That
+    physical path is valid only when it remains below the project anchor; returning its
+    relative logical spelling prevents a drive-qualified host path reaching grants or worker
+    context.
+    """
+    root = Path(project_dir).resolve()
+    raw = Path(path)
+    candidate = raw.resolve() if raw.is_absolute() else (root / raw).resolve()
+    try:
+        return candidate.relative_to(root).as_posix()
+    except ValueError:
+        raise AdapterError(
+            f"mandatory input {str(path)!r} resolves outside the project anchor",
+            REQUIRED_INPUT_INVALID,
+        ) from None
 
 
 def load_execute_specs(
@@ -425,18 +446,16 @@ def build_executor_context_bundles(
     """
     rules = build_rules(project_dir)
     wanted = set(task_ids) if task_ids is not None else {spec.id for spec in specs}
-    plan_rel = project_relative(plan_path, project_dir) or plan_path.name
+    plan_rel = _project_logical_source(plan_path, project_dir)
     plan_entry = _redacted_logical_entry("plan", project_dir, plan_rel, rules)
-    prompt_rel = project_relative(prompt_path, project_dir)
-    prompt_entry = (
-        _redacted_logical_entry("prompt", project_dir, prompt_rel, rules)
-        if prompt_rel else None
-    )
+    prompt_rel = _project_logical_source(prompt_path, project_dir)
+    prompt_entry = _redacted_logical_entry("prompt", project_dir, prompt_rel, rules)
     bundles: dict[str, ExecutorContextBundle] = {}
     for spec in specs:
         if spec.id not in wanted or not spec.path:
             continue
-        task_entry = _redacted_logical_entry("task", project_dir, spec.path, rules)
+        task_rel = _project_logical_source(spec.path, project_dir)
+        task_entry = _redacted_logical_entry("task", project_dir, task_rel, rules)
         if task_entry is None:
             continue
         entries: list[ContextEntry] = [task_entry]
@@ -582,8 +601,8 @@ def build_required_input_dirs(
     agents_root = Path(agents_root)
     working_roots = dict(working_root_by_id or {})
     wanted = set(task_ids) if task_ids is not None else {spec.id for spec in specs}
-    plan_rel = project_relative(plan_path, project_dir)
-    prompt_rel = project_relative(prompt_path, project_dir)
+    plan_rel = _project_logical_source(plan_path, project_dir)
+    prompt_rel = _project_logical_source(prompt_path, project_dir)
     grants: dict[str, tuple[str, ...]] = {}
     for spec in specs:
         if spec.id not in wanted or not spec.path:
@@ -595,7 +614,7 @@ def build_required_input_dirs(
         )
         inputs: list[RequiredInput] = []
         for kind, rel in (
-            ("task", Path(spec.path).as_posix().lstrip("/")),
+            ("task", _project_logical_source(spec.path, project_dir)),
             ("plan", plan_rel),
             ("prompt", prompt_rel if prompt_rel != plan_rel else None),
         ):
@@ -668,6 +687,11 @@ def run_execute(
     make_adapters: ExecuteAdapters = make_execute_adapters,
 ) -> PipelineResult:
     feature, specs = load_execute_specs(plan_path, command.feature)
+    if command.recovery_source_feature:
+        try:
+            feature = replacement_feature(command.recovery_source_feature, command.adapter or "")
+        except ExecutionError as exc:
+            raise CliError(EXIT_ERROR, f"{exc.code}: {exc}") from None
     if not feature or not FEATURE_RE.match(feature):
         raise CliError(EXIT_ERROR, "feature name must be a single [A-Za-z0-9._-] token")
 
@@ -773,6 +797,8 @@ def run_execute(
         verify_dependency_chain=command.verify_dependency_chain,
         grants=tuple(command.grants), approvals=tuple(command.approvals),
         published_refs=tuple(_published_refs(command.published_refs)),
+        recovery_source_feature=command.recovery_source_feature,
+        recovery_task=command.recovery_task,
     )
     request = ExecuteRequest(
         feature=feature,

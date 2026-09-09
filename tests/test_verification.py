@@ -511,6 +511,42 @@ class ProseEnvelopeSettlementTests(unittest.TestCase):
             self.assertTrue(outcome.diagnostic.exists())
             self.assertNotEqual(run.task("VR-02").status, "verified")
 
+    def test_explicit_localized_verdict_conflicting_with_envelope_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run = _implemented_run(Path(directory))
+            task = FakeVerifier(
+                prose="# task_verifier\n\nВердикт: **FAIL**\n",
+                envelope=json.dumps(
+                    {"role": "task_verifier", "verdict": "PASS",
+                     "task_id": "VR-02", "attempt": 1}),
+            )
+            outcome = _orchestrate(run, _spec(), task, FakeVerifier())
+            self.assertEqual(outcome.status, "blocked")
+            self.assertIn("verdict-envelope-mismatch", outcome.failure)
+            self.assertNotEqual(run.task("VR-02").status, "verified")
+
+    def test_conflicting_explicit_verdicts_block_regardless_of_order(self) -> None:
+        cases = (
+            "- Verdict: PASS\n- Verdict: FAIL\n",
+            "- Verdict: FAIL\n- Вердикт: PASS\n",
+            "- Вердикт: **BLOCKED**\n- Verdict: PASS\n",
+        )
+        for prose in cases:
+            with self.subTest(prose=prose), tempfile.TemporaryDirectory() as directory:
+                run = _implemented_run(Path(directory))
+                task = FakeVerifier(
+                    prose=prose,
+                    envelope=json.dumps(
+                        {"role": "task_verifier", "verdict": "PASS",
+                         "task_id": "VR-02", "attempt": 1}),
+                )
+
+                outcome = _orchestrate(run, _spec(), task, FakeVerifier())
+
+                self.assertEqual(outcome.status, "blocked")
+                self.assertIn("verdict-envelope-mismatch", outcome.failure)
+                self.assertNotEqual(run.task("VR-02").status, "verified")
+
     def test_malformed_envelope_blocks_with_a_diagnostic(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             run = _implemented_run(Path(directory))

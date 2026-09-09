@@ -44,6 +44,8 @@ class RunCommand:
     grants: list[str] = field(default_factory=list)
     approvals: list[str] = field(default_factory=list)
     published_refs: list[str] = field(default_factory=list)
+    recovery_source_feature: str | None = None
+    recovery_task: str | None = None
 
     # Delivery gates.
     approve_plan: bool = False
@@ -84,6 +86,8 @@ class RunCommand:
             prompt=args.prompt,
             grants=list(args.grant or []), approvals=list(args.approve or []),
             published_refs=list(args.published_ref or []),
+            recovery_source_feature=args.recovery_source_feature,
+            recovery_task=args.recovery_task,
             approve_plan=args.approve_plan,
             approve_final_diff=args.approve_final_diff,
             commit=args.commit,

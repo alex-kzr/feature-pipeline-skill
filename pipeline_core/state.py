@@ -251,6 +251,8 @@ class Run:
     current_task: str | None = None
     stages: dict[str, dict[str, Any]] = field(default_factory=dict)
     artifacts: dict[str, str] = field(default_factory=dict)
+    #: Immutable provenance for a linked pre-implementation replacement run.
+    recovery: dict[str, Any] | None = None
 
     @classmethod
     def create(cls, feature: str, prompt_path: str | Path, plan_path: str | Path | None, run_dir: str | Path, repo_root: str | Path) -> "Run":
@@ -428,15 +430,31 @@ class Run:
         exit_code: Any,
         detail: str,
     ) -> dict[str, Any]:
-        """Append durable evidence that one launch attempt failed and consumed its generation."""
+        """Append durable evidence and bind its executor diagnostic to this run."""
         record = self.task(task_id)
         entry = {
             "stage": stage,
             "generation": generation,
             "exit_code": exit_code,
             "detail": detail,
+            "source_run_id": self.run_id,
             "at": _now(),
         }
+        if stage == ACTOR_EXECUTOR:
+            diagnostic = (
+                self.run_dir / "reports" / task_id / f"launch-{generation}"
+                / f"launch-failure-{generation}.json"
+            )
+            try:
+                payload = read_json(diagnostic)
+                if not isinstance(payload, dict):
+                    raise StateError("executor launch diagnostic is malformed", "launch-failure-diagnostic")
+                payload["source_run_id"] = self.run_id
+                write_json_atomic(diagnostic, payload, repo_root=self.repo_root)
+            except ArtifactReadError:
+                # Recording the failed launch remains durable even if its diagnostic was not
+                # persisted. Recovery rejects that incomplete source later.
+                pass
         record.external_launch_failures.append(entry)
         self.record_event(
             f"launch-failure:{task_id}:{stage}", frm=str(generation), to=str(generation),
@@ -599,6 +617,7 @@ class Run:
             "commands": self.commands,
             "stages": self.stages,
             "artifacts": self.artifacts,
+            "recovery": self.recovery,
         }
 
     def save(self) -> Path:
@@ -619,6 +638,7 @@ class Run:
             tasks, data.get("history", []), data.get("commands", []),
             data.get("controls", {}), data.get("environment", {}),
             data.get("current_task"), data.get("stages", {}), data.get("artifacts", {}),
+            data.get("recovery"),
         )
 
     def resume(self, *, feature: str, prompt_path: str | Path, plan_path: str | Path | None) -> None:
