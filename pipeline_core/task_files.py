@@ -18,6 +18,7 @@ Standard library only.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,8 +42,10 @@ __all__ = [
     "TaskFileError",
     "load_task_spec",
     "parse_execution_metadata",
+    "parse_supersession_declarations",
     "render_blocker_entry",
     "synthesize_acceptance_criteria",
+    "task_presentation_digest",
     "upsert_blockers_section",
 ]
 
@@ -118,6 +121,27 @@ def load_task_spec(path: Path, *, defaults: TaskDefaults | None = None) -> TaskS
     return TaskDefinitionBuilder.from_markdown_task_file(
         Path(path), defaults=source_defaults, error=TaskFileError
     ).to_task_spec()
+
+
+def task_presentation_digest(path: str | Path) -> str:
+    """Return the whole-file diagnostic digest, never a verified-reuse identity.
+
+    This intentionally includes runner-owned presentation sections (``Status``, ``Result``,
+    and ``Blockers``), so callers must not use it for execution eligibility.
+    """
+    content = Path(path).read_bytes()
+    return f"sha256:{hashlib.sha256(content).hexdigest()}"
+
+
+def parse_supersession_declarations(path: str | Path) -> tuple[str, ...]:
+    """Return the supersession relation using the plan parser's canonical grammar.
+
+    Reuse identity must see exactly the relation the plan uses for readiness; delegate rather
+    than maintaining a second, subtly divergent Markdown grammar here.
+    """
+    from .plan_md import _supersession_ids
+
+    return tuple(sorted(_supersession_ids(Path(path))))
 
 
 # --- narrow, idempotent '## Blockers' section edits (VR-03) -------------------------------

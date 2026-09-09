@@ -24,6 +24,7 @@ from pipeline_core.execution import (
     ExecuteControls,
     ExecuteRequest,
     execute_run,
+    persist_task_contracts,
 )
 from pipeline_core.adapters import LaunchResult
 from pipeline_core.lifecycle import RunLifecycle
@@ -377,6 +378,7 @@ class AttestDependencyTests(unittest.TestCase):
             self._force_verified(life, task_id)
         if {task_id for task_id, _ in tasks} == set(verified_ids):
             run.status = "verified"
+            persist_task_contracts(run, _specs(tuple(task_id for task_id, _ in tasks)))
             run.save()
         return run.run_dir
 
@@ -816,6 +818,7 @@ class BoardProjectionWiringTests(unittest.TestCase):
             source_life.transition("EX-02", "implemented", actor=ACTOR_RUNNER)
             source.record_verdicts("EX-02", "PASS", "PASS")
             source.status = "verified"
+            persist_task_contracts(source, _specs(("EX-02",)))
             source.save()
 
             executor = sa.ScriptedExecutor(("implemented",))

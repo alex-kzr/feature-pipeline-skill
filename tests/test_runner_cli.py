@@ -20,9 +20,12 @@ from unittest.mock import patch
 from feature_pipeline.cli import use_cases
 from pipeline_core import runner_cli
 from pipeline_core.adapters import LaunchRequest
+from pipeline_core.execution import persist_task_contracts
 from pipeline_core.lifecycle import RunLifecycle
 from pipeline_core.state import ACTOR_RUNNER, Run
+from pipeline_core.task_files import load_task_spec, upsert_blockers_section
 from pipeline_core.verification import VerifierLaunchers
+from feature_pipeline.infrastructure.board_projection import CompletionEvidence, project_task_state
 
 from tests.test_repair import ScriptedExecutor, StubVerifier
 
@@ -531,7 +534,7 @@ class DryRunAttestationTests(unittest.TestCase):
             run.status = "verified"
             run.save()
 
-    def test_valid_attestation_stops_reporting_dependency_not_satisfied(self) -> None:
+    def test_thin_plan_attestation_rejects_source_without_canonical_identity(self) -> None:
         with TemporaryDirectory() as directory:
             seed = self._seeded(directory)
             self._make_source_run(seed["project_dir"], "source-feature", verified=True)
@@ -539,11 +542,11 @@ class DryRunAttestationTests(unittest.TestCase):
                 "--profile", seed["profile_rel"], "--plan", "plan.json",
                 "--task", "T-02", "--attest-dependency", "T-01=source-feature", "--dry-run",
             ])
-        self.assertEqual(code, 10, err)
-        self.assertNotIn("T-02: pending -> blocked", out)
-        self.assertIn("T-02: pending -> ready -> running -> implemented -> verified", out)
+        self.assertEqual(code, 30)
+        self.assertEqual(out, "")
+        self.assertIn("evidence-canonical-identity-missing", err)
 
-    def test_valid_attestation_dispatches_no_adapter_and_writes_nothing(self) -> None:
+    def test_rejected_thin_plan_attestation_writes_nothing(self) -> None:
         with TemporaryDirectory() as directory:
             seed = self._seeded(directory)
             self._make_source_run(seed["project_dir"], "source-feature", verified=True)
@@ -554,13 +557,14 @@ class DryRunAttestationTests(unittest.TestCase):
                 "--profile", seed["profile_rel"], "--plan", "plan.json",
                 "--task", "T-02", "--attest-dependency", "T-01=source-feature", "--dry-run",
             ])
-            self.assertEqual(code, 10, err)
+            self.assertEqual(code, 30)
+            self.assertIn("evidence-canonical-identity-missing", err)
             self.assertFalse(
                 (seed["project_dir"] / ".pipeline" / "runs" / "sample-feature"
                  / "run.json").exists())
             self.assertEqual(source_run_json.read_text(encoding="utf-8"), before)
 
-    def test_default_reuse_preview_reports_the_eligible_dependency_source(self) -> None:
+    def test_thin_plan_default_reuse_does_not_accept_unidentifiable_evidence(self) -> None:
         """A focused preview applies the same default reuse lookup as execute."""
         with TemporaryDirectory() as directory:
             seed = self._seeded(directory)
@@ -575,12 +579,78 @@ class DryRunAttestationTests(unittest.TestCase):
                 "--profile", seed["profile_rel"], "--plan", "plan.json",
                 "--task", "T-02", "--dry-run",
             ])
-        self.assertEqual(code, 10, err)
+        self.assertEqual(code, 20, err)
         self.assertIn("dependency verification chain: false", out)
         self.assertIn("execution scope: T-01, T-02", out)
-        self.assertIn(f"reused sources: T-01={source['run_id']}", out)
-        self.assertIn("planned dispatch set: T-02", out)
-        self.assertNotIn("T-02: pending -> blocked", out)
+        self.assertIn("reused sources: (none)", out)
+        self.assertIn("planned dispatch set: T-01, T-02", out)
+        self.assertIn("T-02: pending -> blocked", out)
+
+    def test_fresh_selected_task_preview_reuses_projected_markdown_dependency(self) -> None:
+        """A fresh dry run reuses projected evidence and plans only the selected task."""
+        with TemporaryDirectory() as directory:
+            seed = self._seeded(directory)
+            project = seed["project_dir"]
+            plan = project / "plan.md"
+            tasks = project / "tasks"
+            tasks.mkdir()
+            plan.write_text(
+                "# Projected reuse\n\n## Phase 1\n\n### RE-01 Dependency\n\n### RE-02 Selected\n",
+                encoding="utf-8",
+            )
+            dependency = tasks / "RE-01_dependency.md"
+            selected = tasks / "RE-02_selected.md"
+            for path, task_id, title, depends_on in (
+                (dependency, "RE-01", "Dependency", "none"),
+                (selected, "RE-02", "Selected", "RE-01"),
+            ):
+                path.write_text(
+                    f"# {task_id} - {title}\n\n## Status\n- [ ] To Do\n- [ ] In Progress\n- [ ] Done\n\n"
+                    "## Execution Metadata\n- Type: docs\n- Executor: docs-maintainer\n"
+                    f"- Depends on: {depends_on}\n- Allowed scope: `docs/**`\n"
+                    "- Out of scope: none\n- Required skills: none\n"
+                    "- Documentation impact: none\n"
+                    "- Verification commands:\n  - `.` -> `python -m unittest`\n\n"
+                    "## Purpose\nProjected-reuse regression.\n\n## Acceptance Criteria\n"
+                    "- [ ] AC-1 — The task is complete.\n",
+                    encoding="utf-8",
+                )
+            board = project / "board.md"
+            board.write_text("## To Do\n- [RE-01: Dependency](tasks/RE-01_dependency.md)\n\n## In Progress\n",
+                             encoding="utf-8")
+
+            source = Run.create(
+                "source-feature", plan, plan,
+                project / ".pipeline" / "runs" / "source-feature", project,
+            )
+            source_life = RunLifecycle.initialize(source, tasks=[("RE-01", [])])
+            self._force_verified(source_life, "RE-01")
+            persist_task_contracts(source, (load_task_spec(dependency),))
+            source.status = "verified"
+            source.save()
+            source_bytes = (source.run_dir / "run.json").read_bytes()
+
+            project_task_state(
+                board_path=board, task_path=dependency, task_id="RE-01", task_title="Dependency",
+                state="verified",
+                evidence=CompletionEvidence(
+                    completed_at="2026-09-09T00:00:00Z", run_id=source.run_id,
+                    outcome="verified", repair_count=0, gate_count=1,
+                    task_verdict="PASS", test_verdict="PASS",
+                ),
+            )
+            upsert_blockers_section(dependency, "runner-projection", "historical runner note")
+
+            code, out, err = _run(seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.md",
+                "--task", "RE-02", "--dry-run",
+            ])
+            self.assertEqual(code, 10, err)
+            self.assertIn(f"reused sources: RE-01={source.run_id}", out)
+            self.assertIn("planned dispatch set: RE-02", out)
+            self.assertNotIn("planned dispatch set: RE-01, RE-02", out)
+            self.assertNotIn("RE-02: pending -> blocked", out)
+            self.assertEqual((source.run_dir / "run.json").read_bytes(), source_bytes)
 
     def test_full_chain_preview_ignores_explicit_reuse_sources(self) -> None:
         """Full-chain dry-run must agree with execute's no-external-reuse policy."""

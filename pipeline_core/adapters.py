@@ -59,7 +59,7 @@ import json
 import os
 import re
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Mapping, Protocol, Sequence
 
@@ -126,6 +126,11 @@ class LaunchRequest:
     no_tools: bool = False
     timeout: float | None = None
     envelope_path: Path | None = None
+    #: Physical directories a worker must be able to read for its declared task / plan /
+    #: prompt / required-skill inputs (REC-05). Deliberately distinct from ``allowed_scope``:
+    #: lowering these to ``--add-dir`` never contributes a write capability, a scoped write
+    #: root, or an ``effective_grant`` entry.
+    required_input_dirs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -272,6 +277,114 @@ class ExecutorContextBundle:
             ]
         lines += ["", "=== End runner-supplied executor context ==="]
         return "\n".join(lines) + "\n"
+
+
+#: Stable, machine-readable reason for every required-input rejection.
+REQUIRED_INPUT_INVALID = "required-input-invalid"
+
+#: The anchors a required-input logical source may resolve under. ``project`` is the outer
+#: project root; ``agents`` is the external shared-agents anchor. Nothing else is addressable.
+REQUIRED_INPUT_ANCHORS = frozenset({"project", "agents"})
+
+
+@dataclass(frozen=True)
+class RequiredInput:
+    """One mandatory read input a nested worker must reach before it edits or verifies code.
+
+    ``kind`` is one of :data:`CONTEXT_KINDS`; ``anchor`` is ``"project"`` or ``"agents"``;
+    ``logical_source`` is a safe anchor-relative POSIX path to the *file* (never a directory,
+    never a host path). It is deliberately separate from a task's ``Allowed scope`` — deriving
+    a directory grant from it never adds a write capability (REC-05 AC-2).
+    """
+
+    kind: str
+    anchor: str
+    logical_source: str
+
+    def validate(self) -> None:
+        if self.kind not in CONTEXT_KINDS:
+            raise AdapterError(
+                f"required input kind {self.kind!r} is not one of {sorted(CONTEXT_KINDS)}",
+                REQUIRED_INPUT_INVALID,
+            )
+        if self.anchor not in REQUIRED_INPUT_ANCHORS:
+            raise AdapterError(
+                f"required input anchor {self.anchor!r} is not one of "
+                f"{sorted(REQUIRED_INPUT_ANCHORS)}",
+                REQUIRED_INPUT_INVALID,
+            )
+        if not _is_safe_logical_source(self.logical_source):
+            raise AdapterError(
+                f"required input source {self.logical_source!r} is not a safe "
+                f"anchor-relative logical path",
+                REQUIRED_INPUT_INVALID,
+            )
+        if "/" not in self.logical_source:
+            raise AdapterError(
+                f"required input {self.logical_source!r} names no directory to grant; a bare "
+                f"anchor-root file would widen the grant to the whole anchor",
+                REQUIRED_INPUT_INVALID,
+            )
+
+
+def derive_required_input_dirs(
+    inputs: Sequence[RequiredInput],
+    *,
+    project_root: str | os.PathLike[str],
+    agents_root: str | os.PathLike[str],
+    reachable_roots: Sequence[str | os.PathLike[str]] = (),
+) -> tuple[str, ...]:
+    """The smallest set of physical directories that lets a worker read every declared input.
+
+    Each input is validated, resolved under its declared anchor, and reduced to the parent
+    directory of the referenced file. The result is de-duplicated, collapsed so no directory
+    sits alongside one of its own ancestors, and stripped of anything already reachable from
+    ``reachable_roots`` (the worker's own working root). Fails closed — it never silently
+    widens — on an unsafe path, a traversal that escapes its anchor, a missing anchor, or the
+    same logical source claimed under two anchors (REC-05 AC-4).
+    """
+    anchors: dict[str, Path] = {
+        "project": Path(project_root).resolve(),
+        "agents": Path(agents_root).resolve(),
+    }
+    for name, path in anchors.items():
+        if not path.is_dir():
+            raise AdapterError(
+                f"required-input anchor {name!r} is not a directory: {path}",
+                REQUIRED_INPUT_INVALID,
+            )
+    reachable = [Path(root).resolve() for root in reachable_roots]
+    claimed: dict[tuple[str, str], str] = {}
+    grants: list[Path] = []
+    for item in inputs:
+        item.validate()
+        key = (item.kind, item.logical_source)
+        if claimed.setdefault(key, item.anchor) != item.anchor:
+            raise AdapterError(
+                f"required input {item.logical_source!r} is claimed under two anchors "
+                f"({claimed[key]!r} and {item.anchor!r})",
+                REQUIRED_INPUT_INVALID,
+            )
+        anchor = anchors[item.anchor]
+        target = (anchor / item.logical_source).resolve()
+        try:
+            target.relative_to(anchor)
+        except ValueError:
+            raise AdapterError(
+                f"required input {item.logical_source!r} escapes its {item.anchor!r} anchor",
+                REQUIRED_INPUT_INVALID,
+            ) from None
+        grant = target.parent
+        if grant not in grants:
+            grants.append(grant)
+    kept: list[Path] = []
+    for directory in sorted(set(grants), key=lambda p: len(p.parts)):
+        if any(directory == root or root in directory.parents for root in reachable):
+            continue
+        if any(directory == existing or existing in directory.parents for existing in kept):
+            continue
+        kept.append(directory)
+    return tuple(str(directory) for directory in kept)
 
 
 class Adapter(Protocol):
@@ -574,8 +687,15 @@ def build_claude_argv(
     argv += ["--agents", inline_agents_json(request, read_only=read_only)]
     argv += ["--agent", on_disk_agent_name(request.role)]
 
-    for directory in add_dirs:
-        argv += ["--add-dir", str(directory)]
+    # Scoped write roots first, then the read-only required-input grants (REC-05). Both lower
+    # to ``--add-dir``; the required-input set is deliberately not folded into any write scope.
+    seen_dirs: set[str] = set()
+    for directory in (*add_dirs, *request.required_input_dirs):
+        text = str(directory)
+        if text in seen_dirs:
+            continue
+        seen_dirs.add(text)
+        argv += ["--add-dir", text]
     if request.resume_session_id:
         argv += ["--resume", str(request.resume_session_id)]
 
@@ -601,8 +721,13 @@ def build_codex_argv(
     argv += ["--json", "--sandbox", sandbox]
     if working_root is not None:
         argv += ["--cd", str(working_root)]
-    for directory in add_dirs:
-        argv += ["--add-dir", str(directory)]
+    seen_dirs: set[str] = set()
+    for directory in (*add_dirs, *request.required_input_dirs):
+        text = str(directory)
+        if text in seen_dirs:
+            continue
+        seen_dirs.add(text)
+        argv += ["--add-dir", text]
     _assert_shell_free(argv)
     _ = grant
     return argv
@@ -893,6 +1018,7 @@ class ClaudeAdapter:
         timeout: float = DEFAULT_TIMEOUT_S,
         working_root: str | os.PathLike[str] | None = None,
         executor_contexts: Mapping[str, ExecutorContextBundle] | None = None,
+        required_input_dirs: Mapping[str, Sequence[str]] | None = None,
     ) -> None:
         self._executable = executable
         self._resolver = resolver or (lambda: shutil.which("claude"))
@@ -902,6 +1028,12 @@ class ClaudeAdapter:
         self._env = env
         self._timeout = timeout
         self._working_root = Path(working_root) if working_root is not None else None
+        #: Runner-owned minimal mandatory-input directory grants, keyed by task id. Merged
+        #: into the launch's ``--add-dir`` set on the first (session-opening) launch so a
+        #: nested working root can read its task/plan/prompt/skill files (REC-05).
+        self._required_input_dirs: dict[str, tuple[str, ...]] = {
+            key: tuple(value) for key, value in dict(required_input_dirs or {}).items()
+        }
         #: Runner-owned immutable context, keyed by task id. Merged into the child's stdin
         #: prompt on its first (session-opening) launch so a nested working root gets exact
         #: task/plan/prompt/skill content without a filesystem read outside it.
@@ -940,9 +1072,20 @@ class ClaudeAdapter:
             return False
         return name in _CLAUDE_BUILTIN_AGENTS
 
+    def _with_required_inputs(self, request: LaunchRequest) -> LaunchRequest:
+        """Merge this task's minimal mandatory-input grants onto a fresh, session-opening
+        request. A resumed continuation already has the reach it needs and is left untouched."""
+        if request.resume_session_id:
+            return request
+        dirs = self._required_input_dirs.get(request.task_id, ())
+        if not dirs or tuple(request.required_input_dirs) == tuple(dirs):
+            return request
+        return replace(request, required_input_dirs=tuple(dirs))
+
     def plan(self, request: LaunchRequest) -> list[str]:
         """The argv this request would run — used by a dry run and by the tests, so what is
         reviewed is exactly what would execute."""
+        request = self._with_required_inputs(request)
         executable = self.resolved_executable() or "claude"
         return build_claude_argv(
             request, executable=executable,
@@ -955,6 +1098,7 @@ class ClaudeAdapter:
             raise AdapterError(
                 "the Claude CLI is not available on PATH", "adapter-unavailable"
             )
+        request = self._with_required_inputs(request)
         argv = build_claude_argv(
             request, executable=executable,
             settings_path=self._settings_path, add_dirs=self._add_dirs_for(request),
@@ -1025,6 +1169,7 @@ class CodexAdapter:
         env: dict[str, str] | None = None,
         timeout: float = DEFAULT_TIMEOUT_S,
         working_root: str | os.PathLike[str] | None = None,
+        required_input_dirs: Mapping[str, Sequence[str]] | None = None,
     ) -> None:
         self._executable = executable
         self._resolver = resolver or (lambda: shutil.which("codex"))
@@ -1033,6 +1178,10 @@ class CodexAdapter:
         self._env = env
         self._timeout = timeout
         self._working_root = Path(working_root) if working_root is not None else None
+        #: Runner-owned minimal mandatory-input directory grants, keyed by task id (REC-05).
+        self._required_input_dirs: dict[str, tuple[str, ...]] = {
+            key: tuple(value) for key, value in dict(required_input_dirs or {}).items()
+        }
 
     def resolved_executable(self) -> str | Sequence[str] | None:
         return self._executable if self._executable is not None else self._resolver()
@@ -1040,7 +1189,17 @@ class CodexAdapter:
     def available(self) -> bool:
         return self.resolved_executable() is not None
 
+    def _with_required_inputs(self, request: LaunchRequest) -> LaunchRequest:
+        """Merge this task's minimal mandatory-input grants onto a fresh request (REC-05)."""
+        if request.resume_session_id:
+            return request
+        dirs = self._required_input_dirs.get(request.task_id, ())
+        if not dirs or tuple(request.required_input_dirs) == tuple(dirs):
+            return request
+        return replace(request, required_input_dirs=tuple(dirs))
+
     def plan(self, request: LaunchRequest) -> list[str]:
+        request = self._with_required_inputs(request)
         executable = self.resolved_executable() or "codex"
         return build_codex_argv(
             request,
@@ -1053,6 +1212,7 @@ class CodexAdapter:
         executable = self.resolved_executable()
         if executable is None:
             raise AdapterError("the Codex CLI is not available on PATH", "adapter-unavailable")
+        request = self._with_required_inputs(request)
         completed = self._runner(
             build_codex_argv(
                 request,

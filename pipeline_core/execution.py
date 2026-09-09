@@ -52,6 +52,7 @@ from feature_pipeline.application.task_engine import (
     build_completion_evidence,
 )
 from feature_pipeline.application.verified_reuse import (
+    CANONICAL_CONTRACT_VERSION,
     EvidenceEligibilityError,
     VerifiedEvidenceStore,
     canonical_task_path,
@@ -145,6 +146,7 @@ def persist_task_contracts(run: Run, specs: Sequence[TaskSpec]) -> None:
             spec.id,
             canonical_task_path(spec, run.repo_root),
             task_contract_digest(spec),
+            version=CANONICAL_CONTRACT_VERSION,
         )
 
 
@@ -716,8 +718,10 @@ def _ensure_precondition_contracts_match(run: Run, specs: Sequence[TaskSpec]) ->
     for spec in specs:
         if spec.id not in run.tasks:
             continue
-        digest = run.task(spec.id).task_contract_digest
-        if (digest is not None or spec.preconditions) and digest != task_contract_digest(spec):
+        record = run.task(spec.id)
+        digest = record.task_contract_digest
+        if (record.task_contract_version != CANONICAL_CONTRACT_VERSION
+                or digest != task_contract_digest(spec)):
             raise ExecutionError(
                 f"resume task contract changed for {spec.id}; start a fresh reviewed run",
                 "task-contract-mismatch",

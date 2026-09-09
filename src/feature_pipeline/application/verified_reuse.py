@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
@@ -11,6 +12,9 @@ from typing import Any, Mapping
 
 from feature_pipeline.contracts import TaskSpec
 from feature_pipeline.domain.models import TaskDefinition
+
+
+CANONICAL_CONTRACT_VERSION = "rec09-v1"
 
 
 class EvidenceEligibilityError(Exception):
@@ -21,35 +25,90 @@ class EvidenceEligibilityError(Exception):
         self.code = code
 
 
+@dataclass(frozen=True)
+class CanonicalTaskContract:
+    """The complete executable identity eligible for verified-evidence reuse.
+
+    This is deliberately built from the validated ``TaskSpec`` rather than Markdown bytes:
+    runner-owned ``Status``, ``Result``, and ``Blockers`` projections are presentation only.
+    """
+
+    id: str
+    task_type: str
+    executor: str
+    depends_on: tuple[str, ...]
+    allowed_scope: tuple[str, ...]
+    out_of_scope: tuple[str, ...]
+    required_skills: tuple[str, ...]
+    max_repair_attempts: int
+    documentation_impact: tuple[str, ...]
+    verification_commands: tuple[tuple[str, tuple[str, ...]], ...]
+    verification_tier: str
+    accepts_scoped: tuple[str, ...]
+    deferred_verification_commands: tuple[tuple[str, tuple[str, ...]], ...]
+    runner_evidence: str | None
+    blocking_conditions: str | None
+    preconditions: tuple[tuple[str, str], ...]
+    acceptance_criteria: tuple[tuple[str, str], ...]
+    supersedes: tuple[str, ...]
+
+    @classmethod
+    def from_definition(cls, definition: TaskDefinition | TaskSpec) -> "CanonicalTaskContract":
+        """Create the deterministic execution identity from one validated definition."""
+        spec = definition.spec if isinstance(definition, TaskDefinition) else definition
+        source_path = Path(definition.source_path if isinstance(definition, TaskDefinition) else definition.path)
+        # JSON tasks have no task-file declaration.  A native Markdown task must remain
+        # available while its contract is identified; a missing file cannot be guessed.
+        if source_path.is_file():
+            from pipeline_core.task_files import parse_supersession_declarations
+            supersedes = parse_supersession_declarations(source_path)
+        else:
+            supersedes = ()
+        return cls(
+            id=definition.id,
+            task_type=definition.task_type,
+            executor=definition.executor,
+            depends_on=tuple(sorted(definition.depends_on)),
+            allowed_scope=tuple(sorted(definition.allowed_scope)),
+            out_of_scope=tuple(sorted(definition.out_of_scope)),
+            required_skills=tuple(sorted(definition.required_skills)),
+            max_repair_attempts=definition.max_repair_attempts,
+            documentation_impact=tuple(sorted(definition.documentation_impact)),
+            verification_commands=tuple(
+                (command.cwd, tuple(command.argv)) for command in definition.verification_commands
+            ),
+            verification_tier=definition.verification_tier,
+            accepts_scoped=tuple(sorted(definition.accepts_scoped)),
+            deferred_verification_commands=tuple(
+                (command.cwd, tuple(command.argv))
+                for command in definition.deferred_verification_commands
+            ),
+            runner_evidence=spec.runner_evidence,
+            blocking_conditions=definition.blocking_conditions,
+            preconditions=tuple(sorted(
+                (item.kind, item.value) for item in definition.preconditions
+            )),
+            acceptance_criteria=tuple(
+                (criterion.id, criterion.text) for criterion in definition.acceptance_criteria
+            ),
+            supersedes=supersedes,
+        )
+
+    def as_mapping(self) -> dict[str, object]:
+        """Return a JSON-safe diagnostic view of this typed contract."""
+        return asdict(self)
+
+
 def canonical_task_contract(definition: TaskDefinition | TaskSpec) -> dict[str, object]:
-    """Return the input-neutral fields that define reusable task evidence."""
-    contract: dict[str, object] = {
-        "id": definition.id,
-        "depends_on": sorted(definition.depends_on),
-        "allowed_scope": sorted(definition.allowed_scope),
-        "out_of_scope": sorted(definition.out_of_scope),
-        "acceptance_criteria": [
-            {"id": criterion.id, "text": criterion.text}
-            for criterion in definition.acceptance_criteria
-        ],
-        "verification_commands": [
-            {"cwd": command.cwd, "argv": list(command.argv)}
-            for command in definition.verification_commands
-        ],
-        "verification_tier": definition.verification_tier,
-    }
-    preconditions = getattr(definition, "preconditions", ())
-    if preconditions:
-        contract["preconditions"] = [
-            {"kind": item.kind, "value": item.value} for item in preconditions
-        ]
-    return contract
+    """Return the diagnostic mapping of the typed reusable task contract."""
+    return CanonicalTaskContract.from_definition(definition).as_mapping()
 
 
 def task_contract_digest(definition: TaskDefinition | TaskSpec) -> str:
     """Return the stable SHA-256 identity of ``definition``'s reusable contract."""
     encoded = json.dumps(
-        canonical_task_contract(definition), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        CanonicalTaskContract.from_definition(definition).as_mapping(),
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False
     ).encode("utf-8")
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
@@ -86,33 +145,30 @@ class VerifiedEvidenceStore:
             raise EvidenceEligibilityError("no source run exists", "evidence-source-missing")
 
         exact: list[Mapping[str, str]] = []
-        legacy: list[Mapping[str, str]] = []
         denials: list[EvidenceEligibilityError] = []
         expected_path = canonical_task_path(definition, self.repo_root)
-        expected_digest = task_contract_digest(definition)
         for path, raw, data in sources:
             try:
                 task = self._eligible_task(data, definition.id)
                 digest = task.get("task_contract_digest")
                 task_path = task.get("task_path")
-                if digest is None:
-                    if getattr(definition, "preconditions", ()):
-                        raise EvidenceEligibilityError(
-                            "legacy evidence has no precondition contract", "evidence-contract-digest-mismatch"
-                        )
-                    legacy.append(self._evidence(path, raw, data, task, definition.id, "legacy-task-id"))
-                elif task_path != expected_path:
+                version = task.get("task_contract_version")
+                if version != CANONICAL_CONTRACT_VERSION:
+                    raise EvidenceEligibilityError(
+                        "source task has no recognized canonical contract version",
+                        "evidence-canonical-identity-missing",
+                    )
+                if task_path != expected_path:
                     raise EvidenceEligibilityError(
                         "source task path does not match", "evidence-task-path-mismatch"
                     )
-                elif digest != expected_digest:
+                if digest != task_contract_digest(definition):
                     raise EvidenceEligibilityError(
                         "source task contract digest does not match", "evidence-contract-digest-mismatch"
                     )
-                else:
-                    exact.append(self._evidence(
-                        path, raw, data, task, definition.id, "task-path-and-contract-digest"
-                    ))
+                exact.append(self._evidence(
+                    path, raw, data, task, definition.id, "task-path-and-contract-digest"
+                ))
             except EvidenceEligibilityError as exc:
                 denials.append(exc)
 
@@ -121,12 +177,6 @@ class VerifiedEvidenceStore:
         if len(exact) > 1:
             raise EvidenceEligibilityError(
                 "multiple source runs match the task path and contract digest", "evidence-exact-ambiguous"
-            )
-        if len(legacy) == 1:
-            return legacy[0]
-        if len(legacy) > 1:
-            raise EvidenceEligibilityError(
-                "multiple legacy source runs match the task ID", "evidence-legacy-ambiguous"
             )
         if denials:
             raise denials[0]
@@ -139,24 +189,12 @@ class VerifiedEvidenceStore:
         path, raw, data = self._read_source(Path(run_dir) / "run.json")
         task = self._eligible_task(data, definition.id)
         digest = task.get("task_contract_digest")
-        if digest is None:
-            if getattr(definition, "preconditions", ()):
-                raise EvidenceEligibilityError(
-                    "legacy evidence has no precondition contract", "evidence-contract-digest-mismatch"
-                )
-            legacy_matches = 0
-            for _, _, candidate in self._sources():
-                try:
-                    candidate_task = self._eligible_task(candidate, definition.id)
-                except EvidenceEligibilityError:
-                    continue
-                if candidate_task.get("task_contract_digest") is None:
-                    legacy_matches += 1
-            if legacy_matches > 1:
-                raise EvidenceEligibilityError(
-                    "multiple legacy source runs match the task ID", "evidence-legacy-ambiguous"
-                )
-            return self._evidence(path, raw, data, task, definition.id, "legacy-task-id")
+        version = task.get("task_contract_version")
+        if version != CANONICAL_CONTRACT_VERSION:
+            raise EvidenceEligibilityError(
+                "source task has no recognized canonical contract version",
+                "evidence-canonical-identity-missing",
+            )
         if task.get("task_path") != canonical_task_path(definition, self.repo_root):
             raise EvidenceEligibilityError(
                 "source task path does not match", "evidence-task-path-mismatch"
@@ -245,6 +283,7 @@ class VerifiedEvidenceStore:
 
 
 __all__ = [
-    "EvidenceEligibilityError", "VerifiedEvidenceStore", "canonical_task_contract",
+    "CANONICAL_CONTRACT_VERSION", "CanonicalTaskContract", "EvidenceEligibilityError", "VerifiedEvidenceStore",
+    "canonical_task_contract",
     "canonical_task_path", "task_contract_digest",
 ]

@@ -115,6 +115,15 @@ def _request(role: str = "tooling-executor", **overrides: object) -> LaunchReque
 
 
 class RequiredInputDerivationTests(unittest.TestCase):
+    def test_resolved_task_path_is_normalized_back_to_the_project_anchor(self) -> None:
+        project = _Project()
+        nested_task = project.root / "docs" / "plans" / "tasks" / "REC-08_x.md"
+        spec = project.spec(path=str(nested_task.resolve()), required_skills=[])
+
+        grants = project.grants(spec=spec)
+
+        self.assertEqual(set(grants["REC-08"]), {project.docs_dir()})
+
     def test_dot_agents_prefixed_skill_resolves_to_the_external_agents_anchor(self) -> None:
         project = _Project()
 

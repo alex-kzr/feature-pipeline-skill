@@ -133,6 +133,7 @@ class RoundTripTests(unittest.TestCase):
                  "verified_at": "2026-09-01T09:00:00Z", "attested_at": "2026-09-01T10:00:00Z"}]
             record.task_path = "docs/plans/tasks/EX-1.md"
             record.task_contract_digest = "sha256:contract"
+            record.task_contract_version = "rec09-v1"
             record.reused_verification = [{
                 "dependency_id": "EX-0", "source_run_id": "prior-run-id",
                 "source_run_digest": "sha256:source", "evidence_identity": "legacy-task-id",

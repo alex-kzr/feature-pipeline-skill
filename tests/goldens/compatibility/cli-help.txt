@@ -5,8 +5,10 @@ usage: run_pipeline.py [-h] [--project-root DIR] [--agents-root DIR]
                        [--core-root DIR] [--profile REL] [--project-skill REL]
                        [--plan REL] [--task ID] [--through ID]
                        [--attest-dependency DEP_ID=SOURCE_FEATURE]
-                       [--verify-dependency-chain] [--resume] [--grant GRANT]
-                       [--approve APPROVE] [--published-ref SOURCE=REF]
+                       [--verify-dependency-chain] [--resume]
+                       [--recover-source FEATURE] [--recover-task ID]
+                       [--grant GRANT] [--approve APPROVE]
+                       [--published-ref SOURCE=REF]
                        [--mode {plan-only,unattended,execute,release-dry-run}]
                        [--feature NAME] [--prompt REL] [--approve-plan]
                        [--approve-final-diff] [--commit]
@@ -55,6 +57,11 @@ run selection and scope:
                         are reused
   --resume              resume a previously recorded run instead of starting
                         one
+  --recover-source FEATURE
+                        execute-only: create a fresh linked replacement from
+                        this failed source run
+  --recover-task ID     execute-only: selected pre-implementation task in
+                        --recover-source
   --grant GRANT         assert an operator capability
   --approve APPROVE     assert a named human approval
   --published-ref SOURCE=REF

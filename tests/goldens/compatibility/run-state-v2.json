@@ -48,6 +48,7 @@
       "external_launch_failures": [],
       "task_path": null,
       "task_contract_digest": null,
+      "task_contract_version": null,
       "reused_verification": [],
       "attested_dependencies": [],
       "next_executor_launch_generation": 1,
@@ -90,6 +91,7 @@
       "external_launch_failures": [],
       "task_path": null,
       "task_contract_digest": null,
+      "task_contract_version": null,
       "reused_verification": [],
       "attested_dependencies": [],
       "next_executor_launch_generation": 1,
@@ -132,6 +134,7 @@
       "external_launch_failures": [],
       "task_path": null,
       "task_contract_digest": null,
+      "task_contract_version": null,
       "reused_verification": [],
       "attested_dependencies": [],
       "next_executor_launch_generation": 1,
@@ -174,6 +177,7 @@
       "external_launch_failures": [],
       "task_path": null,
       "task_contract_digest": null,
+      "task_contract_version": null,
       "reused_verification": [],
       "attested_dependencies": [],
       "next_executor_launch_generation": 1,
@@ -284,5 +288,6 @@
       ]
     }
   },
-  "artifacts": {}
+  "artifacts": {},
+  "recovery": null
 }

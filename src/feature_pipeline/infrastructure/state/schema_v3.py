@@ -437,6 +437,7 @@ class TaskEntryV3:
     external_launch_failures: tuple[dict[str, object], ...] = ()
     task_path: str | None = None
     task_contract_digest: str | None = None
+    task_contract_version: str | None = None
     reused_verification: tuple[dict[str, object], ...] = ()
     attested_dependencies: tuple[dict[str, object], ...] = ()
     next_executor_launch_generation: int = 1
@@ -450,7 +451,7 @@ class TaskEntryV3:
             "adapter", "session_id", "verification", "execution_evidence", "changed_files",
             "verification_tier", "accepts_scoped", "promotion", "unblocks",
             "maintenance_audit", "external_launch_failures", "attested_dependencies",
-            "task_path", "task_contract_digest", "reused_verification",
+            "task_path", "task_contract_digest", "task_contract_version", "reused_verification",
             "next_executor_launch_generation", "next_task_verifier_launch_generation",
             "next_test_verifier_launch_generation",
         }
@@ -516,6 +517,9 @@ class TaskEntryV3:
             task_contract_digest=_opt_str(
                 data.get("task_contract_digest"), _join(path, "task_contract_digest")
             ),
+            task_contract_version=_opt_str(
+                data.get("task_contract_version"), _join(path, "task_contract_version")
+            ),
             reused_verification=_mapping_list(
                 data.get("reused_verification", []), _join(path, "reused_verification")
             ),
@@ -559,6 +563,7 @@ class TaskEntryV3:
             ],
             "task_path": self.task_path,
             "task_contract_digest": self.task_contract_digest,
+            "task_contract_version": self.task_contract_version,
             "reused_verification": [dict(entry) for entry in self.reused_verification],
             "attested_dependencies": [
                 dict(entry) for entry in self.attested_dependencies

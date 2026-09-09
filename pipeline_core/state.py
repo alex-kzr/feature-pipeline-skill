@@ -172,6 +172,7 @@ class TaskRecord:
     external_launch_failures: list[dict[str, Any]] = field(default_factory=list)
     task_path: str | None = None
     task_contract_digest: str | None = None
+    task_contract_version: str | None = None
     reused_verification: list[dict[str, Any]] = field(default_factory=list)
     #: Read-only evidence that a declared dependency was attested from another, already-closed
     #: run instead of being dispatched in this one (``--attest-dependency``). Each entry:
@@ -522,11 +523,14 @@ class Run:
             note=f"{dep_id} attested via {entry.get('source_feature')}")
         return entry
 
-    def set_task_contract(self, task_id: str, task_path: str, digest: str) -> None:
+    def set_task_contract(
+        self, task_id: str, task_path: str, digest: str, *, version: str = "rec09-v1"
+    ) -> None:
         """Persist the canonical identity that makes a future verified task reusable."""
         record = self.task(task_id)
         record.task_path = repo_relative(task_path, self.repo_root)
         record.task_contract_digest = digest
+        record.task_contract_version = version
 
     def record_reused_verification(
         self, task_id: str, evidence: Mapping[str, Any]

@@ -65,6 +65,7 @@ def migrate_v2_to_v3(
         if isinstance(task, dict):
             task.setdefault("task_path", None)
             task.setdefault("task_contract_digest", None)
+            task.setdefault("task_contract_version", None)
             task.setdefault("reused_verification", [])
     # Fail closed: the migration output must satisfy the strict v3 reader.
     RunStateV3.from_mapping(migrated, unknown_fields=unknown_fields)
