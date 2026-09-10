@@ -355,6 +355,7 @@ def run_command(command: RunCommand) -> PipelineResult:
                 profile=compiled_profile,
                 overrides=ControlOverrides(
                     max_repair_attempts=command.max_repair_attempts,
+                    adapter=command.adapter,
                     model=command.model,
                     effort=command.effort,
                     verify_dependency_chain=(

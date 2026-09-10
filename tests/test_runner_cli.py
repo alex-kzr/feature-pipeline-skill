@@ -12,12 +12,14 @@ import json
 import os
 import shutil
 import unittest
+from types import SimpleNamespace
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from feature_pipeline.cli import use_cases
+from feature_pipeline.ports.adapters import AdapterCapabilities, AdapterRegistry
 from pipeline_core import runner_cli
 from pipeline_core.adapters import LaunchRequest
 from pipeline_core.execution import persist_task_contracts
@@ -184,6 +186,25 @@ C1_TO_C8 = ("C1.", "C2.", "C3.", "C4.", "C5.", "C6.", "C7.", "C8.")
 
 
 class DryRunPlanShapeTests(unittest.TestCase):
+    def test_execute_dry_run_compiles_explicit_codex_controls_against_codex(self) -> None:
+        with TemporaryDirectory() as directory:
+            dest = Path(directory) / "project"
+            seed = _seed("library-guide", dest, tasks=[{"id": "T-01", "type": "docs"}])
+            composition = SimpleNamespace(
+                adapter_registry=AdapterRegistry((
+                    AdapterCapabilities("claude", True, True, True, True, 3600.0),
+                    AdapterCapabilities("codex", True, False, True, True, 3600.0),
+                )),
+            )
+            with patch.object(use_cases, "build_bootstrap", return_value=composition):
+                code, out, err = _run(seed["anchors"] + [
+                    "--profile", seed["profile_rel"], "--plan", "plan.json",
+                    "--mode", "execute", "--dry-run", "--adapter", "codex",
+                    "--model", "gpt-5.6-terra", "--effort", "medium",
+                ])
+        self.assertEqual(code, 10, err)
+        self.assertIn("C5. Exit code: 10", out)
+
     def test_dry_run_against_library_guide_prints_full_shape_and_is_byte_identical(self) -> None:
         tasks = [
             {"id": "T-01", "type": "docs"},
