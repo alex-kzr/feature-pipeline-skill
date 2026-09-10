@@ -151,6 +151,8 @@ class DispatchRequest:
     fresh_session: bool = True
     attempt: int = 1
     repair_report_path: str | None = None
+    model: str | None = None
+    effort: str | None = None
 
 
 @dataclass(frozen=True)
@@ -229,6 +231,8 @@ def dispatch_executor(
         tools=grant_tool_names(request.role_grant),
         timeout=request.timeout,
         envelope_path=artifacts.status_envelope,
+        model=request.model,
+        effort=request.effort,
     )
     # Runner-owned evidence: content snapshot of the whole worktree immediately before the
     # launch, with the runner's own run/lock/report directory excluded. Subtracting this
@@ -293,6 +297,8 @@ def dispatch_executor(
         no_tools=True,
         read_only=True,
         timeout=request.timeout,
+        model=request.model,
+        effort=request.effort,
     )
     try:
         envelope_result = adapter.launch(envelope_request)

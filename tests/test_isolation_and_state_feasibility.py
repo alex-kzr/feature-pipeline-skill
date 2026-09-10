@@ -151,7 +151,8 @@ class StrictIsolationUnsupportedTests(unittest.TestCase):
         # No validated per-stack bundle, no enforced transitive skill-read list, no nested
         # delegate policy is representable at the launch boundary today.
         self.assertEqual(names & {"stack", "skill_bundle", "bundle_digest", "required_reads",
-                                  "nested_tools", "model", "effort"}, set())
+                                  "nested_tools"}, set())
+        self.assertTrue({"model", "effort"} <= names)
         self.assertEqual({f.name for f in dataclasses.fields(LaunchResult)} & {"stack"}, set())
 
     def test_skill_read_enforcement_is_only_one_line_of_prompt_prose(self) -> None:

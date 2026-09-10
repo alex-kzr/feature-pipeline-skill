@@ -219,7 +219,7 @@ class ResumeAndSafetyTests(unittest.TestCase):
             self.assertEqual(run.controls["adapter_resolved"]["value"], "claude")
             self.assertTrue(executor.calls[0]["is_repair"])
 
-    def test_resume_retries_codex_protocol_failure_with_a_new_generation(self) -> None:
+    def test_plain_resume_rejects_codex_protocol_failure(self) -> None:
         class CodexSequenceExecutor:
             name = "codex"
 
@@ -269,10 +269,11 @@ class ResumeAndSafetyTests(unittest.TestCase):
                     plan_approved=True, resume=True, adapter="codex", adapter_explicit=True),
                 environment={"codex": True}))
 
-            self.assertTrue(resumed.ok)
-            self.assertEqual(executor.launches, 2)
+            self.assertEqual(resumed.status, "error")
+            self.assertIn("recovery-selector-required", resumed.message)
+            self.assertEqual(executor.launches, 1)
             run = Run.load(resumed.run_dir, root)
-            self.assertEqual(run.task("EX-01").next_executor_launch_generation, 3)
+            self.assertEqual(run.task("EX-01").next_executor_launch_generation, 2)
 
     def test_resume_that_would_switch_the_pinned_adapter_is_a_runner_error(self) -> None:
         with TemporaryDirectory() as directory:

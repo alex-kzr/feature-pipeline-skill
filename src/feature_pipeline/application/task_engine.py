@@ -96,6 +96,8 @@ class TaskExecution:
     plan_path: str | None = None
     working_root: str = "."
     timeout: float | None = None
+    model: str | None = None
+    effort: str | None = None
     #: Executor-claimed checks, so :func:`build_verification_evidence` can surface a claim
     #: with no runner-recorded command as a fact-only ``FAIL``.
     claimed_checks: tuple[object, ...] = ()
@@ -236,6 +238,8 @@ class TaskEngine:
                         fresh_session=True,
                         attempt=gate,
                         repair_report_path=repair_of,
+                        model=request.model,
+                        effort=request.effort,
                     ),
                     request.adapter,
                 )
@@ -357,7 +361,9 @@ class TaskEngine:
                 attempt=gate,
                 plan_path=request.plan_path,
                 timeout=request.timeout,
-                claimed_checks=tuple(request.claimed_checks),
+                model=request.model,
+                effort=request.effort,
+                claimed_checks=request.claimed_checks,
             ),
         )
 

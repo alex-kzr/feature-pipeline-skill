@@ -24,6 +24,7 @@ Standard library only.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any, Sequence, Union
 
 from feature_pipeline.application.selection import resolve_selection
@@ -100,6 +101,8 @@ class ControlOverrides:
     diagnostic_output_byte_budget: int | None = None
     timeout_s: float | None = None
     adapter: str | None = None
+    model: str | None = None
+    effort: str | None = None
     verify_dependency_chain: bool | None = None
 
 
@@ -156,9 +159,29 @@ def compile_run_plan(
     chain_control = ResolvedControl.resolve(
         "verify_dependency_chain", overrides.verify_dependency_chain, default=False,
     )
+    if (overrides.model is None) != (overrides.effort is None):
+        raise UnsupportedControl("model and effort must be provided together")
+    model = overrides.model
+    effort = overrides.effort
+    if model is not None and (
+        not re.fullmatch(r"[A-Za-z0-9._-]+", model)
+        or not re.fullmatch(r"[A-Za-z0-9._-]+", effort or "")
+    ):
+        raise UnsupportedControl("model and effort must be non-empty token-safe values")
+    if model is not None:
+        supported = {
+            "claude": ("sonnet", "medium"),
+            "codex": ("gpt-5.6-terra", "medium"),
+        }
+        if supported.get(adapter.name) != (model, effort):
+            raise UnsupportedControl(
+                f"adapter '{adapter.name}' does not support model={model!r} effort={effort!r}"
+            )
     run_controls: tuple[ResolvedControl[Any], ...] = (
         ResolvedControl("adapter_requested", overrides.adapter or "auto", adapter_source),
         ResolvedControl("adapter_resolved", adapter.name, adapter_source),
+        ResolvedControl("model", model, ControlSource.EXPLICIT if model is not None else ControlSource.DEFAULT),
+        ResolvedControl("effort", effort, ControlSource.EXPLICIT if effort is not None else ControlSource.DEFAULT),
         routine_control,
         diagnostic_control,
         timeout_control,

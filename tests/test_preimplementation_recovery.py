@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,6 +19,158 @@ from pipeline_core.verification import VerifierAnchors, VerifierLaunchers
 
 
 class RecoveryProvenanceTests(unittest.TestCase):
+    def test_plain_resume_cannot_retry_a_stranded_launch_failure(self) -> None:
+        class FailingCodex:
+            name = "codex"
+
+            def launch(self, request: object) -> LaunchResult:
+                raise AdapterError("external launch failed", "launch-failed")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prompt = root / "prompt.md"
+            plan = root / "plan.md"
+            prompt.write_text("prompt\n", encoding="utf-8")
+            plan.write_text("plan\n", encoding="utf-8")
+            adapter = FailingCodex()
+            source_request = self._execute_request(
+                root, "source", prompt, plan, adapter,
+                ExecuteControls(plan_approved=True, adapter="codex", adapter_explicit=True, task="LR-01"),
+            )
+            self.assertEqual(execute_run(source_request).status, "retryable")
+
+            result = execute_run(self._execute_request(
+                root, "source", prompt, plan, adapter,
+                ExecuteControls(
+                    plan_approved=True, resume=True, adapter="codex", adapter_explicit=True,
+                    task="LR-01",
+                ),
+            ))
+
+            self.assertEqual(result.status, "error")
+            self.assertIn("explicit launch-failure recovery", result.message)
+            self.assertFalse((source_request.run_dir / "reports" / "LR-01" / "launch-2").exists())
+
+    def test_same_run_recovery_rejects_a_live_worker_before_a_new_launch(self) -> None:
+        class FailingCodex:
+            name = "codex"
+
+            def launch(self, request: object) -> LaunchResult:
+                raise AdapterError("external launch failed", "launch-failed")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prompt = root / "prompt.md"
+            plan = root / "plan.md"
+            prompt.write_text("prompt\n", encoding="utf-8")
+            plan.write_text("plan\n", encoding="utf-8")
+            adapter = FailingCodex()
+            source_request = self._execute_request(
+                root, "source", prompt, plan, adapter,
+                ExecuteControls(plan_approved=True, adapter="codex", adapter_explicit=True, task="LR-01"),
+            )
+            self.assertEqual(execute_run(source_request).status, "retryable")
+            lock = pipeline_lock_path(root)
+            lock.parent.mkdir(parents=True, exist_ok=True)
+            lock.write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
+
+            result = execute_run(self._execute_request(
+                root, "source", prompt, plan, adapter,
+                ExecuteControls(
+                    plan_approved=True, resume=True, adapter="codex", adapter_explicit=True,
+                    task="LR-01", recovery_source_feature="source", recovery_task="LR-01",
+                ),
+            ))
+
+            self.assertEqual(result.status, "error")
+            self.assertIn("live worker", result.message)
+            self.assertFalse((source_request.run_dir / "reports" / "LR-01" / "launch-2").exists())
+
+    def test_same_run_recovery_rejects_an_exhausted_repair_budget_before_a_new_launch(self) -> None:
+        class FailingCodex:
+            name = "codex"
+
+            def launch(self, request: object) -> LaunchResult:
+                raise AdapterError("external launch failed", "launch-failed")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prompt = root / "prompt.md"
+            plan = root / "plan.md"
+            prompt.write_text("prompt\n", encoding="utf-8")
+            plan.write_text("plan\n", encoding="utf-8")
+            adapter = FailingCodex()
+            source_request = self._execute_request(
+                root, "source", prompt, plan, adapter,
+                ExecuteControls(plan_approved=True, adapter="codex", adapter_explicit=True, task="LR-01"),
+            )
+            self.assertEqual(execute_run(source_request).status, "retryable")
+            source = Run.load(source_request.run_dir, root)
+            source.task("LR-01").attempts = self._spec().max_repair_attempts
+            source.save()
+
+            result = execute_run(self._execute_request(
+                root, "source", prompt, plan, adapter,
+                ExecuteControls(
+                    plan_approved=True, resume=True, adapter="codex", adapter_explicit=True,
+                    task="LR-01", recovery_source_feature="source", recovery_task="LR-01",
+                ),
+            ))
+
+            self.assertEqual(result.status, "error")
+            self.assertIn("repair accounting", result.message)
+            self.assertFalse((source_request.run_dir / "reports" / "LR-01" / "launch-2").exists())
+
+    def test_explicit_same_run_recovery_dispatches_a_new_generation_without_spending_repair(self) -> None:
+        class FailingCodex:
+            name = "codex"
+
+            def launch(self, request: object) -> LaunchResult:
+                raise AdapterError("external launch failed", "launch-failed")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prompt = root / "prompt.md"
+            plan = root / "plan.md"
+            prompt.write_text("prompt\n", encoding="utf-8")
+            plan.write_text("plan\n", encoding="utf-8")
+            adapter = FailingCodex()
+            source_request = self._execute_request(
+                root, "source", prompt, plan, adapter,
+                ExecuteControls(
+                    plan_approved=True, adapter="codex", adapter_explicit=True, task="LR-01",
+                ),
+            )
+            self.assertEqual(execute_run(source_request).status, "retryable")
+            source_dir = source_request.run_dir
+            generation_one = {
+                path.relative_to(source_dir): path.read_bytes()
+                for path in (source_dir / "reports" / "LR-01" / "launch-1").rglob("*")
+                if path.is_file()
+            }
+
+            result = execute_run(self._execute_request(
+                root, "source", prompt, plan, adapter,
+                ExecuteControls(
+                    plan_approved=True, resume=True, adapter="codex", adapter_explicit=True,
+                    task="LR-01", recovery_source_feature="source", recovery_task="LR-01",
+                ),
+            ))
+
+            self.assertEqual(result.status, "retryable", result.message)
+            recovered = Run.load(source_dir, root).task("LR-01")
+            self.assertEqual(recovered.attempts, 0)
+            self.assertEqual(recovered.next_executor_launch_generation, 3)
+            self.assertTrue((source_dir / "reports" / "LR-01" / "launch-2" / "launch-failure-2.json").is_file())
+            self.assertEqual(
+                {
+                    path.relative_to(source_dir): path.read_bytes()
+                    for path in (source_dir / "reports" / "LR-01" / "launch-1").rglob("*")
+                    if path.is_file()
+                },
+                generation_one,
+            )
+
     def test_production_recovery_initializes_from_a_real_launch_failure_without_mutating_source(self) -> None:
         class FailingCodex:
             name = "codex"

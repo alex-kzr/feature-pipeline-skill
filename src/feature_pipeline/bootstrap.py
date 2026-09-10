@@ -687,7 +687,7 @@ def run_execute(
     make_adapters: ExecuteAdapters = make_execute_adapters,
 ) -> PipelineResult:
     feature, specs = load_execute_specs(plan_path, command.feature)
-    if command.recovery_source_feature:
+    if command.recovery_source_feature and not command.resume:
         try:
             feature = replacement_feature(command.recovery_source_feature, command.adapter or "")
         except ExecutionError as exc:
@@ -747,6 +747,8 @@ def run_execute(
                 routine_output_byte_budget=command.routine_output_byte_budget,
                 diagnostic_output_byte_budget=command.diagnostic_output_byte_budget,
                 adapter=command.adapter,
+                model=command.model,
+                effort=command.effort,
                 verify_dependency_chain=(
                     True if command.verify_dependency_chain else None
                 ),
@@ -788,6 +790,8 @@ def run_execute(
         resume=command.resume,
         adapter=command.adapter,
         adapter_explicit=command.adapter is not None,
+        model=command.model,
+        effort=command.effort,
         max_repair_attempts=command.max_repair_attempts,
         routine_output_byte_budget=command.routine_output_byte_budget,
         diagnostic_output_byte_budget=command.diagnostic_output_byte_budget,

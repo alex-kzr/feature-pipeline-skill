@@ -59,6 +59,8 @@ class RunCommand:
     status: bool = False
     unattended: bool = False
     adapter: str | None = None
+    model: str | None = None
+    effort: str | None = None
     max_repair_attempts: int | None = None
     routine_output_byte_budget: int | None = None
     diagnostic_output_byte_budget: int | None = None
@@ -97,6 +99,8 @@ class RunCommand:
             status=args.status,
             unattended=args.unattended,
             adapter=args.adapter,
+            model=args.model,
+            effort=args.effort,
             max_repair_attempts=args.max_repair_attempts,
             routine_output_byte_budget=args.routine_output_byte_budget,
             diagnostic_output_byte_budget=args.diagnostic_output_byte_budget,

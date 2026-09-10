@@ -47,6 +47,8 @@ class VerificationRequest:
     attempt: int
     plan_path: str | None = None
     timeout: float | None = None
+    model: str | None = None
+    effort: str | None = None
     #: Executor-claimed checks, so a claim with no runner-recorded command surfaces as a
     #: fact-only ``FAIL`` rather than a prompt to re-run the check.
     claimed_checks: tuple[object, ...] = field(default_factory=tuple)
@@ -81,6 +83,8 @@ class VerificationService:
             anchors=request.anchors,
             attempt=request.attempt,
             plan_path=request.plan_path,
+            model=request.model,
+            effort=request.effort,
         )
         run.save()
         return outcome

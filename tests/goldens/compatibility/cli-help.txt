@@ -14,6 +14,7 @@ usage: run_pipeline.py [-h] [--project-root DIR] [--agents-root DIR]
                        [--approve-final-diff] [--commit]
                        [--commit-approved-manifest] [--dry-run] [--push]
                        [--status] [--unattended] [--adapter NAME]
+                       [--model MODEL] [--effort LEVEL]
                        [--max-repair-attempts N]
                        [--routine-output-byte-budget N]
                        [--diagnostic-output-byte-budget N] [--verbose]
@@ -99,6 +100,9 @@ compatibility surface (forwarded from the legacy CLI; see scripts/README.md):
   --unattended          alias of --mode unattended
   --adapter NAME        execution adapter for --mode execute (real control
                         there); accepted as a no-op in plan-only/unattended
+  --model MODEL         adapter-native model for --mode execute only
+  --effort LEVEL        adapter-native reasoning effort for --mode execute
+                        only
   --max-repair-attempts N
                         repair-loop bound for --mode execute (overrides each
                         task's declared bound); accepted as a no-op in plan-

@@ -566,6 +566,7 @@ def _diagnose(
 def _run_one_verifier(
     run: Run, spec: object, role: str, adapter: Adapter, artifacts: object,
     anchors: VerifierAnchors, evidence_payload: str, attempt: int, plan_path: str | None,
+    model: str | None = None, effort: str | None = None,
 ) -> _SettledVerifier:
     normalized = normalize_role(role)
     tool_less = normalized == "test_verifier"
@@ -591,6 +592,8 @@ def _run_one_verifier(
         resume_session_id=None,
         tools=grant_tool_names(verifier_grant),
         no_tools=tool_less,
+        model=model,
+        effort=effort,
     )
     try:
         result = adapter.launch(request)
@@ -631,6 +634,8 @@ def _run_one_verifier(
         working_root=".",
         resume_session_id=result.session_id,
         no_tools=True,
+        model=model,
+        effort=effort,
     )
     try:
         envelope_result = adapter.launch(envelope_request)
@@ -690,6 +695,8 @@ def orchestrate_verification(
     anchors: VerifierAnchors,
     attempt: int,
     plan_path: str | None = None,
+    model: str | None = None,
+    effort: str | None = None,
 ) -> VerificationOutcome:
     """Obtain two fresh, independent, read-only verdicts and let only their parsed combination
     change ``spec.id``'s state.
@@ -716,7 +723,7 @@ def orchestrate_verification(
 
     task_settled = _run_one_verifier(
         run, spec, "task_verifier", launchers.task, artifacts, anchors, payload, attempt,
-        plan_path)
+        plan_path, model, effort)
     if task_settled.failure:
         status = _block(run, task_id, f"task_verifier: {task_settled.failure}")
         return VerificationOutcome(
@@ -726,7 +733,7 @@ def orchestrate_verification(
 
     test_settled = _run_one_verifier(
         run, spec, "test_verifier", launchers.test, artifacts, anchors, payload, attempt,
-        plan_path)
+        plan_path, model, effort)
     if test_settled.failure:
         status = _block(run, task_id, f"test_verifier: {test_settled.failure}")
         return VerificationOutcome(

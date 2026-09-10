@@ -141,6 +141,10 @@ def build_parser() -> argparse.ArgumentParser:
     compat.add_argument("--adapter", metavar="NAME", choices=["claude", "codex", "auto"],
                         help="execution adapter for --mode execute (real control there); "
                              "accepted as a no-op in plan-only/unattended")
+    compat.add_argument("--model", metavar="MODEL",
+                        help="adapter-native model for --mode execute only")
+    compat.add_argument("--effort", metavar="LEVEL",
+                        help="adapter-native reasoning effort for --mode execute only")
     compat.add_argument("--max-repair-attempts", metavar="N", type=int,
                         help="repair-loop bound for --mode execute (overrides each task's "
                              "declared bound); accepted as a no-op in plan-only/unattended")

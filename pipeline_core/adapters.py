@@ -131,6 +131,10 @@ class LaunchRequest:
     #: lowering these to ``--add-dir`` never contributes a write capability, a scoped write
     #: root, or an ``effective_grant`` entry.
     required_input_dirs: tuple[str, ...] = ()
+    #: Explicit per-run runtime selection (REC-06). These values come from the typed
+    #: execution controls; adapters never infer them from prompt prose or configuration.
+    model: str | None = None
+    effort: str | None = None
 
 
 @dataclass(frozen=True)
@@ -659,6 +663,10 @@ def build_claude_argv(
 
     argv = _executable_prefix(executable)
     argv += ["-p", "--output-format", "json"]
+    if request.model is not None:
+        argv += ["--model", request.model]
+    if request.effort is not None:
+        argv += ["--effort", request.effort]
     argv += ["--permission-mode", PERMISSION_MODE_READ_ONLY if read_only else PERMISSION_MODE_WRITE]
     argv += ["--setting-sources", "user,project"]
     if settings_path is not None:
@@ -719,6 +727,12 @@ def build_codex_argv(
     # request so its read-only sandbox and resolved grants are present on the actual argv.
     sandbox = "read-only" if request_is_read_only(request) else "workspace-write"
     argv += ["--json", "--sandbox", sandbox]
+    if request.model is not None:
+        argv += ["--model", request.model]
+    if request.effort is not None:
+        # `codex exec --help` documents `--config key=value`; the installed
+        # client accepts this native reasoning control without ambient config.
+        argv += ["--config", f'model_reasoning_effort="{request.effort}"']
     if working_root is not None:
         argv += ["--cd", str(working_root)]
     seen_dirs: set[str] = set()

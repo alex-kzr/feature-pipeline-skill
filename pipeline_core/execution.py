@@ -91,7 +91,7 @@ from .dispatch import DispatchError
 from .lease import LeaseHeldError
 from .lifecycle import RunLifecycle
 from .prompt_envelope import EnvelopeAnchors
-from .state import ACTOR_RUNNER, ResumeError, Run, StateError, repo_relative
+from .state import ACTOR_RUNNER, ResumeError, Run, StateError, pid_alive, read_lease, repo_relative
 from .preconditions import GitRunner, bind_refs, evaluate_preconditions
 from .task_files import upsert_blockers_section
 from .verification import (
@@ -280,6 +280,8 @@ class ExecuteControls:
     resume: bool = False
     adapter: str | None = None
     adapter_explicit: bool = False
+    model: str | None = None
+    effort: str | None = None
     max_repair_attempts: int | None = None
     routine_output_byte_budget: int | None = None
     diagnostic_output_byte_budget: int | None = None
@@ -510,6 +512,7 @@ def _ensure_attestations_match(run: Run, requested: tuple[tuple[str, str], ...])
 
 def _ensure_execution_controls_match(
     run: Run, scope: Sequence[str], verify_dependency_chain: bool,
+    model: str | None = None, effort: str | None = None,
 ) -> None:
     """Reject a resume whose immutable scope or chain policy changed."""
     recorded_scope = run.controls.get("execution_scope", {}).get("value")
@@ -526,6 +529,11 @@ def _ensure_execution_controls_match(
             "resume verify-dependency-chain control does not match the recorded run",
             "verify-dependency-chain-mismatch",
         )
+    for name, value in (("model", model), ("effort", effort)):
+        if run.controls.get(name, {}).get("value") != value:
+            raise ExecutionError(
+                f"resume {name} does not match the recorded run", "runtime-control-mismatch"
+            )
 
 
 def replacement_feature(source_feature: str, target_adapter: str) -> str:
@@ -599,7 +607,9 @@ def recovery_provenance(
             "recovery requires both a source feature and a source task",
             "recovery-selector-incomplete",
         )
-    if controls.resume or controls.adapter != "codex" or not controls.adapter_explicit:
+    if controls.resume:
+        return None
+    if controls.adapter != "codex" or not controls.adapter_explicit:
         raise ExecutionError(
             "recovery requires a fresh run and the explicit Codex target adapter",
             "recovery-invalid-controls",
@@ -714,6 +724,76 @@ def recovery_provenance(
         )
 
 
+def _validate_same_run_launch_recovery(
+    request: ExecuteRequest,
+    resolution: AdapterResolution,
+    specs: Sequence[TaskSpec],
+    execution_scope: Sequence[str],
+    plan: CompiledRunPlan | None,
+) -> None:
+    """Prove a stranded executor launch is compatible before resume changes its state."""
+    controls = request.controls
+    task_id = controls.recovery_task
+    if not (
+        controls.resume
+        and controls.recovery_source_feature == request.feature
+        and task_id is not None
+    ):
+        return
+    if controls.task != task_id or controls.through is not None or list(execution_scope) != [task_id]:
+        raise ExecutionError("launch-failure recovery must select exactly its recorded task", "recovery-selector-mismatch")
+    source = Run.load(request.run_dir, request.repo_root)
+    source_task = source.task(task_id)
+    if source.status != "running" or source_task.status != "running" or source.current_task is not None:
+        raise ExecutionError("launch-failure recovery requires a nonterminal task with no live worker", "recovery-not-stranded")
+    for lease_path in (pipeline_lock_path(request.repo_root), task_lock_path(request.repo_root, task_id)):
+        lease = read_lease(lease_path)
+        if lease and (lease.get("unreadable") or pid_alive(lease.get("pid"))):
+            raise ExecutionError("launch-failure recovery requires no live worker", "recovery-lease-held")
+    if source.environment.get("adapter", {}).get("resolved") != resolution.resolved:
+        raise ExecutionError("launch-failure recovery adapter does not match the recorded adapter", "recovery-adapter-mismatch")
+    spec = next((item for item in specs if item.id == task_id), None)
+    if spec is None or (
+        source_task.task_contract_version != CANONICAL_CONTRACT_VERSION
+        or source_task.task_contract_digest != task_contract_digest(spec)
+    ):
+        raise ExecutionError("launch-failure recovery task contract does not match the recorded contract", "recovery-contract-mismatch")
+    _ensure_execution_controls_match(
+        source, execution_scope, controls.verify_dependency_chain, controls.model, controls.effort,
+    )
+    if plan is not None:
+        _ensure_plan_compatible(source, plan)
+    if source_task.execution_evidence.get("executor_report") or source_task.session_id:
+        raise ExecutionError("launch-failure recovery rejects an executor outcome", "recovery-executor-outcome")
+    if any(source_task.verification.get(name) is not None for name in ("task_verdict", "test_verdict", "verified_at")):
+        raise ExecutionError("launch-failure recovery rejects verifier evidence", "recovery-verifier-outcome")
+    if source_task.attempts >= spec.max_repair_attempts:
+        raise ExecutionError("launch-failure recovery repair accounting exceeds its recorded bound", "recovery-repair-exhausted")
+    failures = source_task.external_launch_failures
+    if not failures:
+        raise ExecutionError("launch-failure recovery requires a runner-recorded executor launch failure", "recovery-launch-failure-missing")
+    failure = failures[-1]
+    generation = failure.get("generation")
+    if (
+        failure.get("stage") != "executor"
+        or not isinstance(generation, int)
+        or generation != source_task.next_executor_launch_generation - 1
+    ):
+        raise ExecutionError("launch-failure recovery requires the latest executor generation to have failed", "recovery-launch-failure-stale")
+    diagnostic = request.run_dir / "reports" / task_id / f"launch-{generation}" / f"launch-failure-{generation}.json"
+    try:
+        payload = json.loads(diagnostic.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raise ExecutionError("launch-failure recovery diagnostic is unreadable", "recovery-launch-failure-invalid") from None
+    expected = (
+        ("task_id", task_id), ("generation", generation), ("stage", "executor"),
+        ("exit_code", failure.get("exit_code")), ("reason", failure.get("detail")),
+        ("source_run_id", source.run_id),
+    )
+    if not isinstance(payload, dict) or any(payload.get(key) != value for key, value in expected):
+        raise ExecutionError("launch-failure recovery diagnostic does not match its runner record", "recovery-launch-failure-invalid")
+
+
 def _ensure_precondition_contracts_match(run: Run, specs: Sequence[TaskSpec]) -> None:
     for spec in specs:
         if spec.id not in run.tasks:
@@ -806,6 +886,8 @@ def _controls_map(
         "adapter_requested": (resolution.requested, "explicit" if controls.adapter_explicit
                               else "default"),
         "adapter_resolved": (resolution.resolved, resolution.sourced),
+        "model": ((controls.model, "explicit") if controls.model is not None else (None, "default")),
+        "effort": ((controls.effort, "explicit") if controls.effort is not None else (None, "default")),
         "max_repair_attempts": (
             (controls.max_repair_attempts, "explicit")
             if controls.max_repair_attempts is not None else (None, "default")),
@@ -1035,8 +1117,25 @@ def _resume_open_run(
     """Reconcile the persisted run for a ``--resume`` and return ``(lifecycle, active scope)``."""
     recorded = Run.load(request.run_dir, request.repo_root)
     active_scope = [task_id for task_id in execution_scope if task_id in recorded.tasks]
+    stranded = [
+        task_id for task_id in active_scope
+        if (
+            recorded.task(task_id).status == "running"
+            and recorded.task(task_id).external_launch_failures
+        )
+    ]
+    if stranded and not (
+        request.controls.recovery_source_feature == request.feature
+        and request.controls.recovery_task in stranded
+        and request.controls.task == request.controls.recovery_task
+    ):
+        raise ExecutionError(
+            "a stranded executor launch failure requires explicit launch-failure recovery selectors",
+            "recovery-selector-required",
+        )
     _ensure_execution_controls_match(
         recorded, execution_scope, request.controls.verify_dependency_chain,
+        request.controls.model, request.controls.effort,
     )
     _ensure_precondition_contracts_match(recorded, specs)
     recorded_bindings = recorded.controls.get("precondition_bindings", {}).get("value") or {}
@@ -1284,6 +1383,13 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
         controls_map["plan_digest"] = (plan.digest, "explicit")
         controls_map["plan_fingerprint"] = (_plan_fingerprint(plan), "explicit")
 
+    try:
+        _validate_same_run_launch_recovery(
+            request, resolution, specs, execution_scope, plan,
+        )
+    except (StateError, ExecutionError) as exc:
+        return _error(f"{getattr(exc, 'code', 'state-error')}: {exc}", request)
+
     # 3. Durable lifecycle: initialize a fresh run, or resume the persisted one. A fresh run's
     #    attestations are resolved against their source runs before any run.json exists
     #    (AC-2's "no partial state" on a denial); a resume trusts whatever was recorded.
@@ -1358,6 +1464,8 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
                         plan_path=request.plan_prompt_path,
                         working_root=_task_working_root(request, spec),
                         timeout=request.timeout,
+                        model=request.controls.model,
+                        effort=request.controls.effort,
                         board_path=request.board_path,
                         pre_dispatch=lambda: _prepare_executor(life, request, spec, bindings),
                     ),

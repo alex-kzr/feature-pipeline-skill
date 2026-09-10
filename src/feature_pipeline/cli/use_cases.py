@@ -278,6 +278,8 @@ def run_command(command: RunCommand) -> PipelineResult:
         command.mode != "execute" or command.dry_run
     ):
         raise CliError(EXIT_ERROR, "recovery selectors are valid only for --mode execute")
+    if (command.model is not None or command.effort is not None) and command.mode != "execute":
+        raise CliError(EXIT_ERROR, "--model and --effort are valid only for --mode execute")
 
     profile_rel = _logical_relative(_require(command.profile, "--profile"), "--profile")
     profile_path = _resolve_under(project_root, profile_rel, "--profile")
@@ -353,6 +355,8 @@ def run_command(command: RunCommand) -> PipelineResult:
                 profile=compiled_profile,
                 overrides=ControlOverrides(
                     max_repair_attempts=command.max_repair_attempts,
+                    model=command.model,
+                    effort=command.effort,
                     verify_dependency_chain=(
                         True if command.verify_dependency_chain else None
                     ),

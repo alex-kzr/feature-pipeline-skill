@@ -92,23 +92,26 @@ class AdapterSelectionCharacterizationTests(unittest.TestCase):
                 resolve_adapter(choice, environment)
             self.assertEqual(raised.exception.code, "adapter-unavailable")
 
-    def test_launch_contract_has_no_model_or_effort_and_codex_does_not_resume(self) -> None:
-        self.assertFalse({"model", "effort", "stack"} & {field.name for field in fields(LaunchRequest)})
+    def test_launch_contract_lowers_explicit_runtime_controls_and_codex_does_not_resume(self) -> None:
+        self.assertTrue({"model", "effort"} <= {field.name for field in fields(LaunchRequest)})
         request = LaunchRequest(
             role="test_verifier", task_id="BASE-1", prompt="Return the verdict",
             report_path=Path("report.json"), read_only=True, no_tools=True,
-            resume_session_id="previous-session",
+            resume_session_id="previous-session", model="sonnet", effort="medium",
         )
         claude = build_claude_argv(request)
-        codex = build_codex_argv(request)
+        self.assertEqual(claude[claude.index("--model") + 1], "sonnet")
+        self.assertEqual(claude[claude.index("--effort") + 1], "medium")
         self.assertEqual(claude[claude.index("--resume") + 1], "previous-session")
         self.assertEqual(claude[claude.index("--tools") + 1], "")
+
+        codex_request = replace(request, model="gpt-5.6-terra")
+        codex = build_codex_argv(codex_request)
         self.assertEqual(codex[:2], ["codex", "exec"])
+        self.assertEqual(codex[codex.index("--model") + 1], "gpt-5.6-terra")
+        self.assertEqual(codex[codex.index("--config") + 1], 'model_reasoning_effort="medium"')
         self.assertEqual(codex[codex.index("--sandbox") + 1], "read-only")
         self.assertNotIn("resume", codex)
-        for argv in (claude, codex):
-            self.assertNotIn("--model", argv)
-            self.assertNotIn("--effort", argv)
 
     def test_compiled_adapter_is_an_additional_resume_guard(self) -> None:
         fixture = Path(__file__).parent / "fixtures" / "task_model_routing" / "native.json"
@@ -186,7 +189,7 @@ class DispatchAndResumeCharacterizationTests(unittest.TestCase):
             self.assertEqual(executor.requests, [])
             self.assertEqual(Run.load(first.run_dir, root).task("BASE-1").adapter, "claude")
 
-    def test_repair_launch_failure_resumes_fresh_without_spending_another_repair(self) -> None:
+    def test_explicit_launch_failure_recovery_rejects_a_prior_executor_outcome(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
             executor = CapturingAdapter(ScriptedExecutor(("implemented", "launch-fail")))
@@ -198,18 +201,15 @@ class DispatchAndResumeCharacterizationTests(unittest.TestCase):
             original_bytes = original.read_bytes()
             resumed_executor = CapturingAdapter(ScriptedExecutor())
             resumed = execute_run(_request(root, resumed_executor, controls=ExecuteControls(
-                plan_approved=True, resume=True)))
-            self.assertTrue(resumed.ok, resumed.message)
+                plan_approved=True, resume=True, task="BASE-1",
+                recovery_source_feature="baseline", recovery_task="BASE-1")))
+            self.assertEqual(resumed.status, "error")
+            self.assertIn("recovery-executor-outcome", resumed.message)
             run = Run.load(resumed.run_dir, root)
             self.assertEqual(run.task("BASE-1").attempts, 1)
-            self.assertEqual(run.task("BASE-1").next_executor_launch_generation, 4)
+            self.assertEqual(run.task("BASE-1").next_executor_launch_generation, 3)
             self.assertEqual(original.read_bytes(), original_bytes)
-            request = resumed_executor.requests[0]
-            self.assertTrue(request.fresh_session)
-            self.assertIsNone(request.resume_session_id)
-            self.assertEqual(request.role, "python-executor")
-            self.assertIn("Repair of:", request.prompt)
-            self.assertIn('"attempt":2', request.prompt)
+            self.assertEqual(resumed_executor.requests, [])
 
     def test_dependency_reuse_skips_all_launches_and_preserves_source_bytes(self) -> None:
         with TemporaryDirectory() as directory:
