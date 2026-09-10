@@ -752,6 +752,100 @@ class DryRunAttestationTests(unittest.TestCase):
         self.assertIn("evidence-source-run-not-closed", err)
 
 
+class DryRunSupersessionReuseTests(unittest.TestCase):
+    """A focused dry run resolves a blocked predecessor through its verified replacement.
+
+    TC-05 depends on the historically blocked TC-04; REC-01 declares it supersedes TC-04 and
+    has its own eligible verified evidence in an ordinary repository run. A focused preview
+    for TC-05 must plan without dispatching TC-04 on the normal route, and must not put TC-04
+    in the planned dispatch set on the ``--verify-dependency-chain`` route either.
+    """
+
+    def _force_verified(self, life: RunLifecycle, task_id: str) -> None:
+        life.transition(task_id, "running", actor=ACTOR_RUNNER)
+        life.transition(task_id, "implemented", actor=ACTOR_RUNNER)
+        life.run.record_verdicts(task_id, "PASS", "PASS")
+        life.run.save()
+
+    def _scenario(self, directory: str) -> dict:
+        seed = _seed("library-guide", Path(directory) / "project", tasks=[{"id": "x", "type": "docs"}])
+        project = seed["project_dir"]
+        (project / "plan.json").unlink()
+        plan = project / "plan.md"
+        plan.write_text(
+            "# Supersession reuse\n\n## Phase 1\n\n"
+            "### BLK-01 Blocked predecessor\n\n### REP-01 Replacement\n\n### SEL-01 Selected\n",
+            encoding="utf-8",
+        )
+        tasks = project / "tasks"
+        tasks.mkdir()
+
+        def _task(path: Path, task_id: str, title: str, depends_on: str, extra: str = "") -> None:
+            path.write_text(
+                f"# {task_id} - {title}\n\n## Status\n- [ ] To Do\n- [ ] In Progress\n- [ ] Done\n\n"
+                "## Execution Metadata\n- Type: docs\n- Executor: docs-maintainer\n"
+                f"- Depends on: {depends_on}\n- Allowed scope: `docs/**`\n"
+                "- Out of scope: none\n- Required skills: none\n- Documentation impact: none\n"
+                "- Verification commands:\n  - `.` -> `python -m unittest`\n\n"
+                "## Purpose\nSupersession-reuse regression.\n\n## Acceptance Criteria\n"
+                "- [ ] AC-1 — The task is complete.\n" + extra,
+                encoding="utf-8",
+            )
+
+        blocked = tasks / "BLK-01_blocked.md"
+        replacement = tasks / "REP-01_replacement.md"
+        selected = tasks / "SEL-01_selected.md"
+        _task(blocked, "BLK-01", "Blocked predecessor", "none")
+        _task(replacement, "REP-01", "Replacement", "none",
+              extra="\n## Supersession\n- Supersedes: BLK-01\n")
+        _task(selected, "SEL-01", "Selected", "BLK-01")
+
+        source = Run.create(
+            "source-feature", plan, plan,
+            project / ".pipeline" / "runs" / "source-feature", project,
+        )
+        source_life = RunLifecycle.initialize(source, tasks=[("REP-01", [])])
+        self._force_verified(source_life, "REP-01")
+        persist_task_contracts(source, (load_task_spec(replacement),))
+        source.status = "verified"
+        source.save()
+        seed["source_run_id"] = source.run_id
+        seed["source_bytes"] = (source.run_dir / "run.json").read_bytes()
+        seed["source_run_dir"] = source.run_dir
+        return seed
+
+    def test_focused_dry_run_resolves_the_supersession_replacement(self) -> None:
+        with TemporaryDirectory() as directory:
+            seed = self._scenario(directory)
+            code, out, err = _run(seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.md",
+                "--task", "SEL-01", "--dry-run",
+            ])
+            self.assertEqual(code, 10, err)
+            self.assertNotIn("SEL-01: pending -> blocked", out)
+            self.assertNotIn("dependency-not-satisfied: BLK-01", out)
+            self.assertIn(f"reused sources: BLK-01={seed['source_run_id']}", out)
+            self.assertIn("planned dispatch set: SEL-01", out)
+            self.assertNotIn("planned dispatch set: BLK-01", out)
+            # The historical blocked source run is never touched.
+            self.assertEqual((seed["source_run_dir"] / "run.json").read_bytes(), seed["source_bytes"])
+
+    def test_verify_dependency_chain_dry_run_never_dispatches_the_blocked_predecessor(self) -> None:
+        with TemporaryDirectory() as directory:
+            seed = self._scenario(directory)
+            code, out, err = _run(seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.md",
+                "--task", "SEL-01", "--verify-dependency-chain", "--dry-run",
+            ])
+            self.assertEqual(code, 10, err)
+            dispatch = next(
+                line for line in out.splitlines() if line.strip().startswith("planned dispatch set:")
+            )
+            self.assertNotIn("BLK-01", dispatch)
+            self.assertIn("SEL-01", dispatch)
+            self.assertEqual((seed["source_run_dir"] / "run.json").read_bytes(), seed["source_bytes"])
+
+
 RICH_EXECUTE_TASK = {
     "id": "TSK-01",
     "title": "Rich execute task",

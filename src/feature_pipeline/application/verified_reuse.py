@@ -282,8 +282,76 @@ class VerifiedEvidenceStore:
         })
 
 
+def supersession_graph(definitions: Mapping[str, Any], repo_root: str | Path) -> Any | None:
+    """Rebuild the plan's supersession relation from the task files' canonical
+    ``## Supersession`` grammar, or ``None`` when nothing declares one.
+
+    Read-only: it only re-parses task files already on disk (the same grammar
+    :class:`CanonicalTaskContract` folds into the reuse digest). Fails closed to ``None`` on
+    an invalid / cyclic / ambiguous declaration set — the plan loader already rejected those
+    before a run reaches here, so a malformed declaration can never *grant* a reuse.
+    """
+    from pipeline_core.supersession import Supersession, SupersessionError, SupersessionGraph
+    from pipeline_core.task_files import parse_supersession_declarations
+
+    root = Path(repo_root)
+    edges: list[Any] = []
+    for task_id, definition in definitions.items():
+        source = Path(
+            getattr(definition, "source_path", None) or getattr(definition, "path", "")
+        )
+        if not source.is_absolute():
+            source = root / source
+        if not source.is_file():
+            continue
+        for superseded in parse_supersession_declarations(source):
+            edges.append(Supersession(replacement=task_id, superseded=superseded))
+    if not edges:
+        return None
+    try:
+        return SupersessionGraph(
+            edges,
+            known_ids=list(definitions),
+            dependencies={
+                tid: list(getattr(d, "depends_on", ())) for tid, d in definitions.items()
+            },
+        )
+    except SupersessionError:
+        return None
+
+
+def find_superseding_evidence(
+    store: "VerifiedEvidenceStore",
+    graph: Any | None,
+    superseded_id: str,
+    definitions: Mapping[str, Any],
+) -> tuple[str, Mapping[str, str]] | None:
+    """``(replacement_id, evidence)`` for the first task that supersedes ``superseded_id``
+    and carries its *own* exact eligible verified evidence, following the replacement chain.
+
+    Returns ``None`` when no replacement is declared, or none has eligible evidence. The
+    blocked predecessor itself is never read, forged, or modified — only a replacement's
+    real evidence (task path, canonical digest/version, both PASS verdicts, verification
+    time) can satisfy the edge.
+    """
+    if graph is None:
+        return None
+    seen: set[str] = set()
+    node = graph.replacement_for(superseded_id)
+    while node is not None and node not in seen:
+        seen.add(node)
+        definition = definitions.get(node)
+        if definition is not None:
+            try:
+                return node, store.find(definition)
+            except EvidenceEligibilityError:
+                pass
+        node = graph.replacement_for(node)
+    return None
+
+
 __all__ = [
     "CANONICAL_CONTRACT_VERSION", "CanonicalTaskContract", "EvidenceEligibilityError", "VerifiedEvidenceStore",
     "canonical_task_contract",
-    "canonical_task_path", "task_contract_digest",
+    "canonical_task_path", "find_superseding_evidence", "supersession_graph", "task_contract_digest",
 ]
