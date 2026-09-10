@@ -13,6 +13,7 @@ from feature_pipeline.application.verified_reuse import (
     EvidenceEligibilityError,
     VerifiedEvidenceStore,
     canonical_task_contract,
+    resolve_default_reuse,
     task_contract_digest,
 )
 from feature_pipeline.contracts import AcceptanceCriterionSpec, CommandSpec, Precondition, TaskSpec
@@ -325,6 +326,55 @@ class TerminalBlockedSourceReuseTests(unittest.TestCase):
             with self.assertRaises(EvidenceEligibilityError) as denied:
                 VerifiedEvidenceStore(root / "runs", root).find(definition)
             self.assertEqual(denied.exception.code, "evidence-source-run-not-closed")
+
+
+class SupersessionReuseDenialTests(unittest.TestCase):
+    """REC-14 denial cases never grant default reuse to a terminal predecessor."""
+
+    def _definitions(self, root: Path, *, extra: str = "") -> dict[str, TaskDefinition]:
+        task_dir = root / "tasks"; task_dir.mkdir()
+        paths = {name: task_dir / f"{name}.md" for name in ("TC-04", "REC-01", "TC-05")}
+        paths["TC-04"].write_text("# TC-04\n", encoding="utf-8")
+        paths["REC-01"].write_text(
+            "# REC-01\n\n## Supersession\n- Supersedes: TC-04\n" + extra, encoding="utf-8")
+        paths["TC-05"].write_text("# TC-05\n", encoding="utf-8")
+        return {
+            "TC-04": _changed_definition(_definition(path=str(paths["TC-04"])), id="TC-04"),
+            "REC-01": _changed_definition(_definition(path=str(paths["REC-01"])), id="REC-01"),
+            "TC-05": _changed_definition(_definition(path=str(paths["TC-05"]), depends_on=("TC-04",)), id="TC-05"),
+        }
+
+    def test_absent_stale_and_contract_incompatible_replacement_evidence_are_denied(self) -> None:
+        for mode in ("absent", "stale", "incompatible"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory); definitions = self._definitions(root)
+                replacement = definitions["REC-01"]
+                if mode == "stale":
+                    _source(root, run_id="replacement", definition=replacement, status="implemented")
+                elif mode == "incompatible":
+                    _source(root, run_id="replacement", definition=replacement, digest="sha256:wrong")
+                with self.assertRaises(EvidenceEligibilityError):
+                    resolve_default_reuse(VerifiedEvidenceStore(root / "runs", root), definitions,
+                        ["TC-04", "TC-05"], ["TC-05"], root)
+
+    def test_ambiguous_and_cyclic_replacement_declarations_are_denied(self) -> None:
+        for mode, extra in (
+            ("ambiguous", "\n## Supersession\n- Supersedes: TC-04\n"),
+            ("cyclic", ""),
+        ):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory); definitions = self._definitions(root)
+                if mode == "ambiguous":
+                    path = root / "tasks" / "REC-02.md"
+                    path.write_text("# REC-02\n\n## Supersession\n- Supersedes: TC-04\n", encoding="utf-8")
+                    definitions["REC-02"] = _changed_definition(_definition(path=str(path)), id="REC-02")
+                else:
+                    (root / "tasks" / "TC-04.md").write_text(
+                        "# TC-04\n\n## Supersession\n- Supersedes: REC-01\n", encoding="utf-8")
+                with self.assertRaises(EvidenceEligibilityError) as denied:
+                    resolve_default_reuse(VerifiedEvidenceStore(root / "runs", root), definitions,
+                        ["TC-04", "TC-05"], ["TC-05"], root)
+                self.assertEqual(denied.exception.code, "evidence-supersession-invalid")
 
 
 class ContractPersistenceTests(unittest.TestCase):

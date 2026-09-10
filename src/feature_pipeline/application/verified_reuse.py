@@ -350,8 +350,66 @@ def find_superseding_evidence(
     return None
 
 
+def resolve_default_reuse(
+    store: "VerifiedEvidenceStore",
+    definitions: Mapping[str, Any],
+    scope: tuple[str, ...] | list[str],
+    selected: tuple[str, ...] | list[str],
+    repo_root: str | Path,
+    pre_resolved: tuple[str, ...] | list[str] = (),
+) -> dict[str, Mapping[str, str]]:
+    """Resolve default dependency reuse once for preview and execution.
+
+    A replacement is evidence for the *declared* dependency, never evidence that rewrites the
+    predecessor.  Once a replacement edge exists, failure to validate its evidence is a denial
+    rather than permission to redispatch a retired task.
+    """
+    graph = supersession_graph(definitions, repo_root)
+    if graph is None:
+        # ``supersession_graph`` deliberately has a permissive public shape for legacy callers.
+        # Default reuse cannot be permissive: an invalid declared replacement relation must not
+        # fall through to dispatching the terminal predecessor.
+        from pipeline_core.task_files import parse_supersession_declarations
+        root = Path(repo_root)
+        has_declaration = any(
+            parse_supersession_declarations(
+                path if path.is_absolute() else root / path
+            )
+            for definition in definitions.values()
+            for path in (Path(getattr(definition, "source_path", getattr(definition, "path", "")),),)
+            if (path if path.is_absolute() else root / path).is_file()
+        )
+        if has_declaration:
+            raise EvidenceEligibilityError(
+                "supersession declarations are invalid or cyclic", "evidence-supersession-invalid"
+            )
+    reused: dict[str, Mapping[str, str]] = {}
+    selected_ids = set(selected)
+    pre_resolved_ids = set(pre_resolved)
+    for task_id in scope:
+        if task_id in selected_ids or task_id in pre_resolved_ids:
+            continue
+        try:
+            reused[task_id] = store.find(definitions[task_id])
+            continue
+        except EvidenceEligibilityError as direct_denial:
+            if graph is None:
+                continue
+            replacement_id = graph.replacement_for(task_id)
+            if replacement_id is None:
+                continue
+            replacement = definitions.get(replacement_id)
+            if replacement is None:
+                raise direct_denial
+            evidence = dict(store.find(replacement))
+            evidence["dependency_id"] = task_id
+            evidence["replacement_id"] = replacement_id
+            reused[task_id] = MappingProxyType(evidence)
+    return reused
+
+
 __all__ = [
     "CANONICAL_CONTRACT_VERSION", "CanonicalTaskContract", "EvidenceEligibilityError", "VerifiedEvidenceStore",
     "canonical_task_contract",
-    "canonical_task_path", "find_superseding_evidence", "supersession_graph", "task_contract_digest",
+    "canonical_task_path", "find_superseding_evidence", "resolve_default_reuse", "supersession_graph", "task_contract_digest",
 ]

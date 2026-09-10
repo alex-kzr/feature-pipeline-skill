@@ -785,7 +785,7 @@ class DryRunSupersessionReuseTests(unittest.TestCase):
         plan = project / "plan.md"
         plan.write_text(
             "# Supersession reuse\n\n## Phase 1\n\n"
-            "### BLK-01 Blocked predecessor\n\n### REP-01 Replacement\n\n### SEL-01 Selected\n",
+            "### TC-04 Blocked predecessor\n\n### REC-01 Replacement\n\n### TC-05 Selected\n",
             encoding="utf-8",
         )
         tasks = project / "tasks"
@@ -803,20 +803,20 @@ class DryRunSupersessionReuseTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-        blocked = tasks / "BLK-01_blocked.md"
-        replacement = tasks / "REP-01_replacement.md"
-        selected = tasks / "SEL-01_selected.md"
-        _task(blocked, "BLK-01", "Blocked predecessor", "none")
-        _task(replacement, "REP-01", "Replacement", "none",
-              extra="\n## Supersession\n- Supersedes: BLK-01\n")
-        _task(selected, "SEL-01", "Selected", "BLK-01")
+        blocked = tasks / "TC-04_blocked.md"
+        replacement = tasks / "REC-01_replacement.md"
+        selected = tasks / "TC-05_selected.md"
+        _task(blocked, "TC-04", "Blocked predecessor", "none")
+        _task(replacement, "REC-01", "Replacement", "none",
+              extra="\n## Supersession\n- Supersedes: TC-04\n")
+        _task(selected, "TC-05", "Selected", "TC-04")
 
         source = Run.create(
             "source-feature", plan, plan,
             project / ".pipeline" / "runs" / "source-feature", project,
         )
-        source_life = RunLifecycle.initialize(source, tasks=[("REP-01", [])])
-        self._force_verified(source_life, "REP-01")
+        source_life = RunLifecycle.initialize(source, tasks=[("REC-01", [])])
+        self._force_verified(source_life, "REC-01")
         persist_task_contracts(source, (load_task_spec(replacement),))
         source.status = "verified"
         source.save()
@@ -830,14 +830,14 @@ class DryRunSupersessionReuseTests(unittest.TestCase):
             seed = self._scenario(directory)
             code, out, err = _run(seed["anchors"] + [
                 "--profile", seed["profile_rel"], "--plan", "plan.md",
-                "--task", "SEL-01", "--dry-run",
+                "--task", "TC-05", "--dry-run",
             ])
             self.assertEqual(code, 10, err)
-            self.assertNotIn("SEL-01: pending -> blocked", out)
-            self.assertNotIn("dependency-not-satisfied: BLK-01", out)
-            self.assertIn(f"reused sources: BLK-01={seed['source_run_id']}", out)
-            self.assertIn("planned dispatch set: SEL-01", out)
-            self.assertNotIn("planned dispatch set: BLK-01", out)
+            self.assertNotIn("TC-05: pending -> blocked", out)
+            self.assertNotIn("dependency-not-satisfied: TC-04", out)
+            self.assertIn(f"reused sources: TC-04={seed['source_run_id']}", out)
+            self.assertIn("planned dispatch set: TC-05", out)
+            self.assertNotIn("planned dispatch set: TC-04", out)
             # The historical blocked source run is never touched.
             self.assertEqual((seed["source_run_dir"] / "run.json").read_bytes(), seed["source_bytes"])
 
@@ -846,14 +846,14 @@ class DryRunSupersessionReuseTests(unittest.TestCase):
             seed = self._scenario(directory)
             code, out, err = _run(seed["anchors"] + [
                 "--profile", seed["profile_rel"], "--plan", "plan.md",
-                "--task", "SEL-01", "--verify-dependency-chain", "--dry-run",
+                "--task", "TC-05", "--verify-dependency-chain", "--dry-run",
             ])
             self.assertEqual(code, 10, err)
             dispatch = next(
                 line for line in out.splitlines() if line.strip().startswith("planned dispatch set:")
             )
-            self.assertNotIn("BLK-01", dispatch)
-            self.assertIn("SEL-01", dispatch)
+            self.assertNotIn("TC-04", dispatch)
+            self.assertIn("TC-05", dispatch)
             self.assertEqual((seed["source_run_dir"] / "run.json").read_bytes(), seed["source_bytes"])
 
 

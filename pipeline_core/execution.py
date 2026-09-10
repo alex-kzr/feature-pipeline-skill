@@ -57,6 +57,7 @@ from feature_pipeline.application.verified_reuse import (
     EvidenceEligibilityError,
     VerifiedEvidenceStore,
     canonical_task_path,
+    resolve_default_reuse,
     supersession_graph,
     task_contract_digest,
 )
@@ -1488,25 +1489,26 @@ def _collect_reusable_evidence(
         return reused, list(scope)
     store = VerifiedEvidenceStore(request.run_dir.parent, request.repo_root)
     explicit_sources = dict(request.controls.attested_dependencies)
-    for task_id in scope:
-        if task_id in selected:
-            continue
-        try:
-            evidence = (
-                store.find_at(
-                    _resolve_source_run_dir(request.run_dir, explicit_sources[task_id]),
-                    by_id[task_id],
-                ) if task_id in explicit_sources else store.find(by_id[task_id])
+    try:
+        for task_id, source_feature in explicit_sources.items():
+            reused[task_id] = store.find_at(
+                _resolve_source_run_dir(request.run_dir, source_feature), by_id[task_id]
             )
-        except EvidenceEligibilityError as exc:
-            if task_id in explicit_sources:
-                raise ExecutionError(str(exc), exc.code) from None
-            continue
-        reused[task_id] = evidence
+        reused.update(resolve_default_reuse(
+            store, by_id, list(scope), list(selected), request.repo_root, list(explicit_sources)
+        ))
+    except EvidenceEligibilityError as exc:
+        raise ExecutionError(str(exc), exc.code) from None
     pruned = list(prune_reused_ancestors(
         scope, selected, reused,
         {task_id: spec.depends_on for task_id, spec in by_id.items()},
     ))
+    # A replacement satisfies the declared dependency without admitting its terminal
+    # predecessor into this run at all. Ordinary direct reuse keeps its task record.
+    pruned = [
+        task_id for task_id in pruned
+        if task_id in selected or "replacement_id" not in reused.get(task_id, {})
+    ]
     return reused, pruned
 
 
@@ -1556,6 +1558,13 @@ def _fresh_open_run(
                             note="verified by reusable evidence")
             life.run.record_verdicts(task_id, "PASS", "PASS")
             life.run.record_reused_verification(task_id, evidence)
+        # A superseded predecessor is pruned from this run.  Its evidence belongs to the live
+        # consumer, keyed by the declared edge and the independently verified replacement.
+        for task_id in scope:
+            for dependency_id in by_id[task_id].depends_on:
+                evidence = reused.get(dependency_id)
+                if evidence is not None and dependency_id not in life.run.tasks:
+                    life.run.record_reused_verification(task_id, evidence)
         life.recompute_readiness()
     return life, scope
 

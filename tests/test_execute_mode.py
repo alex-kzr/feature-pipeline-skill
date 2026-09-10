@@ -728,6 +728,7 @@ class AttestDependencyTests(unittest.TestCase):
             self.assertEqual(run.task("EX-02").status, "verified")
             self.assertEqual(run.task("EX-03").status, "verified")
 
+
     def test_attesting_never_writes_to_the_source_run(self) -> None:
         with TemporaryDirectory() as directory:
             root, prompt, plan = self._seed(directory)
@@ -928,6 +929,95 @@ class AttestDependencyTests(unittest.TestCase):
                 controls=ExecuteControls(plan_approved=True, task="EX-02", resume=True)))
             self.assertEqual(resumed.status, "error")
             self.assertIn("verify-dependency-chain-mismatch", resumed.message)
+
+
+class RuntimeSupersessionDefaultReuseTests(unittest.TestCase):
+    """REC-14: execute must consume the same default-reuse resolution as preview."""
+
+    def test_tc05_dispatches_only_when_verified_rec01_supersedes_terminal_tc04(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            prompt, plan = root / "prompt.md", root / "plan.md"
+            prompt.write_text("feature prompt", encoding="utf-8")
+            plan.write_text("# plan\n", encoding="utf-8")
+            tasks = root / "tasks"; tasks.mkdir()
+            def spec(task_id: str, depends_on: tuple[str, ...] = ()) -> TaskSpec:
+                path = tasks / f"{task_id}.md"
+                path.write_text(
+                    f"# {task_id}\n" + (
+                        "\n## Supersession\n- Supersedes: TC-04\n" if task_id == "REC-01" else ""
+                    ), encoding="utf-8")
+                return TaskSpec.build(id=task_id, title=task_id, path=str(path), task_type="python",
+                    executor="python-executor", depends_on=depends_on, allowed_scope=("src/**",),
+                    out_of_scope=(), acceptance_criteria=("works",), verification_commands=(),
+                    max_repair_attempts=0)
+            tc04, rec01, tc05 = spec("TC-04"), spec("REC-01"), spec("TC-05", ("TC-04",))
+            source = Run.create("rec01-verified", prompt, plan, root / "runs" / "rec01-verified", root)
+            source_life = RunLifecycle.initialize(source, tasks=[("REC-01", [])])
+            source_life.transition("REC-01", "running", actor=ACTOR_RUNNER)
+            source_life.transition("REC-01", "implemented", actor=ACTOR_RUNNER)
+            source.record_verdicts("REC-01", "PASS", "PASS")
+            persist_task_contracts(source, (rec01,)); source.status = "verified"; source.save()
+            historical_bytes = (source.run_dir / "run.json").read_bytes()
+            executor = sa.ScriptedExecutor(("implemented",))
+            result = execute_run(ExecuteRequest(
+                feature="tc05-runtime", repo_root=root, run_dir=root / "runs" / "tc05-runtime",
+                prompt_path=prompt, plan_path=plan, specs=(tc04, rec01, tc05), adapter=executor,
+                launchers=VerifierLaunchers(task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))),
+                envelope_anchors=EnvelopeAnchors(project_root=".", agents_root=".agents"),
+                verifier_anchors=VerifierAnchors(project_root=str(root), agents_root=str(root / ".agents")),
+                environment={"claude": True}, controls=ExecuteControls(plan_approved=True, task="TC-05"), plan_prompt_path="plan.md"))
+            self.assertTrue(result.ok, result.message)
+            self.assertEqual([call["task_id"] for call in executor.calls], ["TC-05"])
+            run = Run.load(result.run_dir, root)
+            self.assertNotIn("TC-04", run.tasks)
+            self.assertEqual(run.task("TC-05").reused_verification[0]["dependency_id"], "TC-04")
+            self.assertEqual(run.task("TC-05").reused_verification[0]["replacement_id"], "REC-01")
+            self.assertEqual((source.run_dir / "run.json").read_bytes(), historical_bytes)
+
+    def test_strict_chain_reexecutes_the_replacement_without_default_reuse(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            prompt, plan = root / "prompt.md", root / "plan.md"
+            prompt.write_text("feature prompt", encoding="utf-8")
+            plan.write_text("# plan\n", encoding="utf-8")
+            tasks = root / "tasks"; tasks.mkdir()
+
+            def spec(task_id: str, depends_on: tuple[str, ...] = ()) -> TaskSpec:
+                path = tasks / f"{task_id}.md"
+                path.write_text(
+                    f"# {task_id}\n" + (
+                        "\n## Supersession\n- Supersedes: TC-04\n" if task_id == "REC-01" else ""
+                    ), encoding="utf-8")
+                return TaskSpec.build(id=task_id, title=task_id, path=str(path), task_type="python",
+                    executor="python-executor", depends_on=depends_on, allowed_scope=("src/**",),
+                    out_of_scope=(), acceptance_criteria=("works",), verification_commands=(),
+                    max_repair_attempts=0)
+
+            tc04, rec01, tc05 = spec("TC-04"), spec("REC-01"), spec("TC-05", ("TC-04",))
+            source = Run.create("rec01-verified", prompt, plan, root / "runs" / "rec01-verified", root)
+            source_life = RunLifecycle.initialize(source, tasks=[("REC-01", [])])
+            source_life.transition("REC-01", "running", actor=ACTOR_RUNNER)
+            source_life.transition("REC-01", "implemented", actor=ACTOR_RUNNER)
+            source.record_verdicts("REC-01", "PASS", "PASS")
+            persist_task_contracts(source, (rec01,)); source.status = "verified"; source.save()
+
+            executor = sa.ScriptedExecutor(("implemented", "implemented"))
+            result = execute_run(ExecuteRequest(
+                feature="tc05-strict", repo_root=root, run_dir=root / "runs" / "tc05-strict",
+                prompt_path=prompt, plan_path=plan, specs=(tc04, rec01, tc05), adapter=executor,
+                launchers=VerifierLaunchers(task=sa.ScriptedVerifier(("PASS", "PASS")), test=sa.ScriptedVerifier(("PASS", "PASS"))),
+                envelope_anchors=EnvelopeAnchors(project_root=".", agents_root=".agents"),
+                verifier_anchors=VerifierAnchors(project_root=str(root), agents_root=str(root / ".agents")),
+                environment={"claude": True},
+                controls=ExecuteControls(plan_approved=True, task="TC-05", verify_dependency_chain=True),
+                plan_prompt_path="plan.md"))
+
+            self.assertTrue(result.ok, result.message)
+            self.assertEqual([call["task_id"] for call in executor.calls], ["REC-01", "TC-05"])
+            run = Run.load(result.run_dir, root)
+            self.assertNotIn("TC-04", run.tasks)
+            self.assertEqual(run.task("TC-05").reused_verification, [])
 
 
 class _BoardSnapshotExecutor(sa.ScriptedExecutor):

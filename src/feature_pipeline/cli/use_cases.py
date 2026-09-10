@@ -60,7 +60,7 @@ from feature_pipeline.application.render_plan import render_dry_run
 from feature_pipeline.application.verified_reuse import (
     EvidenceEligibilityError,
     VerifiedEvidenceStore,
-    find_superseding_evidence,
+    resolve_default_reuse,
     supersession_graph,
 )
 from feature_pipeline.application.results import Outcome, PipelineResult
@@ -436,27 +436,23 @@ def run_command(command: RunCommand) -> PipelineResult:
                 dict(item.split("=", 1) for item in (command.attest_dependency or ()))
             )
             store = VerifiedEvidenceStore(lease_dir.parent, project_dir)
-            superseders = supersession_graph(definitions, project_dir)
-            for task_id in compiled_plan.execution_scope:
-                if task_id in compiled_plan.selection or task_id in attested_ids:
-                    continue
-                try:
-                    evidence = store.find(definitions[task_id])
-                except EvidenceEligibilityError:
-                    # A blocked predecessor lends no evidence of its own; a task declared to
-                    # supersede it can, when that replacement carries its own exact eligible
-                    # verified evidence. The predecessor itself is never marked verified.
-                    resolved = find_superseding_evidence(
-                        store, superseders, task_id, definitions
-                    )
-                    if resolved is None:
-                        continue
-                    evidence = resolved[1]
+            try:
+                reused = resolve_default_reuse(
+                    store, definitions, compiled_plan.execution_scope, compiled_plan.selection,
+                    project_dir, tuple(attested_ids),
+                )
+            except EvidenceEligibilityError as exc:
+                raise CliError(EXIT_ERROR, f"{exc.code}: {exc}") from None
+            for task_id, evidence in reused.items():
                 attested_ids.add(task_id)
                 reused_sources[task_id] = evidence["source_run_id"]
             execution_scope = prune_reused_ancestors(
                 execution_scope, compiled_plan.selection, reused_sources,
                 {task_id: definition.depends_on for task_id, definition in definitions.items()},
+            )
+            execution_scope = tuple(
+                task_id for task_id in execution_scope
+                if task_id in compiled_plan.selection or "replacement_id" not in reused.get(task_id, {})
             )
         elif compiled_plan is not None and command.verify_dependency_chain:
             # `--verify-dependency-chain` re-verifies the chain rather than trusting reuse,
