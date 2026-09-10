@@ -18,9 +18,10 @@ import json
 import re
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
-from pipeline_core.execution import TaskExecution, run_task
+from pipeline_core.execution import ExecutionError, TaskExecution, run_task
 from pipeline_core.lifecycle import RunLifecycle
 from pipeline_core.reports import (
     consolidate_findings,
@@ -364,6 +365,183 @@ class ResumeAtRepairBoundaryTests(unittest.TestCase):
             self.assertEqual(reloaded.task("VR-03").attempts, 1)
             self.assertTrue(executor.calls[0]["is_repair"])
             self.assertIn("repair-2.md", executor.calls[0]["prompt"])
+
+    def test_interrupted_repairing_without_a_report_fails_before_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            life = _run(root)
+            spec = _spec(max_repair_attempts=2)
+            life.run.task("VR-03").status = "repairing"
+            life.run.save()
+
+            executor = ScriptedExecutor(("implemented",))
+            with self.assertRaisesRegex(ExecutionError, "no persisted repair report"):
+                run_task(
+                    life,
+                    _execution(
+                        spec, executor, StubVerifier(("PASS",)), StubVerifier(("PASS",))
+                    ),
+                )
+            self.assertEqual(executor.launches, 0)
+
+    def test_resume_reuses_uncommitted_repair_report_without_rewriting_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            life = _run(root)
+            spec = _spec(max_repair_attempts=2)
+            run_task(
+                life,
+                _execution(
+                    spec,
+                    ScriptedExecutor(("implemented", "implemented")),
+                    StubVerifier(("FAIL", "PASS")),
+                    StubVerifier(("PASS", "PASS")),
+                ),
+            )
+            reloaded = Run.load(life.run.run_dir, root)
+            reloaded.task("VR-03").status = "verification_failed"
+            reloaded.task("VR-03").attempts = 0
+            reloaded.save()
+
+            with mock.patch(
+                "feature_pipeline.application.task_engine.write_repair_report",
+                wraps=write_repair_report,
+            ) as writer:
+                result = run_task(
+                    RunLifecycle(reloaded),
+                    _execution(
+                        spec,
+                        ScriptedExecutor(("implemented", "implemented")),
+                        StubVerifier(("FAIL", "PASS")),
+                        StubVerifier(("PASS", "PASS")),
+                    ),
+                )
+
+            self.assertEqual(result.status, "verified")
+            self.assertEqual(writer.call_count, 0)
+            self.assertEqual(_repair_reports(reloaded, "VR-03"), [2])
+
+    def test_resumed_exhausted_repair_states_block_without_another_executor(self) -> None:
+        for status in ("verification_failed", "repairing"):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                life = _run(root)
+                spec = _spec(max_repair_attempts=2)
+                run_task(
+                    life,
+                    _execution(
+                        spec,
+                        ScriptedExecutor(("implemented",) * 3),
+                        StubVerifier(("FAIL",) * 3),
+                        StubVerifier(("PASS",) * 3),
+                    ),
+                )
+                reloaded = Run.load(life.run.run_dir, root)
+                reloaded.task("VR-03").status = status
+                reloaded.save()
+
+                executor = ScriptedExecutor(("implemented",))
+                result = run_task(
+                    RunLifecycle(reloaded),
+                    _execution(
+                        spec, executor, StubVerifier(("PASS",)), StubVerifier(("PASS",))
+                    ),
+                )
+
+                self.assertEqual(result.status, "blocked")
+                self.assertEqual(result.attempts, 2)
+                self.assertEqual(executor.launches, 0)
+                self.assertEqual(_repair_reports(reloaded, "VR-03"), [2, 3, 4])
+
+    def test_resumed_ready_after_final_repair_blocks_without_another_executor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            life = _run(root)
+            spec = _spec(max_repair_attempts=2)
+            run_task(
+                life,
+                _execution(
+                    spec,
+                    ScriptedExecutor(("implemented",) * 3),
+                    StubVerifier(("FAIL",) * 3),
+                    StubVerifier(("PASS",) * 3),
+                ),
+            )
+            reloaded = Run.load(life.run.run_dir, root)
+            reloaded.task("VR-03").status = "ready"
+            reloaded.save()
+
+            executor = ScriptedExecutor(("implemented",))
+            result = run_task(
+                RunLifecycle(reloaded),
+                _execution(
+                    spec, executor, StubVerifier(("PASS",)), StubVerifier(("PASS",))
+                ),
+            )
+
+            self.assertEqual(result.status, "blocked")
+            self.assertEqual(executor.launches, 0)
+
+    def test_repairing_state_rejects_a_stale_repair_report(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            life = _run(root)
+            spec = _spec(max_repair_attempts=2)
+            run_task(
+                life,
+                _execution(
+                    spec,
+                    ScriptedExecutor(("implemented", "implemented")),
+                    StubVerifier(("FAIL", "PASS")),
+                    StubVerifier(("PASS", "PASS")),
+                ),
+            )
+            reloaded = Run.load(life.run.run_dir, root)
+            reloaded.task("VR-03").status = "repairing"
+            stale = repair_report_path(reloaded.run_dir, "VR-03", 99)
+            stale.parent.mkdir(parents=True, exist_ok=True)
+            stale.write_text("stale", encoding="utf-8")
+            reloaded.save()
+
+            executor = ScriptedExecutor(("implemented",))
+            with self.assertRaisesRegex(ExecutionError, "inconsistent repair report"):
+                run_task(
+                    RunLifecycle(reloaded),
+                    _execution(
+                        spec, executor, StubVerifier(("PASS",)), StubVerifier(("PASS",))
+                    ),
+                )
+            self.assertEqual(executor.launches, 0)
+
+    def test_repairing_state_rejects_malformed_repair_report_content(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            life = _run(root)
+            spec = _spec(max_repair_attempts=2)
+            run_task(
+                life,
+                _execution(
+                    spec,
+                    ScriptedExecutor(("implemented", "implemented")),
+                    StubVerifier(("FAIL", "PASS")),
+                    StubVerifier(("PASS", "PASS")),
+                ),
+            )
+            reloaded = Run.load(life.run.run_dir, root)
+            reloaded.task("VR-03").status = "repairing"
+            report = repair_report_path(reloaded.run_dir, "VR-03", 2)
+            report.write_text("garbage", encoding="utf-8")
+            reloaded.save()
+
+            executor = ScriptedExecutor(("implemented",))
+            with self.assertRaisesRegex(ExecutionError, "malformed repair report"):
+                run_task(
+                    RunLifecycle(reloaded),
+                    _execution(
+                        spec, executor, StubVerifier(("PASS",)), StubVerifier(("PASS",))
+                    ),
+                )
+            self.assertEqual(executor.launches, 0)
 
 
 if __name__ == "__main__":

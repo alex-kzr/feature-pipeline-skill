@@ -46,6 +46,7 @@ from pipeline_core.prompt_envelope import EnvelopeAnchors
 from pipeline_core.reports import (
     RepairReport,
     newest_repair_report,
+    repair_report_path,
     verifier_artifacts,
     write_repair_report,
 )
@@ -203,6 +204,31 @@ class TaskEngine:
         spec = request.spec
         task_id = spec.id
         maximum = int(spec.max_repair_attempts)
+        record = run.task(task_id)
+        recovered_repair = (
+            record.status in {"verification_failed", "repairing"}
+            or (record.status == "ready" and record.attempts > 0)
+        )
+        if recovered_repair and record.attempts >= maximum:
+            report = newest_repair_report(run.run_dir, task_id)
+            diagnostic = self._diagnostics.collect(
+                run,
+                task_id=task_id,
+                attempt=record.attempts + 1,
+                note=f"maximum repair attempts ({maximum}) already exhausted on resume",
+            )
+            return self._block(
+                life,
+                request,
+                record.attempts + 1,
+                0,
+                (),
+                blocker=(
+                    f"maximum repair attempts ({maximum}) reached; no repair budget remains"
+                ),
+                diagnostic=diagnostic,
+                repair_report=report,
+            )
 
         repair_of, skip_executor = self._enter(life, task_id)
         passes: list[RepairPass] = []
@@ -315,6 +341,33 @@ class TaskEngine:
         run = life.run
         record = run.task(task_id)
         report = newest_repair_report(run.run_dir, task_id)
+        expects_repair_report = (
+            record.status in {"verification_failed", "repairing"}
+            or (record.status in {"ready", "running"} and record.attempts > 0)
+        )
+        if expects_repair_report:
+            expected_attempts = {record.attempts + 1}
+            if record.status == "verification_failed":
+                expected_attempts.add(record.attempts + 2)
+            expected = {
+                repair_report_path(run.run_dir, task_id, attempt)
+                for attempt in expected_attempts
+            }
+            if report is None:
+                raise ExecutionError(
+                    f"{task_id} resumed at '{record.status}' with no persisted repair report",
+                    "missing-repair-report",
+                )
+            if report not in expected:
+                raise ExecutionError(
+                    f"{task_id} resumed at '{record.status}' with inconsistent repair report",
+                    "inconsistent-repair-report",
+                )
+            if not _valid_repair_report(report, task_id):
+                raise ExecutionError(
+                    f"{task_id} resumed at '{record.status}' with malformed repair report",
+                    "malformed-repair-report",
+                )
 
         if record.status == "implemented":
             return (repo_relative(report, run.repo_root) if report else None), True
@@ -331,7 +384,12 @@ class TaskEngine:
             return repo_relative(report, run.repo_root), False
 
         if record.status == "repairing":
-            return (repo_relative(report, run.repo_root) if report else None), False
+            if report is None:
+                raise ExecutionError(
+                    f"{task_id} resumed at 'repairing' with no persisted repair report",
+                    "missing-repair-report",
+                )
+            return repo_relative(report, run.repo_root), False
 
         if record.status in {"ready", "running"}:
             repair_of = (
@@ -371,10 +429,19 @@ class TaskEngine:
         self, run: Run, spec: TaskSpec, gate: int, outcome: VerificationOutcome
     ) -> RepairReport:
         task_id = spec.id
+        attempt = run.task(task_id).attempts + 2
+        persisted = repair_report_path(run.run_dir, task_id, attempt)
+        if persisted.is_file():
+            if not _valid_repair_report(persisted, task_id):
+                raise ExecutionError(
+                    f"{task_id} has a malformed persisted repair report for attempt {attempt}",
+                    "malformed-repair-report",
+                )
+            return RepairReport(persisted, attempt, gate, (), (), (), ())
         arts = verifier_artifacts(run.run_dir, task_id, gate)
         product, environment, regression = _classify(spec, outcome)
         return write_repair_report(
-            run, spec, run.task(task_id).attempts + 2,
+            run, spec, attempt,
             task_verifier_text=_read(arts.task_report),
             test_verifier_text=_read(arts.test_report),
             source_attempt=gate,
@@ -499,6 +566,26 @@ class TaskEngine:
         return TaskRunResult(
             task_id, "blocked", record.attempts, gates, blocker, Path(diagnostic),
             tuple(passes))
+
+
+def _valid_repair_report(path: Path, task_id: str) -> bool:
+    """Return whether persisted repair evidence has the required identity and provenance."""
+    try:
+        attempt = int(path.stem.rsplit("-", 1)[1])
+        text = path.read_text(encoding="utf-8")
+    except (IndexError, OSError, UnicodeError, ValueError):
+        return False
+    required = (
+        f"# Repair Report — {task_id} — attempt {attempt} of ",
+        f"- Task: {task_id} — ",
+        f"- Attempt: {attempt} of ",
+        f"- Source verification gate: {attempt - 1}",
+        "- Original scope (unchanged): ",
+        "- Out of scope (unchanged): ",
+        "## Task-verifier report (verbatim)",
+        "## Test-verifier report (verbatim)",
+    )
+    return all(marker in text for marker in required)
 
 
 def _classify(
