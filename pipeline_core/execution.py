@@ -33,6 +33,7 @@ import json
 import os
 import re
 import subprocess
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -298,6 +299,11 @@ class ExecuteControls:
     published_refs: tuple[tuple[str, str], ...] = ()
     recovery_source_feature: str | None = None
     recovery_task: str | None = None
+    #: REC-11's explicit runner-owned recovery control.  It may reopen exactly one terminal
+    #: external uv-cache block when accompanied by a safe worktree-local cache directory.
+    operational_unblock_task: str | None = None
+    human_authorized_operational_unblock: bool = False
+    uv_cache_dir: str | None = None
 
     @property
     def gate_opened(self) -> bool:
@@ -535,6 +541,254 @@ def _ensure_execution_controls_match(
             raise ExecutionError(
                 f"resume {name} does not match the recorded run", "runtime-control-mismatch"
             )
+
+
+def _approved_uv_cache_dir(repo_root: Path, value: str | None) -> Path:
+    """Resolve the one retry-only cache control, refusing paths outside this worktree."""
+    if not value or "\\" in value or "\x00" in value:
+        raise ExecutionError("operational unblock requires a token-safe relative UV cache path",
+                             "operational-unblock-cache-invalid")
+    candidate = Path(value)
+    if candidate.is_absolute() or any(part in {"", ".", ".."} for part in candidate.parts):
+        raise ExecutionError("operational unblock cache path must be worktree-local",
+                             "operational-unblock-cache-invalid")
+    resolved_root = repo_root.resolve()
+    resolved = (resolved_root / candidate).resolve()
+    try:
+        resolved.relative_to(resolved_root)
+    except ValueError:
+        raise ExecutionError("operational unblock cache path escapes the worktree",
+                             "operational-unblock-cache-invalid") from None
+    return resolved
+
+
+def _is_uv_cache_operational_blocker(reason: str | None) -> bool:
+    """Classify narrowly: ambiguous, product, verifier, and budget blocks stay terminal."""
+    normalized = (reason or "").lower()
+    return (
+        normalized.startswith("external operational:")
+        and "uv" in normalized and "cache" in normalized
+        and ("access denied" in normalized or "permission denied" in normalized)
+    )
+
+
+def _has_runner_owned_predispatch_uv_cache_evidence(
+    request: ExecuteRequest, source: Run, task_id: str,
+) -> bool:
+    """Recognize only the report-less, first-launch cache-start failure boundary.
+
+    A failed child launch has no executor report.  Its runner-written launch-failure
+    diagnostic is admissible only when every other execution surface proves the executor
+    never started.  Keep this deliberately narrower than ordinary executor evidence.
+    """
+    task = source.task(task_id)
+    implementation = task.execution_evidence.get("implementation", {})
+    if (
+        task.attempts != 0
+        or task.execution_evidence.get("executor_report") is not None
+        or task.session_id
+        or task.changed_files
+        or source.commands
+        or source.artifacts
+        or implementation.get("state") != "not-attempted"
+        or implementation.get("changed_files")
+        or implementation.get("manifest")
+        or implementation.get("diff")
+        or any(task.verification.get(name) is not None for name in (
+            "task_verdict", "test_verdict", "verified_at",
+        ))
+    ):
+        return False
+    failures = task.external_launch_failures
+    if len(failures) != 1:
+        return False
+    failure = failures[0]
+    generation = failure.get("generation")
+    if (
+        failure.get("stage") != "executor"
+        or not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or generation < 1
+        or generation != task.next_executor_launch_generation - 1
+        or failure.get("detail") != task.blocker
+    ):
+        return False
+    diagnostic = request.run_dir / "reports" / task_id / f"launch-{generation}" / (
+        f"launch-failure-{generation}.json"
+    )
+    try:
+        diagnostic.resolve().relative_to(request.run_dir.resolve())
+        payload = json.loads(diagnostic.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    if diagnostic.is_symlink() or not isinstance(payload, dict):
+        return False
+    return all(
+        payload.get(name) == value
+        for name, value in (
+            ("task_id", task_id),
+            ("generation", generation),
+            ("attempt", 0),
+            ("stage", "executor"),
+            ("reason", task.blocker),
+            ("exit_code", failure.get("exit_code")),
+            ("source_run_id", failure.get("source_run_id")),
+        )
+    )
+
+
+def _has_runner_owned_predispatch_blocker_packet(
+    request: ExecuteRequest, source: Run, task_id: str,
+) -> bool:
+    """Recognize REC-11's one legacy TC-01 pre-dispatch blocker packet.
+
+    This is not generic artifact acceptance: the task must show precisely the recorded
+    no-dispatch state and its two artifacts must be the standard runner blocker packet and
+    its canonical diagnostic at the first-block location.
+    """
+    task = source.task(task_id)
+    packet = request.run_dir / "reports" / task_id / "blocked-1.json"
+    try:
+        packet.resolve().relative_to(request.run_dir.resolve())
+        payload = json.loads(packet.read_text(encoding="utf-8"))
+    except ValueError:
+        return False
+    except (OSError, json.JSONDecodeError):
+        return False
+    if packet.is_symlink() or not isinstance(payload, dict):
+        return False
+    diagnostic_ref = payload.get("diagnostic")
+    if not isinstance(diagnostic_ref, str) or not diagnostic_ref:
+        return False
+    try:
+        diagnostic = (request.repo_root.resolve() / diagnostic_ref).resolve()
+        diagnostic.relative_to(request.run_dir.resolve())
+        expected_ref = packet.resolve().relative_to(request.repo_root.resolve()).as_posix()
+        expected_diagnostic_ref = diagnostic.relative_to(request.run_dir.resolve()).as_posix()
+        expected_packet_diagnostic = diagnostic.relative_to(request.repo_root.resolve()).as_posix()
+    except ValueError:
+        return False
+    if (
+        task_id != "TC-01"
+        or task.attempts != 0
+        or task.next_executor_launch_generation != 2
+        or task.execution_evidence.get("executor_report") is not None
+        or source.commands
+        or task.external_launch_failures
+        or source.artifacts != {
+            f"blocker:{task_id}": expected_ref,
+            f"diagnostic:{task_id}:1": expected_diagnostic_ref,
+        }
+    ):
+        return False
+    try:
+        diagnostic.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    if (
+        diagnostic.is_symlink()
+        or not diagnostic.is_file()
+    ):
+        return False
+    return (
+        set(payload) == {
+            "task_id", "gate", "attempts", "max_repair_attempts", "blocker",
+            "diagnostic", "repair_report", "verdicts", "recorded_at",
+        }
+        and payload["task_id"] == task_id
+        and payload["gate"] == 1
+        and payload["attempts"] == 0
+        and payload["blocker"] == task.blocker
+        and payload["diagnostic"] == expected_packet_diagnostic
+        and isinstance(payload["max_repair_attempts"], int)
+        and not isinstance(payload["max_repair_attempts"], bool)
+        and payload["repair_report"] is None
+        and payload["verdicts"] == {"task": None, "test": None}
+        and isinstance(payload["recorded_at"], str)
+        and bool(payload["recorded_at"])
+    )
+
+
+def _validate_operational_unblock(
+    request: ExecuteRequest, source: Run, resolution: AdapterResolution,
+    scope: Sequence[str], specs: Sequence[TaskSpec], plan: CompiledRunPlan | None,
+) -> Path | None:
+    """Fail closed before a terminal task is reopened or a child process can launch."""
+    controls = request.controls
+    target = controls.operational_unblock_task
+    if target is None:
+        if controls.human_authorized_operational_unblock or controls.uv_cache_dir:
+            raise ExecutionError("operational unblock controls require a target task",
+                                 "operational-unblock-invalid-controls")
+        return None
+    if not (controls.resume and controls.human_authorized_operational_unblock):
+        raise ExecutionError("operational unblock requires resume and explicit human authorization",
+                             "operational-unblock-unauthorized")
+    if target not in source.tasks or target not in scope:
+        raise ExecutionError("operational unblock target is outside the recorded execution scope",
+                             "operational-unblock-target-invalid")
+    task = source.task(target)
+    runner_owned_predispatch_packet = _has_runner_owned_predispatch_blocker_packet(
+        request, source, target
+    )
+    if (
+        source.status != "blocked"
+        or task.status != "blocked"
+        or not (
+            _is_uv_cache_operational_blocker(task.blocker)
+            or runner_owned_predispatch_packet
+        )
+    ):
+        raise ExecutionError("operational unblock requires a classified terminal external uv-cache blocker",
+                             "operational-unblock-blocker-invalid")
+    report = task.execution_evidence.get("executor_report")
+    if isinstance(report, str) and report:
+        try:
+            report_path = (request.repo_root / report).resolve()
+            report_path.relative_to(request.run_dir.resolve())
+        except ValueError:
+            raise ExecutionError("operational unblock executor evidence escapes the source run",
+                                 "operational-unblock-evidence-invalid") from None
+        if not report_path.is_file() or report_path.is_symlink():
+            raise ExecutionError("operational unblock requires immutable executor evidence",
+                                 "operational-unblock-evidence-missing")
+    elif not (
+        _has_runner_owned_predispatch_uv_cache_evidence(request, source, target)
+        or _has_runner_owned_predispatch_blocker_packet(request, source, target)
+    ):
+        raise ExecutionError("operational unblock requires immutable runner evidence",
+                             "operational-unblock-evidence-missing")
+    for lease_path in (pipeline_lock_path(request.repo_root), task_lock_path(request.repo_root, target)):
+        lease = read_lease(lease_path)
+        if lease and (lease.get("unreadable") or pid_alive(lease.get("pid"))):
+            raise ExecutionError("operational unblock requires no live pipeline or task lease",
+                                 "operational-unblock-lease-held")
+    if source.environment.get("adapter", {}).get("resolved") != resolution.resolved:
+        raise ExecutionError("operational unblock adapter does not match the recorded adapter",
+                             "operational-unblock-adapter-mismatch")
+    _ensure_execution_controls_match(
+        source, scope, controls.verify_dependency_chain, controls.model, controls.effort)
+    _ensure_precondition_contracts_match(source, specs)
+    if plan is not None:
+        _ensure_plan_compatible(source, plan)
+    return _approved_uv_cache_dir(request.repo_root, controls.uv_cache_dir)
+
+
+@contextmanager
+def _child_uv_cache(cache_dir: Path | None):
+    """Pass the approved cache only to child-launch scope; never write global uv config."""
+    if cache_dir is None:
+        yield
+        return
+    previous = os.environ.get("UV_CACHE_DIR")
+    os.environ["UV_CACHE_DIR"] = str(cache_dir)
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("UV_CACHE_DIR", None)
+        else:
+            os.environ["UV_CACHE_DIR"] = previous
 
 
 def replacement_feature(source_feature: str, target_adapter: str) -> str:
@@ -970,7 +1224,7 @@ def _apply_repair_bound(
 
 
 def _plan_fingerprint(plan: CompiledRunPlan) -> dict[str, str]:
-    """A flat ``{field-path: value}`` map over every resolved decision in ``plan``.
+    """A flat ``{field-path: value}`` map over the run's resolved decisions.
 
     Persisted verbatim on ``run.json`` (control ``plan_fingerprint``); a resume recomputes it
     from the freshly compiled plan and reports the **first** key whose value moved (AC-3).
@@ -981,7 +1235,9 @@ def _plan_fingerprint(plan: CompiledRunPlan) -> dict[str, str]:
         "selection_mode": plan.selection_mode,
         "selection": ",".join(plan.selection),
         "execution_scope": ",".join(plan.execution_scope),
-        "order": ",".join(plan.order),
+        # ``plan.order`` is the whole current board order.  Resume owns only the recorded
+        # execution scope, so preserve its relative order while ignoring new independent work.
+        "order": ",".join(task_id for task_id in plan.order if task_id in plan.execution_scope),
         "adapter": plan.adapter,
     }
     for control in plan.controls:
@@ -1029,9 +1285,14 @@ def _ensure_plan_compatible(run: Run, plan: CompiledRunPlan) -> None:
                 "plan-incompatible",
             )
         return
+    scoped_ids = set(plan.execution_scope)
     for key in list(recorded) + [k for k in now if k not in recorded]:
         before = recorded.get(key, "<absent>")
         after = now.get(key, "<absent>")
+        if key == "order" and isinstance(before, str):
+            # Older runs persisted full-board order. Compare their recorded
+            # scope's relative order only; new independent board work is irrelevant.
+            before = ",".join(task_id for task_id in before.split(",") if task_id in scoped_ids)
         if before != after:
             raise ExecutionError(
                 f"resume: compiled plan is incompatible with the recorded run at "
@@ -1071,6 +1332,12 @@ def _reconcile_projection(
                 state=record.status,
                 evidence=evidence,
             )
+            # Resume reconciliation is also a runner lifecycle projection.  Attribute its
+            # exact writes before any resumed executor can open a worktree window.
+            life.run.record_runner_projection(
+                spec.id, (board_path, life.run.repo_root / spec.path)
+            )
+            life.run.save()
         except BoardProjectionError as exc:
             raise ExecutionError(
                 f"board projection reconciliation failed for {task_id} -> "
@@ -1148,6 +1415,7 @@ def _resume_open_run(
 ) -> tuple[RunLifecycle, list[str]]:
     """Reconcile the persisted run for a ``--resume`` and return ``(lifecycle, active scope)``."""
     recorded = Run.load(request.run_dir, request.repo_root)
+    source_run_bytes = (request.run_dir / "run.json").read_bytes()
     active_scope = [task_id for task_id in execution_scope if task_id in recorded.tasks]
     stranded = [
         task_id for task_id in active_scope
@@ -1179,6 +1447,8 @@ def _resume_open_run(
         )
     if plan is not None:
         _ensure_plan_compatible(recorded, plan)
+    cache_dir = _validate_operational_unblock(
+        request, recorded, resolution, execution_scope, specs, plan)
     life = RunLifecycle.resume(
         request.run_dir, request.repo_root,
         feature=request.feature, prompt_path=request.prompt_path,
@@ -1189,6 +1459,13 @@ def _resume_open_run(
         },
     )
     ensure_pinned_adapter(life.run, resolution)
+    if request.controls.operational_unblock_task is not None:
+        life.reopen_operational_block(
+            request.controls.operational_unblock_task,
+            authorization="human-authorized-operational-unblock",
+            cache_path=cache_dir.relative_to(request.repo_root.resolve()).as_posix(),
+            source_run_bytes=source_run_bytes,
+        )
     _ensure_attestations_match(life.run, request.controls.attested_dependencies)
     for name, (value, sourced) in controls_map.items():
         if sourced == "explicit":
@@ -1436,6 +1713,10 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
     if isinstance(opened, ExecuteResult):
         return opened
     life, scope = opened
+    cache_dir = (
+        _approved_uv_cache_dir(request.repo_root, request.controls.uv_cache_dir)
+        if request.controls.operational_unblock_task is not None else None
+    )
 
     for task_id in scope:
         record = life.run.task(task_id)
@@ -1487,25 +1768,26 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
                     "blocked", EXIT_BLOCKED, f"{exc.code}: {exc}",
                     request.run_dir, life.run.run_id, tuple(results))
             try:
-                outcome = _run_selected_task(
-                    life, plan, task_id,
-                    TaskExecution(
-                        spec=spec,
-                        adapter=request.adapter,
-                        launchers=request.launchers,
-                        verifier_anchors=request.verifier_anchors,
-                        envelope_anchors=request.envelope_anchors,
-                        role_grant=tuple(request.role_grant),
-                        execution_mode=request.execution_mode,
-                        plan_path=request.plan_prompt_path,
-                        working_root=_task_working_root(request, spec),
-                        timeout=request.timeout,
-                        model=request.controls.model,
-                        effort=request.controls.effort,
-                        board_path=request.board_path,
-                        pre_dispatch=lambda: _prepare_executor(life, request, spec, bindings),
-                    ),
-                )
+                with _child_uv_cache(cache_dir if task_id == request.controls.operational_unblock_task else None):
+                    outcome = _run_selected_task(
+                        life, plan, task_id,
+                        TaskExecution(
+                            spec=spec,
+                            adapter=request.adapter,
+                            launchers=request.launchers,
+                            verifier_anchors=request.verifier_anchors,
+                            envelope_anchors=request.envelope_anchors,
+                            role_grant=tuple(request.role_grant),
+                            execution_mode=request.execution_mode,
+                            plan_path=request.plan_prompt_path,
+                            working_root=_task_working_root(request, spec),
+                            timeout=request.timeout,
+                            model=request.controls.model,
+                            effort=request.controls.effort,
+                            board_path=request.board_path,
+                            pre_dispatch=lambda: _prepare_executor(life, request, spec, bindings),
+                        ),
+                    )
             except (ExecutionError, DispatchError) as exc:
                 return _error(
                     f"{getattr(exc, 'code', 'execution-error')}: {exc}",

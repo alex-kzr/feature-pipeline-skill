@@ -11,8 +11,10 @@ stage-9 stop (AC-5). ``AttestDependencyTests`` covers RDS-08's ``--attest-depend
 from __future__ import annotations
 
 import json
+import os
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -87,7 +89,298 @@ def _controls(scenario: sa.Scenario) -> ExecuteControls:
     return ExecuteControls(plan_approved=gated, **overrides)
 
 
+def _seed_reportless_uv_cache_block(request: ExecuteRequest) -> None:
+    """Build REC-11's real first-launch, runner-owned cache-start terminal shape."""
+    source = Run.create(FEATURE, request.prompt_path, request.plan_path, request.run_dir, request.repo_root)
+    life = RunLifecycle.initialize(
+        source, tasks=[("EX-01", [])],
+        controls={
+            "execution_scope": (["EX-01"], "explicit"),
+            "verify_dependency_chain": (False, "default"),
+            "model": (None, "default"), "effort": (None, "default"),
+            "precondition_bindings": ({}, "explicit"),
+        }, adapter_requested="claude", adapter_resolved="claude")
+    life.transition("EX-01", "running", actor=ACTOR_RUNNER)
+    generation = life.consume_launch_generation("EX-01")
+    blocker = "external operational: uv cache access denied"
+    diagnostic = request.run_dir / "reports" / "EX-01" / f"launch-{generation}" / (
+        f"launch-failure-{generation}.json"
+    )
+    diagnostic.parent.mkdir(parents=True)
+    diagnostic.write_text(json.dumps({
+        "task_id": "EX-01", "generation": generation, "attempt": 0,
+        "stage": "executor", "reason": blocker, "exit_code": 1,
+    }), encoding="utf-8")
+    life.run.record_launch_failure(
+        "EX-01", stage="executor", generation=generation, exit_code=1, detail=blocker)
+    persist_task_contracts(life.run, request.specs)
+    life.block("EX-01", blocker)
+    life.run.status = "blocked"
+    life.run.save()
+
+
+def _seed_actual_tc01_predispatch_block(request: ExecuteRequest, *, tamper: bool = False) -> None:
+    """Seed REC-11's persisted TC-01 runner-owned pre-dispatch blocker exactly."""
+    task_id = "TC-01"
+    source = Run.create(FEATURE, request.prompt_path, request.plan_path, request.run_dir, request.repo_root)
+    life = RunLifecycle.initialize(
+        source, tasks=[(task_id, [])],
+        controls={
+            "execution_scope": ([task_id], "explicit"),
+            "verify_dependency_chain": (False, "default"),
+            "model": (None, "default"), "effort": (None, "default"),
+            "precondition_bindings": ({}, "explicit"),
+        }, adapter_requested="claude", adapter_resolved="claude")
+    blocker = "external operational: uv cache access denied"
+    life.transition(task_id, "running", actor=ACTOR_RUNNER)
+    life.block(task_id, blocker)
+    record = life.run.task(task_id)
+    record.next_executor_launch_generation = 2
+    diagnostic = request.run_dir / "reports" / task_id / "attempt-1" / "diagnostic-report.md"
+    diagnostic.parent.mkdir(parents=True)
+    diagnostic.write_text("runner-owned diagnostic\n", encoding="utf-8")
+    diagnostic_ref = diagnostic.relative_to(request.repo_root).as_posix()
+    packet = request.run_dir / "reports" / task_id / "blocked-1.json"
+    packet.write_text(json.dumps({
+        "task_id": task_id,
+        "gate": 2 if tamper else 1,
+        "attempts": 0,
+        "max_repair_attempts": 2,
+        "blocker": blocker,
+        "diagnostic": diagnostic_ref,
+        "repair_report": None,
+        "verdicts": {"task": None, "test": None},
+        "recorded_at": "2026-09-10T00:00:00Z",
+    }), encoding="utf-8")
+    life.run.artifacts = {
+        f"blocker:{task_id}": packet.relative_to(request.repo_root).as_posix(),
+        f"diagnostic:{task_id}:1": diagnostic.relative_to(request.run_dir).as_posix(),
+    }
+    persist_task_contracts(life.run, request.specs)
+    life.run.status = "blocked"
+    life.run.save()
+
+
 class ScenarioTableTests(unittest.TestCase):
+    def test_human_authorized_cache_unblock_reopens_terminal_external_block(self) -> None:
+        """REC-11: only the runner may reopen an evidence-bearing operational block."""
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            scenario = sa.SCENARIOS["direct-success"]
+            executor = scenario.executor()
+            request = _request(
+                root, _specs(("EX-01",)), executor=executor,
+                launchers=VerifierLaunchers(
+                    task=scenario.task_verifier(), test=scenario.test_verifier()),
+                controls=ExecuteControls(plan_approved=True), environment={"claude": True})
+            source = Run.create(FEATURE, request.prompt_path, request.plan_path, request.run_dir, root)
+            life = RunLifecycle.initialize(
+                source, tasks=[("EX-01", [])],
+                controls={
+                    "execution_scope": (["EX-01"], "explicit"),
+                    "verify_dependency_chain": (False, "default"),
+                    "model": (None, "default"), "effort": (None, "default"),
+                    "precondition_bindings": ({}, "explicit"),
+                }, adapter_requested="claude", adapter_resolved="claude")
+            life.transition("EX-01", "running", actor=ACTOR_RUNNER)
+            report = request.run_dir / "reports" / "EX-01" / "report.md"
+            report.parent.mkdir(parents=True)
+            report.write_text("blocked by uv cache\n", encoding="utf-8")
+            life.run.task("EX-01").execution_evidence["executor_report"] = report.relative_to(root).as_posix()
+            persist_task_contracts(life.run, request.specs)
+            life.block("EX-01", "external operational: uv cache access denied")
+            life.run.status = "blocked"
+            life.run.save()
+
+            observed: list[str | None] = []
+            original_launch = executor.launch
+
+            def launch(request):  # noqa: ANN001 - observes real child launch environment
+                observed.append(os.environ.get("UV_CACHE_DIR"))
+                return original_launch(request)
+
+            executor.launch = launch
+            cache = root / ".pipeline" / "uv-cache"
+            result = execute_run(
+                _request(
+                    root, _specs(("EX-01",)), executor=executor,
+                    launchers=VerifierLaunchers(
+                        task=scenario.task_verifier(), test=scenario.test_verifier()),
+                    controls=ExecuteControls(
+                        plan_approved=True, resume=True,
+                        operational_unblock_task="EX-01",
+                        human_authorized_operational_unblock=True,
+                        uv_cache_dir=".pipeline/uv-cache",
+                    ), environment={"claude": True}))
+
+            self.assertEqual(result.status, "ok", result.message)
+            self.assertEqual(observed[0], str(cache.resolve()))
+            reopened = Run.load(request.run_dir, root)
+            self.assertEqual(reopened.task("EX-01").attempts, 0)
+            self.assertEqual(reopened.recovery["operational_unblocks"][-1]["task_id"], "EX-01")
+
+    def test_operational_unblock_accepts_reportless_runner_cache_start_failure(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            scenario = sa.SCENARIOS["direct-success"]
+            executor = scenario.executor()
+            request = _request(
+                root, _specs(("EX-01",)), executor=executor,
+                launchers=VerifierLaunchers(
+                    task=scenario.task_verifier(), test=scenario.test_verifier()),
+                controls=ExecuteControls(plan_approved=True), environment={"claude": True})
+            _seed_reportless_uv_cache_block(request)
+
+            result = execute_run(_request(
+                root, _specs(("EX-01",)), executor=executor,
+                launchers=VerifierLaunchers(
+                    task=scenario.task_verifier(), test=scenario.test_verifier()),
+                controls=ExecuteControls(
+                    plan_approved=True, resume=True, operational_unblock_task="EX-01",
+                    human_authorized_operational_unblock=True, uv_cache_dir=".pipeline/uv-cache",
+                ), environment={"claude": True}))
+
+            self.assertEqual(result.status, "ok", result.message)
+            reopened = Run.load(request.run_dir, root)
+            self.assertEqual(reopened.task("EX-01").attempts, 0)
+
+    def test_operational_unblock_rejects_missing_or_tampered_runner_cache_artifact(self) -> None:
+        for name in ("absent", "tampered"):
+            with self.subTest(name=name), TemporaryDirectory() as directory:
+                root = Path(directory)
+                scenario = sa.SCENARIOS["direct-success"]
+                executor = scenario.executor()
+                request = _request(
+                    root, _specs(("EX-01",)), executor=executor,
+                    launchers=VerifierLaunchers(
+                        task=scenario.task_verifier(), test=scenario.test_verifier()),
+                    controls=ExecuteControls(plan_approved=True), environment={"claude": True})
+                _seed_reportless_uv_cache_block(request)
+                diagnostic = request.run_dir / "reports" / "EX-01" / "launch-1" / "launch-failure-1.json"
+                if name == "absent":
+                    diagnostic.unlink()
+                else:
+                    payload = json.loads(diagnostic.read_text(encoding="utf-8"))
+                    payload["reason"] = "tampered"
+                    diagnostic.write_text(json.dumps(payload), encoding="utf-8")
+
+                result = execute_run(_request(
+                    root, _specs(("EX-01",)), executor=executor,
+                    launchers=VerifierLaunchers(
+                        task=scenario.task_verifier(), test=scenario.test_verifier()),
+                    controls=ExecuteControls(
+                        plan_approved=True, resume=True, operational_unblock_task="EX-01",
+                        human_authorized_operational_unblock=True, uv_cache_dir=".pipeline/uv-cache",
+                    ), environment={"claude": True}))
+
+                self.assertEqual(result.status, "error")
+                self.assertIn("operational-unblock-evidence-missing", result.message)
+                self.assertEqual(executor.launches, 0)
+                self.assertEqual(Run.load(request.run_dir, root).task("EX-01").status, "blocked")
+
+    def test_operational_unblock_accepts_only_the_actual_tc01_predispatch_blocker_packet(self) -> None:
+        for name in ("matching", "absent", "tampered"):
+            with self.subTest(name=name), TemporaryDirectory() as directory:
+                root = Path(directory)
+                scenario = sa.SCENARIOS["direct-success"]
+                executor = scenario.executor()
+                tc01 = replace(_specs(("EX-01",))[0], id="TC-01")
+                request = _request(
+                    root, (tc01,), executor=executor,
+                    launchers=VerifierLaunchers(
+                        task=scenario.task_verifier(), test=scenario.test_verifier()),
+                    controls=ExecuteControls(plan_approved=True), environment={"claude": True})
+                _seed_actual_tc01_predispatch_block(request, tamper=name == "tampered")
+                packet = request.run_dir / "reports" / "TC-01" / "blocked-1.json"
+                if name == "absent":
+                    packet.unlink()
+                seeded = Run.load(request.run_dir, root)
+                seeded_task = seeded.task("TC-01")
+                self.assertEqual(seeded_task.attempts, 0)
+                self.assertIsNone(seeded_task.execution_evidence["executor_report"])
+                self.assertEqual(seeded.commands, [])
+                self.assertEqual(seeded_task.external_launch_failures, [])
+                self.assertEqual(seeded_task.next_executor_launch_generation, 2)
+
+                result = execute_run(_request(
+                    root, (tc01,), executor=executor,
+                    launchers=VerifierLaunchers(
+                        task=scenario.task_verifier(), test=scenario.test_verifier()),
+                    controls=ExecuteControls(
+                        plan_approved=True, resume=True, operational_unblock_task="TC-01",
+                        human_authorized_operational_unblock=True, uv_cache_dir=".pipeline/uv-cache",
+                    ), environment={"claude": True}))
+
+                if name == "matching":
+                    self.assertEqual(result.status, "ok", result.message)
+                    reopened = Run.load(request.run_dir, root).task("TC-01")
+                    self.assertEqual(reopened.attempts, 0)
+                else:
+                    self.assertEqual(result.status, "error")
+                    self.assertIn("operational-unblock-evidence-missing", result.message)
+                    self.assertEqual(executor.launches, 0)
+                    self.assertEqual(Run.load(request.run_dir, root).task("TC-01").status, "blocked")
+
+    def test_operational_unblock_fails_closed_for_unapproved_or_unsafe_retry(self) -> None:
+        cases = (
+            ("missing-authorization", {}, "operational-unblock-unauthorized"),
+            ("unsafe-cache", {"uv_cache_dir": "../uv-cache"}, "operational-unblock-cache-invalid"),
+            ("product-blocker", {"blocker": "repair budget exhausted"}, "operational-unblock-blocker-invalid"),
+            ("model-drift", {"model": "different"}, "runtime-control-mismatch"),
+            ("live-lease", {"live_lease": True}, "operational-unblock-lease-held"),
+            ("missing-evidence", {"missing_evidence": True}, "operational-unblock-evidence-missing"),
+        )
+        for name, override, expected in cases:
+            with self.subTest(name=name), TemporaryDirectory() as directory:
+                root = Path(directory)
+                scenario = sa.SCENARIOS["direct-success"]
+                executor = scenario.executor()
+                request = _request(
+                    root, _specs(("EX-01",)), executor=executor,
+                    launchers=VerifierLaunchers(
+                        task=scenario.task_verifier(), test=scenario.test_verifier()),
+                    controls=ExecuteControls(plan_approved=True), environment={"claude": True})
+                source = Run.create(FEATURE, request.prompt_path, request.plan_path, request.run_dir, root)
+                life = RunLifecycle.initialize(
+                    source, tasks=[("EX-01", [])],
+                    controls={
+                        "execution_scope": (["EX-01"], "explicit"),
+                        "verify_dependency_chain": (False, "default"),
+                        "model": (None, "default"), "effort": (None, "default"),
+                        "precondition_bindings": ({}, "explicit"),
+                    }, adapter_requested="claude", adapter_resolved="claude")
+                life.transition("EX-01", "running", actor=ACTOR_RUNNER)
+                if not override.get("missing_evidence"):
+                    report = request.run_dir / "reports" / "EX-01" / "report.md"
+                    report.parent.mkdir(parents=True)
+                    report.write_text("blocked by uv cache\n", encoding="utf-8")
+                    life.run.task("EX-01").execution_evidence["executor_report"] = report.relative_to(root).as_posix()
+                persist_task_contracts(life.run, request.specs)
+                life.block("EX-01", override.get("blocker", "external operational: uv cache access denied"))
+                life.run.status = "blocked"
+                life.run.save()
+                if override.get("live_lease"):
+                    lock = pipeline_lock_path(root)
+                    lock.parent.mkdir(parents=True, exist_ok=True)
+                    lock.write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
+                controls = ExecuteControls(
+                    plan_approved=True, resume=True, operational_unblock_task="EX-01",
+                    human_authorized_operational_unblock=not name == "missing-authorization",
+                    uv_cache_dir=override.get("uv_cache_dir", ".pipeline/uv-cache"),
+                    model=override.get("model"),
+                )
+
+                result = execute_run(_request(
+                    root, _specs(("EX-01",)), executor=executor,
+                    launchers=VerifierLaunchers(
+                        task=scenario.task_verifier(), test=scenario.test_verifier()),
+                    controls=controls, environment={"claude": True}))
+
+                self.assertEqual(result.status, "error")
+                self.assertIn(expected, result.message)
+                self.assertEqual(executor.launches, 0)
+                self.assertEqual(Run.load(request.run_dir, root).task("EX-01").status, "blocked")
+
     def test_every_scenario_reaches_its_declared_terminal_shape(self) -> None:
         for name, scenario in sa.SCENARIOS.items():
             with self.subTest(scenario=name), TemporaryDirectory() as directory:

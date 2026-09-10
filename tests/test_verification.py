@@ -479,6 +479,46 @@ class CurrentRunMutationEvidenceTests(unittest.TestCase):
         )
 
 
+class VerifierAttributionRulesTests(unittest.TestCase):
+    def test_evidence_carries_prior_runner_projection_owners(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = _implemented_run(root)
+            run.add_task("TC-01")
+            run.add_task("TC-02")
+            board = root / "docs" / "kanban.md"
+            tc01 = root / "docs" / "plans" / "tasks" / "TC-01.md"
+            tc02 = root / "docs" / "plans" / "tasks" / "TC-02.md"
+            for path in (board, tc01, tc02):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("runner projection\n", encoding="utf-8")
+            run.record_runner_projection("TC-01", (board, tc01))
+            run.record_runner_projection("TC-02", (tc02,))
+
+            evidence = build_verification_evidence(
+                run, "VR-02", attempt=1, commands_run=VerificationRun(())
+            )
+
+        self.assertEqual(
+            [(row["task_id"], row["path"]) for row in evidence.runner_owned_writes],
+            [
+                ("TC-01", "docs/kanban.md"),
+                ("TC-01", "docs/plans/tasks/TC-01.md"),
+                ("TC-02", "docs/plans/tasks/TC-02.md"),
+            ],
+        )
+
+    def test_task_verifier_uses_task_snapshot_and_manifest_not_ambient_git_diff(self) -> None:
+        prompt = build_verifier_prompt(
+            "task_verifier", _spec(), anchors=ANCHORS, feature_prompt="prompt.md",
+            evidence_payload=_evidence().serialized(), attempt=1,
+        )
+
+        self.assertIn("task-relevant snapshot", prompt)
+        self.assertIn("not whole-worktree git diff", prompt)
+        self.assertIn("supplementary allowed-scope", prompt)
+
+
 class ProseEnvelopeSettlementTests(unittest.TestCase):
     def test_agreeing_prose_and_envelope_leave_no_drift(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

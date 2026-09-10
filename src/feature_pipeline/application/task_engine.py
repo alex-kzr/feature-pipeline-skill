@@ -480,6 +480,12 @@ class TaskEngine:
                 state=state,
                 evidence=evidence,
             )
+            # The projection has changed protected, human-facing files before the next
+            # executor window opens.  Persist its actor and content digests now; otherwise a
+            # later ambient diff cannot distinguish runner lifecycle maintenance from an
+            # executor edit.
+            run.record_runner_projection(spec.id, (Path(request.board_path), task_path))
+            run.save()
         except BoardProjectionError as exc:
             raise ExecutionError(
                 f"board projection failed for {spec.id} -> {state!r}: {exc}",

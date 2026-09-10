@@ -803,6 +803,9 @@ def run_execute(
         published_refs=tuple(_published_refs(command.published_refs)),
         recovery_source_feature=command.recovery_source_feature,
         recovery_task=command.recovery_task,
+        operational_unblock_task=command.operational_unblock_task,
+        human_authorized_operational_unblock=command.human_authorized_operational_unblock,
+        uv_cache_dir=command.uv_cache_dir,
     )
     request = ExecuteRequest(
         feature=feature,

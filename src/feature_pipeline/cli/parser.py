@@ -94,6 +94,13 @@ def build_parser() -> argparse.ArgumentParser:
                      help="execute-only: create a fresh linked replacement from this failed source run")
     run.add_argument("--recover-task", metavar="ID", dest="recovery_task",
                      help="execute-only: selected pre-implementation task in --recover-source")
+    run.add_argument("--operational-unblock", metavar="ID", dest="operational_unblock_task",
+                     help="execute-only: reopen one terminal external uv-cache blocked task")
+    run.add_argument("--human-authorize-operational-unblock", action="store_true",
+                     dest="human_authorized_operational_unblock",
+                     help="execute-only: explicitly authorize the requested operational unblock")
+    run.add_argument("--uv-cache-dir", metavar="REL",
+                     help="execute-only: worktree-local UV cache directory for the authorized reopen")
     run.add_argument("--grant", action="append", default=[], help="assert an operator capability")
     run.add_argument("--approve", action="append", default=[], help="assert a named human approval")
     run.add_argument("--published-ref", action="append", default=[], metavar="SOURCE=REF",

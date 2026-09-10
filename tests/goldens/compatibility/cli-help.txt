@@ -7,8 +7,10 @@ usage: run_pipeline.py [-h] [--project-root DIR] [--agents-root DIR]
                        [--attest-dependency DEP_ID=SOURCE_FEATURE]
                        [--verify-dependency-chain] [--resume]
                        [--recover-source FEATURE] [--recover-task ID]
-                       [--grant GRANT] [--approve APPROVE]
-                       [--published-ref SOURCE=REF]
+                       [--operational-unblock ID]
+                       [--human-authorize-operational-unblock]
+                       [--uv-cache-dir REL] [--grant GRANT]
+                       [--approve APPROVE] [--published-ref SOURCE=REF]
                        [--mode {plan-only,unattended,execute,release-dry-run}]
                        [--feature NAME] [--prompt REL] [--approve-plan]
                        [--approve-final-diff] [--commit]
@@ -63,6 +65,14 @@ run selection and scope:
                         this failed source run
   --recover-task ID     execute-only: selected pre-implementation task in
                         --recover-source
+  --operational-unblock ID
+                        execute-only: reopen one terminal external uv-cache
+                        blocked task
+  --human-authorize-operational-unblock
+                        execute-only: explicitly authorize the requested
+                        operational unblock
+  --uv-cache-dir REL    execute-only: worktree-local UV cache directory for
+                        the authorized reopen
   --grant GRANT         assert an operator capability
   --approve APPROVE     assert a named human approval
   --published-ref SOURCE=REF

@@ -308,6 +308,9 @@ def run_command(command: RunCommand) -> PipelineResult:
         command.mode != "execute" or command.dry_run
     ):
         raise CliError(EXIT_ERROR, "recovery selectors are valid only for --mode execute")
+    if (command.operational_unblock_task or command.human_authorized_operational_unblock
+            or command.uv_cache_dir) and (command.mode != "execute" or command.dry_run):
+        raise CliError(EXIT_ERROR, "operational unblock controls are valid only for --mode execute")
     if (command.model is not None or command.effort is not None) and command.mode != "execute":
         raise CliError(EXIT_ERROR, "--model and --effort are valid only for --mode execute")
 

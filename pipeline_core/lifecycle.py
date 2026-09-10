@@ -29,10 +29,12 @@ Standard library only.
 
 from __future__ import annotations
 
+import hashlib
 import sys
 from typing import Any, Iterable, Mapping, Sequence
 
 from .state import (
+    ACTOR_HUMAN,
     ACTOR_RUNNER,
     RESUME_ROLLBACKS,
     ResumeError,
@@ -180,6 +182,53 @@ class RunLifecycle:
         self.run.record_event(
             f"blocker:{task_id}", frm=previous, to=reason, actor=actor, note="blocker set")
         self._suppress_dependents()
+        self.run.save()
+
+    def reopen_operational_block(
+        self, task_id: str, *, authorization: str, cache_path: str,
+        source_run_bytes: bytes | None = None,
+    ) -> None:
+        """Append a snapshot of a terminal operational block, then reopen just that task.
+
+        Validation of the authorization, blocker class, cache path, identity and leases belongs
+        to the execute runner.  This durable mutation boundary only accepts its exact approved
+        authorization token and refuses to overwrite the terminal record it is recovering.
+        """
+        if authorization != "human-authorized-operational-unblock":
+            raise ResumeError("operational unblock requires explicit human authorization",
+                              "operational-unblock-unauthorized")
+        record = self.run.task(task_id)
+        if record.status != "blocked" or not record.blocker:
+            raise ResumeError("operational unblock requires a terminal blocked task",
+                              "operational-unblock-not-blocked")
+
+        source_bytes = source_run_bytes if source_run_bytes is not None else (
+            self.run.run_dir / "run.json").read_bytes()
+        recovery = dict(self.run.recovery or {})
+        entries = list(recovery.get("operational_unblocks", []))
+        snapshot_rel = f"recovery/operational-unblock-{len(entries) + 1}"
+        snapshot = self.run.run_dir / snapshot_rel / "run.json"
+        snapshot.parent.mkdir(parents=True, exist_ok=False)
+        snapshot.write_bytes(source_bytes)
+        entries.append({
+            "task_id": task_id,
+            "authorization": authorization,
+            "cache_path": cache_path,
+            "source_run": snapshot_rel,
+            "source_run_sha256": f"sha256:{hashlib.sha256(source_bytes).hexdigest()}",
+            "blocked_status": record.status,
+            "blocker": record.blocker,
+        })
+        recovery["operational_unblocks"] = entries
+        self.run.recovery = recovery
+        self.run.transition_task(task_id, "ready", actor=ACTOR_HUMAN,
+                                 note="human-authorized operational unblock")
+        record.blocker = None
+        self.run.record_event(
+            f"operational-unblock:{task_id}", frm="blocked", to="ready",
+            actor=ACTOR_HUMAN, note="terminal evidence snapshotted before retry",
+        )
+        self._rederive_readiness()
         self.run.save()
 
     # -- readiness ----------------------------------------------------------------------

@@ -110,6 +110,36 @@ class AtomicFlushTests(unittest.TestCase):
             self.assertEqual(_stored(life.run.run_dir)["history"][-1]["scope"],
                              "generation:A-1:executor")
 
+    def test_human_operational_unblock_snapshots_terminal_evidence_before_reopening(self) -> None:
+        """REC-11: retry provenance is append-only; original terminal facts remain intact."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            life = RunLifecycle.initialize(_run(root), tasks=[("A-1", []), ("A-2", ["A-1"])])
+            life.transition("A-1", "running", actor=ACTOR_RUNNER)
+            life.run.task("A-1").attempts = 1
+            life.run.task("A-1").execution_evidence["executor_report"] = "reports/A-1/report.md"
+            life.block("A-1", "external operational: uv cache access denied")
+            before = (life.run.run_dir / "run.json").read_bytes()
+
+            life.reopen_operational_block(
+                "A-1", authorization="human-authorized-operational-unblock",
+                cache_path=".pipeline/uv-cache",
+            )
+
+            reopened = Run.load(life.run.run_dir, root)
+            self.assertEqual(reopened.task("A-1").status, "ready")
+            self.assertEqual(reopened.task("A-1").attempts, 1)
+            self.assertEqual(
+                reopened.task("A-1").execution_evidence["executor_report"],
+                "reports/A-1/report.md",
+            )
+            provenance = reopened.recovery["operational_unblocks"][-1]
+            self.assertEqual(provenance["task_id"], "A-1")
+            self.assertEqual(provenance["cache_path"], ".pipeline/uv-cache")
+            self.assertEqual(
+                (life.run.run_dir / provenance["source_run"] / "run.json").read_bytes(), before)
+            self.assertEqual(reopened.task("A-2").status, "pending")
+
 
 class ResumeReconciliationTests(unittest.TestCase):
     def _interrupted(self, root: Path, status: str) -> Run:

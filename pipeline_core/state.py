@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import hashlib
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
@@ -164,6 +165,10 @@ class TaskRecord:
     verification: dict[str, Any] = field(default_factory=_empty_verification)
     execution_evidence: dict[str, Any] = field(default_factory=_empty_execution_evidence)
     changed_files: list[str] = field(default_factory=list)
+    #: Content-addressed writes made by the runner's lifecycle projection.  These are
+    #: durable provenance, not executor evidence: a later executor window must begin after
+    #: them and must never inherit them as its implementation delta.
+    runner_owned_writes: list[dict[str, Any]] = field(default_factory=list)
     verification_tier: str = "full"
     accepts_scoped: list[str] = field(default_factory=list)
     promotion: dict[str, Any] | None = None
@@ -380,6 +385,39 @@ class Run:
             f"execution-evidence:{task_id}", to=str(generation),
             actor=ACTOR_EXECUTOR, note="executor report recorded as execution evidence")
         return evidence
+
+    def record_runner_projection(
+        self, task_id: str, paths: Sequence[str | Path], *, operation: str = "lifecycle-projection",
+    ) -> list[dict[str, Any]]:
+        """Durably attribute already-written lifecycle projection files to the runner.
+
+        The digest binds the attribution to the exact content the runner wrote.  Refuse an
+        absent or unreadable path rather than leaving a projection difference with ambiguous
+        ownership for the next executor window.
+        """
+        record = self.task(task_id)
+        entries: list[dict[str, Any]] = []
+        for path in paths:
+            relative = repo_relative(path, self.repo_root)
+            target = self.repo_root / relative
+            try:
+                content = target.read_bytes()
+            except OSError as exc:
+                raise StateError(
+                    f"runner projection cannot attribute '{relative}': {exc}",
+                    "runner-attribution-unavailable",
+                ) from exc
+            entries.append({
+                "path": relative,
+                "digest": "sha256:" + hashlib.sha256(content).hexdigest(),
+                "operation": operation,
+            })
+        record.runner_owned_writes.extend(entries)
+        self.record_event(
+            f"runner-projection:{task_id}", to=operation, actor=ACTOR_RUNNER,
+            note="runner-owned writes: " + ", ".join(entry["path"] for entry in entries),
+        )
+        return entries
 
     def record_implementation_attribution(
         self,

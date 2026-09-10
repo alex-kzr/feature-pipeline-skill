@@ -40,6 +40,7 @@
         }
       },
       "changed_files": [],
+      "runner_owned_writes": [],
       "verification_tier": "full",
       "accepts_scoped": [],
       "promotion": null,
@@ -83,6 +84,7 @@
         }
       },
       "changed_files": [],
+      "runner_owned_writes": [],
       "verification_tier": "full",
       "accepts_scoped": [],
       "promotion": null,
@@ -126,6 +128,7 @@
         }
       },
       "changed_files": [],
+      "runner_owned_writes": [],
       "verification_tier": "full",
       "accepts_scoped": [],
       "promotion": null,
@@ -169,6 +172,7 @@
         }
       },
       "changed_files": [],
+      "runner_owned_writes": [],
       "verification_tier": "full",
       "accepts_scoped": [],
       "promotion": null,

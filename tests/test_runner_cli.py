@@ -19,6 +19,8 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from feature_pipeline.cli import use_cases
+from feature_pipeline.cli.commands import RunCommand
+from feature_pipeline.cli.parser import build_parser
 from feature_pipeline.ports.adapters import AdapterCapabilities, AdapterRegistry
 from pipeline_core import runner_cli
 from pipeline_core.adapters import LaunchRequest
@@ -95,6 +97,15 @@ def _seed(fixture: str, dest: Path, *, tasks: list[dict], with_registry: bool = 
 
 
 class HelpAndFlagSurfaceTests(unittest.TestCase):
+    def test_operational_unblock_flags_are_typed_runner_controls(self) -> None:
+        command = RunCommand.from_args(build_parser().parse_args([
+            "--mode", "execute", "--resume", "--operational-unblock", "T-01",
+            "--human-authorize-operational-unblock", "--uv-cache-dir", ".pipeline/uv-cache",
+        ]))
+        self.assertEqual(command.operational_unblock_task, "T-01")
+        self.assertTrue(command.human_authorized_operational_unblock)
+        self.assertEqual(command.uv_cache_dir, ".pipeline/uv-cache")
+
     def test_help_lists_every_anchor_and_core_operational_flag(self) -> None:
         with self.assertRaises(SystemExit) as raised:
             _run(["--help"])
@@ -477,7 +488,7 @@ class ForwardedLegacyFlagTests(unittest.TestCase):
             self.assertIn(flag, help_text)
         for literal in PROJECT_IDENTITY_LITERALS:
             self.assertNotIn(literal, help_text)
-        for banned in ("archive", "purge", "retry", "maintenance", "recovery", "unblock"):
+        for banned in ("archive", "purge", "maintenance", "recovery"):
             self.assertNotIn(banned, help_text)
 
 

@@ -137,6 +137,9 @@ class VerificationEvidence:
     implementation_manifest: str | None = None
     implementation_diff: str | None = None
     changed_files: tuple[Mapping[str, object], ...] = ()
+    #: Content-addressed lifecycle projections written by the runner before this executor
+    #: window. They explain protected ambient files without turning them into executor work.
+    runner_owned_writes: tuple[Mapping[str, object], ...] = ()
     #: Runner-recorded actions performed outside the local implementation window (for
     #: example a push, tag, or remote-ruleset mutation).  It is deliberately explicit
     #: even when empty: task history and ambient Git state are not substitutes for it.
@@ -165,6 +168,7 @@ class VerificationEvidence:
                 "diff": self.implementation_diff,
                 "changed_files": [dict(entry) for entry in self.changed_files],
             },
+            "runner_owned_writes": [dict(entry) for entry in self.runner_owned_writes],
             "commands": [dict(entry) for entry in self.commands],
             "external_actions": [dict(entry) for entry in self.external_actions],
             "missing_evidence": [dict(entry) for entry in self.missing_evidence],
@@ -178,6 +182,7 @@ class VerificationEvidence:
                     "diff": self.implementation_diff,
                     "changed_files": [dict(entry) for entry in self.changed_files],
                 },
+                "runner_owned_writes": [dict(entry) for entry in self.runner_owned_writes],
                 "captured_commands": [dict(entry) for entry in self.commands],
                 "external_actions": [dict(entry) for entry in self.external_actions],
             },
@@ -218,6 +223,16 @@ def build_verification_evidence(
         }
         for cwd, argv in commands_run.unrun
     )
+    runner_writes: list[dict[str, object]] = []
+    # Runner lifecycle projections can belong to earlier tasks (for example TC-01/TC-02
+    # updating the shared board before TC-03 starts).  Carry their durable owner into this
+    # task's evidence so ambient protected files are explainable without treating them as
+    # implementation.  The executor manifest remains the sole source of executor changes.
+    for owner_id, owner in sorted(getattr(run, "tasks", {}).items()):
+        for entry in getattr(owner, "runner_owned_writes", ()):
+            row = dict(entry)
+            row["task_id"] = owner_id
+            runner_writes.append(row)
     return VerificationEvidence(
         task_id=task_id,
         attempt=attempt,
@@ -226,6 +241,7 @@ def build_verification_evidence(
         implementation_manifest=implementation.get("manifest"),
         implementation_diff=implementation.get("diff"),
         changed_files=tuple(dict(entry) for entry in implementation.get("changed_files") or ()),
+        runner_owned_writes=tuple(runner_writes),
         external_actions=tuple(
             dict(entry) for entry in execution.get("external_actions") or ()
         ),
@@ -389,9 +405,15 @@ class VerifierLaunchers:
 _VERIFIER_RULES: dict[str, tuple[str, ...]] = {
     "task_verifier": (
         "Re-read the feature prompt, the task file, and the acceptance criteria yourself.",
-        "Judge only whether the acceptance criteria are met by the implementation below.",
+        "Judge task requirements and acceptance criteria from the task-relevant snapshot and "
+        "runner-owned command evidence below, not whole-worktree git diff as a completion proxy.",
         "You may read the worktree; you may not modify anything and you may not run the "
         "verification commands — their outcomes are the runner-owned evidence below.",
+        "Treat implementation manifest/diff deltas only as supplementary allowed-scope checks; "
+        "they do not establish task completion by themselves.",
+        "Runner-owned writes identify lifecycle projections. Never charge those earlier writes "
+        "to the executor; only changes attributed inside this executor window may be scope "
+        "violations. An unavailable executor attribution is BLOCKED.",
         "Do not tick acceptance-criteria checkboxes.",
         "For an acceptance criterion marked CURRENT-RUN ONLY, assess mutations only from "
         "the current_run_boundary in the runner-owned evidence: its verification snapshot, "

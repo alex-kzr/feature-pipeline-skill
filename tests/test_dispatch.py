@@ -752,6 +752,76 @@ def _init_repo(root: Path) -> None:
 
 
 class DispatchAttributionTests(unittest.TestCase):
+    def test_tc03_runner_projection_is_durable_and_not_charged_to_allowed_review(self) -> None:
+        """TC-03: prior runner projections are protected context, not executor work.
+
+        TC-01/TC-02 and the board are already dirty because the runner projected their
+        lifecycle state.  TC-03's executor writes only its declared review artifact.  The
+        executor manifest must therefore contain only that review while the prior writes
+        remain durably attributed to the runner.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _init_repo(root)
+            protected = (
+                "docs/kanban.md",
+                "docs/plans/tasks/TC-01.md",
+                "docs/plans/tasks/TC-02.md",
+            )
+            for relative in protected:
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("runner lifecycle projection\n", encoding="utf-8")
+            spec = _spec(allowed_scope=("reviews/TC-03.md",))
+            life = _running_life(root, spec)
+            life.run.add_task("TC-01")
+            life.run.add_task("TC-02")
+            life.run.record_runner_projection("TC-01", protected[:2])
+            life.run.record_runner_projection("TC-02", (protected[2],))
+
+            def executor_writes_review() -> None:
+                review = root / "reviews" / "TC-03.md"
+                review.parent.mkdir(parents=True, exist_ok=True)
+                review.write_text("TC-03 review\n", encoding="utf-8")
+
+            outcome = dispatch_executor(
+                life, _request(spec), ScriptedAdapter(on_launch=executor_writes_review))
+
+            self.assertEqual(outcome.status, "implemented")
+            self.assertEqual(
+                [row["path"] for row in outcome.attribution.changed_files],
+                ["reviews/TC-03.md"],
+            )
+            self.assertEqual(
+                [entry["path"] for entry in life.run.task("TC-01").runner_owned_writes],
+                list(protected[:2]),
+            )
+            self.assertEqual(
+                [entry["path"] for entry in life.run.task("TC-02").runner_owned_writes],
+                [protected[2]],
+            )
+
+    def test_executor_change_to_protected_artifact_blocks_before_verifiers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _init_repo(root)
+            protected = "docs/kanban.md"
+            path = root / protected
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("runner lifecycle projection\n", encoding="utf-8")
+            spec = _spec(allowed_scope=("reviews/TC-03.md",))
+            life = _running_life(root, spec)
+            life.run.record_runner_projection(spec.id, (protected,))
+
+            def executor_changes_protected() -> None:
+                path.write_text("executor overwrite\n", encoding="utf-8")
+
+            outcome = dispatch_executor(
+                life, _request(spec), ScriptedAdapter(on_launch=executor_changes_protected))
+
+            self.assertEqual(outcome.status, "blocked")
+            self.assertIn("scope-violation", life.run.task(spec.id).blocker or "")
+
     def test_known_delta_captures_the_executor_edit_and_classifies_scope(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

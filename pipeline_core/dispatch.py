@@ -169,9 +169,31 @@ class DispatchOutcome:
     report_text: str | None
     drift: str | None = None
     failure: str | None = None
-    #: Runner-owned attribution of the implementation diff to this launch window. Present
-    #: only on a trusted ``implemented``; ``None`` for every blocked outcome.
+    #: Runner-owned attribution of the implementation diff to this launch window.  It is also
+    #: retained for a scope/provenance block so the block names the executor-owned delta.
     attribution: AttributionResult | None = None
+
+
+def _scope_or_provenance_block(attribution: AttributionResult) -> str | None:
+    """Return the fail-closed mechanical verdict for one executor window.
+
+    The manifest is the sole authority for executor scope: ambient worktree differences and
+    runner lifecycle projections pre-dating the snapshot are deliberately irrelevant.  A
+    window whose attribution is unavailable is unknown executor activity and cannot proceed.
+    """
+    # A missing repository boundary has no observed executor change to charge (and remains
+    # explicit evidence for the verifier).  An unavailable close *with candidates*, however,
+    # means an executor-window change could not be attributed; fail closed before verifiers.
+    if attribution.state == "unavailable" and attribution.changed_files:
+        return "attribution-unavailable: executor window ownership cannot be proven"
+    outside = [
+        str(row.get("path", "<unknown>"))
+        for row in attribution.changed_files
+        if row.get("classification") == "out_of_scope"
+    ]
+    if outside:
+        return "scope-violation: executor-owned changes outside allowed scope: " + ", ".join(outside)
+    return None
 
 
 def dispatch_executor(
@@ -369,6 +391,13 @@ def dispatch_executor(
         changed_files=attribution.changed_files,
         reason=attribution.reason,
     )
+    scope_block = _scope_or_provenance_block(attribution)
+    if scope_block:
+        life.block(task_id, scope_block)
+        return DispatchOutcome(
+            task_id, generation, "blocked", "blocked", artifacts, result, envelope_result,
+            report_text, resolution.drift, scope_block, attribution,
+        )
     if resolution.drift:
         run.record_event(
             f"executor:{task_id}", to=str(generation), note=resolution.drift)
@@ -448,6 +477,12 @@ def _settle_codex_final_result(
     run.record_implementation_attribution(request.spec.id, generation=generation,
         attempt=request.attempt, attribution_state=attribution.state, manifest=attribution.manifest,
         diff=attribution.diff, changed_files=attribution.changed_files, reason=attribution.reason)
+    scope_block = _scope_or_provenance_block(attribution)
+    if scope_block:
+        life.block(request.spec.id, scope_block)
+        return DispatchOutcome(request.spec.id, generation, "blocked", "blocked", artifacts,
+                               result, None, report_text, failure=scope_block,
+                               attribution=attribution)
     life.transition(request.spec.id, "implemented", actor=ACTOR_EXECUTOR,
                     note=f"executor launch-{generation} reported implemented")
     return DispatchOutcome(request.spec.id, generation, "implemented", "implemented", artifacts,
