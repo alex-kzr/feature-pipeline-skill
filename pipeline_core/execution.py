@@ -56,6 +56,7 @@ from feature_pipeline.application.verified_reuse import (
     EvidenceEligibilityError,
     VerifiedEvidenceStore,
     canonical_task_path,
+    supersession_graph,
     task_contract_digest,
 )
 from feature_pipeline.application.selection import prune_reused_ancestors
@@ -1104,6 +1105,37 @@ def _resolve_selection_and_scope(
     return selected, [task_id for task_id in order if task_id in closure]
 
 
+def _substitute_superseded_scope(
+    scope: Sequence[str], selected: Sequence[str], order: Sequence[str],
+    definitions: Mapping[str, TaskSpec], repo_root: Path,
+) -> list[str]:
+    """Replace retired, non-selected predecessors with their declared live replacements.
+
+    Full-chain verification re-executes dependencies but must never redispatch a task whose
+    successor supersedes it. The replacement remains a real task in the same compiled plan;
+    no historical run record is read or modified here.
+    """
+    graph = supersession_graph(definitions, repo_root)
+    if graph is None:
+        return list(scope)
+    selected_ids = set(selected)
+    resolved: set[str] = set()
+    for task_id in scope:
+        if task_id in selected_ids:
+            resolved.add(task_id)
+            continue
+        node = task_id
+        seen: set[str] = set()
+        while True:
+            replacement = graph.replacement_for(node)
+            if replacement is None or replacement in seen:
+                break
+            seen.add(replacement)
+            node = replacement
+        resolved.add(node)
+    return [task_id for task_id in order if task_id in resolved]
+
+
 def _resume_open_run(
     request: ExecuteRequest,
     resolution: AdapterResolution,
@@ -1324,6 +1356,10 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
 
     try:
         selected, scope = _resolve_selection_and_scope(request, plan, order, spec_by_id)
+        if request.controls.verify_dependency_chain:
+            scope = _substitute_superseded_scope(
+                scope, selected, order, spec_by_id, request.repo_root
+            )
         _validate_attestation_scope(request.controls, spec_by_id)
         recovery = recovery_provenance(
             controls=request.controls, run_dir=request.run_dir, repo_root=request.repo_root,
