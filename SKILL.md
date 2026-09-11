@@ -27,4 +27,3 @@ The core uses these anchors rather than assuming a checkout layout or host-speci
 
 For Hermes-initiated work through an external Codex or Claude worker, follow the complete
 project-neutral procedure in [the Hermes operator guide](docs/hermes-operator.md).
-
