@@ -195,7 +195,7 @@ class ComparableTerminalShapeTests(unittest.TestCase):
             self.assertIsNone(engine_outcome.diagnostic)
 
             run = Run.load(engine.run_dir, engine_root)
-            self.assertEqual(run.task("EX-01").status, "verified")
+            self.assertEqual(run.task("EX-01").status, "done")
             self.assertEqual(run.task("EX-01").verification["task_verdict"], "PASS")
 
     def test_successful_repair_is_identical_with_and_without_a_compiled_plan(self) -> None:
@@ -207,7 +207,7 @@ class ComparableTerminalShapeTests(unittest.TestCase):
                 (legacy.status, legacy.exit_code), (engine.status, engine.exit_code))
             legacy_outcome = legacy.task_results[-1]
             engine_outcome = engine.task_results[-1]
-            self.assertEqual(legacy_outcome.status, "verified")
+            self.assertEqual(legacy_outcome.status, "done")
             self.assertEqual(
                 (legacy_outcome.attempts, legacy_outcome.gates),
                 (engine_outcome.attempts, engine_outcome.gates),
@@ -221,8 +221,7 @@ class ComparableTerminalShapeTests(unittest.TestCase):
 
             self.assertEqual(
                 (legacy.status, legacy.exit_code), (engine.status, engine.exit_code))
-            self.assertIsNotNone(engine.task_results[-1].diagnostic)
-            self.assertTrue(engine.task_results[-1].diagnostic.is_file())
+            self.assertIsNone(engine.task_results[-1].diagnostic)
 
 
 class OnlyOneProductionPathTests(unittest.TestCase):

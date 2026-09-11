@@ -439,7 +439,9 @@ def apply(state: RunState, event: Event) -> RunState:
     raise DomainError(f"unknown state event: {type(event).__name__!r}", code="unknown-event")
 
 
-def _check_transition(task: TaskState, to: TaskStatus, actor: Actor) -> None:
+def _check_transition(
+    task: TaskState, to: TaskStatus, actor: Actor, resolution: DoneResolution | None = None
+) -> None:
     """Raise if ``task`` may not move to ``to`` under ``actor``; return silently otherwise."""
     if to not in TASK_TRANSITIONS.get(task.status, frozenset()):
         raise IllegalTransition(
@@ -447,11 +449,15 @@ def _check_transition(task: TaskState, to: TaskStatus, actor: Actor) -> None:
         )
     if task.status is TaskStatus.DONE and actor is not Actor.HUMAN:
         raise UnauthorizedTransition("only a human may reopen a done task")
+    if to is TaskStatus.DONE and not (
+        actor is Actor.RUNNER or (actor is Actor.HUMAN and resolution is DoneResolution.CANCELLED)
+    ):
+        raise UnauthorizedTransition("only the runner may record completed work")
 
 
 def _apply_transition(state: RunState, event: Transition) -> RunState:
     task = state.task(event.task_id)
-    _check_transition(task, event.to, event.actor)
+    _check_transition(task, event.to, event.actor, event.resolution)
     if task.status is TaskStatus.DONE and not (event.note and event.note.strip()):
         raise IllegalTransition("reopening a done task requires an audit reason")
     if event.to is TaskStatus.DONE:

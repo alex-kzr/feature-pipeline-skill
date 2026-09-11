@@ -70,7 +70,7 @@ def _state(**overrides: object) -> RunStateV3:
         "tasks": [
             {
                 "id": "T-1",
-                "status": "running",
+                "status": "in_progress",
                 "execution_evidence": {
                     "attempt": 1,
                     "executor_report": None,
@@ -442,11 +442,11 @@ class TestOneCommitApi(unittest.TestCase):
     def test_plain_commit_is_compare_and_set(self) -> None:
         persistence, loaded, _ = self._fresh()
         moved = loaded.state.with_task(
-            replace(loaded.state.task("T-1"), status="implemented")
+            replace(loaded.state.task("T-1"), status="in_progress")
         )
         updated = persistence.commit(loaded, moved)
         self.assertEqual(updated.revision, 1)
-        self.assertEqual(persistence.open().state.task("T-1").status, "implemented")
+        self.assertEqual(persistence.open().state.task("T-1").status, "in_progress")
         # the stale handle can no longer commit
         with self.assertRaises(StateRevisionConflict):
             persistence.commit(loaded, moved)

@@ -115,24 +115,20 @@ class StateCharacterizationTests(unittest.TestCase):
             root = Path(directory)
             run = self._run(root)
             run.add_task("NP-01")
-            run.transition_task("NP-01", "ready")
-            run.transition_task("NP-01", "running")
-            run.transition_task("NP-01", "implemented", ACTOR_EXECUTOR)
+            run.transition_task("NP-01", "in_progress")
             run.save()
             loaded = Run.load(run.run_dir, root)
-            self.assertEqual(loaded.task("NP-01").status, "implemented")
+            self.assertEqual(loaded.task("NP-01").status, "in_progress")
             with self.assertRaises(ResumeError):
                 loaded.resume(feature="other", prompt_path="prompts/feature.md", plan_path=None)
 
-    def test_executor_cannot_mark_a_task_verified(self) -> None:
+    def test_executor_cannot_mark_a_task_done(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             run = self._run(Path(directory))
             run.add_task("NP-01")
-            for status in ("ready", "running"):
-                run.transition_task("NP-01", status)
-            run.transition_task("NP-01", "implemented", ACTOR_EXECUTOR)
+            run.transition_task("NP-01", "in_progress")
             with self.assertRaises(TransitionError) as caught:
-                run.transition_task("NP-01", "verified", ACTOR_EXECUTOR)
+                run.transition_task("NP-01", "done", ACTOR_EXECUTOR, resolution="completed")
             self.assertEqual(caught.exception.code, "unauthorized-transition")
 
 

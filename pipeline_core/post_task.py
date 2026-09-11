@@ -2,13 +2,13 @@
 contract.
 
 The minimum execution engine (:mod:`pipeline_core.execution`) drives every selected task to
-``verified`` and stops after stage 9. This module owns the stages that may run *after* that,
+``done`` with independently verified completion evidence and stops after stage 9. This module owns the stages that may run *after* that,
 each behind an explicit guard:
 
 ===== ===================== ================================================================
 Stage Name                  Guard
 ===== ===================== ================================================================
-10    ``documentation``     unreachable until **every selected task** is ``verified`` (AC-1)
+10    ``documentation``     unreachable until **every selected task** is ``done`` (AC-1)
 11    ``documentation-audit`` runs in a context that is never the stage-10 context
 12    ``graphify-refresh``  unreachable unless stage 11 returned ``PASS`` (AC-2); invokes
                             only the project-configured wrapper; enforces the declared
@@ -189,13 +189,13 @@ def run_post_task_lifecycle(life: RunLifecycle, request: PostTaskRequest) -> Pos
     results: list[StageResult] = []
 
     # --- Stage 10 guard (AC-1): documentation is unreachable while any selected task is
-    #     not yet 'verified'. Nothing is dispatched; the run simply is not ready.
+    #     not yet 'done'. Nothing is dispatched; the run simply is not ready.
     unverified = [tid for tid in request.selected_task_ids
-                  if run.task(tid).status != "verified"]
+                  if run.task(tid).status != "done"]
     if unverified:
         pending = StageResult(
             DOCUMENTATION, 10, BLOCKED,
-            (f"documentation cannot begin: selected task(s) not verified: "
+            (f"documentation cannot begin: selected task(s) not done: "
              f"{', '.join(unverified)}",),
         )
         _record(life, pending)

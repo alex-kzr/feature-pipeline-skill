@@ -171,7 +171,8 @@ def build_completion_evidence(run: Run, spec: TaskSpec) -> CompletionEvidence:
     return CompletionEvidence(
         completed_at=record.verification.get("verified_at") or _utcnow(),
         run_id=run.run_id,
-        outcome="verified",
+        resolution=record.resolution or "completed",
+        resolution_reason=record.resolution_reason,
         repair_count=record.attempts,
         gate_count=gate,
         task_verdict=record.verification.get("task_verdict"),
@@ -205,7 +206,7 @@ class TaskEngine:
         task_id = spec.id
         maximum = int(spec.max_repair_attempts)
         record = run.task(task_id)
-        repair_of, skip_executor = self._enter(life, task_id)
+        repair_of, skip_executor = self._enter(life, request)
         if skip_executor:
             return TaskRunResult(task_id, "done", record.attempts, 0, None, None, ())
         passes: list[RepairPass] = []
@@ -265,6 +266,7 @@ class TaskEngine:
                 passes.append(RepairPass(gate, "done", repair_of, *verdict))
                 life.recompute_readiness()
                 run.save()
+                self._project(run, request, "done", build_completion_evidence(run, spec))
                 return TaskRunResult(
                     task_id, "done", run.task(task_id).attempts, gates, None, None,
                     tuple(passes))
@@ -293,17 +295,21 @@ class TaskEngine:
 
     # -- entry reconciliation -----------------------------------------------------------
 
-    def _enter(self, life: RunLifecycle, task_id: str) -> tuple[str | None, bool]:
+    def _enter(self, life: RunLifecycle, request: TaskExecution) -> tuple[str | None, bool]:
         """Resolve the latest resumable operation without reintroducing legacy states."""
         run = life.run
+        task_id = request.spec.id
         record = run.task(task_id)
         if record.status == "to_do":
+            self._project(run, request, "to_do")
             life.transition(task_id, "in_progress", actor=ACTOR_RUNNER,
                             note="executor operation started")
+            self._project(run, request, "in_progress")
         if record.status == "in_progress":
             report = newest_repair_report(run.run_dir, task_id)
             return (repo_relative(report, run.repo_root) if report else None), False
         if record.status == "done":
+            self._project(run, request, "done", build_completion_evidence(run, request.spec))
             return None, True
         raise ExecutionError(
             f"{task_id} cannot enter the repair loop from '{record.status}'",
@@ -371,7 +377,7 @@ class TaskEngine:
         :class:`ExecutionError`; ``run.json`` is already intact, so the next ``--resume``
         repairs the human view idempotently (:func:`pipeline_core.execution.execute_run`).
         """
-        if request.board_path is None or run.task(request.spec.id).status in {"to_do", "in_progress", "done"}:
+        if request.board_path is None:
             return
         spec = request.spec
         # ``spec.path`` is already repository-relative for a Markdown-backed task file.

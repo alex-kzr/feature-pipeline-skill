@@ -6,15 +6,15 @@
 sole authority for task lifecycle state. This module owns none of that policy — it only
 renders an already-decided :class:`~feature_pipeline.domain.vocabulary.TaskStatus` value into
 the human-facing view: the active board (``docs/kanban.md``) and the task file's
-``## Status`` checkboxes and, for ``verified``, its ``## Result`` section.
+``## Status`` checkboxes and, for ``done``, its ``## Result`` section.
 
 The mapping (KLC-02 Requirements):
 
-* ``pending`` / ``ready`` / ``blocked`` -> ``To Do`` (board card in ``## To Do``, task file
-  ``To Do`` checked).
-* ``running`` / ``implemented`` / ``verification_failed`` / ``repairing`` -> ``In Progress``.
-* ``verified`` -> no board card, task file ``Done`` checked, and exactly one ``## Result``
-  section upserted from the supplied :class:`CompletionEvidence`.
+* ``to_do`` -> ``To Do`` (board card in ``## To Do``, task file ``To Do`` checked).
+* ``in_progress`` -> ``In Progress``.
+* ``done`` -> no board card, task file ``Done`` checked, and exactly one ``## Result``
+  section upserted from the supplied :class:`CompletionEvidence`. Its resolution is either
+  ``completed`` or ``cancelled``; a cancellation has an explicit human reason.
 
 :func:`project_task_state` computes both the new board text and the new task-file text in
 memory, validates both fully, and only then writes each with a replace-style
@@ -72,7 +72,7 @@ class InvalidEvidenceError(BoardProjectionError):
 
 
 # ==============================================================================================
-# Evidence — the caller-supplied facts a ``verified`` projection renders. Only typed, closed
+# Evidence — the caller-supplied facts a ``done`` projection renders. Only typed, closed
 # fields are accepted; raw command output (which could carry secrets) is never one of them.
 # ==============================================================================================
 
@@ -88,19 +88,29 @@ class CommandEvidence:
 
 @dataclass(frozen=True)
 class CompletionEvidence:
-    """Everything a ``verified`` ``## Result`` section renders."""
+    """Everything a ``done`` ``## Result`` section renders."""
 
     completed_at: str
     run_id: str
-    outcome: str
+    resolution: str
     repair_count: int
     gate_count: int
+    resolution_reason: str | None = None
     task_verdict: str | None = None
     test_verdict: str | None = None
     commands: tuple[CommandEvidence, ...] = ()
     evidence_paths: tuple[str, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
+        if self.resolution not in {"completed", "cancelled"}:
+            raise InvalidEvidenceError("done resolution must be completed or cancelled")
+        if self.resolution == "cancelled":
+            if not self.resolution_reason or not self.resolution_reason.strip():
+                raise InvalidEvidenceError("cancelled completion requires a reason")
+            if self.task_verdict is not None or self.test_verdict is not None or self.commands:
+                raise InvalidEvidenceError(
+                    "cancelled completion must not claim implementation verification"
+                )
         for path in self.evidence_paths:
             _require_repo_relative(path)
 
@@ -125,21 +135,19 @@ def _require_repo_relative(path: str) -> None:
 # State -> column mapping.
 # ==============================================================================================
 
-_TO_DO_STATES = frozenset({"pending", "ready", "blocked"})
-_IN_PROGRESS_STATES = frozenset(
-    {"running", "implemented", "verification_failed", "repairing"}
-)
-_VERIFIED_STATE = "verified"
+_TO_DO_STATE = "to_do"
+_IN_PROGRESS_STATE = "in_progress"
+_DONE_STATE = "done"
 
 _COLUMN_LABELS = {"to_do": "To Do", "in_progress": "In Progress", "none": "Done"}
 
 
 def _target_column(state: str) -> str:
-    if state in _TO_DO_STATES:
+    if state == _TO_DO_STATE:
         return "to_do"
-    if state in _IN_PROGRESS_STATES:
+    if state == _IN_PROGRESS_STATE:
         return "in_progress"
-    if state == _VERIFIED_STATE:
+    if state == _DONE_STATE:
         return "none"
     raise BoardProjectionError(f"unsupported durable state: {state!r}")
 
@@ -166,9 +174,9 @@ def project_task_state(
     target = _target_column(state)
     if target == "none":
         if evidence is None:
-            raise InvalidEvidenceError("the verified state requires completion evidence")
+            raise InvalidEvidenceError("the done state requires completion evidence")
     elif evidence is not None:
-        raise InvalidEvidenceError("completion evidence is only accepted for verified")
+        raise InvalidEvidenceError("completion evidence is only accepted for done")
 
     board_display = _display_path(board_path)
     task_display = _display_path(task_path)
@@ -334,7 +342,7 @@ def _apply_board_transition(
         in_progress_body = _upsert_column(
             in_progress_body, task_id, link, card_line, newline
         )
-    else:  # target == "none" (verified)
+    else:  # target == "none" (done)
         todo_body = _remove_matching_cards(todo_body, task_id, link)
         in_progress_body = _remove_matching_cards(in_progress_body, task_id, link)
 
@@ -399,13 +407,16 @@ def _render_result_section(evidence: CompletionEvidence, newline: str) -> list[s
     lines = [f"## Result{newline}", newline]
     lines.append(
         f"Completed {evidence.completed_at} for run `{evidence.run_id}` "
-        f"— outcome: **{evidence.outcome}**.{newline}"
+        f"— outcome: **{evidence.resolution}**.{newline}"
     )
     lines.append(newline)
     lines.append(f"- Repairs: {evidence.repair_count}{newline}")
     lines.append(f"- Gate failures: {evidence.gate_count}{newline}")
-    lines.append(f"- Task verifier verdict: {evidence.task_verdict or 'none'}{newline}")
-    lines.append(f"- Test verifier verdict: {evidence.test_verdict or 'none'}{newline}")
+    if evidence.resolution_reason:
+        lines.append(f"- Reason: {evidence.resolution_reason}{newline}")
+    if evidence.resolution == "completed":
+        lines.append(f"- Task verifier verdict: {evidence.task_verdict or 'none'}{newline}")
+        lines.append(f"- Test verifier verdict: {evidence.test_verdict or 'none'}{newline}")
     if evidence.commands:
         lines.append(newline)
         lines.append(f"Verification commands:{newline}")

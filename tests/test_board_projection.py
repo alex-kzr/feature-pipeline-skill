@@ -74,7 +74,7 @@ def _evidence(**overrides: object) -> CompletionEvidence:
     fields: dict[str, object] = dict(
         completed_at="2026-09-05T00:00:00Z",
         run_id="run-123",
-        outcome="verified",
+        resolution="completed",
         repair_count=0,
         gate_count=0,
         task_verdict="PASS",
@@ -89,6 +89,21 @@ def _evidence(**overrides: object) -> CompletionEvidence:
 class StartTransitionTests(unittest.TestCase):
     """AC-1."""
 
+    def test_to_do_projects_the_public_to_do_state(self) -> None:
+        with temp_root() as root:
+            board = _write_bytes_exact(root / "docs/kanban.md", BOARD)
+            task = _write_bytes_exact(root / "docs/plans/tasks/ABC-01_do-the-thing.md", TASK)
+
+            project_task_state(
+                board_path=board,
+                task_path=task,
+                task_id="ABC-01",
+                task_title="Do the thing",
+                state="to_do",
+            )
+
+            self.assertIn("- [x] To Do\n", task.read_text(encoding="utf-8"))
+
     def test_start_accepts_one_blank_line_after_status_heading(self) -> None:
         task_with_status_gap = TASK.replace("## Status\n", "## Status\n\n")
         with temp_root() as root:
@@ -102,7 +117,7 @@ class StartTransitionTests(unittest.TestCase):
                 task_path=task,
                 task_id="ABC-01",
                 task_title="Do the thing",
-                state="running",
+                state="in_progress",
             )
 
             task_text = task.read_text(encoding="utf-8")
@@ -120,7 +135,7 @@ class StartTransitionTests(unittest.TestCase):
                 task_path=task,
                 task_id="ABC-01",
                 task_title="Do the thing",
-                state="running",
+                state="in_progress",
             )
 
             board_text = board.read_text(encoding="utf-8")
@@ -144,7 +159,7 @@ class StartTransitionTests(unittest.TestCase):
             self.assertIn("- [x] In Progress\n", task_text)
             self.assertIn("- [ ] Done\n", task_text)
 
-    def test_blocked_returns_card_to_to_do_and_preserves_blockers(self) -> None:
+    def test_legacy_blocked_state_is_rejected(self) -> None:
         task_with_blockers = TASK.replace(
             "## Execution Metadata",
             "## Blockers\n\nRecorded 2026-09-05: waiting on ABC-00.\n\n## Execution Metadata",
@@ -161,33 +176,20 @@ class StartTransitionTests(unittest.TestCase):
                 root / "docs/plans/tasks/ABC-01_do-the-thing.md", task_with_blockers
             )
 
-            project_task_state(
-                board_path=board,
-                task_path=task,
-                task_id="ABC-01",
-                task_title="Do the thing",
-                state="blocked",
-            )
-
-            board_text = board.read_text(encoding="utf-8")
-            task_text = task.read_text(encoding="utf-8")
-
-            self.assertIn(
-                "[ABC-01: Do the thing](plans/tasks/ABC-01_do-the-thing.md)",
-                board_text.split("## In Progress")[0],
-            )
-            self.assertNotIn(
-                "[ABC-01: Do the thing](plans/tasks/ABC-01_do-the-thing.md)",
-                board_text.split("## In Progress")[1],
-            )
-            self.assertIn("- [x] To Do\n", task_text)
-            self.assertIn("Recorded 2026-09-05: waiting on ABC-00.", task_text)
+            with self.assertRaisesRegex(Exception, "unsupported durable state"):
+                project_task_state(
+                    board_path=board,
+                    task_path=task,
+                    task_id="ABC-01",
+                    task_title="Do the thing",
+                    state="blocked",
+                )
 
 
-class VerifiedTransitionTests(unittest.TestCase):
+class DoneTransitionTests(unittest.TestCase):
     """AC-2."""
 
-    def test_verified_removes_card_marks_done_and_writes_result(self) -> None:
+    def test_completed_done_removes_card_marks_done_and_writes_result(self) -> None:
         board_in_progress = BOARD.replace(
             "- [ABC-01: Do the thing](plans/tasks/ABC-01_do-the-thing.md)\n", ""
         ).replace(
@@ -203,7 +205,7 @@ class VerifiedTransitionTests(unittest.TestCase):
                 task_path=task,
                 task_id="ABC-01",
                 task_title="Do the thing",
-                state="verified",
+                state="done",
                 evidence=_evidence(),
             )
 
@@ -219,14 +221,14 @@ class VerifiedTransitionTests(unittest.TestCase):
             self.assertIn("- [x] Done\n", task_text)
             self.assertEqual(task_text.count("## Result"), 1)
             self.assertIn("run-123", task_text)
-            self.assertIn("outcome: **verified**", task_text)
+            self.assertIn("outcome: **completed**", task_text)
             self.assertIn("Repairs: 0", task_text)
             self.assertIn("Task verifier verdict: PASS", task_text)
             self.assertIn("`. -> pytest` — exit 0", task_text)
             self.assertIn("docs/acceptance/artifacts/run-123.md", task_text)
             self.assertIn("## Execution Metadata", task_text)
 
-    def test_verified_requires_evidence(self) -> None:
+    def test_done_requires_evidence(self) -> None:
         with temp_root() as root:
             board = _write_bytes_exact(root / "docs/kanban.md", BOARD)
             task = _write_bytes_exact(root / "docs/plans/tasks/ABC-01_do-the-thing.md", TASK)
@@ -236,8 +238,45 @@ class VerifiedTransitionTests(unittest.TestCase):
                     task_path=task,
                     task_id="ABC-01",
                     task_title="Do the thing",
-                    state="verified",
+                    state="done",
                 )
+
+    def test_cancelled_done_requires_reason_and_omits_verification_claims(self) -> None:
+        with temp_root() as root:
+            board = _write_bytes_exact(root / "docs/kanban.md", BOARD)
+            task = _write_bytes_exact(root / "docs/plans/tasks/ABC-01_do-the-thing.md", TASK)
+
+            project_task_state(
+                board_path=board,
+                task_path=task,
+                task_id="ABC-01",
+                task_title="Do the thing",
+                state="done",
+                evidence=_evidence(
+                    resolution="cancelled",
+                    resolution_reason="The feature is no longer needed.",
+                    task_verdict=None,
+                    test_verdict=None,
+                    commands=(),
+                ),
+            )
+
+            result = task.read_text(encoding="utf-8")
+            self.assertIn("outcome: **cancelled**", result)
+            self.assertIn("Reason: The feature is no longer needed.", result)
+            self.assertNotIn("Task verifier verdict:", result)
+            self.assertNotIn("Verification commands:", result)
+
+    def test_cancelled_done_rejects_command_evidence(self) -> None:
+        with self.assertRaisesRegex(
+            InvalidEvidenceError, "must not claim implementation verification"
+        ):
+            _evidence(
+                resolution="cancelled",
+                resolution_reason="The feature is no longer needed.",
+                task_verdict=None,
+                test_verdict=None,
+            )
 
     def test_evidence_rejects_absolute_paths(self) -> None:
         with self.assertRaises(InvalidEvidenceError):
@@ -267,7 +306,7 @@ class VerifiedTransitionTests(unittest.TestCase):
 class IdempotentReplayTests(unittest.TestCase):
     """AC-3."""
 
-    def test_replaying_running_is_byte_identical(self) -> None:
+    def test_replaying_in_progress_is_byte_identical(self) -> None:
         with temp_root() as root:
             board = _write_bytes_exact(root / "docs/kanban.md", BOARD)
             task = _write_bytes_exact(root / "docs/plans/tasks/ABC-01_do-the-thing.md", TASK)
@@ -277,7 +316,7 @@ class IdempotentReplayTests(unittest.TestCase):
                 task_path=task,
                 task_id="ABC-01",
                 task_title="Do the thing",
-                state="running",
+                state="in_progress",
             )
             first_board = board.read_bytes()
             first_task = task.read_bytes()
@@ -287,13 +326,13 @@ class IdempotentReplayTests(unittest.TestCase):
                 task_path=task,
                 task_id="ABC-01",
                 task_title="Do the thing",
-                state="running",
+                state="in_progress",
             )
 
             self.assertEqual(board.read_bytes(), first_board)
             self.assertEqual(task.read_bytes(), first_task)
 
-    def test_replaying_verified_is_byte_identical(self) -> None:
+    def test_replaying_done_is_byte_identical(self) -> None:
         with temp_root() as root:
             board = _write_bytes_exact(root / "docs/kanban.md", BOARD)
             task = _write_bytes_exact(root / "docs/plans/tasks/ABC-01_do-the-thing.md", TASK)
@@ -303,7 +342,7 @@ class IdempotentReplayTests(unittest.TestCase):
                 task_path=task,
                 task_id="ABC-01",
                 task_title="Do the thing",
-                state="verified",
+                state="done",
                 evidence=_evidence(),
             )
             first_board = board.read_bytes()
@@ -314,7 +353,7 @@ class IdempotentReplayTests(unittest.TestCase):
                 task_path=task,
                 task_id="ABC-01",
                 task_title="Do the thing",
-                state="verified",
+                state="done",
                 evidence=_evidence(),
             )
 
@@ -333,7 +372,7 @@ class IdempotentReplayTests(unittest.TestCase):
                     task_path=task,
                     task_id="ABC-01",
                     task_title="Do the thing",
-                    state="running",
+                    state="in_progress",
                 )
 
             self.assertEqual(board.read_text(encoding="utf-8"), malformed_board)
@@ -353,7 +392,7 @@ class IdempotentReplayTests(unittest.TestCase):
                     task_path=task,
                     task_id="ABC-01",
                     task_title="Do the thing",
-                    state="running",
+                    state="in_progress",
                 )
 
             self.assertEqual(board.read_text(encoding="utf-8"), BOARD)
@@ -372,7 +411,7 @@ class IdempotentReplayTests(unittest.TestCase):
                 task_path=task,
                 task_id="ABC-01",
                 task_title="Do the thing",
-                state="running",
+                state="in_progress",
             )
 
             board_text = board.read_text(encoding="utf-8")
@@ -397,7 +436,7 @@ class IdempotentReplayTests(unittest.TestCase):
                 task_path=task,
                 task_id="ABC-01",
                 task_title="Do the thing",
-                state="running",
+                state="in_progress",
             )
 
             board_text = board.read_text(encoding="utf-8")
@@ -409,7 +448,7 @@ class IdempotentReplayTests(unittest.TestCase):
                 board_text.split("## In Progress")[1],
             )
 
-    def test_verified_replay_when_already_removed_is_a_no_op(self) -> None:
+    def test_done_replay_when_already_removed_is_a_no_op(self) -> None:
         with temp_root() as root:
             board = _write_bytes_exact(root / "docs/kanban.md", BOARD)
             task = _write_bytes_exact(root / "docs/plans/tasks/ABC-01_do-the-thing.md", TASK)
@@ -419,19 +458,19 @@ class IdempotentReplayTests(unittest.TestCase):
                 task_path=task,
                 task_id="ABC-01",
                 task_title="Do the thing",
-                state="verified",
+                state="done",
                 evidence=_evidence(),
             )
             first_board = board.read_bytes()
 
-            # Replaying verified again with the card already absent must not fail or
+            # Replaying done again with the card already absent must not fail or
             # reintroduce it.
             project_task_state(
                 board_path=board,
                 task_path=task,
                 task_id="ABC-01",
                 task_title="Do the thing",
-                state="verified",
+                state="done",
                 evidence=_evidence(),
             )
 
@@ -453,7 +492,7 @@ class CrlfPreservationTests(unittest.TestCase):
                 task_path=task,
                 task_id="ABC-01",
                 task_title="Do the thing",
-                state="running",
+                state="in_progress",
             )
 
             board_bytes = board.read_bytes()

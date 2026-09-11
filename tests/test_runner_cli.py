@@ -664,10 +664,10 @@ class DryRunAttestationTests(unittest.TestCase):
 
             project_task_state(
                 board_path=board, task_path=dependency, task_id="RE-01", task_title="Dependency",
-                state="verified",
+                state="done",
                 evidence=CompletionEvidence(
                     completed_at="2026-09-09T00:00:00Z", run_id=source.run_id,
-                    outcome="verified", repair_count=0, gate_count=1,
+                    resolution="completed", repair_count=0, gate_count=1,
                     task_verdict="PASS", test_verdict="PASS",
                 ),
             )
@@ -907,7 +907,7 @@ class ExecuteModeTests(unittest.TestCase):
                 (seed["project_dir"] / ".pipeline" / "runs" / "sample-feature"
                  / "run.json").exists())
 
-    def test_execute_with_plan_approval_runs_a_task_to_verified(self) -> None:
+    def test_execute_with_plan_approval_runs_a_task_to_done(self) -> None:
         with TemporaryDirectory() as directory:
             seed = self._seed_rich(directory, [RICH_EXECUTE_TASK])
             with patch.object(use_cases, "make_execute_adapters", _fake_execute_adapters):
@@ -920,7 +920,7 @@ class ExecuteModeTests(unittest.TestCase):
             run = json.loads(
                 (seed["project_dir"] / ".pipeline" / "runs" / "sample-feature" / "run.json")
                 .read_text(encoding="utf-8"))
-            self.assertEqual(run["tasks"][0]["status"], "verified")
+            self.assertEqual(run["tasks"][0]["status"], "done")
 
     def test_execute_rejects_an_id_and_type_only_plan(self) -> None:
         with TemporaryDirectory() as directory:

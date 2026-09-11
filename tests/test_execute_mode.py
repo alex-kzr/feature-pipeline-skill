@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import unittest
 from dataclasses import replace
@@ -1136,7 +1137,7 @@ class BoardProjectionWiringTests(unittest.TestCase):
     board path (AC-3, second half).
     """
 
-    def test_execution_does_not_project_intermediate_operation_states(self) -> None:
+    def test_execution_projects_in_progress_before_each_executor_launch(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
             board = _seed_board(root)
@@ -1154,15 +1155,13 @@ class BoardProjectionWiringTests(unittest.TestCase):
             self.assertEqual(len(executor.board_snapshots), 2)
             first, second = executor.board_snapshots
 
-            # Operation history is durable state; the legacy board projection does not infer
-            # intermediate task phases from it.
-            self.assertNotIn("EX-01", first.split("## In Progress")[1])
+            self.assertIn("EX-01", first.split("## In Progress")[1])
             self.assertIn("EX-02", first.split("## In Progress")[0])
 
-            self.assertIn("EX-01", second)
-            self.assertNotIn("EX-02", second.split("## In Progress")[1])
+            self.assertNotIn("EX-01", second)
+            self.assertIn("EX-02", second.split("## In Progress")[1])
 
-    def test_completion_does_not_use_the_legacy_board_projection(self) -> None:
+    def test_completion_projects_done_with_durable_evidence(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
             board = _seed_board(root)
@@ -1177,13 +1176,92 @@ class BoardProjectionWiringTests(unittest.TestCase):
 
             self.assertTrue(result.ok, result.message)
             board_text = board.read_text(encoding="utf-8")
-            self.assertIn("EX-01", board_text)
+            self.assertNotIn("EX-01", board_text)
 
             task_text = task_path.read_text(encoding="utf-8")
-            self.assertIn("- [ ] Done", task_text)
-            self.assertEqual(task_text.count("## Result"), 0)
+            self.assertIn("- [x] Done", task_text)
+            self.assertEqual(task_text.count("## Result"), 1)
             run = Run.load(result.run_dir, root)
             self.assertEqual(run.task("EX-01").status, "done")
+
+    def test_failed_verification_with_justified_scope_amendment_reaches_done(self) -> None:
+        class ScopeAmendmentExecutor(sa.ScriptedExecutor):
+            def launch(self, request):  # noqa: ANN001 - test double
+                if not (request.no_tools or request.resume_session_id):
+                    amended = root / "fixtures/execution/tasks/EX-01_direct-success.md"
+                    amended.write_text(
+                        amended.read_text(encoding="utf-8")
+                        + "\n## Repair Scope Amendment\n\n"
+                        + "This task-specific migration note is required to repair the "
+                        "failed verification.\n",
+                        encoding="utf-8",
+                    )
+                return super().launch(request)
+
+        class AmendmentReviewVerifier(sa.ScriptedVerifier):
+            def __init__(self, verdicts: tuple[str, ...], *, role: str) -> None:
+                super().__init__(verdicts)
+                self.role = role
+                self.amendment_reports: list[str] = []
+
+            def launch(self, request):  # noqa: ANN001 - test double
+                result = super().launch(request)
+                if not request.resume_session_id:
+                    if "Amendment-justification finding:" not in request.prompt:
+                        raise AssertionError("verifier did not receive the review requirement")
+                    report = (
+                        f"# {self.role}\n\n- Verdict: {self._verdict()}\n\n"
+                        "- Amendment-justification finding: accepted — EX-01's "
+                        "migration note is a reviewable repair artifact for the failed "
+                        "verification.\n"
+                    )
+                    self.amendment_reports.append(report)
+                    Path(request.report_path).write_text(report, encoding="utf-8")
+                return result
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            board = _seed_board(root)
+            task_path = root / "fixtures/execution/tasks/EX-01_direct-success.md"
+            subprocess.run(("git", "init", "-q"), cwd=root, check=True)
+            subprocess.run(("git", "add", "."), cwd=root, check=True)
+            subprocess.run(
+                ("git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                 "commit", "-qm", "fixture baseline"),
+                cwd=root,
+                check=True,
+            )
+            task_verifier = AmendmentReviewVerifier(("FAIL", "PASS"), role="task_verifier")
+            test_verifier = AmendmentReviewVerifier(("PASS", "PASS"), role="test_verifier")
+            result = execute_run(
+                _request(
+                    root, _specs(("EX-01",)),
+                    executor=ScopeAmendmentExecutor(("implemented", "implemented")),
+                    launchers=VerifierLaunchers(
+                        task=task_verifier, test=test_verifier),
+                    controls=ExecuteControls(plan_approved=True), environment={"claude": True},
+                    board_path=board))
+
+            self.assertTrue(result.ok, result.message)
+            run = Run.load(result.run_dir, root)
+            record = run.task("EX-01")
+            self.assertEqual(record.status, "done")
+            self.assertTrue(record.execution_evidence["implementation"]["scope_amendment"]["present"])
+            self.assertIn(
+                "fixtures/execution/tasks/EX-01_direct-success.md",
+                record.execution_evidence["implementation"]["scope_amendment"]["observed_paths"],
+            )
+            self.assertEqual(
+                record.execution_evidence["implementation"]["scope_amendment"]["rationale"],
+                "executor-owned paths outside the initial estimate require independent "
+                "amendment-justification review",
+            )
+            self.assertIn("failed", [entry["outcome"] for entry in record.operation_history])
+            self.assertNotIn("unblock", " ".join(entry["outcome"] for entry in record.operation_history))
+            reports = task_verifier.amendment_reports + test_verifier.amendment_reports
+            self.assertEqual(len(reports), 4)
+            for report in reports:
+                self.assertIn("Amendment-justification finding: accepted", report)
 
     def test_escalation_does_not_project_a_terminal_board_state(self) -> None:
         with TemporaryDirectory() as directory:
@@ -1200,11 +1278,11 @@ class BoardProjectionWiringTests(unittest.TestCase):
 
             self.assertEqual(result.status, "blocked")
             board_text = board.read_text(encoding="utf-8")
-            self.assertIn("EX-01", board_text.split("## In Progress")[0])
-            self.assertNotIn("EX-01", board_text.split("## In Progress")[1])
+            self.assertNotIn("EX-01", board_text.split("## In Progress")[0])
+            self.assertIn("EX-01", board_text.split("## In Progress")[1])
 
             task_text = task_path.read_text(encoding="utf-8")
-            self.assertIn("- [ ] To Do", task_text)
+            self.assertIn("- [x] In Progress", task_text)
             self.assertNotIn("## Blockers", task_text)
 
     def test_resume_preserves_completed_task_without_legacy_projection(self) -> None:

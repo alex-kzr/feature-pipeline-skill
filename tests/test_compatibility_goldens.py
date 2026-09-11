@@ -162,7 +162,7 @@ class EnvelopeContractTests(unittest.TestCase):
         state = json.loads(harness.load_golden("run-state-v2.json"))
         self.assertEqual(state["schema_version"], SCHEMA_VERSION)
         statuses = {task["status"] for task in state["tasks"]}
-        self.assertEqual(statuses, {"pending", "implemented", "verified", "blocked"})
+        self.assertEqual(statuses, {"to_do", "in_progress", "done"})
 
 
 class NormalizationDocTests(unittest.TestCase):

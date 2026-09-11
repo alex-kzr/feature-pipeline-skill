@@ -353,6 +353,10 @@ class Run:
             raise TransitionError(f"cannot transition {task_id} from {record.status} to {to}", "illegal-transition")
         if to == "done" and resolution not in {"completed", "cancelled"}:
             raise TransitionError("a done task requires a resolution", "missing-task-resolution")
+        if to == "done" and resolution == "completed" and actor != ACTOR_RUNNER:
+            raise TransitionError("only the runner may record completed work", "unauthorized-transition")
+        if to == "done" and resolution == "cancelled" and actor != ACTOR_HUMAN:
+            raise TransitionError("only a human may cancel a task", "unauthorized-transition")
         if record.status == "done" and actor != ACTOR_HUMAN:
             raise TransitionError("only a human may reopen a done task", "unauthorized-transition")
         previous = record.status

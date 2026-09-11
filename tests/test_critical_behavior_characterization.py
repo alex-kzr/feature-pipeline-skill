@@ -373,7 +373,7 @@ class F04OutOfScopeChangesAreNotEnforcedStructurally(unittest.TestCase):
 
             self.assertEqual(outcome.status, "retryable")
             self.assertIsNone(outcome.settled_status)
-            self.assertEqual(life.run.task(spec.id).status, "running")
+        self.assertEqual(life.run.task(spec.id).status, "in_progress")
 
     @superseded_characterization(
         finding="F-04",

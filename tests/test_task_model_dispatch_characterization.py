@@ -169,7 +169,7 @@ class DispatchAndResumeCharacterizationTests(unittest.TestCase):
             envelope = result.run_dir / "reports" / "BASE-1" / "launch-1" / "executor-envelope-1.json"
             self.assertEqual(json.loads(envelope.read_text(encoding="utf-8"))["status"], "implemented")
 
-    def test_resume_keeps_pin_and_skips_verified_tasks_but_auto_drift_is_denied(self) -> None:
+    def test_resume_keeps_pin_and_skips_done_tasks_but_auto_drift_is_denied(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)
             first = execute_run(_request(root, CapturingAdapter(ScriptedExecutor())))
@@ -228,7 +228,7 @@ class DispatchAndResumeCharacterizationTests(unittest.TestCase):
             for adapter in (executor, request.launchers.task, request.launchers.test):
                 self.assertEqual({item.task_id for item in adapter.requests}, {"BASE-2"})
             consumed = Run.load(result.run_dir, root).task("BASE-1")
-            self.assertEqual(consumed.status, "verified")
+            self.assertEqual(consumed.status, "done")
             self.assertTrue(consumed.reused_verification)
             self.assertEqual(source_path.read_bytes(), before)
 
