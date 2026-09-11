@@ -30,6 +30,7 @@ from dataclasses import fields, replace
 from pathlib import Path
 
 from feature_pipeline.contracts import SchemaError, TaskSpec
+from feature_pipeline.application.work_items import activate_work_item, register_work_items
 
 from feature_pipeline.application import task_engine as task_engine_mod
 from feature_pipeline.application import verification_service as verification_service_mod
@@ -47,7 +48,7 @@ from pipeline_core.commands import (
     DIAGNOSTIC_OUTPUT_BUDGET,
     run_command,
 )
-from pipeline_core.dispatch import DispatchRequest, dispatch_executor
+from pipeline_core.dispatch import DispatchRequest, dispatch_executor as _dispatch_executor
 from pipeline_core.execution import ExecuteControls, ExecuteRequest, TaskExecution, _apply_repair_bound
 from pipeline_core.git_port import GitPort, GitSafetyError
 from pipeline_core.lifecycle import RunLifecycle
@@ -86,8 +87,15 @@ def _running_life(root: Path, spec: TaskSpec) -> RunLifecycle:
     prompt.write_text("feature", encoding="utf-8")
     run = Run.create("charcz", prompt, None, root / "storage" / "charcz", root)
     life = RunLifecycle.initialize(run, tasks=[(spec.id, [])])
+    register_work_items(run, (spec,))
     life.transition(spec.id, "running", actor=ACTOR_RUNNER)
     return life
+
+
+def dispatch_executor(life: RunLifecycle, request: DispatchRequest, adapter: object):
+    """Exercise dispatch beneath the production producer-activation boundary."""
+    with activate_work_item(life.run, request.spec.id):
+        return _dispatch_executor(life, request, adapter)  # type: ignore[arg-type]
 
 
 class _ScriptedAdapter:

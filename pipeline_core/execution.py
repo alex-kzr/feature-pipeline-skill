@@ -61,6 +61,7 @@ from feature_pipeline.application.verified_reuse import (
     supersession_graph,
     task_contract_digest,
 )
+from feature_pipeline.application.work_items import activate_work_item, register_work_items
 from feature_pipeline.application.selection import prune_reused_ancestors
 from feature_pipeline.domain.plan import CompiledRunPlan
 from feature_pipeline.domain.stages import (
@@ -165,7 +166,9 @@ def run_task(life: RunLifecycle, request: TaskExecution) -> TaskRunResult:
     keeps the ``run_task`` / :class:`TaskExecution` / :class:`TaskRunResult` names the
     execute-mode integration and the existing tests import.
     """
-    return TaskEngine().run(life, request)
+    register_work_items(life.run, (request.spec,))
+    with activate_work_item(life.run, request.spec.id):
+        return TaskEngine().run(life, request)
 
 
 # ============================================================================================
@@ -235,15 +238,16 @@ def _run_selected_task(
     if plan is None:
         return run_task(life, request)
     sink: list[TaskRunResult] = []
-    PipelineEngine(_STAGE_SEQUENCE).run(
-        plan,
-        resources={
-            "lifecycle": life,
-            "task_execution": request,
-            "selected_task_id": task_id,
-            "task_result_sink": sink,
-        },
-    )
+    with activate_work_item(life.run, task_id):
+        PipelineEngine(_STAGE_SEQUENCE).run(
+            plan,
+            resources={
+                "lifecycle": life,
+                "task_execution": request,
+                "selected_task_id": task_id,
+                "task_result_sink": sink,
+            },
+        )
     return sink[0]
 
 
@@ -1722,6 +1726,7 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
     if isinstance(opened, ExecuteResult):
         return opened
     life, scope = opened
+    register_work_items(life.run, tuple(by_id[task_id] for task_id in scope))
     cache_dir = (
         _approved_uv_cache_dir(request.repo_root, request.controls.uv_cache_dir)
         if request.controls.operational_unblock_task is not None else None

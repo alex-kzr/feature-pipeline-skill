@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
 from feature_pipeline.application.diagnostic_service import DiagnosticService
+from feature_pipeline.application.work_items import WorkItemError, require_active_work_item
 
 from .adapters import (
     Adapter,
@@ -731,6 +732,10 @@ def orchestrate_verification(
     verdict to ``FAIL`` regardless of what the tool-less test verifier returned (AC-4).
     """
     task_id = spec.id
+    try:
+        require_active_work_item(run, task_id)
+    except WorkItemError as exc:
+        raise VerificationError(f"{exc.code}: {exc}") from None
     record = run.task(task_id)
     if record.status != "implemented":
         raise VerificationError(

@@ -10,7 +10,9 @@ from dataclasses import replace
 from pathlib import Path
 
 from feature_pipeline.application.verified_reuse import (
+    CANONICAL_CONTRACT_VERSION,
     EvidenceEligibilityError,
+    LEGACY_CANONICAL_CONTRACT_VERSION,
     VerifiedEvidenceStore,
     canonical_task_contract,
     resolve_default_reuse,
@@ -55,14 +57,17 @@ def _definition(
 
 def _source(root: Path, *, run_id: str, definition: TaskDefinition, status: str = "verified",
             task_verdict: str = "PASS", test_verdict: str = "PASS", digest: str | None = None,
-            run_status: str = "verified", version: str | None = "rec09-v1") -> Path:
+            run_status: str = "verified", version: str | None = CANONICAL_CONTRACT_VERSION) -> Path:
     path = root / "runs" / run_id / "run.json"
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps({
         "schema_version": 2, "feature": "source", "prompt_path": "other.md", "plan_path": "other.json",
         "run_id": run_id, "status": run_status, "tasks": [{
             "id": definition.id, "status": status, "task_path": definition.source_path,
-            "task_contract_digest": task_contract_digest(definition) if digest is None else digest,
+            "task_contract_digest": (
+                task_contract_digest(definition, version=version)
+                if digest is None and version is not None else digest
+            ),
             "task_contract_version": version,
             "verification": {"task_verdict": task_verdict, "test_verdict": test_verdict,
                              "verified_at": "2026-09-05T09:00:00Z"},
@@ -76,6 +81,13 @@ def _changed_definition(definition: TaskDefinition, **changes: object) -> TaskDe
 
 
 class TaskContractTests(unittest.TestCase):
+    def test_contract_digest_is_explicitly_versioned(self) -> None:
+        definition = _definition()
+        self.assertNotEqual(
+            task_contract_digest(definition, version=LEGACY_CANONICAL_CONTRACT_VERSION),
+            task_contract_digest(definition, version=CANONICAL_CONTRACT_VERSION),
+        )
+
     def test_supersession_declaration_is_part_of_the_contract_digest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "VR-01.md"
@@ -148,6 +160,22 @@ class TaskContractTests(unittest.TestCase):
 
 
 class VerifiedEvidenceStoreTests(unittest.TestCase):
+    def test_rec09_v1_evidence_remains_readable_as_legacy_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            definition = _definition()
+            source = _source(
+                root, run_id="rec09-v1-source", definition=definition,
+                version=LEGACY_CANONICAL_CONTRACT_VERSION,
+            )
+            before = source.read_bytes()
+
+            evidence = VerifiedEvidenceStore(root / "runs", root).find(definition)
+
+            self.assertEqual(evidence["evidence_contract_version"], LEGACY_CANONICAL_CONTRACT_VERSION)
+            self.assertEqual(evidence["evidence_identity"], "legacy-task-path-and-contract-digest")
+            self.assertEqual(source.read_bytes(), before)
+
     def test_legacy_contract_is_rejected_when_canonical_identity_is_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -390,7 +418,7 @@ class ContractPersistenceTests(unittest.TestCase):
             task = run.task(definition.id)
             self.assertEqual(task.task_path, "docs/plans/tasks/VR-01.md")
             self.assertEqual(task.task_contract_digest, task_contract_digest(definition))
-            self.assertEqual(task.task_contract_version, "rec09-v1")
+            self.assertEqual(task.task_contract_version, CANONICAL_CONTRACT_VERSION)
 
 
 if __name__ == "__main__":

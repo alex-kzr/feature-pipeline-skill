@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 
 from pipeline_core.adapters import AdapterError, ClaudeAdapter, LaunchResult
-from pipeline_core.dispatch import DispatchRequest, dispatch_executor
+from pipeline_core.dispatch import DispatchError, DispatchRequest, dispatch_executor as _dispatch_executor
 from pipeline_core.lifecycle import RunLifecycle
 from pipeline_core.prompt_envelope import EnvelopeAnchors, build_executor_envelope
 from pipeline_core.reports import (
@@ -23,6 +23,7 @@ from pipeline_core.reports import (
 )
 from pipeline_core.state import ACTOR_EXECUTOR, ACTOR_RUNNER, Run, TransitionError
 from feature_pipeline.contracts import TaskSpec
+from feature_pipeline.application.work_items import activate_work_item, register_work_items
 
 
 # --- fixtures --------------------------------------------------------------------------------
@@ -155,6 +156,7 @@ def _running_life(root: Path, spec: TaskSpec) -> RunLifecycle:
     prompt.write_text("feature", encoding="utf-8")
     run = Run.create("dispatch", prompt, None, root / "storage" / "dispatch", root)
     life = RunLifecycle.initialize(run, tasks=[(spec.id, [])])
+    register_work_items(run, (spec,))
     life.transition(spec.id, "running", actor=ACTOR_RUNNER)
     return life
 
@@ -168,6 +170,12 @@ def _request(spec: TaskSpec, **overrides: object) -> DispatchRequest:
     return DispatchRequest(**base)  # type: ignore[arg-type]
 
 
+def dispatch_executor(life: RunLifecycle, request: DispatchRequest, adapter: object):
+    """Dispatch through the explicit producer-activation boundary used in production."""
+    with activate_work_item(life.run, request.spec.id):
+        return _dispatch_executor(life, request, adapter)  # type: ignore[arg-type]
+
+
 # --- reports.py units ----------------------------------------------------------------------------
 
 
@@ -178,6 +186,20 @@ class ReportParsingTests(unittest.TestCase):
         with self.assertRaises(ReportError) as ctx:
             parse_executor_status("the work is done")
         self.assertEqual(ctx.exception.code, "unparseable-report")
+
+
+class ProducerAttributionTests(unittest.TestCase):
+    def test_direct_unregistered_executor_launch_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = _spec()
+            prompt = root / "prompt.md"; prompt.write_text("x", encoding="utf-8")
+            run = Run.create("direct", prompt, None, root / "runs" / "direct", root)
+            life = RunLifecycle.initialize(run, tasks=[(spec.id, ())])
+            life.transition(spec.id, "running", actor=ACTOR_RUNNER)
+            with self.assertRaises(DispatchError) as raised:
+                _dispatch_executor(life, _request(spec), ScriptedAdapter())
+            self.assertEqual(raised.exception.code, "unregistered-producer")
 
     def test_status_envelope_is_strict_about_shape_and_identity(self) -> None:
         self.assertEqual(

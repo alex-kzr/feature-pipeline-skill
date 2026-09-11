@@ -14,7 +14,15 @@ from feature_pipeline.contracts import TaskSpec
 from feature_pipeline.domain.models import TaskDefinition
 
 
-CANONICAL_CONTRACT_VERSION = "rec09-v1"
+# ``rec09-v1`` digests were persisted before the normalized work-item metadata was part of
+# the reusable-evidence boundary.  Keep their wire format readable, but never mistake them
+# for the versioned evidence newly emitted by this release.
+LEGACY_CANONICAL_CONTRACT_VERSION = "rec09-v1"
+CANONICAL_CONTRACT_VERSION = "rec09-v2"
+_SUPPORTED_CONTRACT_VERSIONS = frozenset({
+    LEGACY_CANONICAL_CONTRACT_VERSION,
+    CANONICAL_CONTRACT_VERSION,
+})
 
 
 class EvidenceEligibilityError(Exception):
@@ -104,10 +112,23 @@ def canonical_task_contract(definition: TaskDefinition | TaskSpec) -> dict[str, 
     return CanonicalTaskContract.from_definition(definition).as_mapping()
 
 
-def task_contract_digest(definition: TaskDefinition | TaskSpec) -> str:
-    """Return the stable SHA-256 identity of ``definition``'s reusable contract."""
+def task_contract_digest(
+    definition: TaskDefinition | TaskSpec, *, version: str = CANONICAL_CONTRACT_VERSION,
+) -> str:
+    """Return the versioned stable SHA-256 identity of a reusable task contract.
+
+    V1 is deliberately byte-compatible with historical persisted digests.  V2 adds an
+    unambiguous version domain to the digest, so new evidence cannot be replayed as legacy
+    evidence (or vice versa) when task metadata evolves again.
+    """
+    if version not in _SUPPORTED_CONTRACT_VERSIONS:
+        raise ValueError(f"unsupported canonical contract version: {version}")
+    contract = CanonicalTaskContract.from_definition(definition).as_mapping()
+    payload: object = contract
+    if version != LEGACY_CANONICAL_CONTRACT_VERSION:
+        payload = {"canonical_contract_version": version, "contract": contract}
     encoded = json.dumps(
-        CanonicalTaskContract.from_definition(definition).as_mapping(),
+        payload,
         sort_keys=True, separators=(",", ":"), ensure_ascii=False
     ).encode("utf-8")
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
@@ -150,24 +171,10 @@ class VerifiedEvidenceStore:
         for path, raw, data in sources:
             try:
                 task = self._eligible_task(data, definition.id)
-                digest = task.get("task_contract_digest")
-                task_path = task.get("task_path")
-                version = task.get("task_contract_version")
-                if version != CANONICAL_CONTRACT_VERSION:
-                    raise EvidenceEligibilityError(
-                        "source task has no recognized canonical contract version",
-                        "evidence-canonical-identity-missing",
-                    )
-                if task_path != expected_path:
-                    raise EvidenceEligibilityError(
-                        "source task path does not match", "evidence-task-path-mismatch"
-                    )
-                if digest != task_contract_digest(definition):
-                    raise EvidenceEligibilityError(
-                        "source task contract digest does not match", "evidence-contract-digest-mismatch"
-                    )
+                version = self._canonical_identity(task, definition, expected_path)
                 exact.append(self._evidence(
-                    path, raw, data, task, definition.id, "task-path-and-contract-digest"
+                    path, raw, data, task, definition.id,
+                    self._identity_name(version), version,
                 ))
             except EvidenceEligibilityError as exc:
                 denials.append(exc)
@@ -188,22 +195,39 @@ class VerifiedEvidenceStore:
         """Evaluate one explicitly selected source run with the default lookup policy."""
         path, raw, data = self._read_source(Path(run_dir) / "run.json")
         task = self._eligible_task(data, definition.id)
-        digest = task.get("task_contract_digest")
+        version = self._canonical_identity(
+            task, definition, canonical_task_path(definition, self.repo_root)
+        )
+        return self._evidence(
+            path, raw, data, task, definition.id, self._identity_name(version), version
+        )
+
+    @staticmethod
+    def _identity_name(version: str) -> str:
+        if version == LEGACY_CANONICAL_CONTRACT_VERSION:
+            return "legacy-task-path-and-contract-digest"
+        return "task-path-and-contract-digest"
+
+    @staticmethod
+    def _canonical_identity(
+        task: Mapping[str, Any], definition: TaskDefinition, expected_path: str,
+    ) -> str:
+        """Validate the source identity using its declared digest format, never a guess."""
         version = task.get("task_contract_version")
-        if version != CANONICAL_CONTRACT_VERSION:
+        if not isinstance(version, str) or version not in _SUPPORTED_CONTRACT_VERSIONS:
             raise EvidenceEligibilityError(
                 "source task has no recognized canonical contract version",
                 "evidence-canonical-identity-missing",
             )
-        if task.get("task_path") != canonical_task_path(definition, self.repo_root):
+        if task.get("task_path") != expected_path:
             raise EvidenceEligibilityError(
                 "source task path does not match", "evidence-task-path-mismatch"
             )
-        if digest != task_contract_digest(definition):
+        if task.get("task_contract_digest") != task_contract_digest(definition, version=version):
             raise EvidenceEligibilityError(
                 "source task contract digest does not match", "evidence-contract-digest-mismatch"
             )
-        return self._evidence(path, raw, data, task, definition.id, "task-path-and-contract-digest")
+        return version
 
     def _sources(self) -> list[tuple[Path, bytes, Mapping[str, Any]]]:
         if not self.runs_root.exists():
@@ -263,7 +287,7 @@ class VerifiedEvidenceStore:
     @staticmethod
     def _evidence(
         path: Path, raw: bytes, data: Mapping[str, Any], task: Mapping[str, Any], dependency_id: str,
-        identity: str,
+        identity: str, evidence_contract_version: str,
     ) -> Mapping[str, str]:
         verification = task["verification"]
         assert isinstance(verification, Mapping)
@@ -275,6 +299,8 @@ class VerifiedEvidenceStore:
             "source_run_id": run_id,
             "source_run_digest": f"sha256:{hashlib.sha256(raw).hexdigest()}",
             "evidence_identity": identity,
+            "evidence_contract_version": evidence_contract_version,
+            "evidence_digest_version": evidence_contract_version,
             "task_verdict": "PASS",
             "test_verdict": "PASS",
             "verified_at": str(verification["verified_at"]),
@@ -409,7 +435,7 @@ def resolve_default_reuse(
 
 
 __all__ = [
-    "CANONICAL_CONTRACT_VERSION", "CanonicalTaskContract", "EvidenceEligibilityError", "VerifiedEvidenceStore",
+    "CANONICAL_CONTRACT_VERSION", "LEGACY_CANONICAL_CONTRACT_VERSION", "CanonicalTaskContract", "EvidenceEligibilityError", "VerifiedEvidenceStore",
     "canonical_task_contract",
     "canonical_task_path", "find_superseding_evidence", "resolve_default_reuse", "supersession_graph", "task_contract_digest",
 ]

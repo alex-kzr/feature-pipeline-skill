@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from feature_pipeline.contracts import TaskSpec
+from feature_pipeline.application.work_items import WorkItemError, require_active_work_item
 
 from .adapters import (
     Adapter,
@@ -203,6 +204,11 @@ def dispatch_executor(
     run = life.run
     spec = request.spec
     task_id = spec.id
+
+    try:
+        require_active_work_item(run, task_id)
+    except WorkItemError as exc:
+        raise DispatchError(str(exc), exc.code) from None
 
     record = run.task(task_id)
     if record.status != "running":

@@ -51,6 +51,7 @@ from pipeline_core.verification import (
     orchestrate_verification,
 )
 from feature_pipeline.contracts import CommandSpec, TaskSpec
+from feature_pipeline.application.work_items import activate_work_item, register_work_items
 
 ANCHORS = VerifierAnchors(project_root="/repo", agents_root="/repo/.agents")
 
@@ -173,11 +174,13 @@ class FakeVerifier:
 
 
 def _orchestrate(run: Run, spec: TaskSpec, task: FakeVerifier, test: FakeVerifier, **kw):
-    return orchestrate_verification(
-        run, spec, _evidence(**kw.pop("evidence_kw", {})),
-        launchers=VerifierLaunchers(task=task, test=test),
-        anchors=ANCHORS, attempt=1,
-    )
+    register_work_items(run, (spec,))
+    with activate_work_item(run, spec.id):
+        return orchestrate_verification(
+            run, spec, _evidence(**kw.pop("evidence_kw", {})),
+            launchers=VerifierLaunchers(task=task, test=test),
+            anchors=ANCHORS, attempt=1,
+        )
 
 
 # --- transition table (written before the orchestration) ------------------------------------
@@ -648,10 +651,13 @@ class NoFalseVerifiedTests(unittest.TestCase):
                 missing_evidence=missing)
             self.assertIsNotNone(evidence_forces_fail(evidence))
 
-            outcome = orchestrate_verification(
-                run, _spec(), evidence,
-                launchers=VerifierLaunchers(task=FakeVerifier(), test=FakeVerifier()),
-                anchors=ANCHORS, attempt=1)
+            spec = _spec()
+            register_work_items(run, (spec,))
+            with activate_work_item(run, spec.id):
+                outcome = orchestrate_verification(
+                    run, spec, evidence,
+                    launchers=VerifierLaunchers(task=FakeVerifier(), test=FakeVerifier()),
+                    anchors=ANCHORS, attempt=1)
 
             self.assertEqual(outcome.task_verdict, "PASS")
             self.assertEqual(outcome.test_verdict, "FAIL")
