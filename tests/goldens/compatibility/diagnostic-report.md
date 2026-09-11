@@ -4,7 +4,7 @@
 
 - Run: `<timestamp>-compat-diagnostic`
 - Task: `T-1`
-- Task state: `running`
+- Task state: `in_progress`
 - Run state: `pending`
 - Attempt: `1`
 - Written: <timestamp>
@@ -35,4 +35,4 @@ M pipeline_core/x.py
 
 ## Current task state
 
-`T-1` is `running` (run `pending`).
+`T-1` is `in_progress` (run `pending`).

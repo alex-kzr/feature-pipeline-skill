@@ -19,6 +19,8 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from feature_pipeline.cli import use_cases
+from feature_pipeline.cli.commands import RunCommand
+from feature_pipeline.cli.parser import build_parser
 from feature_pipeline.ports.adapters import AdapterCapabilities, AdapterRegistry
 from pipeline_core import runner_cli
 from pipeline_core.adapters import LaunchRequest
@@ -95,6 +97,15 @@ def _seed(fixture: str, dest: Path, *, tasks: list[dict], with_registry: bool = 
 
 
 class HelpAndFlagSurfaceTests(unittest.TestCase):
+    def test_operational_unblock_flags_are_typed_runner_controls(self) -> None:
+        command = RunCommand.from_args(build_parser().parse_args([
+            "--mode", "execute", "--resume", "--operational-unblock", "T-01",
+            "--human-authorize-operational-unblock", "--uv-cache-dir", ".pipeline/uv-cache",
+        ]))
+        self.assertEqual(command.operational_unblock_task, "T-01")
+        self.assertTrue(command.human_authorized_operational_unblock)
+        self.assertEqual(command.uv_cache_dir, ".pipeline/uv-cache")
+
     def test_help_lists_every_anchor_and_core_operational_flag(self) -> None:
         with self.assertRaises(SystemExit) as raised:
             _run(["--help"])
@@ -477,7 +488,7 @@ class ForwardedLegacyFlagTests(unittest.TestCase):
             self.assertIn(flag, help_text)
         for literal in PROJECT_IDENTITY_LITERALS:
             self.assertNotIn(literal, help_text)
-        for banned in ("archive", "purge", "retry", "maintenance", "recovery", "unblock"):
+        for banned in ("archive", "purge", "maintenance", "recovery"):
             self.assertNotIn(banned, help_text)
 
 
@@ -653,10 +664,10 @@ class DryRunAttestationTests(unittest.TestCase):
 
             project_task_state(
                 board_path=board, task_path=dependency, task_id="RE-01", task_title="Dependency",
-                state="verified",
+                state="done",
                 evidence=CompletionEvidence(
                     completed_at="2026-09-09T00:00:00Z", run_id=source.run_id,
-                    outcome="verified", repair_count=0, gate_count=1,
+                    resolution="completed", repair_count=0, gate_count=1,
                     task_verdict="PASS", test_verdict="PASS",
                 ),
             )
@@ -752,6 +763,100 @@ class DryRunAttestationTests(unittest.TestCase):
         self.assertIn("evidence-source-run-not-closed", err)
 
 
+class DryRunSupersessionReuseTests(unittest.TestCase):
+    """A focused dry run resolves a blocked predecessor through its verified replacement.
+
+    TC-05 depends on the historically blocked TC-04; REC-01 declares it supersedes TC-04 and
+    has its own eligible verified evidence in an ordinary repository run. A focused preview
+    for TC-05 must plan without dispatching TC-04 on the normal route, and must not put TC-04
+    in the planned dispatch set on the ``--verify-dependency-chain`` route either.
+    """
+
+    def _force_verified(self, life: RunLifecycle, task_id: str) -> None:
+        life.transition(task_id, "running", actor=ACTOR_RUNNER)
+        life.transition(task_id, "implemented", actor=ACTOR_RUNNER)
+        life.run.record_verdicts(task_id, "PASS", "PASS")
+        life.run.save()
+
+    def _scenario(self, directory: str) -> dict:
+        seed = _seed("library-guide", Path(directory) / "project", tasks=[{"id": "x", "type": "docs"}])
+        project = seed["project_dir"]
+        (project / "plan.json").unlink()
+        plan = project / "plan.md"
+        plan.write_text(
+            "# Supersession reuse\n\n## Phase 1\n\n"
+            "### TC-04 Blocked predecessor\n\n### REC-01 Replacement\n\n### TC-05 Selected\n",
+            encoding="utf-8",
+        )
+        tasks = project / "tasks"
+        tasks.mkdir()
+
+        def _task(path: Path, task_id: str, title: str, depends_on: str, extra: str = "") -> None:
+            path.write_text(
+                f"# {task_id} - {title}\n\n## Status\n- [ ] To Do\n- [ ] In Progress\n- [ ] Done\n\n"
+                "## Execution Metadata\n- Type: docs\n- Executor: docs-maintainer\n"
+                f"- Depends on: {depends_on}\n- Allowed scope: `docs/**`\n"
+                "- Out of scope: none\n- Required skills: none\n- Documentation impact: none\n"
+                "- Verification commands:\n  - `.` -> `python -m unittest`\n\n"
+                "## Purpose\nSupersession-reuse regression.\n\n## Acceptance Criteria\n"
+                "- [ ] AC-1 — The task is complete.\n" + extra,
+                encoding="utf-8",
+            )
+
+        blocked = tasks / "TC-04_blocked.md"
+        replacement = tasks / "REC-01_replacement.md"
+        selected = tasks / "TC-05_selected.md"
+        _task(blocked, "TC-04", "Blocked predecessor", "none")
+        _task(replacement, "REC-01", "Replacement", "none",
+              extra="\n## Supersession\n- Supersedes: TC-04\n")
+        _task(selected, "TC-05", "Selected", "TC-04")
+
+        source = Run.create(
+            "source-feature", plan, plan,
+            project / ".pipeline" / "runs" / "source-feature", project,
+        )
+        source_life = RunLifecycle.initialize(source, tasks=[("REC-01", [])])
+        self._force_verified(source_life, "REC-01")
+        persist_task_contracts(source, (load_task_spec(replacement),))
+        source.status = "verified"
+        source.save()
+        seed["source_run_id"] = source.run_id
+        seed["source_bytes"] = (source.run_dir / "run.json").read_bytes()
+        seed["source_run_dir"] = source.run_dir
+        return seed
+
+    def test_focused_dry_run_resolves_the_supersession_replacement(self) -> None:
+        with TemporaryDirectory() as directory:
+            seed = self._scenario(directory)
+            code, out, err = _run(seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.md",
+                "--task", "TC-05", "--dry-run",
+            ])
+            self.assertEqual(code, 10, err)
+            self.assertNotIn("TC-05: pending -> blocked", out)
+            self.assertNotIn("dependency-not-satisfied: TC-04", out)
+            self.assertIn(f"reused sources: TC-04={seed['source_run_id']}", out)
+            self.assertIn("planned dispatch set: TC-05", out)
+            self.assertNotIn("planned dispatch set: TC-04", out)
+            # The historical blocked source run is never touched.
+            self.assertEqual((seed["source_run_dir"] / "run.json").read_bytes(), seed["source_bytes"])
+
+    def test_verify_dependency_chain_dry_run_never_dispatches_the_blocked_predecessor(self) -> None:
+        with TemporaryDirectory() as directory:
+            seed = self._scenario(directory)
+            code, out, err = _run(seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.md",
+                "--task", "TC-05", "--verify-dependency-chain", "--dry-run",
+            ])
+            self.assertEqual(code, 10, err)
+            dispatch = next(
+                line for line in out.splitlines() if line.strip().startswith("planned dispatch set:")
+            )
+            self.assertNotIn("TC-04", dispatch)
+            self.assertIn("TC-05", dispatch)
+            self.assertEqual((seed["source_run_dir"] / "run.json").read_bytes(), seed["source_bytes"])
+
+
 RICH_EXECUTE_TASK = {
     "id": "TSK-01",
     "title": "Rich execute task",
@@ -802,7 +907,7 @@ class ExecuteModeTests(unittest.TestCase):
                 (seed["project_dir"] / ".pipeline" / "runs" / "sample-feature"
                  / "run.json").exists())
 
-    def test_execute_with_plan_approval_runs_a_task_to_verified(self) -> None:
+    def test_execute_with_plan_approval_runs_a_task_to_done(self) -> None:
         with TemporaryDirectory() as directory:
             seed = self._seed_rich(directory, [RICH_EXECUTE_TASK])
             with patch.object(use_cases, "make_execute_adapters", _fake_execute_adapters):
@@ -815,7 +920,7 @@ class ExecuteModeTests(unittest.TestCase):
             run = json.loads(
                 (seed["project_dir"] / ".pipeline" / "runs" / "sample-feature" / "run.json")
                 .read_text(encoding="utf-8"))
-            self.assertEqual(run["tasks"][0]["status"], "verified")
+            self.assertEqual(run["tasks"][0]["status"], "done")
 
     def test_execute_rejects_an_id_and_type_only_plan(self) -> None:
         with TemporaryDirectory() as directory:

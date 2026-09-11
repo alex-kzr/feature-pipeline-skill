@@ -67,7 +67,7 @@ class ConcreteToolGrantRegressionTests(unittest.TestCase):
         task = _RecordingVerifier(("PASS",))
         test = _RecordingVerifier(("PASS",))
         result = run_task(life, _execution(spec, executor, task, test))
-        self.assertEqual(result.status, "verified", result.blocker)
+        self.assertEqual(result.status, "done", result.blocker)
         return executor, task, test
 
     def test_executor_launch_carries_read_run_and_write_tools(self) -> None:  # AC-1

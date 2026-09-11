@@ -47,9 +47,8 @@ class RecoveryProvenanceTests(unittest.TestCase):
                 ),
             ))
 
-            self.assertEqual(result.status, "error")
-            self.assertIn("explicit launch-failure recovery", result.message)
-            self.assertFalse((source_request.run_dir / "reports" / "LR-01" / "launch-2").exists())
+            self.assertEqual(result.status, "retryable")
+            self.assertTrue((source_request.run_dir / "reports" / "LR-01" / "launch-2").exists())
 
     def test_same_run_recovery_rejects_a_live_worker_before_a_new_launch(self) -> None:
         class FailingCodex:
@@ -277,6 +276,20 @@ class RecoveryProvenanceTests(unittest.TestCase):
             }
             self.assertEqual(after, before)
 
+    def test_recovery_accepts_the_runner_owned_executor_diagnostic_for_the_failed_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._write_launch_failed_source(root)
+
+            provenance = recovery_provenance(
+                controls=self._controls(),
+                run_dir=root / ".pipeline" / "runs" / "source-recovery-codex",
+                repo_root=root,
+                specs=(self._spec(),),
+            )
+
+            self.assertEqual(provenance["source_task"], "LR-01")
+
     def test_recovery_rejects_an_arbitrary_replacement_run_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -311,7 +324,7 @@ class RecoveryProvenanceTests(unittest.TestCase):
 
     def test_recovery_rejects_every_source_execution_or_artifact_boundary(self) -> None:
         cases = {
-            "terminal task state": lambda run: setattr(run.task("LR-01"), "status", "implemented"),
+            "completed task state": lambda run: setattr(run.task("LR-01"), "status", "done"),
             "executor report": lambda run: run.task("LR-01").execution_evidence.__setitem__(
                 "executor_report", "reports/LR-01/executor.md"),
             "command evidence": lambda run: run.commands.append({"id": "command-1"}),
@@ -407,11 +420,11 @@ class RecoveryProvenanceTests(unittest.TestCase):
 
     def test_recovery_rejects_every_noncanonical_launch_failure_artifact(self) -> None:
         cases = (
-            ("reports/LR-01/launch-1/executor-1.md", "executor report"),
             ("reports/LR-01/launch-1/executor-envelope-1.json", "executor envelope"),
             ("reports/LR-01/launch-1/result-protocol-invalid-1.json", "result envelope"),
             ("reports/LR-01/launch-1/implementation-manifest-1.json", "implementation manifest"),
             ("reports/LR-01/launch-1/implementation-diff-1.md", "implementation diff"),
+            ("reports/LR-01/launch-1/executor-2.md", "wrong executor diagnostic"),
             ("logs/command-1.log", "command log"),
             ("reports/LR-01/verify-1/task-verifier-1.md", "verifier report"),
             ("reports/LR-01/launch-1/nested/unlisted.json", "nested file"),
@@ -556,6 +569,8 @@ class RecoveryProvenanceTests(unittest.TestCase):
         prompt_envelope = source_dir / "reports" / "LR-01" / "launch-1" / "executor-prompt-1.md"
         prompt_envelope.parent.mkdir(parents=True, exist_ok=True)
         prompt_envelope.write_text("canonical launch prompt\n", encoding="utf-8")
+        executor_diagnostic = source_dir / "reports" / "LR-01" / "launch-1" / "executor-1.md"
+        executor_diagnostic.write_text("launch failed before implementation\n", encoding="utf-8")
         diagnostic = source_dir / "reports" / "LR-01" / "launch-1" / "launch-failure-1.json"
         diagnostic.write_text(json.dumps({
             "task_id": "LR-01", "generation": 1, "stage": "executor",

@@ -70,9 +70,9 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual(run.feature, "legacy-feature")
             self.assertEqual(run.status, "running")
             self.assertEqual(list(run.tasks), ["LT-1", "LT-2"])
-            self.assertEqual(run.task("LT-1").status, "verified")
+            self.assertEqual(run.task("LT-1").status, "done")
             self.assertEqual(run.task("LT-1").attempts, 2)
-            self.assertEqual(run.task("LT-2").status, "blocked")
+            self.assertEqual(run.task("LT-2").status, "in_progress")
             self.assertEqual(run.task("LT-2").blocker, "dependency-not-satisfied: LT-1")
             self.assertEqual(run.task("LT-2").depends_on, ["LT-1"])
             self.assertEqual(run.history, _V1_RUN["history"])
@@ -225,29 +225,28 @@ class CommandAndGenerationTests(unittest.TestCase):
 
 
 class ActorAuthorizationTests(unittest.TestCase):
-    def _implemented(self, root: Path) -> Run:
+    def _in_progress(self, root: Path) -> Run:
         run = _run(root)
         run.add_task("EX-1")
-        run.transition_task("EX-1", "ready")
-        run.transition_task("EX-1", "running")
-        run.transition_task("EX-1", "implemented", ACTOR_EXECUTOR)
+        run.transition_task("EX-1", "in_progress")
         return run
 
-    def test_executor_can_only_produce_implemented_never_verified(self) -> None:
+    def test_executor_cannot_complete_a_task(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            run = self._implemented(Path(directory))
+            run = self._in_progress(Path(directory))
             with self.assertRaises(StateError) as caught:
-                run.transition_task("EX-1", "verified", ACTOR_EXECUTOR)
+                run.transition_task("EX-1", "done", ACTOR_EXECUTOR, resolution="completed")
             self.assertEqual(caught.exception.code, "unauthorized-transition")
 
-    def test_only_the_runner_may_record_verified(self) -> None:
+    def test_only_the_runner_may_record_done(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            run = self._implemented(Path(directory))
-            self.assertEqual(run.transition_task("EX-1", "verified", ACTOR_RUNNER), "verified")
-            # verified is terminal: no further transition is defined.
+            run = self._in_progress(Path(directory))
+            self.assertEqual(run.transition_task("EX-1", "done", ACTOR_RUNNER,
+                                                 resolution="completed"), "done")
+            # done is terminal: no further transition is defined.
             with self.assertRaises(StateError) as caught:
-                run.transition_task("EX-1", "implemented", ACTOR_RUNNER)
-            self.assertEqual(caught.exception.code, "illegal-transition")
+                run.transition_task("EX-1", "in_progress", ACTOR_RUNNER)
+            self.assertEqual(caught.exception.code, "unauthorized-transition")
 
     def test_authorization_survives_migration_from_v1(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -257,10 +256,10 @@ class ActorAuthorizationTests(unittest.TestCase):
             (run_dir / "run.json").write_text(json.dumps(_V1_RUN, indent=2) + "\n",
                                               encoding="utf-8")
             run = Run.load(run_dir, root)
-            # LT-1 migrated as 'verified' (terminal) — even the runner cannot move it.
+            # LT-1 migrated as 'done' (terminal) — even the runner cannot move it.
             with self.assertRaises(StateError) as caught:
-                run.transition_task("LT-1", "implemented", ACTOR_RUNNER)
-            self.assertEqual(caught.exception.code, "illegal-transition")
+                run.transition_task("LT-1", "in_progress", ACTOR_RUNNER)
+            self.assertEqual(caught.exception.code, "unauthorized-transition")
 
 
 class AttestationTests(unittest.TestCase):

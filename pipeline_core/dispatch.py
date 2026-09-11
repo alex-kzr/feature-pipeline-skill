@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from feature_pipeline.contracts import TaskSpec
+from feature_pipeline.application.work_items import WorkItemError, require_active_work_item
 
 from .adapters import (
     Adapter,
@@ -169,9 +170,63 @@ class DispatchOutcome:
     report_text: str | None
     drift: str | None = None
     failure: str | None = None
-    #: Runner-owned attribution of the implementation diff to this launch window. Present
-    #: only on a trusted ``implemented``; ``None`` for every blocked outcome.
+    #: Runner-owned attribution of the implementation diff to this launch window.  It is also
+    #: retained for a scope/provenance block so the block names the executor-owned delta.
     attribution: AttributionResult | None = None
+
+
+def _scope_or_provenance_block(attribution: AttributionResult) -> str | None:
+    """Return the fail-closed mechanical verdict for one executor window.
+
+    The manifest is the sole authority for executor scope: ambient worktree differences and
+    runner lifecycle projections pre-dating the snapshot are deliberately irrelevant.  A
+    window whose attribution is unavailable is unknown executor activity and cannot proceed.
+    """
+    # A missing repository boundary has no observed executor change to charge (and remains
+    # explicit evidence for the verifier).  An unavailable close *with candidates*, however,
+    # means an executor-window change could not be attributed; fail closed before verifiers.
+    if attribution.state == "unavailable" and attribution.changed_files:
+        return "attribution-unavailable: executor window ownership cannot be proven"
+    outside = [
+        str(row.get("path", "<unknown>"))
+        for row in attribution.changed_files
+        if row.get("classification") == "out_of_scope"
+    ]
+    unsafe = [path for path in outside if _unsafe_scope_amendment_path(path)]
+    if unsafe:
+        return "scope-safety-violation: unsafe executor-owned path: " + ", ".join(unsafe)
+    return None
+
+
+def _unsafe_scope_amendment_path(path: str) -> bool:
+    """Keep closed safety controls separate from a reviewable scope amendment."""
+    normalized = path.replace("\\", "/").casefold()
+    parts = tuple(part for part in normalized.split("/") if part)
+    if not parts or normalized.startswith(("/", "../", "~")):
+        return True
+    if ":" in parts[0]:
+        return True
+    return (
+        ".git" in parts
+        or any(part in {".env", "secrets", "credentials"} or "secret" in part for part in parts)
+    )
+
+
+def _record_scope_amendment(run: Run, task_id: str, attribution: AttributionResult) -> None:
+    """Attach reviewable, runner-observed amendment facts without changing the manifest."""
+    observed_paths = [
+        str(row["path"])
+        for row in attribution.changed_files
+        if row.get("classification") == "out_of_scope"
+    ]
+    if not observed_paths:
+        return
+    implementation = run.task(task_id).execution_evidence["implementation"]
+    implementation["scope_amendment"] = {
+        "present": True,
+        "observed_paths": observed_paths,
+        "rationale": "executor-owned paths outside the initial estimate require independent amendment-justification review",
+    }
 
 
 def dispatch_executor(
@@ -182,15 +237,22 @@ def dispatch_executor(
     spec = request.spec
     task_id = spec.id
 
+    try:
+        require_active_work_item(run, task_id)
+    except WorkItemError as exc:
+        raise DispatchError(str(exc), exc.code) from None
+
     record = run.task(task_id)
-    if record.status != "running":
+    if record.status != "in_progress":
         raise DispatchError(
-            f"{task_id} must be 'running' to dispatch an executor, is '{record.status}'",
+            f"{task_id} must be 'in_progress' to dispatch an executor, is '{record.status}'",
             "task-not-running",
         )
 
     # Consume the generation *before* the launch: a failed attempt still owns its number.
     generation = life.consume_launch_generation(task_id, EXECUTOR_ROLE)
+    life.record_operation(task_id, "executor", "started", "executor window opened",
+                          generation=generation, attempt=request.attempt)
     artifacts = launch_artifacts(run.run_dir, task_id, generation)
     artifacts.directory.mkdir(parents=True, exist_ok=True)
     runner_evidence_satisfied = False
@@ -369,12 +431,20 @@ def dispatch_executor(
         changed_files=attribution.changed_files,
         reason=attribution.reason,
     )
+    _record_scope_amendment(run, task_id, attribution)
+    scope_block = _scope_or_provenance_block(attribution)
+    if scope_block:
+        life.block(task_id, scope_block)
+        return DispatchOutcome(
+            task_id, generation, "blocked", "blocked", artifacts, result, envelope_result,
+            report_text, resolution.drift, scope_block, attribution,
+        )
     if resolution.drift:
         run.record_event(
             f"executor:{task_id}", to=str(generation), note=resolution.drift)
-    life.transition(
-        task_id, "implemented", actor=ACTOR_EXECUTOR,
-        note=f"executor launch-{generation} reported implemented",
+    life.record_operation(
+        task_id, "executor", "succeeded",
+        f"executor launch-{generation} reported implemented", generation=generation,
     )
     return DispatchOutcome(
         task_id, generation, "implemented", "implemented", artifacts, result, envelope_result,
@@ -448,8 +518,16 @@ def _settle_codex_final_result(
     run.record_implementation_attribution(request.spec.id, generation=generation,
         attempt=request.attempt, attribution_state=attribution.state, manifest=attribution.manifest,
         diff=attribution.diff, changed_files=attribution.changed_files, reason=attribution.reason)
-    life.transition(request.spec.id, "implemented", actor=ACTOR_EXECUTOR,
-                    note=f"executor launch-{generation} reported implemented")
+    _record_scope_amendment(run, request.spec.id, attribution)
+    scope_block = _scope_or_provenance_block(attribution)
+    if scope_block:
+        life.block(request.spec.id, scope_block)
+        return DispatchOutcome(request.spec.id, generation, "blocked", "blocked", artifacts,
+                               result, None, report_text, failure=scope_block,
+                               attribution=attribution)
+    life.record_operation(request.spec.id, "executor", "succeeded",
+                          f"executor launch-{generation} reported implemented",
+                          generation=generation)
     return DispatchOutcome(request.spec.id, generation, "implemented", "implemented", artifacts,
                            result, None, report_text, attribution=attribution)
 

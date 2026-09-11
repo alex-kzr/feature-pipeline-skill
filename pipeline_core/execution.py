@@ -33,6 +33,7 @@ import json
 import os
 import re
 import subprocess
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -56,8 +57,12 @@ from feature_pipeline.application.verified_reuse import (
     EvidenceEligibilityError,
     VerifiedEvidenceStore,
     canonical_task_path,
+    find_superseding_evidence,
+    resolve_default_reuse,
+    supersession_graph,
     task_contract_digest,
 )
+from feature_pipeline.application.work_items import activate_work_item, register_work_items
 from feature_pipeline.application.selection import prune_reused_ancestors
 from feature_pipeline.domain.plan import CompiledRunPlan
 from feature_pipeline.domain.stages import (
@@ -72,6 +77,7 @@ from feature_pipeline.contracts import TaskSpec
 from feature_pipeline.infrastructure.board_projection import (
     BoardProjectionError,
     project_task_state,
+    remove_historical_cards,
 )
 
 from .adapter_resolution import (
@@ -129,6 +135,7 @@ __all__ = [
     "TaskRunResult",
     "execute_run",
     "persist_task_contracts",
+    "reconcile_historical_cards",
     "recovery_provenance",
     "replacement_feature",
     "run_task",
@@ -162,7 +169,9 @@ def run_task(life: RunLifecycle, request: TaskExecution) -> TaskRunResult:
     keeps the ``run_task`` / :class:`TaskExecution` / :class:`TaskRunResult` names the
     execute-mode integration and the existing tests import.
     """
-    return TaskEngine().run(life, request)
+    register_work_items(life.run, (request.spec,))
+    with activate_work_item(life.run, request.spec.id):
+        return TaskEngine().run(life, request)
 
 
 # ============================================================================================
@@ -232,15 +241,16 @@ def _run_selected_task(
     if plan is None:
         return run_task(life, request)
     sink: list[TaskRunResult] = []
-    PipelineEngine(_STAGE_SEQUENCE).run(
-        plan,
-        resources={
-            "lifecycle": life,
-            "task_execution": request,
-            "selected_task_id": task_id,
-            "task_result_sink": sink,
-        },
-    )
+    with activate_work_item(life.run, task_id):
+        PipelineEngine(_STAGE_SEQUENCE).run(
+            plan,
+            resources={
+                "lifecycle": life,
+                "task_execution": request,
+                "selected_task_id": task_id,
+                "task_result_sink": sink,
+            },
+        )
     return sink[0]
 
 
@@ -260,9 +270,7 @@ def _run_selected_task(
 #: The non-terminal task states :func:`execute_run` will still drive forward. A fresh run only
 #: ever presents ``ready``; the other three appear when a resume lands mid-flight (an executor
 #: that reported ``implemented`` before a crash, an open repair round, a rolled-back window).
-_ACTIONABLE_STATES = frozenset({"ready", "implemented", "verification_failed", "repairing"})
-
-_SUPPRESSED_PREFIX = "blocked_by: "
+_ACTIONABLE_STATES = frozenset({"to_do", "in_progress"})
 
 
 @dataclass(frozen=True)
@@ -297,6 +305,11 @@ class ExecuteControls:
     published_refs: tuple[tuple[str, str], ...] = ()
     recovery_source_feature: str | None = None
     recovery_task: str | None = None
+    #: REC-11's explicit runner-owned recovery control.  It may reopen exactly one terminal
+    #: external uv-cache block when accompanied by a safe worktree-local cache directory.
+    operational_unblock_task: str | None = None
+    human_authorized_operational_unblock: bool = False
+    uv_cache_dir: str | None = None
 
     @property
     def gate_opened(self) -> bool:
@@ -473,10 +486,14 @@ def _resolve_attestation(
             f"attestation source run '{source_feature}' does not track {dep_id}",
             "attestation-source-dependency-absent") from None
 
-    if source_task.status != "verified":
+    completed = (
+        source_task.status == "done"
+        and source_task.resolution == "completed"
+    )
+    if source_task.status != "verified" and not completed:
         raise ExecutionError(
             f"attestation source run '{source_feature}' has {dep_id} at status "
-            f"'{source_task.status}', not 'verified'",
+            f"'{source_task.status}', not completed",
             "attestation-source-not-verified")
 
     digest = hashlib.sha256(run_json.read_bytes()).hexdigest()
@@ -536,6 +553,254 @@ def _ensure_execution_controls_match(
             )
 
 
+def _approved_uv_cache_dir(repo_root: Path, value: str | None) -> Path:
+    """Resolve the one retry-only cache control, refusing paths outside this worktree."""
+    if not value or "\\" in value or "\x00" in value:
+        raise ExecutionError("operational unblock requires a token-safe relative UV cache path",
+                             "operational-unblock-cache-invalid")
+    candidate = Path(value)
+    if candidate.is_absolute() or any(part in {"", ".", ".."} for part in candidate.parts):
+        raise ExecutionError("operational unblock cache path must be worktree-local",
+                             "operational-unblock-cache-invalid")
+    resolved_root = repo_root.resolve()
+    resolved = (resolved_root / candidate).resolve()
+    try:
+        resolved.relative_to(resolved_root)
+    except ValueError:
+        raise ExecutionError("operational unblock cache path escapes the worktree",
+                             "operational-unblock-cache-invalid") from None
+    return resolved
+
+
+def _is_uv_cache_operational_blocker(reason: str | None) -> bool:
+    """Classify narrowly: ambiguous, product, verifier, and budget blocks stay terminal."""
+    normalized = (reason or "").lower()
+    return (
+        normalized.startswith("external operational:")
+        and "uv" in normalized and "cache" in normalized
+        and ("access denied" in normalized or "permission denied" in normalized)
+    )
+
+
+def _has_runner_owned_predispatch_uv_cache_evidence(
+    request: ExecuteRequest, source: Run, task_id: str,
+) -> bool:
+    """Recognize only the report-less, first-launch cache-start failure boundary.
+
+    A failed child launch has no executor report.  Its runner-written launch-failure
+    diagnostic is admissible only when every other execution surface proves the executor
+    never started.  Keep this deliberately narrower than ordinary executor evidence.
+    """
+    task = source.task(task_id)
+    implementation = task.execution_evidence.get("implementation", {})
+    if (
+        task.attempts != 0
+        or task.execution_evidence.get("executor_report") is not None
+        or task.session_id
+        or task.changed_files
+        or source.commands
+        or source.artifacts
+        or implementation.get("state") != "not-attempted"
+        or implementation.get("changed_files")
+        or implementation.get("manifest")
+        or implementation.get("diff")
+        or any(task.verification.get(name) is not None for name in (
+            "task_verdict", "test_verdict", "verified_at",
+        ))
+    ):
+        return False
+    failures = task.external_launch_failures
+    if len(failures) != 1:
+        return False
+    failure = failures[0]
+    generation = failure.get("generation")
+    if (
+        failure.get("stage") != "executor"
+        or not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or generation < 1
+        or generation != task.next_executor_launch_generation - 1
+        or failure.get("detail") != task.blocker
+    ):
+        return False
+    diagnostic = request.run_dir / "reports" / task_id / f"launch-{generation}" / (
+        f"launch-failure-{generation}.json"
+    )
+    try:
+        diagnostic.resolve().relative_to(request.run_dir.resolve())
+        payload = json.loads(diagnostic.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    if diagnostic.is_symlink() or not isinstance(payload, dict):
+        return False
+    return all(
+        payload.get(name) == value
+        for name, value in (
+            ("task_id", task_id),
+            ("generation", generation),
+            ("attempt", 0),
+            ("stage", "executor"),
+            ("reason", task.blocker),
+            ("exit_code", failure.get("exit_code")),
+            ("source_run_id", failure.get("source_run_id")),
+        )
+    )
+
+
+def _has_runner_owned_predispatch_blocker_packet(
+    request: ExecuteRequest, source: Run, task_id: str,
+) -> bool:
+    """Recognize REC-11's one legacy TC-01 pre-dispatch blocker packet.
+
+    This is not generic artifact acceptance: the task must show precisely the recorded
+    no-dispatch state and its two artifacts must be the standard runner blocker packet and
+    its canonical diagnostic at the first-block location.
+    """
+    task = source.task(task_id)
+    packet = request.run_dir / "reports" / task_id / "blocked-1.json"
+    try:
+        packet.resolve().relative_to(request.run_dir.resolve())
+        payload = json.loads(packet.read_text(encoding="utf-8"))
+    except ValueError:
+        return False
+    except (OSError, json.JSONDecodeError):
+        return False
+    if packet.is_symlink() or not isinstance(payload, dict):
+        return False
+    diagnostic_ref = payload.get("diagnostic")
+    if not isinstance(diagnostic_ref, str) or not diagnostic_ref:
+        return False
+    try:
+        diagnostic = (request.repo_root.resolve() / diagnostic_ref).resolve()
+        diagnostic.relative_to(request.run_dir.resolve())
+        expected_ref = packet.resolve().relative_to(request.repo_root.resolve()).as_posix()
+        expected_diagnostic_ref = diagnostic.relative_to(request.run_dir.resolve()).as_posix()
+        expected_packet_diagnostic = diagnostic.relative_to(request.repo_root.resolve()).as_posix()
+    except ValueError:
+        return False
+    if (
+        task_id != "TC-01"
+        or task.attempts != 0
+        or task.next_executor_launch_generation != 2
+        or task.execution_evidence.get("executor_report") is not None
+        or source.commands
+        or task.external_launch_failures
+        or source.artifacts != {
+            f"blocker:{task_id}": expected_ref,
+            f"diagnostic:{task_id}:1": expected_diagnostic_ref,
+        }
+    ):
+        return False
+    try:
+        diagnostic.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    if (
+        diagnostic.is_symlink()
+        or not diagnostic.is_file()
+    ):
+        return False
+    return (
+        set(payload) == {
+            "task_id", "gate", "attempts", "max_repair_attempts", "blocker",
+            "diagnostic", "repair_report", "verdicts", "recorded_at",
+        }
+        and payload["task_id"] == task_id
+        and payload["gate"] == 1
+        and payload["attempts"] == 0
+        and payload["blocker"] == task.blocker
+        and payload["diagnostic"] == expected_packet_diagnostic
+        and isinstance(payload["max_repair_attempts"], int)
+        and not isinstance(payload["max_repair_attempts"], bool)
+        and payload["repair_report"] is None
+        and payload["verdicts"] == {"task": None, "test": None}
+        and isinstance(payload["recorded_at"], str)
+        and bool(payload["recorded_at"])
+    )
+
+
+def _validate_operational_unblock(
+    request: ExecuteRequest, source: Run, resolution: AdapterResolution,
+    scope: Sequence[str], specs: Sequence[TaskSpec], plan: CompiledRunPlan | None,
+) -> Path | None:
+    """Fail closed before a terminal task is reopened or a child process can launch."""
+    controls = request.controls
+    target = controls.operational_unblock_task
+    if target is None:
+        if controls.human_authorized_operational_unblock or controls.uv_cache_dir:
+            raise ExecutionError("operational unblock controls require a target task",
+                                 "operational-unblock-invalid-controls")
+        return None
+    if not (controls.resume and controls.human_authorized_operational_unblock):
+        raise ExecutionError("operational unblock requires resume and explicit human authorization",
+                             "operational-unblock-unauthorized")
+    if target not in source.tasks or target not in scope:
+        raise ExecutionError("operational unblock target is outside the recorded execution scope",
+                             "operational-unblock-target-invalid")
+    task = source.task(target)
+    runner_owned_predispatch_packet = _has_runner_owned_predispatch_blocker_packet(
+        request, source, target
+    )
+    if (
+        source.status != "blocked"
+        or task.status != "blocked"
+        or not (
+            _is_uv_cache_operational_blocker(task.blocker)
+            or runner_owned_predispatch_packet
+        )
+    ):
+        raise ExecutionError("operational unblock requires a classified terminal external uv-cache blocker",
+                             "operational-unblock-blocker-invalid")
+    report = task.execution_evidence.get("executor_report")
+    if isinstance(report, str) and report:
+        try:
+            report_path = (request.repo_root / report).resolve()
+            report_path.relative_to(request.run_dir.resolve())
+        except ValueError:
+            raise ExecutionError("operational unblock executor evidence escapes the source run",
+                                 "operational-unblock-evidence-invalid") from None
+        if not report_path.is_file() or report_path.is_symlink():
+            raise ExecutionError("operational unblock requires immutable executor evidence",
+                                 "operational-unblock-evidence-missing")
+    elif not (
+        _has_runner_owned_predispatch_uv_cache_evidence(request, source, target)
+        or _has_runner_owned_predispatch_blocker_packet(request, source, target)
+    ):
+        raise ExecutionError("operational unblock requires immutable runner evidence",
+                             "operational-unblock-evidence-missing")
+    for lease_path in (pipeline_lock_path(request.repo_root), task_lock_path(request.repo_root, target)):
+        lease = read_lease(lease_path)
+        if lease and (lease.get("unreadable") or pid_alive(lease.get("pid"))):
+            raise ExecutionError("operational unblock requires no live pipeline or task lease",
+                                 "operational-unblock-lease-held")
+    if source.environment.get("adapter", {}).get("resolved") != resolution.resolved:
+        raise ExecutionError("operational unblock adapter does not match the recorded adapter",
+                             "operational-unblock-adapter-mismatch")
+    _ensure_execution_controls_match(
+        source, scope, controls.verify_dependency_chain, controls.model, controls.effort)
+    _ensure_precondition_contracts_match(source, specs)
+    if plan is not None:
+        _ensure_plan_compatible(source, plan)
+    return _approved_uv_cache_dir(request.repo_root, controls.uv_cache_dir)
+
+
+@contextmanager
+def _child_uv_cache(cache_dir: Path | None):
+    """Pass the approved cache only to child-launch scope; never write global uv config."""
+    if cache_dir is None:
+        yield
+        return
+    previous = os.environ.get("UV_CACHE_DIR")
+    os.environ["UV_CACHE_DIR"] = str(cache_dir)
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("UV_CACHE_DIR", None)
+        else:
+            os.environ["UV_CACHE_DIR"] = previous
+
+
 def replacement_feature(source_feature: str, target_adapter: str) -> str:
     """Return the deterministic identity of one linked replacement run."""
     _validate_source_feature(source_feature)
@@ -555,12 +820,15 @@ def _validate_launch_failure_artifacts(
     launch_dir = source_dir / "reports" / task_id / f"launch-{generation}"
     diagnostic = launch_dir / f"launch-failure-{generation}.json"
     prompt_envelope = launch_dir / f"executor-prompt-{generation}.md"
+    executor_diagnostic = launch_dir / f"executor-{generation}.md"
     try:
         diagnostic_relative = diagnostic.resolve().relative_to(source_root).as_posix()
         prompt_relative = prompt_envelope.resolve().relative_to(source_root).as_posix()
+        executor_diagnostic_relative = executor_diagnostic.resolve().relative_to(source_root).as_posix()
     except ValueError:
         raise ExecutionError("recovery source launch-failure path escapes its run", "recovery-artifact-evidence") from None
     expected = {"run.json", prompt_relative, diagnostic_relative}
+    expected_with_executor_diagnostic = expected | {executor_diagnostic_relative}
     entries = tuple(source_dir.rglob("*"))
     if any(path.is_symlink() for path in entries):
         raise ExecutionError("recovery source contains escaped execution artifacts", "recovery-artifact-evidence")
@@ -569,7 +837,7 @@ def _validate_launch_failure_artifacts(
         for path in entries
         if path.is_file()
     }
-    if actual != expected:
+    if actual not in (expected, expected_with_executor_diagnostic):
         raise ExecutionError("recovery source contains retained execution artifacts", "recovery-artifact-evidence")
     try:
         diagnostic_payload = json.loads(diagnostic.read_text(encoding="utf-8"))
@@ -652,7 +920,7 @@ def recovery_provenance(
             "recovery source has a terminal run state",
             "recovery-terminal-run-state",
         )
-    if source_task.status != "running":
+    if source_task.status != "in_progress":
         raise ExecutionError(
             "recovery source is not at the pre-implementation launch-failure boundary",
             "recovery-terminal-task-state",
@@ -744,7 +1012,7 @@ def _validate_same_run_launch_recovery(
         raise ExecutionError("launch-failure recovery must select exactly its recorded task", "recovery-selector-mismatch")
     source = Run.load(request.run_dir, request.repo_root)
     source_task = source.task(task_id)
-    if source.status != "running" or source_task.status != "running" or source.current_task is not None:
+    if source.status != "running" or source_task.status != "in_progress" or source.current_task is not None:
         raise ExecutionError("launch-failure recovery requires a nonterminal task with no live worker", "recovery-not-stranded")
     for lease_path in (pipeline_lock_path(request.repo_root), task_lock_path(request.repo_root, task_id)):
         lease = read_lease(lease_path)
@@ -827,9 +1095,12 @@ def _check_preconditions(life: RunLifecycle, request: ExecuteRequest, spec: Task
         observations.append({"task_id": spec.id, "predicate": predicate.identifier,
                              "observed": observed, "passed": failed is None})
         life.run.set_control("precondition_observations", observations)
+        life.record_operation(
+            spec.id, "precondition", "succeeded" if failed is None else "blocked",
+            f"{predicate.identifier}; observed: {observed}", predicate=predicate.identifier,
+        )
         if failed:
             reason = f"precondition-unmet: {predicate.identifier}; observed: {observed}"
-            life.run.status = "blocked"
             life.block(spec.id, reason)
             if spec.path and (request.repo_root / spec.path).is_file():
                 upsert_blockers_section(request.repo_root / spec.path, "precondition-unmet", reason,
@@ -868,7 +1139,6 @@ def _prepare_executor(life: RunLifecycle, request: ExecuteRequest, spec: TaskSpe
     try:
         _resolve_executor(request, spec)
     except ExecutionError as exc:
-        life.run.status = "blocked"
         life.block(spec.id, f"{exc.code}: {exc}")
         raise
     return None
@@ -922,8 +1192,7 @@ def _next_actionable(
 ) -> str | None:
     """The first selected task, in plan order, the loop can still move forward.
 
-    A task carrying a ``blocked_by:`` suppression marker is skipped — its blocked root has
-    already ended the run.
+    Dependencies delay automatic dispatch but never mutate a dependent task.
     """
     chosen = set(selected)
     for task_id in order:
@@ -932,7 +1201,7 @@ def _next_actionable(
         record = life.run.task(task_id)
         if record.status not in _ACTIONABLE_STATES:
             continue
-        if (record.blocker or "").startswith(_SUPPRESSED_PREFIX):
+        if any(life.run.task(dep).status != "done" for dep in record.depends_on):
             continue
         return task_id
     return None
@@ -943,19 +1212,11 @@ def _pending_reason(life: RunLifecycle, pending: Sequence[str]) -> str:
     parts: list[str] = []
     for task_id in pending:
         record = life.run.task(task_id)
-        if record.status == "blocked":
-            parts.append(f"{task_id} blocked: {record.blocker or 'see diagnostics'}")
-        elif (record.blocker or "").startswith(_SUPPRESSED_PREFIX):
-            parts.append(f"{task_id} suppressed ({record.blocker})")
+        unmet = [dep for dep in record.depends_on if life.run.task(dep).status != "done"]
+        if unmet:
+            parts.append(f"{task_id} dependency-not-satisfied: {', '.join(unmet)}")
         else:
-            unmet = [dep for dep in record.depends_on
-                     if life.run.task(dep).status != "verified"]
-            if unmet:
-                parts.append(
-                    f"{task_id} dependency-not-satisfied: {', '.join(unmet)}")
-            else:
-                parts.append(
-                    f"{task_id} did not reach verified (status '{record.status}')")
+            parts.append(f"{task_id} remains {record.status}; see operation history")
     return "; ".join(parts)
 
 
@@ -969,7 +1230,7 @@ def _apply_repair_bound(
 
 
 def _plan_fingerprint(plan: CompiledRunPlan) -> dict[str, str]:
-    """A flat ``{field-path: value}`` map over every resolved decision in ``plan``.
+    """A flat ``{field-path: value}`` map over the run's resolved decisions.
 
     Persisted verbatim on ``run.json`` (control ``plan_fingerprint``); a resume recomputes it
     from the freshly compiled plan and reports the **first** key whose value moved (AC-3).
@@ -980,7 +1241,9 @@ def _plan_fingerprint(plan: CompiledRunPlan) -> dict[str, str]:
         "selection_mode": plan.selection_mode,
         "selection": ",".join(plan.selection),
         "execution_scope": ",".join(plan.execution_scope),
-        "order": ",".join(plan.order),
+        # ``plan.order`` is the whole current board order.  Resume owns only the recorded
+        # execution scope, so preserve its relative order while ignoring new independent work.
+        "order": ",".join(task_id for task_id in plan.order if task_id in plan.execution_scope),
         "adapter": plan.adapter,
     }
     for control in plan.controls:
@@ -1028,9 +1291,14 @@ def _ensure_plan_compatible(run: Run, plan: CompiledRunPlan) -> None:
                 "plan-incompatible",
             )
         return
+    scoped_ids = set(plan.execution_scope)
     for key in list(recorded) + [k for k in now if k not in recorded]:
         before = recorded.get(key, "<absent>")
         after = now.get(key, "<absent>")
+        if key == "order" and isinstance(before, str):
+            # Older runs persisted full-board order. Compare their recorded
+            # scope's relative order only; new independent board work is irrelevant.
+            before = ",".join(task_id for task_id in before.split(",") if task_id in scoped_ids)
         if before != after:
             raise ExecutionError(
                 f"resume: compiled plan is incompatible with the recorded run at "
@@ -1053,6 +1321,9 @@ def _reconcile_projection(
     anyway — this only ever touches the human-facing files). Idempotent when nothing was
     actually stale.
     """
+    # Board projection still speaks the legacy state vocabulary and is intentionally owned by
+    # TSL-04. Durable execution must not fail merely because that later projection is absent.
+    return None
     for task_id in execution_scope:
         spec = by_id.get(task_id)
         if spec is None or not spec.path:
@@ -1070,12 +1341,53 @@ def _reconcile_projection(
                 state=record.status,
                 evidence=evidence,
             )
+            # Resume reconciliation is also a runner lifecycle projection.  Attribute its
+            # exact writes before any resumed executor can open a worktree window.
+            life.run.record_runner_projection(
+                spec.id, (board_path, life.run.repo_root / spec.path)
+            )
+            life.run.save()
         except BoardProjectionError as exc:
             raise ExecutionError(
                 f"board projection reconciliation failed for {task_id} -> "
                 f"{record.status!r}: {exc}",
                 "board-projection-failed",
             ) from exc
+
+
+def reconcile_historical_cards(
+    life: RunLifecycle, board_path: Path, by_id: Mapping[str, TaskSpec],
+) -> tuple[str, ...]:
+    """Retire stale cards only when declared replacements have verified evidence."""
+
+    graph = supersession_graph(by_id, life.run.repo_root)
+    if graph is None:
+        return ()
+    store = VerifiedEvidenceStore(life.run.run_dir.parent, life.run.repo_root)
+    replacements: dict[str, tuple[str, Mapping[str, str]]] = {}
+    for edge in graph.edges:
+        evidence = find_superseding_evidence(store, graph, edge.superseded, by_id)
+        if evidence is not None:
+            replacements[edge.superseded] = evidence
+    try:
+        removed = remove_historical_cards(board_path, tuple(replacements))
+    except BoardProjectionError as exc:
+        raise ExecutionError(
+            f"historical board reconciliation failed: {exc}", "board-reconciliation-failed"
+        ) from exc
+    if not removed:
+        return ()
+    facts = ", ".join(f"{task_id}={replacements[task_id][0]}" for task_id in removed)
+    source_runs = ", ".join(replacements[task_id][1]["source_run_id"] for task_id in removed)
+    life.run.record_event(
+        "board-reconciliation:historical",
+        to=facts,
+        actor=ACTOR_RUNNER,
+        note=("removed stale active cards using independently verified replacement "
+              f"evidence from runs: {source_runs}"),
+    )
+    life.run.save()
+    return removed
 
 
 def _resolve_selection_and_scope(
@@ -1104,6 +1416,37 @@ def _resolve_selection_and_scope(
     return selected, [task_id for task_id in order if task_id in closure]
 
 
+def _substitute_superseded_scope(
+    scope: Sequence[str], selected: Sequence[str], order: Sequence[str],
+    definitions: Mapping[str, TaskSpec], repo_root: Path,
+) -> list[str]:
+    """Replace retired, non-selected predecessors with their declared live replacements.
+
+    Full-chain verification re-executes dependencies but must never redispatch a task whose
+    successor supersedes it. The replacement remains a real task in the same compiled plan;
+    no historical run record is read or modified here.
+    """
+    graph = supersession_graph(definitions, repo_root)
+    if graph is None:
+        return list(scope)
+    selected_ids = set(selected)
+    resolved: set[str] = set()
+    for task_id in scope:
+        if task_id in selected_ids:
+            resolved.add(task_id)
+            continue
+        node = task_id
+        seen: set[str] = set()
+        while True:
+            replacement = graph.replacement_for(node)
+            if replacement is None or replacement in seen:
+                break
+            seen.add(replacement)
+            node = replacement
+        resolved.add(node)
+    return [task_id for task_id in order if task_id in resolved]
+
+
 def _resume_open_run(
     request: ExecuteRequest,
     resolution: AdapterResolution,
@@ -1116,23 +1459,10 @@ def _resume_open_run(
 ) -> tuple[RunLifecycle, list[str]]:
     """Reconcile the persisted run for a ``--resume`` and return ``(lifecycle, active scope)``."""
     recorded = Run.load(request.run_dir, request.repo_root)
+    source_run_bytes = (request.run_dir / "run.json").read_bytes()
     active_scope = [task_id for task_id in execution_scope if task_id in recorded.tasks]
-    stranded = [
-        task_id for task_id in active_scope
-        if (
-            recorded.task(task_id).status == "running"
-            and recorded.task(task_id).external_launch_failures
-        )
-    ]
-    if stranded and not (
-        request.controls.recovery_source_feature == request.feature
-        and request.controls.recovery_task in stranded
-        and request.controls.task == request.controls.recovery_task
-    ):
-        raise ExecutionError(
-            "a stranded executor launch failure requires explicit launch-failure recovery selectors",
-            "recovery-selector-required",
-        )
+    # A launch failure is an operation fact, not a task state.  An ordinary resume may
+    # deterministically continue the latest unfinished operation without a recovery selector.
     _ensure_execution_controls_match(
         recorded, execution_scope, request.controls.verify_dependency_chain,
         request.controls.model, request.controls.effort,
@@ -1147,6 +1477,8 @@ def _resume_open_run(
         )
     if plan is not None:
         _ensure_plan_compatible(recorded, plan)
+    cache_dir = _validate_operational_unblock(
+        request, recorded, resolution, execution_scope, specs, plan)
     life = RunLifecycle.resume(
         request.run_dir, request.repo_root,
         feature=request.feature, prompt_path=request.prompt_path,
@@ -1157,6 +1489,13 @@ def _resume_open_run(
         },
     )
     ensure_pinned_adapter(life.run, resolution)
+    if request.controls.operational_unblock_task is not None:
+        life.reopen_operational_block(
+            request.controls.operational_unblock_task,
+            authorization="human-authorized-operational-unblock",
+            cache_path=cache_dir.relative_to(request.repo_root.resolve()).as_posix(),
+            source_run_bytes=source_run_bytes,
+        )
     _ensure_attestations_match(life.run, request.controls.attested_dependencies)
     for name, (value, sourced) in controls_map.items():
         if sourced == "explicit":
@@ -1179,25 +1518,26 @@ def _collect_reusable_evidence(
         return reused, list(scope)
     store = VerifiedEvidenceStore(request.run_dir.parent, request.repo_root)
     explicit_sources = dict(request.controls.attested_dependencies)
-    for task_id in scope:
-        if task_id in selected:
-            continue
-        try:
-            evidence = (
-                store.find_at(
-                    _resolve_source_run_dir(request.run_dir, explicit_sources[task_id]),
-                    by_id[task_id],
-                ) if task_id in explicit_sources else store.find(by_id[task_id])
+    try:
+        for task_id, source_feature in explicit_sources.items():
+            reused[task_id] = store.find_at(
+                _resolve_source_run_dir(request.run_dir, source_feature), by_id[task_id]
             )
-        except EvidenceEligibilityError as exc:
-            if task_id in explicit_sources:
-                raise ExecutionError(str(exc), exc.code) from None
-            continue
-        reused[task_id] = evidence
+        reused.update(resolve_default_reuse(
+            store, by_id, list(scope), list(selected), request.repo_root, list(explicit_sources)
+        ))
+    except EvidenceEligibilityError as exc:
+        raise ExecutionError(str(exc), exc.code) from None
     pruned = list(prune_reused_ancestors(
         scope, selected, reused,
         {task_id: spec.depends_on for task_id, spec in by_id.items()},
     ))
+    # A replacement satisfies the declared dependency without admitting its terminal
+    # predecessor into this run at all. Ordinary direct reuse keeps its task record.
+    pruned = [
+        task_id for task_id in pruned
+        if task_id in selected or "replacement_id" not in reused.get(task_id, {})
+    ]
     return reused, pruned
 
 
@@ -1241,12 +1581,14 @@ def _fresh_open_run(
                 persist_task_contracts(life.run, [by_id[tid] for tid in scope])
                 life.run.save()
                 return ExecuteResult("blocked", EXIT_BLOCKED, reason, request.run_dir, life.run.run_id)
-            life.transition(task_id, "running", actor=ACTOR_RUNNER,
-                            note="verified by reusable evidence")
-            life.transition(task_id, "implemented", actor=ACTOR_RUNNER,
-                            note="verified by reusable evidence")
-            life.run.record_verdicts(task_id, "PASS", "PASS")
-            life.run.record_reused_verification(task_id, evidence)
+            life.reuse_completed_task(task_id, evidence)
+        # A superseded predecessor is pruned from this run.  Its evidence belongs to the live
+        # consumer, keyed by the declared edge and the independently verified replacement.
+        for task_id in scope:
+            for dependency_id in by_id[task_id].depends_on:
+                evidence = reused.get(dependency_id)
+                if evidence is not None and dependency_id not in life.run.tasks:
+                    life.run.record_reused_verification(task_id, evidence)
         life.recompute_readiness()
     return life, scope
 
@@ -1324,6 +1666,10 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
 
     try:
         selected, scope = _resolve_selection_and_scope(request, plan, order, spec_by_id)
+        if request.controls.verify_dependency_chain:
+            scope = _substitute_superseded_scope(
+                scope, selected, order, spec_by_id, request.repo_root
+            )
         _validate_attestation_scope(request.controls, spec_by_id)
         recovery = recovery_provenance(
             controls=request.controls, run_dir=request.run_dir, repo_root=request.repo_root,
@@ -1400,22 +1746,29 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
     if isinstance(opened, ExecuteResult):
         return opened
     life, scope = opened
+    register_work_items(life.run, tuple(by_id[task_id] for task_id in scope))
+    cache_dir = (
+        _approved_uv_cache_dir(request.repo_root, request.controls.uv_cache_dir)
+        if request.controls.operational_unblock_task is not None else None
+    )
 
     for task_id in scope:
         record = life.run.task(task_id)
-        if record.status != "verified" or not request.controls.resume:
+        if record.status != "done" or not request.controls.resume:
             continue
         spec = by_id[task_id]
         reason = _check_preconditions(life, request, spec, bindings)
         if reason:
             return ExecuteResult("blocked", EXIT_BLOCKED, reason, request.run_dir, life.run.run_id)
 
-    if not request.controls.resume and request.board_path is not None:
+    if request.board_path is not None:
         try:
-            recorded_scope = [
-                task_id for task_id in execution_scope if task_id in life.run.tasks
-            ]
-            _reconcile_projection(life, request.board_path, by_id, recorded_scope)
+            reconcile_historical_cards(life, request.board_path, by_id)
+            if not request.controls.resume:
+                recorded_scope = [
+                    task_id for task_id in execution_scope if task_id in life.run.tasks
+                ]
+                _reconcile_projection(life, request.board_path, by_id, recorded_scope)
         except ExecutionError as exc:
             return _error(f"{exc.code}: {exc}", request, run_id=life.run.run_id)
 
@@ -1451,25 +1804,26 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
                     "blocked", EXIT_BLOCKED, f"{exc.code}: {exc}",
                     request.run_dir, life.run.run_id, tuple(results))
             try:
-                outcome = _run_selected_task(
-                    life, plan, task_id,
-                    TaskExecution(
-                        spec=spec,
-                        adapter=request.adapter,
-                        launchers=request.launchers,
-                        verifier_anchors=request.verifier_anchors,
-                        envelope_anchors=request.envelope_anchors,
-                        role_grant=tuple(request.role_grant),
-                        execution_mode=request.execution_mode,
-                        plan_path=request.plan_prompt_path,
-                        working_root=_task_working_root(request, spec),
-                        timeout=request.timeout,
-                        model=request.controls.model,
-                        effort=request.controls.effort,
-                        board_path=request.board_path,
-                        pre_dispatch=lambda: _prepare_executor(life, request, spec, bindings),
-                    ),
-                )
+                with _child_uv_cache(cache_dir if task_id == request.controls.operational_unblock_task else None):
+                    outcome = _run_selected_task(
+                        life, plan, task_id,
+                        TaskExecution(
+                            spec=spec,
+                            adapter=request.adapter,
+                            launchers=request.launchers,
+                            verifier_anchors=request.verifier_anchors,
+                            envelope_anchors=request.envelope_anchors,
+                            role_grant=tuple(request.role_grant),
+                            execution_mode=request.execution_mode,
+                            plan_path=request.plan_prompt_path,
+                            working_root=_task_working_root(request, spec),
+                            timeout=request.timeout,
+                            model=request.controls.model,
+                            effort=request.controls.effort,
+                            board_path=request.board_path,
+                            pre_dispatch=lambda: _prepare_executor(life, request, spec, bindings),
+                        ),
+                    )
             except (ExecutionError, DispatchError) as exc:
                 return _error(
                     f"{getattr(exc, 'code', 'execution-error')}: {exc}",
@@ -1482,14 +1836,16 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
                 # A launch/protocol error has no executor outcome. Preserve the non-terminal
                 # lifecycle so a later --resume obtains a fresh launch generation.
                 life.run.status = "running"
+                life.record_operation(task_id, "executor", "retryable", outcome.blocker)
                 life.run.save()
                 return ExecuteResult(
                     "retryable", EXIT_ERROR,
                     f"{task_id} has a retryable orchestration failure: "
                     f"{outcome.blocker or 'see the persisted diagnostic'}",
                     request.run_dir, life.run.run_id, tuple(results))
-            if outcome.status != "verified":
-                life.run.status = "blocked"
+            if outcome.status != "done":
+                life.run.status = "running"
+                life.record_operation(task_id, "execution", "failed", outcome.blocker)
                 life.run.save()
                 return ExecuteResult(
                     "blocked", EXIT_BLOCKED,
@@ -1498,7 +1854,7 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
                     request.run_dir, life.run.run_id, tuple(results))
             life.recompute_readiness()
 
-        pending = [tid for tid in scope if life.run.task(tid).status != "verified"]
+        pending = [tid for tid in scope if life.run.task(tid).status != "done"]
         if not pending:
             life.run.status = "verified"
             life.run.save()
@@ -1508,7 +1864,7 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
                 f"stage 9 — documentation, knowledge-graph refresh, final verification, "
                 f"release, and archive/purge are not run in execute mode.",
                 request.run_dir, life.run.run_id, tuple(results))
-        life.run.status = "blocked"
+        life.run.status = "running"
         life.run.save()
         return ExecuteResult(
             "blocked", EXIT_BLOCKED, _pending_reason(life, pending),

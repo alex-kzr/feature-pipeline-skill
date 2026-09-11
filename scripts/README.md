@@ -49,7 +49,7 @@ has no commit code path. `--push` is refused before any run artifact exists, wit
 Exit codes are mode-specific. Planning previews (`plan-only`, `unattended`, and
 `release-dry-run`) return `10` when their delivery gate is pending. In `execute` mode, `0`
 means every selected task verified, `10` means the plan gate is pending, `20` means a task is
-blocked, and `30` means a runner error. Parser failures are separate command-line errors; a
+still awaiting operational resolution, and `30` means a runner error. Parser failures are separate command-line errors; a
 `--push` request is separately refused with exit `1` before any run artifact exists. A
 successful outer Hermes process is not evidence of an execute result. Execute ends after stage
 9; documentation and later lifecycle stages are distinct.
@@ -91,8 +91,8 @@ Each task `type` must be a core task type and must have a route in the profile's
 ### `--dry-run`
 
 Prints a deterministic, redacted plan and writes nothing outside a temporary run directory.
-A non-blocked `--dry-run` exits `10` (a delivery gate is pending), matching the legacy
-runner; a blocked one still exits `20`, and an invalid anchor / profile / route still `30`.
+A dry run with no operational finding exits `10` (a delivery gate is pending), matching the
+legacy runner; an operational finding exits `20`, and an invalid anchor / profile / route still `30`.
 The plan has the fixed sections of the parallel-acceptance comparison matrix: `C1` selected
 task IDs, `C2` per-task resolved route, `C3` generated shell-free argv, `C4` pending delivery
 gates in order, `C5` exit code (`Exit code: 10 (a delivery gate is pending)`), `C6` planned
@@ -130,7 +130,7 @@ after the four stage-9 delivery gates it also lays out the **post-task lifecycle
 10–16 (`documentation`, `documentation-audit`, `graphify-refresh`, `graphify-verification`,
 `final-verification`, `final-diff-approval`, `release`) — and their gates, in order, in `C4`,
 with a matching post-task transition chain in `C6` and an extra `C8` safety line. It implies
-`--dry-run`: no executor is dispatched, nothing is written, and every non-blocked run exits
+`--dry-run`: no executor is dispatched, nothing is written, and every clean run exits
 `10`.
 
 It consumes the project's post-task contract **as declared**, from the two files beside the
@@ -156,8 +156,9 @@ For every dependency-ready selected task, in plan order, it: resolves the comple
 contract, initializes (or `--resume`s) the durable schema-v2 run, acquires the pipeline and
 per-task write leases, dispatches the executor, runs the task-declared verification commands
 as runner-owned evidence, obtains two independent read-only verifier verdicts, and repairs
-within the task's bounded attempt limit — ending each task at `verified` or at a truthful
-non-zero terminal state. No documentation, Graphify, final verification, release, recovery,
+within the task's bounded attempt limit. Tasks remain `in_progress` while failed verification,
+waiting, or repair evidence is recorded; only completed or human-cancelled work becomes `done`.
+No documentation, Graphify, final verification, release, recovery,
 or archive/purge code is reachable from `execute`.
 
 - **Plan gate.** The first executor dispatch is refused until the plan gate is satisfied:
@@ -198,13 +199,13 @@ or archive/purge code is reachable from `execute`.
   candidates fail closed as `evidence-legacy-ambiguous`. Reuse records immutable consumer-side
   `reused_verification` evidence and never modifies source-run bytes. Pass
   `--verify-dependency-chain` to verify the full closure locally instead.
-- **Board projection.** For a Markdown-backed board plan the runner projects each durable task
-  transition onto `docs/kanban.md` and the task file after the transition is saved: a selected
-  task moves from `## To Do` to `## In Progress` after the durable `running` transition and
-  before the executor launches; a `blocked` task returns to `## To Do` keeping its `## Blockers`;
-  a `verified` task loses its card and gets a checked `Done` plus one `## Result` section
-  rendered from structured run/command/report evidence (there is no `Done` column or completed
-  ledger). Projection is convergent and idempotent, touches only `execution_scope` IDs, and a
+- **Board projection.** For a Markdown-backed board plan the runner projects only `to_do`,
+  `in_progress`, and `done` onto `docs/kanban.md` and the task file after the transition is
+  saved. A `done` task loses its card and gets a checked `Done` plus one `## Result` section:
+  `completed` records independent verification, while `cancelled` requires a human reason and
+  never claims implementation verification. Failed checks, waiting, and scope amendments remain
+  auditable operation evidence on `in_progress` (there is no `Done` column or completed ledger).
+  Projection is convergent and idempotent, touches only `execution_scope` IDs, and a
   failed projection write is reported as `board-projection-failed` with `run.json` left intact.
   `--resume` reconciles the in-scope task files and board cards from `run.json` before selecting
   the next task and never redispatches a `verified` task. A boardless JSON plan is
@@ -231,11 +232,11 @@ or archive/purge code is reachable from `execute`.
   `agents_root`, or an `agents_root` that resolves to the same real path as `project_dir`,
   adds nothing (`working_root` / the wider grant already covers it). Resolution is layout-
   agnostic — no absolute path or host assumption.
-- **Exit codes.** `0` every selected task `verified`; `10` plan gate pending; `20` a task
-  ended `blocked` (repair limit reached, external `BLOCKED` verdict, malformed verifier
-  evidence, out-of-scope change, live foreign lease, dependency suppression); `30` runner
-  error (unknown/unavailable adapter, resume identity or adapter mismatch, incomplete task
-  metadata). The run never reports `0` while any selected task is non-terminal.
+- **Exit codes.** `0` every selected task is independently verified; `10` plan gate pending;
+  `20` records an operational outcome requiring human attention (for example a repair limit,
+  an external verifier finding, malformed verifier evidence, an unsafe scope change, or a live
+  foreign lease); `30` runner error (unknown/unavailable adapter, resume identity or adapter
+  mismatch, incomplete task metadata). The run never reports `0` while work remains open.
 - **Plan input.** `execute` needs the full execution metadata per task: a Markdown plan
   whose `tasks/<ID>_*.md` files carry an `## Execution Metadata` block, or a JSON plan whose
   entries carry `task_type` / `executor` / `allowed_scope` / `acceptance_criteria`. The
@@ -271,8 +272,8 @@ subcommands have no lifecycle-maintenance counterpart in the portable core yet. 
 still reaches an argparse error. This is handed to the MI-01 amendment tracked by OI-02 /
 CA-03; it is out of scope for CR-03.
 
-Recovery / maintenance flags (`maintenance apply`, `--unblock`, …) are **deliberately absent**
-from the core CLI and its `--help` — they stay launcher-only (OF-02 §4).
+Recovery and maintenance controls are not part of the core CLI's public task-state surface;
+open work continues through fresh runner-owned evidence rather than a task-state transition.
 
 ```
 python scripts/run_pipeline.py \

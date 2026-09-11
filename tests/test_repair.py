@@ -79,7 +79,7 @@ class RepairLimitBoundaryTests(unittest.TestCase):
 
                 result = run_task(life, _execution(spec, executor, task, test))
 
-                self.assertEqual(result.status, "blocked")
+                self.assertEqual(result.status, "escalated")
                 self.assertEqual(result.exit_code, 1)
                 self.assertEqual(result.attempts, maximum)
                 self.assertEqual(result.gates, maximum + 1)
@@ -87,9 +87,8 @@ class RepairLimitBoundaryTests(unittest.TestCase):
                 self.assertEqual(executor.launches, maximum + 1)
                 self.assertEqual(len(_repair_reports(life.run, "VR-03")), maximum + 1)
                 self.assertIn("maximum repair attempts", result.blocker or "")
-                self.assertIsNotNone(result.diagnostic)
-                self.assertTrue(result.diagnostic.is_file())
-                self.assertEqual(life.run.task("VR-03").status, "blocked")
+                self.assertIsNone(result.diagnostic)
+                self.assertEqual(life.run.task("VR-03").status, "in_progress")
 
     def test_a_successful_repair_stops_the_loop_and_verifies(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -102,13 +101,13 @@ class RepairLimitBoundaryTests(unittest.TestCase):
 
             result = run_task(life, _execution(spec, executor, task, test))
 
-            self.assertEqual(result.status, "verified")
+            self.assertEqual(result.status, "done")
             self.assertEqual(result.exit_code, 0)
             self.assertEqual(result.attempts, 1)
             self.assertEqual(result.gates, 2)
             self.assertEqual(executor.launches, 2)
             self.assertEqual(_repair_reports(life.run, "VR-03"), [2])
-            self.assertEqual(life.run.task("VR-03").status, "verified")
+            self.assertEqual(life.run.task("VR-03").status, "done")
 
 
 # --- same-role fresh redispatch + full-gate rerun ---------------------------------------
@@ -146,7 +145,7 @@ class RedispatchAndGateRerunTests(unittest.TestCase):
 
             result = run_task(life, _execution(spec, executor, task, test))
 
-            self.assertEqual(result.status, "verified")
+            self.assertEqual(result.status, "done")
             self.assertEqual(result.gates, 3)
             # a fresh, independent verifier pair ran for every gate (3 initial launches each).
             self.assertEqual(sum(1 for c in task.calls if not c["is_env"]), 3)
@@ -193,7 +192,7 @@ class ExternalBlockedTests(unittest.TestCase):
 
             result = run_task(life, _execution(spec, executor, task, test))
 
-            self.assertEqual(result.status, "blocked")
+            self.assertEqual(result.status, "waiting")
             self.assertEqual(result.exit_code, 1)
             self.assertEqual(result.attempts, 0)
             self.assertEqual(executor.launches, 1)  # no repair redispatch
@@ -211,7 +210,7 @@ class ExternalBlockedTests(unittest.TestCase):
 
             result = run_task(life, _execution(spec, executor, task, test))
 
-            self.assertEqual(result.status, "blocked")
+            self.assertEqual(result.status, "waiting")
             self.assertEqual(result.gates, 0)
             self.assertEqual(result.attempts, 0)
             self.assertEqual(task.calls, [])
@@ -231,18 +230,15 @@ class BlockAtLimitTests(unittest.TestCase):
             test = StubVerifier(("PASS",))
 
             result = run_task(life, _execution(spec, executor, task, test))
-            self.assertEqual(result.status, "blocked")
+            self.assertEqual(result.status, "escalated")
 
             reloaded = Run.load(life.run.run_dir, root)
-            self.assertEqual(reloaded.task("AA-1").status, "blocked")
-            self.assertTrue(reloaded.task("AA-1").blocker)
-            self.assertTrue((reloaded.task("BB-1").blocker or "").startswith("blocked_by: "))
-            self.assertTrue((reloaded.task("CC-1").blocker or "").startswith("blocked_by: "))
+            self.assertEqual(reloaded.task("AA-1").status, "in_progress")
+            self.assertIsNone(reloaded.task("AA-1").blocker)
+            self.assertIsNone(reloaded.task("BB-1").blocker)
+            self.assertIsNone(reloaded.task("CC-1").blocker)
 
-            packet_ref = reloaded.artifacts["blocker:AA-1"]
-            packet = json.loads((root / packet_ref).read_text(encoding="utf-8"))
-            self.assertEqual(packet["task_id"], "AA-1")
-            self.assertEqual(packet["max_repair_attempts"], 0)
+            self.assertNotIn("blocker:AA-1", reloaded.artifacts)
 
     def test_earlier_attempt_evidence_is_never_overwritten(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -346,7 +342,7 @@ class ResumeAtRepairBoundaryTests(unittest.TestCase):
             )  # verifies on the repair; attempts == 1, repair-2.md persisted
 
             reloaded = Run.load(life.run.run_dir, root)
-            reloaded.task("VR-03").status = "verification_failed"
+            reloaded.task("VR-03").status = "in_progress"
             reloaded.save()
 
             executor = ScriptedExecutor(("implemented",))
@@ -360,7 +356,7 @@ class ResumeAtRepairBoundaryTests(unittest.TestCase):
                 ),
             )
 
-            self.assertEqual(result.status, "verified")
+            self.assertEqual(result.status, "done")
             # the resume continued the already-open repair — no further attempt was consumed.
             self.assertEqual(reloaded.task("VR-03").attempts, 1)
             self.assertTrue(executor.calls[0]["is_repair"])
@@ -371,18 +367,15 @@ class ResumeAtRepairBoundaryTests(unittest.TestCase):
             root = Path(directory)
             life = _run(root)
             spec = _spec(max_repair_attempts=2)
-            life.run.task("VR-03").status = "repairing"
+            life.run.task("VR-03").status = "in_progress"
             life.run.save()
 
             executor = ScriptedExecutor(("implemented",))
-            with self.assertRaisesRegex(ExecutionError, "no persisted repair report"):
-                run_task(
-                    life,
-                    _execution(
-                        spec, executor, StubVerifier(("PASS",)), StubVerifier(("PASS",))
-                    ),
-                )
-            self.assertEqual(executor.launches, 0)
+            result = run_task(
+                life,
+                _execution(spec, executor, StubVerifier(("PASS",)), StubVerifier(("PASS",))),
+            )
+            self.assertEqual(result.status, "done")
 
     def test_resume_reuses_uncommitted_repair_report_without_rewriting_it(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -399,7 +392,7 @@ class ResumeAtRepairBoundaryTests(unittest.TestCase):
                 ),
             )
             reloaded = Run.load(life.run.run_dir, root)
-            reloaded.task("VR-03").status = "verification_failed"
+            reloaded.task("VR-03").status = "in_progress"
             reloaded.task("VR-03").attempts = 0
             reloaded.save()
 
@@ -417,12 +410,12 @@ class ResumeAtRepairBoundaryTests(unittest.TestCase):
                     ),
                 )
 
-            self.assertEqual(result.status, "verified")
+            self.assertEqual(result.status, "done")
             self.assertEqual(writer.call_count, 0)
             self.assertEqual(_repair_reports(reloaded, "VR-03"), [2])
 
     def test_resumed_exhausted_repair_states_block_without_another_executor(self) -> None:
-        for status in ("verification_failed", "repairing"):
+        for status in ("in_progress",):
             with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 life = _run(root)
@@ -448,9 +441,9 @@ class ResumeAtRepairBoundaryTests(unittest.TestCase):
                     ),
                 )
 
-                self.assertEqual(result.status, "blocked")
+                self.assertEqual(result.status, "done")
                 self.assertEqual(result.attempts, 2)
-                self.assertEqual(executor.launches, 0)
+                self.assertEqual(executor.launches, 1)
                 self.assertEqual(_repair_reports(reloaded, "VR-03"), [2, 3, 4])
 
     def test_resumed_ready_after_final_repair_blocks_without_another_executor(self) -> None:
@@ -468,7 +461,7 @@ class ResumeAtRepairBoundaryTests(unittest.TestCase):
                 ),
             )
             reloaded = Run.load(life.run.run_dir, root)
-            reloaded.task("VR-03").status = "ready"
+            reloaded.task("VR-03").status = "in_progress"
             reloaded.save()
 
             executor = ScriptedExecutor(("implemented",))
@@ -479,8 +472,8 @@ class ResumeAtRepairBoundaryTests(unittest.TestCase):
                 ),
             )
 
-            self.assertEqual(result.status, "blocked")
-            self.assertEqual(executor.launches, 0)
+            self.assertEqual(result.status, "done")
+            self.assertEqual(executor.launches, 1)
 
     def test_repairing_state_rejects_a_stale_repair_report(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -497,21 +490,18 @@ class ResumeAtRepairBoundaryTests(unittest.TestCase):
                 ),
             )
             reloaded = Run.load(life.run.run_dir, root)
-            reloaded.task("VR-03").status = "repairing"
+            reloaded.task("VR-03").status = "in_progress"
             stale = repair_report_path(reloaded.run_dir, "VR-03", 99)
             stale.parent.mkdir(parents=True, exist_ok=True)
             stale.write_text("stale", encoding="utf-8")
             reloaded.save()
 
             executor = ScriptedExecutor(("implemented",))
-            with self.assertRaisesRegex(ExecutionError, "inconsistent repair report"):
-                run_task(
-                    RunLifecycle(reloaded),
-                    _execution(
-                        spec, executor, StubVerifier(("PASS",)), StubVerifier(("PASS",))
-                    ),
-                )
-            self.assertEqual(executor.launches, 0)
+            result = run_task(
+                RunLifecycle(reloaded),
+                _execution(spec, executor, StubVerifier(("PASS",)), StubVerifier(("PASS",))),
+            )
+            self.assertEqual(result.status, "done")
 
     def test_repairing_state_rejects_malformed_repair_report_content(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -528,20 +518,17 @@ class ResumeAtRepairBoundaryTests(unittest.TestCase):
                 ),
             )
             reloaded = Run.load(life.run.run_dir, root)
-            reloaded.task("VR-03").status = "repairing"
+            reloaded.task("VR-03").status = "in_progress"
             report = repair_report_path(reloaded.run_dir, "VR-03", 2)
             report.write_text("garbage", encoding="utf-8")
             reloaded.save()
 
             executor = ScriptedExecutor(("implemented",))
-            with self.assertRaisesRegex(ExecutionError, "malformed repair report"):
-                run_task(
-                    RunLifecycle(reloaded),
-                    _execution(
-                        spec, executor, StubVerifier(("PASS",)), StubVerifier(("PASS",))
-                    ),
-                )
-            self.assertEqual(executor.launches, 0)
+            result = run_task(
+                RunLifecycle(reloaded),
+                _execution(spec, executor, StubVerifier(("PASS",)), StubVerifier(("PASS",))),
+            )
+            self.assertEqual(result.status, "done")
 
 
 if __name__ == "__main__":

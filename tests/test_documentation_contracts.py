@@ -163,7 +163,7 @@ class ExitCodeTableTests(unittest.TestCase):
         self.assertEqual(EXIT_OK, 0)
         self.assertIn(f"Exit `{EXIT_OK}` is reserved for `--status`", text)
         self.assertIn(f"`{EXIT_GATE_PENDING}` means a delivery gate is pending", text)
-        self.assertIn(f"`{EXIT_BLOCKED}` blocked", text)
+        self.assertIn(f"`{EXIT_BLOCKED}` records an\noperational finding", text)
         self.assertIn(f"`{EXIT_ERROR}` input/profile/routing error", text)
 
 
@@ -190,6 +190,42 @@ class CrossLinkTests(unittest.TestCase):
 
 
 class DocumentationContractTests(unittest.TestCase):
+    def test_lifecycle_docs_distinguish_three_task_states_from_operation_outcomes(self) -> None:
+        text = (
+            _text("docs/contracts/feature-pipeline.md")
+            + _text("docs/agents/README.md")
+            + _text("docs/agents/task-metadata-contract.md")
+        )
+        for token in (
+            "`to_do`, `in_progress`, and `done`",
+            "operation outcomes",
+            "scope amendment",
+            "reopen a Done task",
+            "cancelled",
+            "independent verification",
+        ):
+            with self.subTest(token=token):
+                self.assertIn(token, text)
+
+    def test_lifecycle_docs_do_not_describe_blocked_as_a_terminal_state(self) -> None:
+        text = (
+            _text("feature-pipeline-skill/README.md")
+            + _text("feature-pipeline-skill/scripts/README.md")
+            + _text("docs/agents/README.md")
+            + _text("docs/agents/task-metadata-contract.md")
+            + _text("docs/contracts/feature-pipeline.md")
+        )
+        for obsolete_description in (
+            "ended `blocked`",
+            "dependency suppression",
+            "Blocked tasks require explicit human recovery",
+            "blocked predecessor",
+            "unblock procedure",
+            "unblock transition",
+        ):
+            with self.subTest(obsolete_description=obsolete_description):
+                self.assertNotIn(obsolete_description, text)
+
     def test_runtime_contract_mentions_reuse_scope_protocol_and_recovery(self) -> None:
         text = _text("docs/contracts/feature-pipeline.md") + _text("docs/architecture/feature-pipeline.md")
         for token in (
@@ -198,6 +234,20 @@ class DocumentationContractTests(unittest.TestCase):
             "result-protocol-invalid", "launch-failure-<N>.json", "turn.completed",
             "durable-first", "canonical task-local state", "real filesystem failure",
             "KLC-03", "KLC-02", "klc-current-plan",
+        ):
+            with self.subTest(token=token):
+                self.assertIn(token, text)
+
+    def test_operator_docs_explain_historical_card_reconciliation(self) -> None:
+        text = " ".join((
+            _text("docs/agents/README.md") + _text("docs/contracts/feature-pipeline.md")
+        ).split())
+        for token in (
+            "Historical-card reconciliation",
+            "durable verified replacement evidence",
+            "historical run bytes",
+            "runner-owned audit event",
+            "leaves every ineligible card",
         ):
             with self.subTest(token=token):
                 self.assertIn(token, text)

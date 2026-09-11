@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 
 from pipeline_core.adapters import AdapterError, ClaudeAdapter, LaunchResult
-from pipeline_core.dispatch import DispatchRequest, dispatch_executor
+from pipeline_core.dispatch import DispatchError, DispatchRequest, dispatch_executor as _dispatch_executor
 from pipeline_core.lifecycle import RunLifecycle
 from pipeline_core.prompt_envelope import EnvelopeAnchors, build_executor_envelope
 from pipeline_core.reports import (
@@ -23,6 +23,7 @@ from pipeline_core.reports import (
 )
 from pipeline_core.state import ACTOR_EXECUTOR, ACTOR_RUNNER, Run, TransitionError
 from feature_pipeline.contracts import TaskSpec
+from feature_pipeline.application.work_items import activate_work_item, register_work_items
 
 
 # --- fixtures --------------------------------------------------------------------------------
@@ -155,6 +156,7 @@ def _running_life(root: Path, spec: TaskSpec) -> RunLifecycle:
     prompt.write_text("feature", encoding="utf-8")
     run = Run.create("dispatch", prompt, None, root / "storage" / "dispatch", root)
     life = RunLifecycle.initialize(run, tasks=[(spec.id, [])])
+    register_work_items(run, (spec,))
     life.transition(spec.id, "running", actor=ACTOR_RUNNER)
     return life
 
@@ -168,6 +170,12 @@ def _request(spec: TaskSpec, **overrides: object) -> DispatchRequest:
     return DispatchRequest(**base)  # type: ignore[arg-type]
 
 
+def dispatch_executor(life: RunLifecycle, request: DispatchRequest, adapter: object):
+    """Dispatch through the explicit producer-activation boundary used in production."""
+    with activate_work_item(life.run, request.spec.id):
+        return _dispatch_executor(life, request, adapter)  # type: ignore[arg-type]
+
+
 # --- reports.py units ----------------------------------------------------------------------------
 
 
@@ -178,6 +186,20 @@ class ReportParsingTests(unittest.TestCase):
         with self.assertRaises(ReportError) as ctx:
             parse_executor_status("the work is done")
         self.assertEqual(ctx.exception.code, "unparseable-report")
+
+
+class ProducerAttributionTests(unittest.TestCase):
+    def test_direct_unregistered_executor_launch_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = _spec()
+            prompt = root / "prompt.md"; prompt.write_text("x", encoding="utf-8")
+            run = Run.create("direct", prompt, None, root / "runs" / "direct", root)
+            life = RunLifecycle.initialize(run, tasks=[(spec.id, ())])
+            life.transition(spec.id, "running", actor=ACTOR_RUNNER)
+            with self.assertRaises(DispatchError) as raised:
+                _dispatch_executor(life, _request(spec), ScriptedAdapter())
+            self.assertEqual(raised.exception.code, "unregistered-producer")
 
     def test_status_envelope_is_strict_about_shape_and_identity(self) -> None:
         self.assertEqual(
@@ -267,7 +289,7 @@ class GenerationTests(unittest.TestCase):
 
             self.assertEqual(outcome.generation, 1)
             self.assertEqual(outcome.status, "retryable")
-            self.assertEqual(life.run.task(spec.id).status, "running")
+            self.assertEqual(life.run.task(spec.id).status, "in_progress")
             self.assertIsNone(outcome.settled_status)
             self.assertEqual(life.run.task(spec.id).next_executor_launch_generation, 2)
 
@@ -287,7 +309,7 @@ class GenerationTests(unittest.TestCase):
             outcome = dispatch_executor(life, _request(spec), adapter)
 
             self.assertEqual(outcome.status, "retryable")
-            self.assertEqual(life.run.task(spec.id).status, "running")
+            self.assertEqual(life.run.task(spec.id).status, "in_progress")
             self.assertTrue(outcome.artifacts.launch_failure.is_file())
             saved = json.loads(outcome.artifacts.launch_failure.read_text(encoding="utf-8"))
             self.assertEqual(saved["exit_code"], 7)
@@ -305,7 +327,7 @@ class GenerationTests(unittest.TestCase):
                 life, _request(spec), ScriptedAdapter(raise_code="adapter-unavailable"))
 
             self.assertEqual(outcome.status, "retryable")
-            self.assertEqual(life.run.task(spec.id).status, "running")
+            self.assertEqual(life.run.task(spec.id).status, "in_progress")
             self.assertIn("adapter-unavailable", outcome.failure or "")
             self.assertTrue(outcome.artifacts.launch_failure.is_file())
             self.assertEqual(life.run.task(spec.id).next_executor_launch_generation, 2)
@@ -437,7 +459,7 @@ class StatusSettlementTests(unittest.TestCase):
                 "status": "implemented",
             }]))
             self.assertEqual(outcome.status, "implemented")
-            self.assertEqual(life.run.task(spec.id).status, "implemented")
+            self.assertEqual(life.run.task(spec.id).status, "in_progress")
             captured = outcome.artifacts.executor_report.read_text(encoding="utf-8")
             self.assertIn('"status\\": \\"implemented\\"', captured)
 
@@ -512,7 +534,7 @@ class RecoveryEvidenceTests(unittest.TestCase):
                        "status": "implemented"}
             outcome = dispatch_executor(life, _request(spec), CodexFinalAdapter([payload, payload]))
             self.assertEqual(outcome.status, "retryable")
-            self.assertEqual(life.run.task(spec.id).status, "running")
+            self.assertEqual(life.run.task(spec.id).status, "in_progress")
             self.assertTrue(outcome.artifacts.result_protocol_invalid.is_file())
             self.assertNotIn("executor reported blocked", life.run.task(spec.id).blocker or "")
 
@@ -571,7 +593,9 @@ class RecoveryEvidenceTests(unittest.TestCase):
                 "status": "blocked", "reason": "required service is unavailable",
             }]))
             self.assertEqual(outcome.status, "blocked")
-            self.assertEqual(life.run.task(spec.id).blocker, "required service is unavailable")
+            wait = life.run.task(spec.id).operation_history[-1]
+            self.assertEqual(wait["kind"], "wait")
+            self.assertEqual(wait["detail"], "required service is unavailable")
 
     def test_codex_prompt_uses_the_current_repair_attempt(self) -> None:
         spec = _spec()
@@ -605,7 +629,7 @@ class RecoveryEvidenceTests(unittest.TestCase):
             outcome = dispatch_executor(life, _request(spec), ScriptedAdapter())
 
             self.assertEqual(outcome.status, "implemented")
-            self.assertEqual(life.run.task(spec.id).status, "implemented")
+            self.assertEqual(life.run.task(spec.id).status, "in_progress")
             evidence = life.run.task(spec.id).execution_evidence
             self.assertEqual(evidence["launch_generation"], 1)
             self.assertTrue(
@@ -636,7 +660,7 @@ class RecoveryEvidenceTests(unittest.TestCase):
             self.assertEqual(outcome.status, "retryable")
             self.assertIsNone(outcome.settled_status)
             self.assertIn("status-envelope-mismatch", outcome.failure or "")
-            self.assertEqual(life.run.task(spec.id).status, "running")
+            self.assertEqual(life.run.task(spec.id).status, "in_progress")
             self.assertTrue(outcome.artifacts.launch_failure.exists())
 
     def test_malformed_status_envelope_is_denied(self) -> None:
@@ -649,7 +673,7 @@ class RecoveryEvidenceTests(unittest.TestCase):
 
             self.assertEqual(outcome.status, "retryable")
             self.assertIn("unparseable-status-envelope", outcome.failure or "")
-            self.assertEqual(life.run.task(spec.id).status, "running")
+            self.assertEqual(life.run.task(spec.id).status, "in_progress")
 
     def test_executor_reported_blocked_blocks_without_a_launch_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -662,7 +686,9 @@ class RecoveryEvidenceTests(unittest.TestCase):
             self.assertEqual(outcome.status, "blocked")
             self.assertEqual(outcome.settled_status, "blocked")
             self.assertFalse(outcome.artifacts.launch_failure.exists())
-            self.assertIn("executor reported blocked", life.run.task(spec.id).blocker or "")
+            wait = life.run.task(spec.id).operation_history[-1]
+            self.assertEqual(wait["kind"], "wait")
+            self.assertIn("executor reported blocked", wait["detail"] or "")
 
 
 # --- state authority -------------------------------------------------------------------------
@@ -683,19 +709,16 @@ class StateAuthorityTests(unittest.TestCase):
                 self.assertEqual(outcome.status, expected)
                 self.assertIn(outcome.status, {"implemented", "blocked", "retryable"})
 
-    def test_executor_output_cannot_set_verified(self) -> None:
+    def test_executor_output_leaves_completion_for_independent_verification(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             spec = _spec()
             life = _running_life(root, spec)
             dispatch_executor(life, _request(spec), ScriptedAdapter())
 
-            with self.assertRaises(TransitionError) as ctx:
-                life.run.transition_task(spec.id, "verified", actor=ACTOR_EXECUTOR)
-            self.assertEqual(ctx.exception.code, "unauthorized-transition")
-            # The runner remains the only actor that can.
-            life.run.transition_task(spec.id, "verified", actor=ACTOR_RUNNER)
-            self.assertEqual(life.run.task(spec.id).status, "verified")
+            self.assertEqual(life.run.task(spec.id).status, "in_progress")
+            self.assertIsNone(life.run.task(spec.id).verification["task_verdict"])
+            self.assertIsNone(life.run.task(spec.id).verification["test_verdict"])
 
     def test_dispatch_attributes_the_window_and_fails_closed_without_a_repo(self) -> None:
         # The dispatch fixtures run outside a Git work tree, so attribution has no baseline:
@@ -752,6 +775,77 @@ def _init_repo(root: Path) -> None:
 
 
 class DispatchAttributionTests(unittest.TestCase):
+    def test_tc03_runner_projection_is_durable_and_not_charged_to_allowed_review(self) -> None:
+        """TC-03: prior runner projections are protected context, not executor work.
+
+        TC-01/TC-02 and the board are already dirty because the runner projected their
+        lifecycle state.  TC-03's executor writes only its declared review artifact.  The
+        executor manifest must therefore contain only that review while the prior writes
+        remain durably attributed to the runner.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _init_repo(root)
+            protected = (
+                "docs/kanban.md",
+                "docs/plans/tasks/TC-01.md",
+                "docs/plans/tasks/TC-02.md",
+            )
+            for relative in protected:
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("runner lifecycle projection\n", encoding="utf-8")
+            spec = _spec(allowed_scope=("reviews/TC-03.md",))
+            life = _running_life(root, spec)
+            life.run.add_task("TC-01")
+            life.run.add_task("TC-02")
+            life.run.record_runner_projection("TC-01", protected[:2])
+            life.run.record_runner_projection("TC-02", (protected[2],))
+
+            def executor_writes_review() -> None:
+                review = root / "reviews" / "TC-03.md"
+                review.parent.mkdir(parents=True, exist_ok=True)
+                review.write_text("TC-03 review\n", encoding="utf-8")
+
+            outcome = dispatch_executor(
+                life, _request(spec), ScriptedAdapter(on_launch=executor_writes_review))
+
+            self.assertEqual(outcome.status, "implemented")
+            self.assertEqual(
+                [row["path"] for row in outcome.attribution.changed_files],
+                ["reviews/TC-03.md"],
+            )
+            self.assertEqual(
+                [entry["path"] for entry in life.run.task("TC-01").runner_owned_writes],
+                list(protected[:2]),
+            )
+            self.assertEqual(
+                [entry["path"] for entry in life.run.task("TC-02").runner_owned_writes],
+                [protected[2]],
+            )
+
+    def test_executor_change_outside_initial_estimate_is_recorded_for_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _init_repo(root)
+            protected = "docs/kanban.md"
+            path = root / protected
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("runner lifecycle projection\n", encoding="utf-8")
+            spec = _spec(allowed_scope=("reviews/TC-03.md",))
+            life = _running_life(root, spec)
+            life.run.record_runner_projection(spec.id, (protected,))
+
+            def executor_changes_protected() -> None:
+                path.write_text("executor overwrite\n", encoding="utf-8")
+
+            outcome = dispatch_executor(
+                life, _request(spec), ScriptedAdapter(on_launch=executor_changes_protected))
+
+            self.assertEqual(outcome.status, "implemented")
+            amendment = life.run.task(spec.id).execution_evidence["implementation"]["scope_amendment"]
+            self.assertEqual(amendment["observed_paths"], [protected])
+
     def test_known_delta_captures_the_executor_edit_and_classifies_scope(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -766,12 +860,17 @@ class DispatchAttributionTests(unittest.TestCase):
             outcome = dispatch_executor(
                 life, _request(spec), ScriptedAdapter(on_launch=mutate))
 
+            self.assertEqual(outcome.status, "implemented")
             self.assertEqual(outcome.attribution.state, "known")
             by_path = {row["path"]: row for row in outcome.attribution.changed_files}
             self.assertEqual(by_path["src.py"]["status"], "modified")
             self.assertEqual(by_path["src.py"]["classification"], "in_allowed_scope")
             self.assertTrue(by_path["src.py"]["digest"].startswith("sha256:"))
             self.assertEqual(by_path["stray.txt"]["classification"], "out_of_scope")
+
+            implementation = life.run.task(spec.id).execution_evidence["implementation"]
+            self.assertEqual(
+                implementation["scope_amendment"]["observed_paths"], ["stray.txt"])
 
             diff = outcome.artifacts.implementation_diff.read_text(encoding="utf-8")
             self.assertIn("# attribution: known", diff)

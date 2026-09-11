@@ -325,6 +325,42 @@ class ResumeCompatibilityTests(unittest.TestCase):
             run.save()
             _ensure_plan_compatible(run, plan)  # no raise
 
+    def test_resume_tolerates_rec_11_outside_recorded_execution_scope(self) -> None:
+        """An independent newly planned task must not invalidate TC-05's recorded scope."""
+        profile = compiled_profile_from_core(Profile.from_data(_native_profile()))
+        recorded = compile_run_plan(
+            feature="tc-05-work-items-pipeline",
+            definitions=[
+                ShallowTaskInput("TC-01", "docs"),
+                ShallowTaskInput("TC-05", "docs", ("TC-01",)),
+            ],
+            profile=profile,
+            task="TC-05",
+        )
+        resumed = compile_run_plan(
+            feature="tc-05-work-items-pipeline",
+            definitions=[
+                ShallowTaskInput("TC-01", "docs"),
+                ShallowTaskInput("REC-11", "docs"),
+                ShallowTaskInput("TC-05", "docs", ("TC-01",)),
+            ],
+            profile=profile,
+            task="TC-05",
+        )
+        self.assertEqual(recorded.execution_scope, resumed.execution_scope)
+        self.assertNotEqual(recorded.order, resumed.order)
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = Run.create(
+                "tc-05-work-items-pipeline", root / "prompt.md", root / "plan.json",
+                root / "runs" / "tc-05-work-items-pipeline", root,
+            )
+            run.set_control(
+                "plan_fingerprint", _plan_fingerprint(recorded), sourced="explicit")
+            run.save()
+            _ensure_plan_compatible(run, resumed)
+
 
 if __name__ == "__main__":
     unittest.main()

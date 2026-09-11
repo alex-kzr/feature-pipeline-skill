@@ -134,12 +134,12 @@ class TaskRunResult:
 
     @property
     def ok(self) -> bool:
-        return self.status == "verified"
+        return self.status in {"done", "verified"}
 
     @property
     def exit_code(self) -> int:
         """0 only for ``verified``; a blocked task exits non-zero (AC-4)."""
-        return 0 if self.status == "verified" else 1
+        return 0 if self.ok else 1
 
 
 def build_completion_evidence(run: Run, spec: TaskSpec) -> CompletionEvidence:
@@ -171,7 +171,8 @@ def build_completion_evidence(run: Run, spec: TaskSpec) -> CompletionEvidence:
     return CompletionEvidence(
         completed_at=record.verification.get("verified_at") or _utcnow(),
         run_id=run.run_id,
-        outcome="verified",
+        resolution=record.resolution or "completed",
+        resolution_reason=record.resolution_reason,
         repair_count=record.attempts,
         gate_count=gate,
         task_verdict=record.verification.get("task_verdict"),
@@ -205,32 +206,9 @@ class TaskEngine:
         task_id = spec.id
         maximum = int(spec.max_repair_attempts)
         record = run.task(task_id)
-        recovered_repair = (
-            record.status in {"verification_failed", "repairing"}
-            or (record.status == "ready" and record.attempts > 0)
-        )
-        if recovered_repair and record.attempts >= maximum:
-            report = newest_repair_report(run.run_dir, task_id)
-            diagnostic = self._diagnostics.collect(
-                run,
-                task_id=task_id,
-                attempt=record.attempts + 1,
-                note=f"maximum repair attempts ({maximum}) already exhausted on resume",
-            )
-            return self._block(
-                life,
-                request,
-                record.attempts + 1,
-                0,
-                (),
-                blocker=(
-                    f"maximum repair attempts ({maximum}) reached; no repair budget remains"
-                ),
-                diagnostic=diagnostic,
-                repair_report=report,
-            )
-
-        repair_of, skip_executor = self._enter(life, task_id)
+        repair_of, skip_executor = self._enter(life, request)
+        if skip_executor:
+            return TaskRunResult(task_id, "done", record.attempts, 0, None, None, ())
         passes: list[RepairPass] = []
         gates = 0
 
@@ -242,15 +220,9 @@ class TaskEngine:
                 if request.pre_dispatch is not None:
                     blocker = request.pre_dispatch()
                     if blocker:
-                        return TaskRunResult(task_id, "blocked", record.attempts, gates,
+                        life.record_operation(task_id, "precondition", "blocked", blocker)
+                        return TaskRunResult(task_id, "waiting", record.attempts, gates,
                                              blocker, None, tuple(passes))
-                if record.status == "repairing":
-                    life.transition(
-                        task_id, "running", actor=ACTOR_RUNNER,
-                        note=f"repair attempt {record.attempts}: fresh executor window")
-                # KLC-03: project the durable 'running' transition onto the Markdown board
-                # before the executor is launched — never after.
-                self._project(run, request, "running")
                 dispatch = dispatch_executor(
                     life,
                     DispatchRequest(
@@ -278,128 +250,67 @@ class TaskEngine:
                         tuple(passes),
                     )
                 if dispatch.status != "implemented":
-                    passes.append(RepairPass(gate, "blocked", repair_of, None, None))
-                    return self._block(
-                        life, request, gate, gates, passes,
-                        blocker=(run.task(task_id).blocker
-                                 or f"executor could not implement {task_id}: "
-                                    f"{dispatch.failure}"),
-                        diagnostic=None)
+                    blocker = (run.task(task_id).blocker
+                               or f"executor could not implement {task_id}: {dispatch.failure}")
+                    life.record_operation(task_id, "executor", "failed", blocker, gate=gate)
+                    passes.append(RepairPass(gate, "waiting", repair_of, None, None))
+                    return TaskRunResult(task_id, "waiting", record.attempts, gates,
+                                         blocker, None, tuple(passes))
             skip_executor = False
 
             gates += 1
             outcome = self._verify_gate(run, request, gate)
             verdict = (outcome.task_verdict, outcome.test_verdict)
 
-            if outcome.status == "verified":
-                passes.append(RepairPass(gate, "verified", repair_of, *verdict))
+            if outcome.status == "done":
+                passes.append(RepairPass(gate, "done", repair_of, *verdict))
                 life.recompute_readiness()
                 run.save()
-                self._project(run, request, "verified", build_completion_evidence(run, spec))
+                self._project(run, request, "done", build_completion_evidence(run, spec))
                 return TaskRunResult(
-                    task_id, "verified", run.task(task_id).attempts, gates, None, None,
+                    task_id, "done", run.task(task_id).attempts, gates, None, None,
                     tuple(passes))
 
-            if outcome.status == "blocked":
-                # An external BLOCKED verdict or a verifier launch/settlement failure — never
-                # spends a repair attempt (AC-3). The task is already 'blocked' with a blocker.
-                passes.append(RepairPass(gate, "blocked", repair_of, *verdict))
-                return self._block(
-                    life, request, gate, gates, passes,
-                    blocker=run.task(task_id).blocker
-                    or "verification blocked (external cause)",
-                    diagnostic=outcome.diagnostic)
+            if outcome.failure or "BLOCKED" in verdict:
+                # External waits and verifier launch failures are resumable operations.
+                blocker = run.task(task_id).blocker or "verification waiting on an external cause"
+                life.record_operation(task_id, "verification", "blocked", blocker, gate=gate)
+                passes.append(RepairPass(gate, "waiting", repair_of, *verdict))
+                run.save()
+                return TaskRunResult(task_id, "waiting", record.attempts, gates,
+                                     blocker, outcome.diagnostic, tuple(passes))
 
-            # outcome.status == 'verification_failed': consolidate and try a bounded repair.
+            # A failed gate is auditable and a later operation may always continue it.
             report = self._write_repair_report(run, spec, gate, outcome)
-            passes.append(RepairPass(gate, "verification_failed", repair_of, *verdict))
+            passes.append(RepairPass(gate, "failed", repair_of, *verdict))
 
             if not run.begin_repair(task_id, maximum=maximum):
                 run.save()
-                diagnostic = self._diagnostics.collect(
-                    run, task_id=task_id, attempt=gate,
-                    note=f"maximum repair attempts ({maximum}) reached; no repair budget "
-                         f"remains")
-                return self._block(
-                    life, request, gate, gates, passes,
-                    blocker=(f"maximum repair attempts ({maximum}) reached after verification "
-                             f"gate {gate}; last verdicts task={verdict[0]} test={verdict[1]}"),
-                    diagnostic=diagnostic, repair_report=report.path)
+                blocker = (f"maximum repair attempts ({maximum}) reached after verification "
+                           f"gate {gate}; last verdicts task={verdict[0]} test={verdict[1]}")
+                return TaskRunResult(task_id, "escalated", record.attempts, gates,
+                                     blocker, None, tuple(passes))
             run.save()
             repair_of = repo_relative(report.path, run.repo_root)
 
     # -- entry reconciliation -----------------------------------------------------------
 
-    def _enter(self, life: RunLifecycle, task_id: str) -> tuple[str | None, bool]:
-        """Resolve the loop's starting point from the persisted task state.
-
-        Returns ``(repair_report_path, skip_executor)``. A resume that rolled an interrupted
-        ``repairing`` back to ``verification_failed`` (or an interrupted repair executor back
-        to ``ready``) is continued against the already-written repair report so the attempt
-        is not counted twice.
-        """
+    def _enter(self, life: RunLifecycle, request: TaskExecution) -> tuple[str | None, bool]:
+        """Resolve the latest resumable operation without reintroducing legacy states."""
         run = life.run
+        task_id = request.spec.id
         record = run.task(task_id)
-        report = newest_repair_report(run.run_dir, task_id)
-        expects_repair_report = (
-            record.status in {"verification_failed", "repairing"}
-            or (record.status in {"ready", "running"} and record.attempts > 0)
-        )
-        if expects_repair_report:
-            expected_attempts = {record.attempts + 1}
-            if record.status == "verification_failed":
-                expected_attempts.add(record.attempts + 2)
-            expected = {
-                repair_report_path(run.run_dir, task_id, attempt)
-                for attempt in expected_attempts
-            }
-            if report is None:
-                raise ExecutionError(
-                    f"{task_id} resumed at '{record.status}' with no persisted repair report",
-                    "missing-repair-report",
-                )
-            if report not in expected:
-                raise ExecutionError(
-                    f"{task_id} resumed at '{record.status}' with inconsistent repair report",
-                    "inconsistent-repair-report",
-                )
-            if not _valid_repair_report(report, task_id):
-                raise ExecutionError(
-                    f"{task_id} resumed at '{record.status}' with malformed repair report",
-                    "malformed-repair-report",
-                )
-
-        if record.status == "implemented":
-            return (repo_relative(report, run.repo_root) if report else None), True
-
-        if record.status == "verification_failed":
-            if report is None:
-                raise ExecutionError(
-                    f"{task_id} resumed at 'verification_failed' with no persisted repair "
-                    f"report",
-                    "missing-repair-report")
-            life.transition(
-                task_id, "repairing", actor=ACTOR_RUNNER,
-                note="resume: continue interrupted repair")
-            return repo_relative(report, run.repo_root), False
-
-        if record.status == "repairing":
-            if report is None:
-                raise ExecutionError(
-                    f"{task_id} resumed at 'repairing' with no persisted repair report",
-                    "missing-repair-report",
-                )
-            return repo_relative(report, run.repo_root), False
-
-        if record.status in {"ready", "running"}:
-            repair_of = (
-                repo_relative(report, run.repo_root)
-                if record.attempts > 0 and report is not None
-                else None
-            )
-            life.transition(task_id, "running", actor=ACTOR_RUNNER)
-            return repair_of, False
-
+        if record.status == "to_do":
+            self._project(run, request, "to_do")
+            life.transition(task_id, "in_progress", actor=ACTOR_RUNNER,
+                            note="executor operation started")
+            self._project(run, request, "in_progress")
+        if record.status == "in_progress":
+            report = newest_repair_report(run.run_dir, task_id)
+            return (repo_relative(report, run.repo_root) if report else None), False
+        if record.status == "done":
+            self._project(run, request, "done", build_completion_evidence(run, request.spec))
+            return None, True
         raise ExecutionError(
             f"{task_id} cannot enter the repair loop from '{record.status}'",
             "unexpected-entry-state")
@@ -480,6 +391,12 @@ class TaskEngine:
                 state=state,
                 evidence=evidence,
             )
+            # The projection has changed protected, human-facing files before the next
+            # executor window opens.  Persist its actor and content digests now; otherwise a
+            # later ambient diff cannot distinguish runner lifecycle maintenance from an
+            # executor edit.
+            run.record_runner_projection(spec.id, (Path(request.board_path), task_path))
+            run.save()
         except BoardProjectionError as exc:
             raise ExecutionError(
                 f"board projection failed for {spec.id} -> {state!r}: {exc}",
@@ -512,13 +429,7 @@ class TaskEngine:
                 run, task_id=task_id, attempt=gate, note=blocker)
 
         record = run.task(task_id)
-        if record.status != "blocked":
-            life.block(task_id, blocker)  # transition + blocker + suppress dependents + flush
-        else:
-            record.blocker = blocker
-            run.record_event(f"blocker:{task_id}", to="blocked", note=blocker)
-            life.recompute_readiness()  # suppress dependents an earlier block did not
-            run.save()
+        life.block(task_id, blocker)
 
         packet = write_json_atomic(
             Path(run.run_dir) / "reports" / task_id / f"blocked-{gate}.json",

@@ -46,6 +46,9 @@ class RunCommand:
     published_refs: list[str] = field(default_factory=list)
     recovery_source_feature: str | None = None
     recovery_task: str | None = None
+    operational_unblock_task: str | None = None
+    human_authorized_operational_unblock: bool = False
+    uv_cache_dir: str | None = None
 
     # Delivery gates.
     approve_plan: bool = False
@@ -90,6 +93,9 @@ class RunCommand:
             published_refs=list(args.published_ref or []),
             recovery_source_feature=args.recovery_source_feature,
             recovery_task=args.recovery_task,
+            operational_unblock_task=args.operational_unblock_task,
+            human_authorized_operational_unblock=args.human_authorized_operational_unblock,
+            uv_cache_dir=args.uv_cache_dir,
             approve_plan=args.approve_plan,
             approve_final_diff=args.approve_final_diff,
             commit=args.commit,

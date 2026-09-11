@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
 from feature_pipeline.application.diagnostic_service import DiagnosticService
+from feature_pipeline.application.work_items import WorkItemError, require_active_work_item
 
 from .adapters import (
     Adapter,
@@ -137,6 +138,9 @@ class VerificationEvidence:
     implementation_manifest: str | None = None
     implementation_diff: str | None = None
     changed_files: tuple[Mapping[str, object], ...] = ()
+    #: Content-addressed lifecycle projections written by the runner before this executor
+    #: window. They explain protected ambient files without turning them into executor work.
+    runner_owned_writes: tuple[Mapping[str, object], ...] = ()
     #: Runner-recorded actions performed outside the local implementation window (for
     #: example a push, tag, or remote-ruleset mutation).  It is deliberately explicit
     #: even when empty: task history and ambient Git state are not substitutes for it.
@@ -156,6 +160,11 @@ class VerificationEvidence:
         return self.external_blocker is None and not self.unrun_commands
 
     def as_dict(self) -> dict[str, object]:
+        amendment_paths = [
+            str(entry.get("path", ""))
+            for entry in self.changed_files
+            if entry.get("classification") == "out_of_scope"
+        ]
         return {
             "task_id": self.task_id,
             "attempt": self.attempt,
@@ -165,11 +174,21 @@ class VerificationEvidence:
                 "diff": self.implementation_diff,
                 "changed_files": [dict(entry) for entry in self.changed_files],
             },
+            "runner_owned_writes": [dict(entry) for entry in self.runner_owned_writes],
             "commands": [dict(entry) for entry in self.commands],
             "external_actions": [dict(entry) for entry in self.external_actions],
             "missing_evidence": [dict(entry) for entry in self.missing_evidence],
             "unrun_commands": [dict(entry) for entry in self.unrun_commands],
             "external_blocker": self.external_blocker,
+            "scope_amendment": {
+                "present": bool(amendment_paths),
+                "observed_paths": amendment_paths,
+                "rationale": (
+                    "executor-owned paths outside the initial estimate require independent "
+                    "amendment-justification review"
+                    if amendment_paths else None
+                ),
+            },
             "snapshot": dict(self.snapshot) if self.snapshot is not None else None,
             "current_run_boundary": {
                 "verification_snapshot": dict(self.snapshot) if self.snapshot is not None else None,
@@ -178,6 +197,7 @@ class VerificationEvidence:
                     "diff": self.implementation_diff,
                     "changed_files": [dict(entry) for entry in self.changed_files],
                 },
+                "runner_owned_writes": [dict(entry) for entry in self.runner_owned_writes],
                 "captured_commands": [dict(entry) for entry in self.commands],
                 "external_actions": [dict(entry) for entry in self.external_actions],
             },
@@ -218,6 +238,16 @@ def build_verification_evidence(
         }
         for cwd, argv in commands_run.unrun
     )
+    runner_writes: list[dict[str, object]] = []
+    # Runner lifecycle projections can belong to earlier tasks (for example TC-01/TC-02
+    # updating the shared board before TC-03 starts).  Carry their durable owner into this
+    # task's evidence so ambient protected files are explainable without treating them as
+    # implementation.  The executor manifest remains the sole source of executor changes.
+    for owner_id, owner in sorted(getattr(run, "tasks", {}).items()):
+        for entry in getattr(owner, "runner_owned_writes", ()):
+            row = dict(entry)
+            row["task_id"] = owner_id
+            runner_writes.append(row)
     return VerificationEvidence(
         task_id=task_id,
         attempt=attempt,
@@ -226,6 +256,7 @@ def build_verification_evidence(
         implementation_manifest=implementation.get("manifest"),
         implementation_diff=implementation.get("diff"),
         changed_files=tuple(dict(entry) for entry in implementation.get("changed_files") or ()),
+        runner_owned_writes=tuple(runner_writes),
         external_actions=tuple(
             dict(entry) for entry in execution.get("external_actions") or ()
         ),
@@ -281,13 +312,8 @@ def current_run_mutation_reason(spec: object, evidence: VerificationEvidence) ->
 
 
 def combine_verdict_status(task_verdict: str, test_verdict: str) -> str:
-    """The task state two parsed verdicts imply, fail-closed: any ``BLOCKED`` blocks, then any
-    ``FAIL`` fails verification, and only ``PASS`` + ``PASS`` verifies."""
-    if "BLOCKED" in (task_verdict, test_verdict):
-        return "blocked"
-    if "FAIL" in (task_verdict, test_verdict):
-        return "verification_failed"
-    return "verified"
+    """Return product status implied by verdicts; only two PASS verdicts complete work."""
+    return "done" if task_verdict == test_verdict == "PASS" else "in_progress"
 
 
 @dataclass(frozen=True)
@@ -389,10 +415,19 @@ class VerifierLaunchers:
 _VERIFIER_RULES: dict[str, tuple[str, ...]] = {
     "task_verifier": (
         "Re-read the feature prompt, the task file, and the acceptance criteria yourself.",
-        "Judge only whether the acceptance criteria are met by the implementation below.",
+        "Judge task requirements and acceptance criteria from the task-relevant snapshot and "
+        "runner-owned command evidence below, not whole-worktree git diff as a completion proxy.",
         "You may read the worktree; you may not modify anything and you may not run the "
         "verification commands — their outcomes are the runner-owned evidence below.",
+        "Treat implementation manifest/diff deltas only as supplementary allowed-scope checks; "
+        "they do not establish task completion by themselves.",
+        "Runner-owned writes identify lifecycle projections. Never charge those earlier writes "
+        "to the executor; only changes attributed inside this executor window may be scope "
+        "violations. An unavailable executor attribution is BLOCKED.",
         "Do not tick acceptance-criteria checkboxes.",
+        "Your report must include a separate 'Amendment-justification finding:' that states "
+        "whether the structured scope-amendment rationale and observed paths support the "
+        "claimed functionality (or that no amendment is present).",
         "For an acceptance criterion marked CURRENT-RUN ONLY, assess mutations only from "
         "the current_run_boundary in the runner-owned evidence: its verification snapshot, "
         "implementation manifest/diff and changed files, captured commands, and external "
@@ -407,6 +442,9 @@ _VERIFIER_RULES: dict[str, tuple[str, ...]] = {
         "never a prompt to re-run the check.",
         "Judge whether the recorded command evidence shows the task's verification commands "
         "passed.",
+        "Your report must include a separate 'Amendment-justification finding:' that states "
+        "whether the structured scope-amendment rationale and observed paths support the "
+        "claimed functionality (or that no amendment is present).",
     ),
 }
 
@@ -495,6 +533,7 @@ def build_verifier_prompt(
         "Final report:",
         "- Verdict: PASS | FAIL | BLOCKED",
         "- Findings:",
+        "- Amendment-justification finding:",
         "- Acceptance criteria assessment:",
     ]
     return "\n".join(lines) + "\n"
@@ -678,11 +717,13 @@ def _run_one_verifier(
 
 
 def _block(run: Run, task_id: str, reason: str) -> str:
+    """Record an unavailable verifier as an operation, leaving the task resumable."""
     record = run.task(task_id)
-    if record.status != "blocked":
-        run.transition_task(task_id, "blocked", actor=ACTOR_RUNNER, note=reason)
-    record.blocker = reason
-    run.record_event(f"verification-blocked:{task_id}", to="blocked", note=reason)
+    if record.status == "to_do":
+        run.transition_task(task_id, "in_progress", actor=ACTOR_RUNNER,
+                            note="verification operation started")
+    run.record_operation(task_id, "verification", "blocked", reason)
+    run.record_event(f"verification-wait:{task_id}", to="blocked", note=reason)
     return record.status
 
 
@@ -709,10 +750,14 @@ def orchestrate_verification(
     verdict to ``FAIL`` regardless of what the tool-less test verifier returned (AC-4).
     """
     task_id = spec.id
+    try:
+        require_active_work_item(run, task_id)
+    except WorkItemError as exc:
+        raise VerificationError(f"{exc.code}: {exc}") from None
     record = run.task(task_id)
-    if record.status != "implemented":
+    if record.status != "in_progress":
         raise VerificationError(
-            f"{task_id} must be 'implemented' to verify independently, is '{record.status}'")
+            f"{task_id} must be 'in_progress' to verify independently, is '{record.status}'")
     if evidence.task_id != task_id or evidence.attempt != attempt:
         raise VerificationError(
             "verification evidence does not match the task/attempt being verified")

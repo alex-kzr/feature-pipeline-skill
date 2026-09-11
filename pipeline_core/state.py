@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import hashlib
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,25 +20,13 @@ EXIT_LAUNCH_FAILED = "error"
 ACTOR_RUNNER = "runner"
 ACTOR_EXECUTOR = "executor"
 ACTOR_HUMAN = "human"
-TASK_TRANSITIONS = {
-    "pending": {"ready", "blocked"}, "ready": {"running", "blocked"},
-    "running": {"implemented", "blocked"},
-    "implemented": {"verified", "verification_failed", "blocked"},
-    "verification_failed": {"repairing", "implemented", "blocked"},
-    # ``repairing -> running`` lets the runner reopen a consumed repair attempt as a fresh
-    # executor window so the one dispatch path — which owns launch generations, status
-    # settlement, and diff attribution — is reused unchanged for a repair redispatch.
-    "repairing": {"implemented", "blocked", "running"},
-    # Fresh precondition observations can revoke eligibility; old verification evidence stays.
-    "verified": {"blocked"},
-    "blocked": {"ready", "implemented"},
-}
+TASK_TRANSITIONS = {"to_do": {"in_progress"}, "in_progress": {"done"}, "done": {"in_progress"}}
 
 #: Interrupted non-terminal states rolled back on resume. A ``running`` task lost its executor
 #: window and returns to ``ready`` for redispatch; a ``repairing`` task lost its repair window
 #: and returns to ``verification_failed`` for the repair loop. ``implemented`` and ``verified``
 #: are preserved; every other state is already safe to resume from as-is.
-RESUME_ROLLBACKS = {"running": "ready", "repairing": "verification_failed"}
+RESUME_ROLLBACKS: dict[str, str] = {}
 
 #: The only verdict tokens an independent verifier may return. ``BLOCKED`` is an external
 #: condition, never a defect, so it takes precedence over ``FAIL`` when the two verifiers
@@ -152,7 +141,10 @@ def _empty_execution_evidence() -> dict[str, Any]:
 class TaskRecord:
     """A portable task's durable identity, execution, and verification facts (schema v2)."""
     id: str
-    status: str = "pending"
+    status: str = "to_do"
+    resolution: str | None = None
+    resolution_reason: str | None = None
+    operation_history: list[dict[str, Any]] = field(default_factory=list)
     depends_on: list[str] = field(default_factory=list)
     attempts: int = 0
     blocker: str | None = None
@@ -164,6 +156,10 @@ class TaskRecord:
     verification: dict[str, Any] = field(default_factory=_empty_verification)
     execution_evidence: dict[str, Any] = field(default_factory=_empty_execution_evidence)
     changed_files: list[str] = field(default_factory=list)
+    #: Content-addressed writes made by the runner's lifecycle projection.  These are
+    #: durable provenance, not executor evidence: a later executor window must begin after
+    #: them and must never inherit them as its implementation delta.
+    runner_owned_writes: list[dict[str, Any]] = field(default_factory=list)
     verification_tier: str = "full"
     accepts_scoped: list[str] = field(default_factory=list)
     promotion: dict[str, Any] | None = None
@@ -227,10 +223,28 @@ def migrate_run_state(payload: Mapping[str, object]) -> dict[str, object]:
     rewriting the source file — callers only read here.
     """
     if payload.get("schema_version") == 1:
-        return migrate_v1_to_v2(payload)
+        payload = migrate_v1_to_v2(payload)
     if payload.get("schema_version") != SCHEMA_VERSION:
         raise StateError("unsupported run-state schema version", "unknown-schema-version")
-    return dict(payload)
+    migrated = dict(payload)
+    legacy = {
+        "pending": "to_do", "ready": "to_do", "running": "in_progress",
+        "implemented": "in_progress", "verification_failed": "in_progress",
+        "repairing": "in_progress", "verified": "done", "blocked": "in_progress",
+    }
+    tasks = []
+    for item in payload.get("tasks", []):
+        task = dict(item)
+        old_status = task.get("status")
+        if old_status in legacy:
+            task["status"] = legacy[old_status]
+            task.setdefault("resolution", "completed" if old_status == "verified" else None)
+            task.setdefault("resolution_reason", None)
+            task.setdefault("operation_history", []).append({"at": _now(), "kind": "legacy-state",
+                                                               "outcome": "migrated", "detail": old_status})
+        tasks.append(task)
+    migrated["tasks"] = tasks
+    return migrated
 
 
 @dataclass
@@ -313,24 +327,60 @@ class Run:
             raise StateError(f"unknown task '{task_id}'", "unknown-task") from None
 
     def ready_tasks(self) -> list[str]:
-        return [task.id for task in self.tasks.values() if task.status == "pending" and all(self.task(dep).status == "verified" for dep in task.depends_on)]
+        return [task.id for task in self.tasks.values() if task.status == "to_do" and all(self.task(dep).status == "done" for dep in task.depends_on)]
 
-    def transition_task(self, task_id: str, to: str, actor: str = ACTOR_RUNNER, note: str | None = None) -> str:
+    def transition_task(self, task_id: str, to: str, actor: str = ACTOR_RUNNER, note: str | None = None,
+                        resolution: str | None = None) -> str:
         record = self.task(task_id)
+        # Transitional callers from pre-v3 orchestration may still name a former execution
+        # phase.  Normalize it at this boundary; durable records never retain that vocabulary.
+        legacy_targets = {
+            "ready": "to_do", "running": "in_progress", "implemented": "in_progress",
+            "verification_failed": "in_progress", "repairing": "in_progress",
+            "blocked": "in_progress", "verified": "done",
+        }
+        legacy_target = to in legacy_targets
+        to = legacy_targets.get(to, to)
+        if legacy_target and to == "done" and resolution is None:
+            resolution = "completed"
+        if legacy_target and to == record.status:
+            self.record_event(
+                f"operation:{task_id}:legacy-transition", to=to, actor=actor,
+                note=note or "legacy execution phase normalized",
+            )
+            return to
         if to not in TASK_TRANSITIONS.get(record.status, set()):
             raise TransitionError(f"cannot transition {task_id} from {record.status} to {to}", "illegal-transition")
-        if to == "implemented" and actor not in {ACTOR_RUNNER, ACTOR_EXECUTOR}:
-            raise TransitionError("only an executor or runner may mark implemented", "unauthorized-transition")
-        if to == "verified" and actor != ACTOR_RUNNER:
-            raise TransitionError("only the runner may mark verified", "unauthorized-transition")
-        if record.status == "verified" and actor != ACTOR_RUNNER:
-            raise TransitionError("only the runner may revoke verified eligibility", "unauthorized-transition")
-        if record.status == "blocked" and actor != ACTOR_HUMAN:
-            raise TransitionError("only a human may unblock a task", "unauthorized-transition")
+        if to == "done" and resolution not in {"completed", "cancelled"}:
+            raise TransitionError("a done task requires a resolution", "missing-task-resolution")
+        if to == "done" and resolution == "completed" and actor != ACTOR_RUNNER:
+            raise TransitionError("only the runner may record completed work", "unauthorized-transition")
+        if to == "done" and resolution == "cancelled" and actor != ACTOR_HUMAN:
+            raise TransitionError("only a human may cancel a task", "unauthorized-transition")
+        if record.status == "done" and actor != ACTOR_HUMAN:
+            raise TransitionError("only a human may reopen a done task", "unauthorized-transition")
         previous = record.status
         record.status = to
+        record.resolution = resolution if to == "done" else None
+        record.resolution_reason = note if to == "done" else None
         self.history.append({"at": _now(), "scope": f"task:{task_id}", "from": previous, "to": to, "actor": actor, "note": note})
         return to
+
+    def record_operation(self, task_id: str, kind: str, outcome: str, detail: str | None = None,
+                         **facts: Any) -> dict[str, Any]:
+        """Persist a repeatable operation outcome without changing task progress."""
+        entry: dict[str, Any] = {"at": _now(), "kind": kind, "outcome": outcome, "detail": detail}
+        entry.update(facts)
+        self.task(task_id).operation_history.append(entry)
+        self.record_event(f"operation:{task_id}:{kind}", to=outcome, note=detail)
+        return entry
+
+    def latest_unfinished_operation(self, task_id: str) -> dict[str, Any] | None:
+        """Return the newest operation that did not reach a successful outcome."""
+        for entry in reversed(self.task(task_id).operation_history):
+            if entry.get("outcome") != "succeeded":
+                return dict(entry)
+        return None
 
     def record_command(self, stage: str, cwd: str | Path, argv: list[str], exit_code: Any, duration: float, stdout: str, stderr: str) -> dict[str, Any]:
         entry = {"id": f"command-{len(self.commands) + 1}", "stage": stage, "cwd": repo_relative(cwd, self.repo_root), "argv": list(argv), "exit_code": exit_code, "duration": duration, "stdout": stdout, "stderr": stderr}
@@ -380,6 +430,39 @@ class Run:
             f"execution-evidence:{task_id}", to=str(generation),
             actor=ACTOR_EXECUTOR, note="executor report recorded as execution evidence")
         return evidence
+
+    def record_runner_projection(
+        self, task_id: str, paths: Sequence[str | Path], *, operation: str = "lifecycle-projection",
+    ) -> list[dict[str, Any]]:
+        """Durably attribute already-written lifecycle projection files to the runner.
+
+        The digest binds the attribution to the exact content the runner wrote.  Refuse an
+        absent or unreadable path rather than leaving a projection difference with ambiguous
+        ownership for the next executor window.
+        """
+        record = self.task(task_id)
+        entries: list[dict[str, Any]] = []
+        for path in paths:
+            relative = repo_relative(path, self.repo_root)
+            target = self.repo_root / relative
+            try:
+                content = target.read_bytes()
+            except OSError as exc:
+                raise StateError(
+                    f"runner projection cannot attribute '{relative}': {exc}",
+                    "runner-attribution-unavailable",
+                ) from exc
+            entries.append({
+                "path": relative,
+                "digest": "sha256:" + hashlib.sha256(content).hexdigest(),
+                "operation": operation,
+            })
+        record.runner_owned_writes.extend(entries)
+        self.record_event(
+            f"runner-projection:{task_id}", to=operation, actor=ACTOR_RUNNER,
+            note="runner-owned writes: " + ", ".join(entry["path"] for entry in entries),
+        )
+        return entries
 
     def record_implementation_attribution(
         self,
@@ -457,20 +540,20 @@ class Run:
                 # persisted. Recovery rejects that incomplete source later.
                 pass
         record.external_launch_failures.append(entry)
+        self.record_operation(
+            task_id, stage, "failed", detail,
+            generation=generation, exit_code=exit_code,
+        )
         self.record_event(
             f"launch-failure:{task_id}:{stage}", frm=str(generation), to=str(generation),
             note=f"{stage} launch generation {generation} failed: {detail}")
         return entry
 
     def record_verdicts(self, task_id: str, task_verdict: str, test_verdict: str) -> str:
-        """Record two independent verifier verdicts and derive the task's next state.
+        """Record verdict evidence without making an operational failure terminal.
 
-        The sole producer of ``verified``: it takes ``PASS`` from *both* the task verifier
-        and the test verifier. When the two verdicts differ, precedence is fail-closed — any
-        ``BLOCKED`` blocks the task (an external cause; no repair attempt is consumed) and,
-        failing that, any ``FAIL`` sends it to ``verification_failed`` for the repair loop.
-        Both verdicts and a UTC timestamp are persisted whatever the outcome, so a resume can
-        see exactly what the verifiers said (AC-3).
+        Only two PASS verdicts complete a task.  FAIL and BLOCKED remain durable operation
+        facts on its in-progress task, which permits a later executor or verifier window.
         """
         for verdict in (task_verdict, test_verdict):
             if verdict not in VERDICT_TOKENS:
@@ -485,23 +568,14 @@ class Run:
             "test_verdict": test_verdict,
             "verified_at": _now(),
         }
-        if "BLOCKED" in (task_verdict, test_verdict):
-            reason = "a verifier returned BLOCKED — external cause"
-            if record.status != "blocked":
-                self.transition_task(task_id, "blocked", actor=ACTOR_RUNNER, note=reason)
-            record.blocker = reason
-            self.record_event(
-                f"verdicts:{task_id}", to="blocked",
-                note=f"task_verdict={task_verdict} test_verdict={test_verdict}")
-            return record.status
-        target = "verified" if task_verdict == test_verdict == "PASS" else "verification_failed"
-        self.transition_task(
-            task_id, target, actor=ACTOR_RUNNER,
-            note=f"independent verdicts task={task_verdict} test={test_verdict}")
-        self.record_event(
-            f"verdicts:{task_id}", to=target,
-            note=f"task_verdict={task_verdict} test_verdict={test_verdict}")
-        return target
+        outcome = "succeeded" if task_verdict == test_verdict == "PASS" else (
+            "blocked" if "BLOCKED" in (task_verdict, test_verdict) else "failed")
+        self.record_operation(task_id, "verification", outcome,
+                              f"task_verdict={task_verdict} test={test_verdict}")
+        if outcome == "succeeded" and record.status != "done":
+            self.transition_task(task_id, "done", actor=ACTOR_RUNNER,
+                                 note="independent completion policy passed", resolution="completed")
+        return record.status
 
     def record_attestation(
         self, task_id: str, dep_id: str, evidence: Mapping[str, Any]
@@ -549,29 +623,19 @@ class Run:
         return entry
 
     def begin_repair(self, task_id: str, *, maximum: int) -> bool:
-        """Spend one repair attempt on a ``verification_failed`` task.
-
-        When repair budget remains this increments ``attempts`` and moves the task
-        ``verification_failed -> repairing`` in one step, returning ``True``. When ``attempts``
-        has already reached ``maximum`` nothing is mutated and ``False`` is returned, so the
-        caller can block the task at the limit. An external ``BLOCKED`` outcome is settled by
-        :meth:`record_verdicts` before this is ever reached, so an attempt is only spent on a
-        real verification ``FAIL``.
-        """
+        """Spend an advisory repair attempt, recording escalation at its threshold."""
         if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 0:
             raise StateError(
                 "maximum repair attempts must be a non-negative integer", "invalid-max-attempts")
         record = self.task(task_id)
-        if record.status != "verification_failed":
-            raise TransitionError(
-                f"cannot begin a repair for {task_id} from {record.status}", "illegal-transition")
         if record.attempts >= maximum:
+            self.record_operation(task_id, "repair", "escalated", "repair threshold exhausted",
+                                  attempts=record.attempts, maximum=maximum)
             return False
         previous = record.attempts
         record.attempts = previous + 1
-        self.transition_task(
-            task_id, "repairing", actor=ACTOR_RUNNER,
-            note=f"repair attempt {record.attempts} of {maximum}")
+        self.record_operation(task_id, "repair", "retryable",
+                              f"repair attempt {record.attempts} of {maximum}")
         self.record_event(
             f"repair-attempt:{task_id}", frm=str(previous), to=str(record.attempts),
             note="repair attempt consumed")

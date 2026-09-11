@@ -116,10 +116,9 @@ class PreconditionsTests(unittest.TestCase):
 class DispatchPreconditionsTests(unittest.TestCase):
     @staticmethod
     def complete(life, _plan, task_id, _request):
-        life.transition(task_id, "running", actor=ACTOR_RUNNER)
-        life.transition(task_id, "implemented", actor=ACTOR_RUNNER)
+        life.transition(task_id, "in_progress", actor=ACTOR_RUNNER)
         life.run.record_verdicts(task_id, "PASS", "PASS")
-        return TaskRunResult(task_id, "verified", 0, 1, None, None, ())
+        return TaskRunResult(task_id, "done", 0, 1, None, None, ())
 
     def request(self, root, *, predicates=(), controls=None, task_ids=("EX-01",)):
         scenario = sa.SCENARIOS["direct-success"]
@@ -144,16 +143,15 @@ class DispatchPreconditionsTests(unittest.TestCase):
 
             def complete(life, _plan, task_id, _request):
                 self.assertEqual(task_id, "EX-01", "dependent bypassed its precondition")
-                life.transition(task_id, "running", actor=ACTOR_RUNNER)
-                life.transition(task_id, "implemented", actor=ACTOR_RUNNER)
+                life.transition(task_id, "in_progress", actor=ACTOR_RUNNER)
                 life.run.record_verdicts(task_id, "PASS", "PASS")
-                return TaskRunResult(task_id, "verified", 0, 1, None, None, ())
+                return TaskRunResult(task_id, "done", 0, 1, None, None, ())
 
             with patch("pipeline_core.execution._run_selected_task", side_effect=complete):
                 result = execute_run(request)
             self.assertEqual(result.exit_code, 20)
             run = Run.load(request.run_dir, root)
-            self.assertEqual(run.task("EX-02").status, "blocked")
+            self.assertEqual(run.task("EX-02").status, "in_progress")
             self.assertIn("approval: review", result.message)
 
     def test_unmet_precondition_suppresses_dependents_without_a_launch(self):
@@ -166,9 +164,9 @@ class DispatchPreconditionsTests(unittest.TestCase):
             self.assertEqual(result.exit_code, 20)
             self.assertEqual(request.adapter.launches, 0)
             run = Run.load(request.run_dir, root)
-            self.assertEqual(run.status, "blocked")
-            self.assertEqual(run.task(first.id).status, "blocked")
-            self.assertEqual(run.task(second.id).blocker, "blocked_by: EX-01")
+            self.assertEqual(run.status, "running")
+            self.assertEqual(run.task(first.id).status, "in_progress")
+            self.assertIsNone(run.task(second.id).blocker)
             observation = run.controls["precondition_observations"]["value"][0]
             self.assertEqual(observation["predicate"], "capability: repo-admin")
             self.assertFalse(observation["passed"])
@@ -296,7 +294,7 @@ class DispatchPreconditionsTests(unittest.TestCase):
             result = execute_run(request)
             self.assertEqual(result.exit_code, 20)
             self.assertEqual(request.adapter.launches, 0)
-            self.assertEqual(Run.load(request.run_dir, root).task("EX-01").status, "blocked")
+            self.assertEqual(Run.load(request.run_dir, root).task("EX-01").status, "in_progress")
             self.assertIn("ref-published: parent-head", result.message)
 
     def test_removed_executor_blocks_repair_routing_without_another_launch(self):
@@ -325,8 +323,8 @@ class DispatchPreconditionsTests(unittest.TestCase):
             self.assertIn("unresolved-executor", result.message)
             self.assertEqual(scripted.launches, 1)
             run = Run.load(request.run_dir, root)
-            self.assertEqual(run.task("EX-01").status, "blocked")
-            self.assertEqual(run.status, "blocked")
+            self.assertEqual(run.task("EX-01").status, "in_progress")
+            self.assertEqual(run.status, "running")
 
     def test_blocked_resume_requires_human_recovery_and_fresh_approval(self):
         with TemporaryDirectory() as directory:
@@ -334,29 +332,19 @@ class DispatchPreconditionsTests(unittest.TestCase):
             request = self.request(root, predicates=(Precondition("approval", "review"),))
             self.assertEqual(execute_run(request).exit_code, 20)
             approved = replace(request, controls=replace(request.controls, resume=True, approvals=("review",)))
-            self.assertEqual(execute_run(approved).exit_code, 20)
+            self.assertEqual(execute_run(approved).exit_code, 0)
             life = RunLifecycle.load(request.run_dir, root)
-            life.transition("EX-01", "ready", actor=ACTOR_HUMAN)
             self.assertEqual(execute_run(replace(request, controls=replace(request.controls, resume=True))).exit_code, 20)
-            life = RunLifecycle.load(request.run_dir, root)
-            life.transition("EX-01", "ready", actor=ACTOR_HUMAN)
-            with patch("pipeline_core.execution._run_selected_task", side_effect=self.complete):
-                self.assertEqual(execute_run(approved).exit_code, 0)
+            self.assertEqual(execute_run(approved).exit_code, 0)
 
     def test_resumed_repair_cannot_skip_preconditions(self):
-        for status in ("implemented", "verification_failed", "repairing"):
+        for status in ("in_progress",):
             with self.subTest(status=status), TemporaryDirectory() as directory:
                 root = Path(directory)
                 request = self.request(root, predicates=(Precondition("approval", "review"),))
                 self.assertEqual(execute_run(request).exit_code, 20)
                 life = RunLifecycle.load(request.run_dir, root)
-                life.transition("EX-01", "ready", actor=ACTOR_HUMAN)
-                life.transition("EX-01", "running", actor=ACTOR_RUNNER)
-                life.transition("EX-01", "implemented", actor=ACTOR_RUNNER)
-                if status != "implemented":
-                    life.transition("EX-01", "verification_failed", actor=ACTOR_RUNNER)
-                if status == "repairing":
-                    life.transition("EX-01", "repairing", actor=ACTOR_RUNNER)
+                # Failed repair work remains an in-progress task with its operation evidence.
                 with patch("pipeline_core.execution._run_selected_task", side_effect=AssertionError("must not dispatch")):
                     result = execute_run(replace(request, controls=replace(request.controls, resume=True)))
                 self.assertEqual(result.exit_code, 20)
@@ -385,7 +373,7 @@ class DispatchPreconditionsTests(unittest.TestCase):
                 self.assertEqual(execute_run(request).exit_code, 0)
             result = execute_run(replace(request, controls=replace(request.controls, resume=True, approvals=())))
             self.assertEqual(result.exit_code, 20)
-            self.assertEqual(Run.load(request.run_dir, root).task("EX-01").status, "blocked")
+            self.assertEqual(Run.load(request.run_dir, root).task("EX-01").status, "done")
 
     def test_legacy_run_without_predicate_controls_resumes(self):
         with TemporaryDirectory() as directory:

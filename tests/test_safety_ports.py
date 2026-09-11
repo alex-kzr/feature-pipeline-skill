@@ -38,7 +38,7 @@ class VerificationPortTests(unittest.TestCase):
         evidence = VerificationEvidence("NP-02", 1, ({"exit_code": 0},))
         task = LaunchRequest("task-verifier", "NP-02", "task", Path("task.json"), read_only=True)
         test = LaunchRequest("test-verifier", "NP-02", "test", Path("test.json"), read_only=True)
-        self.assertEqual(verify_independently(StubAdapter(), evidence, task, test).status, "verified")
+        self.assertEqual(verify_independently(StubAdapter(), evidence, task, test).status, "done")
         with self.assertRaises(VerificationError):
             verify_independently(StubAdapter(), evidence, task, LaunchRequest("test", "NP-02", "", Path("x")))
 

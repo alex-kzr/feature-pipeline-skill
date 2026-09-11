@@ -21,6 +21,7 @@ Standard library only.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -59,6 +60,8 @@ from feature_pipeline.application.render_plan import render_dry_run
 from feature_pipeline.application.verified_reuse import (
     EvidenceEligibilityError,
     VerifiedEvidenceStore,
+    resolve_default_reuse,
+    supersession_graph,
 )
 from feature_pipeline.application.results import Outcome, PipelineResult
 from feature_pipeline.application.selection import (
@@ -261,6 +264,33 @@ def _preview_exit_code(
     return EXIT_GATE_PENDING
 
 
+def _substitute_superseded(
+    scope: Sequence[str], selected: Sequence[str], order: Sequence[str], graph,
+) -> tuple[str, ...]:
+    """Replace each non-selected scope task a later task supersedes with that replacement.
+
+    Used by the ``--verify-dependency-chain`` preview so a retired blocked predecessor is
+    never in the planned dispatch set; its live replacement (which *can* be verified) stands
+    in. Order follows the plan; the result is de-duplicated.
+    """
+    selected_set = set(selected)
+    resolved: set[str] = set()
+    for task_id in scope:
+        if task_id in selected_set:
+            resolved.add(task_id)
+            continue
+        node = task_id
+        seen: set[str] = set()
+        while True:
+            nxt = graph.replacement_for(node)
+            if nxt is None or nxt in seen:
+                break
+            seen.add(nxt)
+            node = nxt
+        resolved.add(node)
+    return tuple(task_id for task_id in order if task_id in resolved)
+
+
 def run_command(command: RunCommand) -> PipelineResult:
     """Resolve anchors and profile, then dispatch to status, dry-run, or execute."""
     project_root = Path(_require(command.project_root, "--project-root"))
@@ -278,6 +308,9 @@ def run_command(command: RunCommand) -> PipelineResult:
         command.mode != "execute" or command.dry_run
     ):
         raise CliError(EXIT_ERROR, "recovery selectors are valid only for --mode execute")
+    if (command.operational_unblock_task or command.human_authorized_operational_unblock
+            or command.uv_cache_dir) and (command.mode != "execute" or command.dry_run):
+        raise CliError(EXIT_ERROR, "operational unblock controls are valid only for --mode execute")
     if (command.model is not None or command.effort is not None) and command.mode != "execute":
         raise CliError(EXIT_ERROR, "--model and --effort are valid only for --mode execute")
 
@@ -403,19 +436,33 @@ def run_command(command: RunCommand) -> PipelineResult:
                 dict(item.split("=", 1) for item in (command.attest_dependency or ()))
             )
             store = VerifiedEvidenceStore(lease_dir.parent, project_dir)
-            for task_id in compiled_plan.execution_scope:
-                if task_id in compiled_plan.selection or task_id in attested_ids:
-                    continue
-                try:
-                    evidence = store.find(definitions[task_id])
-                except EvidenceEligibilityError:
-                    continue
+            try:
+                reused = resolve_default_reuse(
+                    store, definitions, compiled_plan.execution_scope, compiled_plan.selection,
+                    project_dir, tuple(attested_ids),
+                )
+            except EvidenceEligibilityError as exc:
+                raise CliError(EXIT_ERROR, f"{exc.code}: {exc}") from None
+            for task_id, evidence in reused.items():
                 attested_ids.add(task_id)
                 reused_sources[task_id] = evidence["source_run_id"]
             execution_scope = prune_reused_ancestors(
                 execution_scope, compiled_plan.selection, reused_sources,
                 {task_id: definition.depends_on for task_id, definition in definitions.items()},
             )
+            execution_scope = tuple(
+                task_id for task_id in execution_scope
+                if task_id in compiled_plan.selection or "replacement_id" not in reused.get(task_id, {})
+            )
+        elif compiled_plan is not None and command.verify_dependency_chain:
+            # `--verify-dependency-chain` re-verifies the chain rather than trusting reuse,
+            # but a retired blocked predecessor cannot be re-run: substitute the live task
+            # that supersedes it so the preview never plans to dispatch the blocked one.
+            superseders = supersession_graph(definitions, project_dir)
+            if superseders is not None:
+                execution_scope = _substitute_superseded(
+                    execution_scope, compiled_plan.selection, compiled_plan.order, superseders
+                )
 
     dep_blocked: dict[str, list[str]] = {}
     if command.task is not None:
