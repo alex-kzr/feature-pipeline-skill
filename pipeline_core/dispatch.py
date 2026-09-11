@@ -192,9 +192,41 @@ def _scope_or_provenance_block(attribution: AttributionResult) -> str | None:
         for row in attribution.changed_files
         if row.get("classification") == "out_of_scope"
     ]
-    if outside:
-        return "scope-violation: executor-owned changes outside allowed scope: " + ", ".join(outside)
+    unsafe = [path for path in outside if _unsafe_scope_amendment_path(path)]
+    if unsafe:
+        return "scope-safety-violation: unsafe executor-owned path: " + ", ".join(unsafe)
     return None
+
+
+def _unsafe_scope_amendment_path(path: str) -> bool:
+    """Keep closed safety controls separate from a reviewable scope amendment."""
+    normalized = path.replace("\\", "/").casefold()
+    parts = tuple(part for part in normalized.split("/") if part)
+    if not parts or normalized.startswith(("/", "../", "~")):
+        return True
+    if ":" in parts[0]:
+        return True
+    return (
+        ".git" in parts
+        or any(part in {".env", "secrets", "credentials"} or "secret" in part for part in parts)
+    )
+
+
+def _record_scope_amendment(run: Run, task_id: str, attribution: AttributionResult) -> None:
+    """Attach reviewable, runner-observed amendment facts without changing the manifest."""
+    observed_paths = [
+        str(row["path"])
+        for row in attribution.changed_files
+        if row.get("classification") == "out_of_scope"
+    ]
+    if not observed_paths:
+        return
+    implementation = run.task(task_id).execution_evidence["implementation"]
+    implementation["scope_amendment"] = {
+        "present": True,
+        "observed_paths": observed_paths,
+        "rationale": "executor-owned paths outside the initial estimate require independent amendment-justification review",
+    }
 
 
 def dispatch_executor(
@@ -399,6 +431,7 @@ def dispatch_executor(
         changed_files=attribution.changed_files,
         reason=attribution.reason,
     )
+    _record_scope_amendment(run, task_id, attribution)
     scope_block = _scope_or_provenance_block(attribution)
     if scope_block:
         life.block(task_id, scope_block)
@@ -485,6 +518,7 @@ def _settle_codex_final_result(
     run.record_implementation_attribution(request.spec.id, generation=generation,
         attempt=request.attempt, attribution_state=attribution.state, manifest=attribution.manifest,
         diff=attribution.diff, changed_files=attribution.changed_files, reason=attribution.reason)
+    _record_scope_amendment(run, request.spec.id, attribution)
     scope_block = _scope_or_provenance_block(attribution)
     if scope_block:
         life.block(request.spec.id, scope_block)

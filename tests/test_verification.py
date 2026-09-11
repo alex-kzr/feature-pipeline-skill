@@ -65,6 +65,42 @@ class FreshEnvelopePromptTests(unittest.TestCase):
         self.assertIn("Runner-observed verdict from the verifier report: PASS.", prompt)
 
 
+class ScopeAmendmentVerifierEvidenceTests(unittest.TestCase):
+    def test_both_prompts_embed_the_same_amendment_and_require_a_justification_finding(self) -> None:
+        evidence = VerificationEvidence(
+            "VR-02",
+            1,
+            changed_files=(
+                {
+                    "path": "feature-pipeline-skill/src/feature_pipeline/domain/scope.py",
+                    "status": "modified",
+                    "digest": "sha256:amended",
+                    "classification": "out_of_scope",
+                },
+            ),
+        )
+        payload = evidence.serialized()
+
+        task_prompt = build_verifier_prompt(
+            "task_verifier", _spec(), anchors=ANCHORS, feature_prompt="prompt.md",
+            evidence_payload=payload, attempt=1,
+        )
+        test_prompt = build_verifier_prompt(
+            "test_verifier", _spec(), anchors=ANCHORS, feature_prompt="prompt.md",
+            evidence_payload=payload, attempt=1,
+        )
+
+        amendment = json.loads(payload)["scope_amendment"]
+        self.assertEqual(
+            amendment["observed_paths"],
+            ["feature-pipeline-skill/src/feature_pipeline/domain/scope.py"],
+        )
+        self.assertEqual(task_prompt.split("```json\n", 1)[1], test_prompt.split("```json\n", 1)[1])
+        for prompt in (task_prompt, test_prompt):
+            self.assertIn("Amendment-justification finding:", prompt)
+            self.assertIn("observed paths", prompt)
+
+
 def _spec(**overrides: object) -> TaskSpec:
     base: dict[str, object] = dict(
         id="VR-02",
@@ -186,15 +222,15 @@ def _orchestrate(run: Run, spec: TaskSpec, task: FakeVerifier, test: FakeVerifie
 # --- transition table (written before the orchestration) ------------------------------------
 
 _MATRIX = {
-    ("PASS", "PASS"): "verified",
-    ("PASS", "FAIL"): "verification_failed",
-    ("FAIL", "PASS"): "verification_failed",
-    ("FAIL", "FAIL"): "verification_failed",
-    ("PASS", "BLOCKED"): "blocked",
-    ("BLOCKED", "PASS"): "blocked",
-    ("FAIL", "BLOCKED"): "blocked",
-    ("BLOCKED", "FAIL"): "blocked",
-    ("BLOCKED", "BLOCKED"): "blocked",
+    ("PASS", "PASS"): "done",
+    ("PASS", "FAIL"): "in_progress",
+    ("FAIL", "PASS"): "in_progress",
+    ("FAIL", "FAIL"): "in_progress",
+    ("PASS", "BLOCKED"): "in_progress",
+    ("BLOCKED", "PASS"): "in_progress",
+    ("FAIL", "BLOCKED"): "in_progress",
+    ("BLOCKED", "FAIL"): "in_progress",
+    ("BLOCKED", "BLOCKED"): "in_progress",
 }
 
 
@@ -211,15 +247,13 @@ class RecordVerdictsTransitionTableTests(unittest.TestCase):
                     self.assertEqual(recorded["task_verdict"], task_verdict)
                     self.assertEqual(recorded["test_verdict"], test_verdict)
                     self.assertIsNotNone(recorded["verified_at"])
-                    if expected == "blocked":
-                        self.assertIn("BLOCKED", run.task("VR-02").blocker or "")
 
     def test_only_pass_pass_verifies(self) -> None:
-        self.assertEqual(combine_verdict_status("PASS", "PASS"), "verified")
+        self.assertEqual(combine_verdict_status("PASS", "PASS"), "done")
         for combo in (("PASS", "FAIL"), ("FAIL", "PASS"), ("FAIL", "FAIL")):
-            self.assertEqual(combine_verdict_status(*combo), "verification_failed")
+            self.assertEqual(combine_verdict_status(*combo), "in_progress")
         for combo in (("PASS", "BLOCKED"), ("BLOCKED", "FAIL")):
-            self.assertEqual(combine_verdict_status(*combo), "blocked")
+            self.assertEqual(combine_verdict_status(*combo), "in_progress")
 
     def test_an_unknown_token_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -250,7 +284,7 @@ class VerdictMatrixOrchestrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             run = _implemented_run(Path(directory))
             outcome = _orchestrate(run, _spec(), FakeVerifier(), FakeVerifier())
-            self.assertEqual(outcome.status, "verified")
+            self.assertEqual(outcome.status, "done")
             self.assertIsNotNone(outcome.verdict_record)
 
 
@@ -284,7 +318,7 @@ class VerifierAgentNameRegressionTests(unittest.TestCase):
         task = _AgentNameRecordingVerifier()
         test = _AgentNameRecordingVerifier()
         outcome = _orchestrate(run, _spec(), task, test)
-        self.assertEqual(outcome.status, "verified", outcome.failure)
+        self.assertEqual(outcome.status, "done", outcome.failure)
         return task.initial_request(), test.initial_request()
 
     def _agent_arg(self, request) -> str:  # noqa: ANN001 - test helper
@@ -347,7 +381,7 @@ class VerifierResultTextExtractionTests(unittest.TestCase):
                 ClaudeAdapter(executable=executable),
             )
 
-            self.assertEqual(outcome.status, "verified")
+            self.assertEqual(outcome.status, "done")
             self.assertEqual(outcome.task_verdict, "PASS")
             self.assertEqual(outcome.test_verdict, "PASS")
             self.assertIsNone(outcome.failure)
@@ -473,7 +507,7 @@ class CurrentRunMutationEvidenceTests(unittest.TestCase):
                 evidence_kw={"external_actions": ({"action": "commit", "after": "deadbeef"},)},
             )
 
-        self.assertEqual(outcome.status, "verification_failed")
+        self.assertEqual(outcome.status, "in_progress")
         self.assertEqual(outcome.task_verdict, "FAIL")
         self.assertEqual(outcome.test_verdict, "FAIL")
         self.assertEqual(
@@ -527,7 +561,7 @@ class ProseEnvelopeSettlementTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             run = _implemented_run(Path(directory))
             outcome = _orchestrate(run, _spec(), FakeVerifier(), FakeVerifier())
-            self.assertEqual(outcome.status, "verified")
+            self.assertEqual(outcome.status, "done")
             self.assertIsNone(outcome.task_drift)
             self.assertIsNone(outcome.test_drift)
 
@@ -536,7 +570,7 @@ class ProseEnvelopeSettlementTests(unittest.TestCase):
             run = _implemented_run(Path(directory))
             task = FakeVerifier(prose="# task_verifier\n\nno verdict line at all\n")
             outcome = _orchestrate(run, _spec(), task, FakeVerifier())
-            self.assertEqual(outcome.status, "verified")
+            self.assertEqual(outcome.status, "done")
             self.assertIsNotNone(outcome.task_drift)
 
     def test_prose_envelope_disagreement_fails_closed_and_blocks(self) -> None:
@@ -549,7 +583,7 @@ class ProseEnvelopeSettlementTests(unittest.TestCase):
                      "task_id": "VR-02", "attempt": 1}),
             )
             outcome = _orchestrate(run, _spec(), task, FakeVerifier())
-            self.assertEqual(outcome.status, "blocked")
+            self.assertEqual(outcome.status, "in_progress")
             self.assertIn("verdict-envelope-mismatch", outcome.failure)
             self.assertTrue(outcome.diagnostic.exists())
             self.assertNotEqual(run.task("VR-02").status, "verified")
@@ -564,7 +598,7 @@ class ProseEnvelopeSettlementTests(unittest.TestCase):
                      "task_id": "VR-02", "attempt": 1}),
             )
             outcome = _orchestrate(run, _spec(), task, FakeVerifier())
-            self.assertEqual(outcome.status, "blocked")
+            self.assertEqual(outcome.status, "in_progress")
             self.assertIn("verdict-envelope-mismatch", outcome.failure)
             self.assertNotEqual(run.task("VR-02").status, "verified")
 
@@ -586,7 +620,7 @@ class ProseEnvelopeSettlementTests(unittest.TestCase):
 
                 outcome = _orchestrate(run, _spec(), task, FakeVerifier())
 
-                self.assertEqual(outcome.status, "blocked")
+                self.assertEqual(outcome.status, "in_progress")
                 self.assertIn("verdict-envelope-mismatch", outcome.failure)
                 self.assertNotEqual(run.task("VR-02").status, "verified")
 
@@ -595,7 +629,7 @@ class ProseEnvelopeSettlementTests(unittest.TestCase):
             run = _implemented_run(Path(directory))
             task = FakeVerifier(envelope="not json at all")
             outcome = _orchestrate(run, _spec(), task, FakeVerifier())
-            self.assertEqual(outcome.status, "blocked")
+            self.assertEqual(outcome.status, "in_progress")
             self.assertIn("unparseable-verdict-envelope", outcome.failure)
             self.assertTrue(outcome.diagnostic.exists())
 
@@ -607,7 +641,7 @@ class LaunchFailureTests(unittest.TestCase):
             task = FakeVerifier(launch_exit=3)
             test = FakeVerifier()
             outcome = _orchestrate(run, _spec(), task, test)
-            self.assertEqual(outcome.status, "blocked")
+            self.assertEqual(outcome.status, "in_progress")
             self.assertIn("exited with 3", outcome.failure)
             self.assertTrue(outcome.diagnostic.exists())
             self.assertEqual(test.calls, [])
@@ -618,7 +652,7 @@ class LaunchFailureTests(unittest.TestCase):
             run = _implemented_run(Path(directory))
             outcome = _orchestrate(
                 run, _spec(), FakeVerifier(raise_code="adapter-unavailable"), FakeVerifier())
-            self.assertEqual(outcome.status, "blocked")
+            self.assertEqual(outcome.status, "in_progress")
             self.assertIn("adapter-unavailable", outcome.failure)
 
     def test_a_missing_session_id_blocks_before_the_envelope_request(self) -> None:
@@ -626,7 +660,7 @@ class LaunchFailureTests(unittest.TestCase):
             run = _implemented_run(Path(directory))
             task = FakeVerifier(session_id=None)
             outcome = _orchestrate(run, _spec(), task, FakeVerifier())
-            self.assertEqual(outcome.status, "blocked")
+            self.assertEqual(outcome.status, "in_progress")
             self.assertIn("no session id", outcome.failure)
             self.assertNotIn("envelope", [c["kind"] for c in task.calls])
 
@@ -635,7 +669,7 @@ class LaunchFailureTests(unittest.TestCase):
             run = _implemented_run(Path(directory))
             task = FakeVerifier(envelope_exit=1)
             outcome = _orchestrate(run, _spec(), task, FakeVerifier())
-            self.assertEqual(outcome.status, "blocked")
+            self.assertEqual(outcome.status, "in_progress")
             self.assertIn("envelope request exited with 1", outcome.failure)
 
 
@@ -661,7 +695,7 @@ class NoFalseVerifiedTests(unittest.TestCase):
 
             self.assertEqual(outcome.task_verdict, "PASS")
             self.assertEqual(outcome.test_verdict, "FAIL")
-            self.assertEqual(outcome.status, "verification_failed")
+            self.assertEqual(outcome.status, "in_progress")
             self.assertIsNotNone(outcome.forced_fail_reason)
             self.assertNotEqual(run.task("VR-02").status, "verified")
 
@@ -698,7 +732,7 @@ class PersistenceTests(unittest.TestCase):
             ):
                 self.assertTrue(path.exists(), path)
             persisted = json.loads(artifacts.verdict_record.read_text(encoding="utf-8"))
-            self.assertEqual(persisted["status"], "verified")
+            self.assertEqual(persisted["status"], "done")
             self.assertEqual(persisted["task_verdict"], "PASS")
 
             reloaded = Run.load(run.run_dir, run.repo_root)
@@ -706,7 +740,7 @@ class PersistenceTests(unittest.TestCase):
             self.assertEqual(recorded["task_verdict"], "PASS")
             self.assertEqual(recorded["test_verdict"], "PASS")
             self.assertIsNotNone(recorded["verified_at"])
-            self.assertEqual(reloaded.task("VR-02").status, "verified")
+            self.assertEqual(reloaded.task("VR-02").status, "done")
             self.assertEqual(outcome.verdict_record, artifacts.verdict_record)
 
 

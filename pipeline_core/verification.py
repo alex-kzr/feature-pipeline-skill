@@ -160,6 +160,11 @@ class VerificationEvidence:
         return self.external_blocker is None and not self.unrun_commands
 
     def as_dict(self) -> dict[str, object]:
+        amendment_paths = [
+            str(entry.get("path", ""))
+            for entry in self.changed_files
+            if entry.get("classification") == "out_of_scope"
+        ]
         return {
             "task_id": self.task_id,
             "attempt": self.attempt,
@@ -175,6 +180,15 @@ class VerificationEvidence:
             "missing_evidence": [dict(entry) for entry in self.missing_evidence],
             "unrun_commands": [dict(entry) for entry in self.unrun_commands],
             "external_blocker": self.external_blocker,
+            "scope_amendment": {
+                "present": bool(amendment_paths),
+                "observed_paths": amendment_paths,
+                "rationale": (
+                    "executor-owned paths outside the initial estimate require independent "
+                    "amendment-justification review"
+                    if amendment_paths else None
+                ),
+            },
             "snapshot": dict(self.snapshot) if self.snapshot is not None else None,
             "current_run_boundary": {
                 "verification_snapshot": dict(self.snapshot) if self.snapshot is not None else None,
@@ -411,6 +425,9 @@ _VERIFIER_RULES: dict[str, tuple[str, ...]] = {
         "to the executor; only changes attributed inside this executor window may be scope "
         "violations. An unavailable executor attribution is BLOCKED.",
         "Do not tick acceptance-criteria checkboxes.",
+        "Your report must include a separate 'Amendment-justification finding:' that states "
+        "whether the structured scope-amendment rationale and observed paths support the "
+        "claimed functionality (or that no amendment is present).",
         "For an acceptance criterion marked CURRENT-RUN ONLY, assess mutations only from "
         "the current_run_boundary in the runner-owned evidence: its verification snapshot, "
         "implementation manifest/diff and changed files, captured commands, and external "
@@ -425,6 +442,9 @@ _VERIFIER_RULES: dict[str, tuple[str, ...]] = {
         "never a prompt to re-run the check.",
         "Judge whether the recorded command evidence shows the task's verification commands "
         "passed.",
+        "Your report must include a separate 'Amendment-justification finding:' that states "
+        "whether the structured scope-amendment rationale and observed paths support the "
+        "claimed functionality (or that no amendment is present).",
     ),
 }
 
@@ -513,6 +533,7 @@ def build_verifier_prompt(
         "Final report:",
         "- Verdict: PASS | FAIL | BLOCKED",
         "- Findings:",
+        "- Amendment-justification finding:",
         "- Acceptance criteria assessment:",
     ]
     return "\n".join(lines) + "\n"
