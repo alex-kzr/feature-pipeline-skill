@@ -57,6 +57,7 @@ from feature_pipeline.application.verified_reuse import (
     EvidenceEligibilityError,
     VerifiedEvidenceStore,
     canonical_task_path,
+    find_superseding_evidence,
     resolve_default_reuse,
     supersession_graph,
     task_contract_digest,
@@ -76,6 +77,7 @@ from feature_pipeline.contracts import TaskSpec
 from feature_pipeline.infrastructure.board_projection import (
     BoardProjectionError,
     project_task_state,
+    remove_historical_cards,
 )
 
 from .adapter_resolution import (
@@ -133,6 +135,7 @@ __all__ = [
     "TaskRunResult",
     "execute_run",
     "persist_task_contracts",
+    "reconcile_historical_cards",
     "recovery_provenance",
     "replacement_feature",
     "run_task",
@@ -1352,6 +1355,41 @@ def _reconcile_projection(
             ) from exc
 
 
+def reconcile_historical_cards(
+    life: RunLifecycle, board_path: Path, by_id: Mapping[str, TaskSpec],
+) -> tuple[str, ...]:
+    """Retire stale cards only when declared replacements have verified evidence."""
+
+    graph = supersession_graph(by_id, life.run.repo_root)
+    if graph is None:
+        return ()
+    store = VerifiedEvidenceStore(life.run.run_dir.parent, life.run.repo_root)
+    replacements: dict[str, tuple[str, Mapping[str, str]]] = {}
+    for edge in graph.edges:
+        evidence = find_superseding_evidence(store, graph, edge.superseded, by_id)
+        if evidence is not None:
+            replacements[edge.superseded] = evidence
+    try:
+        removed = remove_historical_cards(board_path, tuple(replacements))
+    except BoardProjectionError as exc:
+        raise ExecutionError(
+            f"historical board reconciliation failed: {exc}", "board-reconciliation-failed"
+        ) from exc
+    if not removed:
+        return ()
+    facts = ", ".join(f"{task_id}={replacements[task_id][0]}" for task_id in removed)
+    source_runs = ", ".join(replacements[task_id][1]["source_run_id"] for task_id in removed)
+    life.run.record_event(
+        "board-reconciliation:historical",
+        to=facts,
+        actor=ACTOR_RUNNER,
+        note=("removed stale active cards using independently verified replacement "
+              f"evidence from runs: {source_runs}"),
+    )
+    life.run.save()
+    return removed
+
+
 def _resolve_selection_and_scope(
     request: ExecuteRequest,
     plan: CompiledRunPlan | None,
@@ -1723,12 +1761,14 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
         if reason:
             return ExecuteResult("blocked", EXIT_BLOCKED, reason, request.run_dir, life.run.run_id)
 
-    if not request.controls.resume and request.board_path is not None:
+    if request.board_path is not None:
         try:
-            recorded_scope = [
-                task_id for task_id in execution_scope if task_id in life.run.tasks
-            ]
-            _reconcile_projection(life, request.board_path, by_id, recorded_scope)
+            reconcile_historical_cards(life, request.board_path, by_id)
+            if not request.controls.resume:
+                recorded_scope = [
+                    task_id for task_id in execution_scope if task_id in life.run.tasks
+                ]
+                _reconcile_projection(life, request.board_path, by_id, recorded_scope)
         except ExecutionError as exc:
             return _error(f"{exc.code}: {exc}", request, run_id=life.run.run_id)
 

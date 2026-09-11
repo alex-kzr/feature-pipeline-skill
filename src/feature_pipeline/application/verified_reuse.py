@@ -354,28 +354,26 @@ def find_superseding_evidence(
     superseded_id: str,
     definitions: Mapping[str, Any],
 ) -> tuple[str, Mapping[str, str]] | None:
-    """``(replacement_id, evidence)`` for the first task that supersedes ``superseded_id``
-    and carries its *own* exact eligible verified evidence, following the replacement chain.
+    """``(replacement_id, evidence)`` for the task that directly supersedes
+    ``superseded_id`` and carries its *own* exact eligible verified evidence.
 
-    Returns ``None`` when no replacement is declared, or none has eligible evidence. The
-    blocked predecessor itself is never read, forged, or modified — only a replacement's
-    real evidence (task path, canonical digest/version, both PASS verdicts, verification
-    time) can satisfy the edge.
+    Returns ``None`` when no direct replacement is declared or it lacks eligible evidence.
+    A later successor cannot validate an unfinished intermediate replacement: every retired
+    card must have a formal edge backed by that edge's replacement evidence. The blocked
+    predecessor itself is never read, forged, or modified.
     """
     if graph is None:
         return None
-    seen: set[str] = set()
     node = graph.replacement_for(superseded_id)
-    while node is not None and node not in seen:
-        seen.add(node)
-        definition = definitions.get(node)
-        if definition is not None:
-            try:
-                return node, store.find(definition)
-            except EvidenceEligibilityError:
-                pass
-        node = graph.replacement_for(node)
-    return None
+    if node is None:
+        return None
+    definition = definitions.get(node)
+    if definition is None:
+        return None
+    try:
+        return node, store.find(definition)
+    except EvidenceEligibilityError:
+        return None
 
 
 def resolve_default_reuse(

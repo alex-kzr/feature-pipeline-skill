@@ -238,6 +238,20 @@ class DocumentationContractTests(unittest.TestCase):
             with self.subTest(token=token):
                 self.assertIn(token, text)
 
+    def test_operator_docs_explain_historical_card_reconciliation(self) -> None:
+        text = " ".join((
+            _text("docs/agents/README.md") + _text("docs/contracts/feature-pipeline.md")
+        ).split())
+        for token in (
+            "Historical-card reconciliation",
+            "durable verified replacement evidence",
+            "historical run bytes",
+            "runner-owned audit event",
+            "leaves every ineligible card",
+        ):
+            with self.subTest(token=token):
+                self.assertIn(token, text)
+
     def test_metadata_contract_limits_globs_to_documentation_impact(self) -> None:
         text = _text("docs/agents/task-metadata-contract.md")
         for token in (

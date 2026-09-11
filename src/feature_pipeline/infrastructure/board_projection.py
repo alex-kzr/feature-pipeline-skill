@@ -44,6 +44,7 @@ __all__ = [
     "CommandEvidence",
     "CompletionEvidence",
     "project_task_state",
+    "remove_historical_cards",
 ]
 
 
@@ -310,6 +311,49 @@ def _upsert_column(
 
 def _remove_matching_cards(body: list[str], task_id: str, link: str) -> list[str]:
     return [line for line in body if not _is_task_card(line, task_id, link)]
+
+
+def remove_historical_cards(board_path: Path, task_ids: tuple[str, ...]) -> tuple[str, ...]:
+    """Remove evidence-eligible historical cards without touching task files."""
+
+    try:
+        text = _read_text_preserving_newlines(board_path)
+    except OSError as exc:
+        raise BoardProjectionError(f"read {_display_path(board_path)}: {exc}") from exc
+    requested = tuple(dict.fromkeys(task_ids))
+    if not requested:
+        return ()
+    requested_set = set(requested)
+    lines = text.splitlines(keepends=True)
+    todo_idx = _find_heading_once(lines, "## To Do")
+    in_progress_idx = _find_heading_once(lines, "## In Progress", after=todo_idx + 1)
+    next_heading = next(
+        (index for index in range(in_progress_idx + 1, len(lines))
+         if lines[index].rstrip("\r\n").startswith("## ")),
+        len(lines),
+    )
+    removed: set[str] = set()
+
+    def retain(line: str) -> bool:
+        match = _CARD_RE.match(line.rstrip("\r\n"))
+        if match is None:
+            return True
+        task_id = match.group(1).split(":", 1)[0].strip()
+        if task_id not in requested_set:
+            return True
+        removed.add(task_id)
+        return False
+
+    todo_body = [line for line in lines[todo_idx + 1:in_progress_idx] if retain(line)]
+    progress_body = [line for line in lines[in_progress_idx + 1:next_heading] if retain(line)]
+    if not removed:
+        return ()
+    rendered = "".join(
+        lines[:todo_idx + 1] + todo_body + lines[in_progress_idx:in_progress_idx + 1]
+        + progress_body + lines[next_heading:]
+    )
+    _replace_write(board_path, rendered, "write-board", _display_path(board_path))
+    return tuple(task_id for task_id in requested if task_id in removed)
 
 
 def _apply_board_transition(
