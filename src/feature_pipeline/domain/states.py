@@ -42,45 +42,30 @@ from typing import Union
 
 from .errors import DomainError
 from .repair import RepairBound
-from .vocabulary import Actor, RunStatus, TaskStatus, Verdict
+from .vocabulary import Actor, DoneResolution, RunStatus, TaskStatus, Verdict
 
 # ==========================================================================================
 # Policy — re-declared here, parity-pinned against ``pipeline_core.state`` in the tests.
 # ==========================================================================================
 
-#: Mirrors ``pipeline_core.state.TASK_TRANSITIONS``. The runner may revoke verified
-#: eligibility when a fresh precondition observation fails.
+#: Product-progress transitions. Operation retries and failures are recorded as evidence,
+#: never as task states.
 TASK_TRANSITIONS: Mapping[TaskStatus, frozenset[TaskStatus]] = {
-    TaskStatus.PENDING: frozenset({TaskStatus.READY, TaskStatus.BLOCKED}),
-    TaskStatus.READY: frozenset({TaskStatus.RUNNING, TaskStatus.BLOCKED}),
-    TaskStatus.RUNNING: frozenset({TaskStatus.IMPLEMENTED, TaskStatus.BLOCKED}),
-    TaskStatus.IMPLEMENTED: frozenset(
-        {TaskStatus.VERIFIED, TaskStatus.VERIFICATION_FAILED, TaskStatus.BLOCKED}
-    ),
-    TaskStatus.VERIFICATION_FAILED: frozenset(
-        {TaskStatus.REPAIRING, TaskStatus.IMPLEMENTED, TaskStatus.BLOCKED}
-    ),
-    TaskStatus.REPAIRING: frozenset(
-        {TaskStatus.IMPLEMENTED, TaskStatus.BLOCKED, TaskStatus.RUNNING}
-    ),
-    TaskStatus.VERIFIED: frozenset({TaskStatus.BLOCKED}),
-    TaskStatus.BLOCKED: frozenset({TaskStatus.READY, TaskStatus.IMPLEMENTED}),
+    TaskStatus.TO_DO: frozenset({TaskStatus.IN_PROGRESS}),
+    TaskStatus.IN_PROGRESS: frozenset({TaskStatus.DONE}),
+    TaskStatus.DONE: frozenset({TaskStatus.IN_PROGRESS}),
 }
 
-#: Completed work is terminal for dispatch until prerequisite eligibility is revoked.
-TERMINAL_TASK_STATES: frozenset[TaskStatus] = frozenset({TaskStatus.VERIFIED})
+#: Done is deliberately not terminal: a human can explicitly reopen it with an audit reason.
+TERMINAL_TASK_STATES: frozenset[TaskStatus] = frozenset()
 
 #: Interrupted non-terminal states rolled back on resume. Mirrors
 #: ``pipeline_core.state.RESUME_ROLLBACKS``: a ``running`` task lost its executor window and
 #: returns to ``ready``; a ``repairing`` task lost its repair window and returns to
 #: ``verification_failed``. Every other state resumes as-is.
-RESUME_ROLLBACKS: Mapping[TaskStatus, TaskStatus] = {
-    TaskStatus.RUNNING: TaskStatus.READY,
-    TaskStatus.REPAIRING: TaskStatus.VERIFICATION_FAILED,
-}
+RESUME_ROLLBACKS: Mapping[TaskStatus, TaskStatus] = {}
 
 #: Only an executor or the runner may drive a task to ``implemented``.
-_IMPLEMENTED_ACTORS: frozenset[Actor] = frozenset({Actor.RUNNER, Actor.EXECUTOR})
 
 
 # ==========================================================================================
@@ -282,7 +267,9 @@ class TaskState:
     """One task's durable lifecycle facts — identity, status, evidence, verdicts."""
 
     id: str
-    status: TaskStatus = TaskStatus.PENDING
+    status: TaskStatus = TaskStatus.TO_DO
+    resolution: DoneResolution | None = None
+    resolution_reason: str | None = None
     depends_on: tuple[str, ...] = ()
     blocker: str | None = None
     verification: Verification = field(default_factory=Verification)
@@ -292,6 +279,21 @@ class TaskState:
     launch_failures: tuple[LaunchFailure, ...] = ()
     promotion: Promotion | None = None
     attested_dependencies: tuple[Attestation, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Keep Done's durable resolution invariant true at construction."""
+        if self.status is TaskStatus.DONE and self.resolution is None:
+            raise DomainError("a done task requires a resolution", code="missing-task-resolution")
+        if self.status is not TaskStatus.DONE and self.resolution is not None:
+            raise DomainError("only a done task may have a resolution", code="unexpected-task-resolution")
+        if (
+            self.resolution is DoneResolution.CANCELLED
+            and not (self.resolution_reason and self.resolution_reason.strip())
+        ):
+            raise DomainError(
+                "cancelling a task requires a non-empty reason",
+                code="missing-cancellation-reason",
+            )
 
     @property
     def attempts(self) -> int:
@@ -314,6 +316,8 @@ class TaskState:
             "depends_on": list(self.depends_on),
             "attempts": self.repair.attempts,
             "blocker": self.blocker,
+            "resolution": self.resolution.value if self.resolution else None,
+            "resolution_reason": self.resolution_reason,
             "verification": self.verification.as_record(),
             "execution_evidence": self.evidence.as_record(),
             "promotion": self.promotion.as_record() if self.promotion else None,
@@ -353,12 +357,12 @@ class RunState:
         )
 
     def ready_tasks(self) -> tuple[str, ...]:
-        """Pending tasks whose every dependency has reached ``verified``."""
-        verified = {t.id for t in self.tasks if t.status is TaskStatus.VERIFIED}
+        """To-do tasks whose dependencies have completed."""
+        verified = {t.id for t in self.tasks if t.status is TaskStatus.DONE}
         return tuple(
             t.id
             for t in self.tasks
-            if t.status is TaskStatus.PENDING and set(t.depends_on) <= verified
+            if t.status is TaskStatus.TO_DO and set(t.depends_on) <= verified
         )
 
 
@@ -375,6 +379,7 @@ class Transition:
     to: TaskStatus
     actor: Actor = Actor.RUNNER
     note: str | None = None
+    resolution: DoneResolution | None = None
 
 
 @dataclass(frozen=True)
@@ -440,22 +445,24 @@ def _check_transition(task: TaskState, to: TaskStatus, actor: Actor) -> None:
         raise IllegalTransition(
             f"cannot transition {task.id} from {task.status.value} to {to.value}"
         )
-    if to is TaskStatus.IMPLEMENTED and actor not in _IMPLEMENTED_ACTORS:
-        raise UnauthorizedTransition("only an executor or runner may mark implemented")
-    if to is TaskStatus.VERIFIED and actor is not Actor.RUNNER:
-        raise UnauthorizedTransition("only the runner may mark verified")
-    if task.status is TaskStatus.VERIFIED and actor is not Actor.RUNNER:
-        raise UnauthorizedTransition("only the runner may revoke verified eligibility")
-    if task.status is TaskStatus.BLOCKED and actor is not Actor.HUMAN:
-        raise UnauthorizedTransition("only a human may unblock a task")
+    if task.status is TaskStatus.DONE and actor is not Actor.HUMAN:
+        raise UnauthorizedTransition("only a human may reopen a done task")
 
 
 def _apply_transition(state: RunState, event: Transition) -> RunState:
     task = state.task(event.task_id)
     _check_transition(task, event.to, event.actor)
-    moved = replace(task, status=event.to)
-    if event.to is TaskStatus.BLOCKED and event.note:
-        moved = replace(moved, blocker=event.note)
+    if task.status is TaskStatus.DONE and not (event.note and event.note.strip()):
+        raise IllegalTransition("reopening a done task requires an audit reason")
+    if event.to is TaskStatus.DONE:
+        if event.resolution is None:
+            raise IllegalTransition("a done task requires a resolution")
+        if event.resolution is DoneResolution.CANCELLED and not (event.note and event.note.strip()):
+            raise IllegalTransition("cancelling a task requires a non-empty reason")
+        moved = replace(task, status=event.to, resolution=event.resolution,
+                        resolution_reason=event.note)
+    else:
+        moved = replace(task, status=event.to, resolution=None, resolution_reason=None)
     return state.with_task(moved)
 
 
@@ -477,36 +484,18 @@ def _apply_verdicts(state: RunState, event: RecordVerdicts) -> RunState:
     test_verdict = _coerce_verdict(event.test_verdict)
     verification = Verification(task_verdict, test_verdict, event.at)
 
-    if Verdict.BLOCKED in (task_verdict, test_verdict):
-        reason = "a verifier returned BLOCKED — external cause"
-        settled = replace(task, verification=verification)
-        if settled.status is not TaskStatus.BLOCKED:
-            _check_transition(settled, TaskStatus.BLOCKED, Actor.RUNNER)
-            settled = replace(settled, status=TaskStatus.BLOCKED)
-        settled = replace(settled, blocker=reason)
-        return state.with_task(settled)
-
-    target = (
-        TaskStatus.VERIFIED
-        if task_verdict is test_verdict is Verdict.PASS
-        else TaskStatus.VERIFICATION_FAILED
-    )
-    _check_transition(task, target, Actor.RUNNER)
-    return state.with_task(replace(task, status=target, verification=verification))
+    # Verdicts are operation evidence. They do not alter product-progress status.
+    return state.with_task(replace(task, verification=verification))
 
 
 def _apply_begin_repair(state: RunState, event: BeginRepair) -> RunState:
     task = state.task(event.task_id)
-    if task.status is not TaskStatus.VERIFICATION_FAILED:
-        raise IllegalTransition(
-            f"cannot begin a repair for {task.id} from {task.status.value}"
-        )
     if task.repair.exhausted:
         raise RepairBudgetExhausted(
             f"{task.id} has consumed all {int(task.repair.bound)} repair attempts"
         )
     spent = replace(task.repair, attempts=task.repair.attempts + 1)
-    return state.with_task(replace(task, repair=spent, status=TaskStatus.REPAIRING))
+    return state.with_task(replace(task, repair=spent))
 
 
 def _apply_resume(state: RunState) -> RunState:

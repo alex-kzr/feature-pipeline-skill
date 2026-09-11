@@ -257,11 +257,11 @@ class ArgvConstructionTests(unittest.TestCase):
 # Closed vocabularies
 # --------------------------------------------------------------------------------------------
 class VocabularyParityTests(unittest.TestCase):
-    def test_task_status_covers_state_machine(self) -> None:
-        names = set(state.TASK_TRANSITIONS)
-        for successors in state.TASK_TRANSITIONS.values():
-            names |= set(successors)
-        self.assertEqual({s.value for s in TaskStatus}, names)
+    def test_task_status_covers_product_state_machine(self) -> None:
+        self.assertEqual(
+            {s.value for s in TaskStatus},
+            {"to_do", "in_progress", "done"},
+        )
 
     def test_run_status_matches_contract(self) -> None:
         self.assertEqual({s.value for s in RunStatus}, set(RUN_STATUSES))
@@ -299,16 +299,16 @@ class VocabularyParityTests(unittest.TestCase):
                 self.assertEqual(StageId(name).number, number)
 
     def test_parse_is_fail_closed_and_idempotent(self) -> None:
-        self.assertIs(TaskStatus.parse("verified"), TaskStatus.VERIFIED)
-        self.assertIs(TaskStatus.parse(TaskStatus.BLOCKED), TaskStatus.BLOCKED)
-        for bad in ["", "done", "VERIFIED", None, 3]:
+        self.assertIs(TaskStatus.parse("done"), TaskStatus.DONE)
+        self.assertIs(TaskStatus.parse(TaskStatus.TO_DO), TaskStatus.TO_DO)
+        for bad in ["", "verified", "VERIFIED", None, 3]:
             with self.subTest(bad=bad):
                 with self.assertRaises(InvalidTerm) as caught:
                     Verdict.parse(bad)
                 self.assertEqual(caught.exception.code, "invalid-term")
 
     def test_str_enum_values_compare_equal_to_plain_strings(self) -> None:
-        self.assertEqual(TaskStatus.VERIFIED, "verified")
+        self.assertEqual(TaskStatus.DONE, "done")
         self.assertEqual(Verdict.PASS, "PASS")
         self.assertEqual(f"{Actor.RUNNER}", "runner")
 
@@ -329,3 +329,8 @@ class DomainErrorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ThreeStateTaskVocabularyTests(unittest.TestCase):
+    def test_task_status_exposes_only_product_progress_states(self) -> None:
+        self.assertEqual(TaskStatus.values(), ("to_do", "in_progress", "done"))

@@ -42,7 +42,7 @@ from dataclasses import dataclass, field, replace
 from typing import Literal, Mapping, Sequence
 
 from feature_pipeline.contracts import SCHEMA_VERSION as CONTRACT_SCHEMA_VERSION
-from feature_pipeline.domain.vocabulary import RunStatus, TaskStatus, Verdict
+from feature_pipeline.domain.vocabulary import DoneResolution, RunStatus, TaskStatus, Verdict
 
 from .errors import (
     FieldTypeError,
@@ -62,6 +62,7 @@ SUPPORTED_READ_SCHEMA_VERSIONS: frozenset[int] = frozenset({2, 3})
 UnknownFieldPolicy = Literal["reject", "ignore", "preserve"]
 
 _TASK_STATUSES: frozenset[str] = frozenset(TaskStatus.values())
+_DONE_RESOLUTIONS: frozenset[str] = frozenset(DoneResolution.values())
 _VERDICTS: frozenset[str] = frozenset(Verdict.values())
 #: ``pipeline_core.state.Run`` defaults ``status`` to ``"pending"`` before the first
 #: transition, so it is accepted alongside the declared :class:`RunStatus` members.
@@ -419,6 +420,9 @@ class TaskEntryV3:
 
     id: str
     status: str
+    resolution: str | None = None
+    resolution_reason: str | None = None
+    operation_history: tuple[dict[str, object], ...] = ()
     depends_on: tuple[str, ...] = ()
     attempts: int = 0
     blocker: str | None = None
@@ -447,7 +451,8 @@ class TaskEntryV3:
 
     _KNOWN = frozenset(
         {
-            "id", "status", "depends_on", "attempts", "blocker", "type", "executor",
+            "id", "status", "resolution", "resolution_reason", "operation_history",
+            "depends_on", "attempts", "blocker", "type", "executor",
             "adapter", "session_id", "verification", "execution_evidence", "changed_files",
             "verification_tier", "accepts_scoped", "promotion", "unblocks",
             "maintenance_audit", "external_launch_failures", "attested_dependencies",
@@ -473,9 +478,30 @@ class TaskEntryV3:
             if promotion_raw is None
             else dict(_mapping(promotion_raw, _join(path, "promotion")))
         )
+        status = _enum(_require(data, "status", path), _join(path, "status"), _TASK_STATUSES)
+        resolution = (
+            None if data.get("resolution") is None else _enum(
+                data["resolution"], _join(path, "resolution"), _DONE_RESOLUTIONS
+            )
+        )
+        resolution_reason = _opt_str(data.get("resolution_reason"), _join(path, "resolution_reason"))
+        if status == "done" and resolution is None:
+            raise FieldValueError("a done task requires a resolution", field=_join(path, "resolution"))
+        if status != "done" and resolution is not None:
+            raise FieldValueError("only a done task may have a resolution", field=_join(path, "resolution"))
+        if resolution == "cancelled" and not (resolution_reason and resolution_reason.strip()):
+            raise FieldValueError(
+                "a cancelled task requires a non-empty reason",
+                field=_join(path, "resolution_reason"),
+            )
         return cls(
             id=_str(_require(data, "id", path), _join(path, "id")),
-            status=_enum(_require(data, "status", path), _join(path, "status"), _TASK_STATUSES),
+            status=status,
+            resolution=resolution,
+            resolution_reason=resolution_reason,
+            operation_history=_mapping_list(
+                data.get("operation_history", []), _join(path, "operation_history")
+            ),
             depends_on=_str_list(data.get("depends_on", []), _join(path, "depends_on")),
             attempts=_int(data.get("attempts", 0), _join(path, "attempts")),
             blocker=_opt_str(data.get("blocker"), _join(path, "blocker")),
@@ -543,6 +569,9 @@ class TaskEntryV3:
         out: dict[str, object] = {
             "id": self.id,
             "status": self.status,
+            "resolution": self.resolution,
+            "resolution_reason": self.resolution_reason,
+            "operation_history": [dict(entry) for entry in self.operation_history],
             "depends_on": list(self.depends_on),
             "attempts": self.attempts,
             "blocker": self.blocker,

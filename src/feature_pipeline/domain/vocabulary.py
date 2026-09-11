@@ -2,10 +2,8 @@
 
 Each enum replaces a set of bare string literals scattered across ``pipeline_core``. The
 member *values* are byte-identical to the strings the current code compares against, so a
-serialized ``run.json``, verdict envelope, or command record is unchanged when a call site
-starts using the enum. ``StrEnum`` (Python 3.11+, ``requires-python >= 3.11``) keeps
-``TaskStatus.VERIFIED == "verified"`` true, so equality checks and JSON round-trips need no
-adapter.
+serialized value is explicit at its persistence boundary. ``StrEnum`` (Python 3.11+,
+``requires-python >= 3.11``) keeps enum values JSON-friendly.
 
 Parity is pinned by ``tests/test_domain_vocabulary.py`` against the live constants in
 ``pipeline_core.state``, ``pipeline_core.commands``, ``pipeline_core.roles``,
@@ -50,16 +48,27 @@ class _Vocabulary(StrEnum):
 
 
 class TaskStatus(_Vocabulary):
-    """Lifecycle state of one task inside a run (``pipeline_core.state._ALLOWED``)."""
+    """The three public product-progress states of one task."""
 
-    PENDING = "pending"
-    READY = "ready"
-    RUNNING = "running"
-    IMPLEMENTED = "implemented"
-    VERIFICATION_FAILED = "verification_failed"
-    REPAIRING = "repairing"
-    VERIFIED = "verified"
+    TO_DO = "to_do"
+    IN_PROGRESS = "in_progress"
+    DONE = "done"
+
+
+class DoneResolution(_Vocabulary):
+    """Human-visible resolution required for a :class:`TaskStatus.DONE` task."""
+
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+
+
+class OperationOutcome(_Vocabulary):
+    """Diagnostic outcome of an execution operation, distinct from task progress."""
+
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
     BLOCKED = "blocked"
+    RETRYABLE = "retryable"
 
 
 class RunStatus(_Vocabulary):
@@ -147,6 +156,8 @@ _STAGE_ORDER: tuple[StageId, ...] = tuple(StageId)
 
 __all__ = [
     "TaskStatus",
+    "DoneResolution",
+    "OperationOutcome",
     "RunStatus",
     "Verdict",
     "Disposition",

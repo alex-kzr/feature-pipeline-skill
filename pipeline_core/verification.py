@@ -298,13 +298,8 @@ def current_run_mutation_reason(spec: object, evidence: VerificationEvidence) ->
 
 
 def combine_verdict_status(task_verdict: str, test_verdict: str) -> str:
-    """The task state two parsed verdicts imply, fail-closed: any ``BLOCKED`` blocks, then any
-    ``FAIL`` fails verification, and only ``PASS`` + ``PASS`` verifies."""
-    if "BLOCKED" in (task_verdict, test_verdict):
-        return "blocked"
-    if "FAIL" in (task_verdict, test_verdict):
-        return "verification_failed"
-    return "verified"
+    """Return product status implied by verdicts; only two PASS verdicts complete work."""
+    return "done" if task_verdict == test_verdict == "PASS" else "in_progress"
 
 
 @dataclass(frozen=True)
@@ -701,11 +696,13 @@ def _run_one_verifier(
 
 
 def _block(run: Run, task_id: str, reason: str) -> str:
+    """Record an unavailable verifier as an operation, leaving the task resumable."""
     record = run.task(task_id)
-    if record.status != "blocked":
-        run.transition_task(task_id, "blocked", actor=ACTOR_RUNNER, note=reason)
-    record.blocker = reason
-    run.record_event(f"verification-blocked:{task_id}", to="blocked", note=reason)
+    if record.status == "to_do":
+        run.transition_task(task_id, "in_progress", actor=ACTOR_RUNNER,
+                            note="verification operation started")
+    run.record_operation(task_id, "verification", "blocked", reason)
+    run.record_event(f"verification-wait:{task_id}", to="blocked", note=reason)
     return record.status
 
 
@@ -737,9 +734,9 @@ def orchestrate_verification(
     except WorkItemError as exc:
         raise VerificationError(f"{exc.code}: {exc}") from None
     record = run.task(task_id)
-    if record.status != "implemented":
+    if record.status != "in_progress":
         raise VerificationError(
-            f"{task_id} must be 'implemented' to verify independently, is '{record.status}'")
+            f"{task_id} must be 'in_progress' to verify independently, is '{record.status}'")
     if evidence.task_id != task_id or evidence.attempt != attempt:
         raise VerificationError(
             "verification evidence does not match the task/attempt being verified")

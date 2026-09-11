@@ -259,7 +259,7 @@ class VerifiedEvidenceStore:
     #: (e.g. a sibling task needs human recovery). Reuse from a ``blocked`` source is only
     #: ever granted when the *named task itself* clears every check below — the run is never
     #: treated as successful and its bytes are never touched.
-    _TERMINAL_RUN_STATES = ("verified", "blocked")
+    _TERMINAL_RUN_STATES = ("verified", "blocked", "completed")
 
     @classmethod
     def _eligible_task(cls, data: Mapping[str, Any], task_id: str) -> Mapping[str, Any]:
@@ -271,7 +271,9 @@ class VerifiedEvidenceStore:
         task = next((item for item in tasks if isinstance(item, dict) and item.get("id") == task_id), None)
         if task is None:
             raise EvidenceEligibilityError("source task is absent", "evidence-source-task-missing")
-        if task.get("status") != "verified":
+        legacy_verified = task.get("status") == "verified"
+        completed = task.get("status") == "done" and task.get("resolution") == "completed"
+        if not (legacy_verified or completed):
             raise EvidenceEligibilityError("source task is not verified", "evidence-source-task-not-verified")
         verification = task.get("verification")
         if not isinstance(verification, dict):

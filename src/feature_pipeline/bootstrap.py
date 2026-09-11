@@ -708,13 +708,6 @@ def run_execute(
             "agents": profile.logical_paths.agents,
             "core": profile.logical_paths.core,
         },
-        executor_contexts=build_executor_context_bundles(
-            specs,
-            project_dir=project_dir,
-            agents_root=agents_root,
-            plan_path=plan_path,
-            prompt_path=project_dir / prompt_rel,
-        ),
     )
     executor = None
     launchers = None
@@ -767,6 +760,7 @@ def run_execute(
     ) / feature
 
     try:
+        execution_scope = tuple(compiled_plan.execution_scope)
         required_input_dirs = build_required_input_dirs(
             specs,
             project_dir=project_dir,
@@ -776,11 +770,23 @@ def run_execute(
             working_root_by_id={
                 spec.id: _compiled_working_root(compiled_plan, spec.id) for spec in specs
             },
+            task_ids=execution_scope,
             agents_logical_prefix=profile.logical_paths.agents,
         )
     except AdapterError as exc:
         raise CliError(EXIT_ERROR, f"{exc.code}: {exc}") from None
-    composition = replace(composition, required_input_dirs=required_input_dirs)
+    composition = replace(
+        composition,
+        executor_contexts=build_executor_context_bundles(
+            specs,
+            project_dir=project_dir,
+            agents_root=agents_root,
+            plan_path=plan_path,
+            prompt_path=project_dir / prompt_rel,
+            task_ids=execution_scope,
+        ),
+        required_input_dirs=required_input_dirs,
+    )
 
     if executor is None or launchers is None or environment is None:
         executor, launchers, environment = composition.make_execute_adapters(command.adapter)

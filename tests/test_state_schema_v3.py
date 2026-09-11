@@ -65,7 +65,16 @@ class MigrationPreservesEveryRecordedFact(unittest.TestCase):
                 self.assertEqual(len(migrated["tasks"]), len(source["tasks"]))
                 for before, after in zip(source["tasks"], migrated["tasks"]):
                     for key, value in before.items():
+                        if key == "status":
+                            continue
                         self.assertEqual(after[key], value, f"{path.name}:{before['id']}.{key}")
+
+    def test_legacy_statuses_are_mapped_to_product_progress_with_history(self) -> None:
+        source = _read(_FIXTURES / "v2" / "run-state-basic.json")
+        migrated = migrate_v2_to_v3(source)
+        for before, after in zip(source["tasks"], migrated["tasks"]):
+            self.assertIn(after["status"], {"to_do", "in_progress", "done"})
+            self.assertEqual(after["operation_history"][-1]["legacy_status"], before["status"])
 
     def test_run_level_facts_survive_migration(self) -> None:
         for path in _V2_FIXTURES:
@@ -149,6 +158,14 @@ class CorruptOrFutureStateFailsWithFieldLevelDiagnostics(unittest.TestCase):
         self._expect(
             "invalid-status.json", FieldValueError, "invalid-field-value", "tasks[0].status",
         )
+
+    def test_done_status_requires_a_resolution(self) -> None:
+        payload = migrate_v2_to_v3(_read(_FIXTURES / "v2" / "run-state-basic.json"))
+        payload["tasks"][0]["status"] = "done"
+        payload["tasks"][0]["resolution"] = None
+        with self.assertRaises(FieldValueError) as caught:
+            RunStateV3.from_mapping(payload)
+        self.assertEqual(caught.exception.field, "tasks[0].resolution")
 
     def test_invalid_nested_evidence_is_not_coerced(self) -> None:
         self._expect(

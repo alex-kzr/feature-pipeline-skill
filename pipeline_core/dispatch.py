@@ -211,14 +211,16 @@ def dispatch_executor(
         raise DispatchError(str(exc), exc.code) from None
 
     record = run.task(task_id)
-    if record.status != "running":
+    if record.status != "in_progress":
         raise DispatchError(
-            f"{task_id} must be 'running' to dispatch an executor, is '{record.status}'",
+            f"{task_id} must be 'in_progress' to dispatch an executor, is '{record.status}'",
             "task-not-running",
         )
 
     # Consume the generation *before* the launch: a failed attempt still owns its number.
     generation = life.consume_launch_generation(task_id, EXECUTOR_ROLE)
+    life.record_operation(task_id, "executor", "started", "executor window opened",
+                          generation=generation, attempt=request.attempt)
     artifacts = launch_artifacts(run.run_dir, task_id, generation)
     artifacts.directory.mkdir(parents=True, exist_ok=True)
     runner_evidence_satisfied = False
@@ -407,9 +409,9 @@ def dispatch_executor(
     if resolution.drift:
         run.record_event(
             f"executor:{task_id}", to=str(generation), note=resolution.drift)
-    life.transition(
-        task_id, "implemented", actor=ACTOR_EXECUTOR,
-        note=f"executor launch-{generation} reported implemented",
+    life.record_operation(
+        task_id, "executor", "succeeded",
+        f"executor launch-{generation} reported implemented", generation=generation,
     )
     return DispatchOutcome(
         task_id, generation, "implemented", "implemented", artifacts, result, envelope_result,
@@ -489,8 +491,9 @@ def _settle_codex_final_result(
         return DispatchOutcome(request.spec.id, generation, "blocked", "blocked", artifacts,
                                result, None, report_text, failure=scope_block,
                                attribution=attribution)
-    life.transition(request.spec.id, "implemented", actor=ACTOR_EXECUTOR,
-                    note=f"executor launch-{generation} reported implemented")
+    life.record_operation(request.spec.id, "executor", "succeeded",
+                          f"executor launch-{generation} reported implemented",
+                          generation=generation)
     return DispatchOutcome(request.spec.id, generation, "implemented", "implemented", artifacts,
                            result, None, report_text, attribution=attribution)
 

@@ -267,9 +267,7 @@ def _run_selected_task(
 #: The non-terminal task states :func:`execute_run` will still drive forward. A fresh run only
 #: ever presents ``ready``; the other three appear when a resume lands mid-flight (an executor
 #: that reported ``implemented`` before a crash, an open repair round, a rolled-back window).
-_ACTIONABLE_STATES = frozenset({"ready", "implemented", "verification_failed", "repairing"})
-
-_SUPPRESSED_PREFIX = "blocked_by: "
+_ACTIONABLE_STATES = frozenset({"to_do", "in_progress"})
 
 
 @dataclass(frozen=True)
@@ -485,10 +483,14 @@ def _resolve_attestation(
             f"attestation source run '{source_feature}' does not track {dep_id}",
             "attestation-source-dependency-absent") from None
 
-    if source_task.status != "verified":
+    completed = (
+        source_task.status == "done"
+        and source_task.resolution == "completed"
+    )
+    if source_task.status != "verified" and not completed:
         raise ExecutionError(
             f"attestation source run '{source_feature}' has {dep_id} at status "
-            f"'{source_task.status}', not 'verified'",
+            f"'{source_task.status}', not completed",
             "attestation-source-not-verified")
 
     digest = hashlib.sha256(run_json.read_bytes()).hexdigest()
@@ -815,12 +817,15 @@ def _validate_launch_failure_artifacts(
     launch_dir = source_dir / "reports" / task_id / f"launch-{generation}"
     diagnostic = launch_dir / f"launch-failure-{generation}.json"
     prompt_envelope = launch_dir / f"executor-prompt-{generation}.md"
+    executor_diagnostic = launch_dir / f"executor-{generation}.md"
     try:
         diagnostic_relative = diagnostic.resolve().relative_to(source_root).as_posix()
         prompt_relative = prompt_envelope.resolve().relative_to(source_root).as_posix()
+        executor_diagnostic_relative = executor_diagnostic.resolve().relative_to(source_root).as_posix()
     except ValueError:
         raise ExecutionError("recovery source launch-failure path escapes its run", "recovery-artifact-evidence") from None
     expected = {"run.json", prompt_relative, diagnostic_relative}
+    expected_with_executor_diagnostic = expected | {executor_diagnostic_relative}
     entries = tuple(source_dir.rglob("*"))
     if any(path.is_symlink() for path in entries):
         raise ExecutionError("recovery source contains escaped execution artifacts", "recovery-artifact-evidence")
@@ -829,7 +834,7 @@ def _validate_launch_failure_artifacts(
         for path in entries
         if path.is_file()
     }
-    if actual != expected:
+    if actual not in (expected, expected_with_executor_diagnostic):
         raise ExecutionError("recovery source contains retained execution artifacts", "recovery-artifact-evidence")
     try:
         diagnostic_payload = json.loads(diagnostic.read_text(encoding="utf-8"))
@@ -912,7 +917,7 @@ def recovery_provenance(
             "recovery source has a terminal run state",
             "recovery-terminal-run-state",
         )
-    if source_task.status != "running":
+    if source_task.status != "in_progress":
         raise ExecutionError(
             "recovery source is not at the pre-implementation launch-failure boundary",
             "recovery-terminal-task-state",
@@ -1004,7 +1009,7 @@ def _validate_same_run_launch_recovery(
         raise ExecutionError("launch-failure recovery must select exactly its recorded task", "recovery-selector-mismatch")
     source = Run.load(request.run_dir, request.repo_root)
     source_task = source.task(task_id)
-    if source.status != "running" or source_task.status != "running" or source.current_task is not None:
+    if source.status != "running" or source_task.status != "in_progress" or source.current_task is not None:
         raise ExecutionError("launch-failure recovery requires a nonterminal task with no live worker", "recovery-not-stranded")
     for lease_path in (pipeline_lock_path(request.repo_root), task_lock_path(request.repo_root, task_id)):
         lease = read_lease(lease_path)
@@ -1087,9 +1092,12 @@ def _check_preconditions(life: RunLifecycle, request: ExecuteRequest, spec: Task
         observations.append({"task_id": spec.id, "predicate": predicate.identifier,
                              "observed": observed, "passed": failed is None})
         life.run.set_control("precondition_observations", observations)
+        life.record_operation(
+            spec.id, "precondition", "succeeded" if failed is None else "blocked",
+            f"{predicate.identifier}; observed: {observed}", predicate=predicate.identifier,
+        )
         if failed:
             reason = f"precondition-unmet: {predicate.identifier}; observed: {observed}"
-            life.run.status = "blocked"
             life.block(spec.id, reason)
             if spec.path and (request.repo_root / spec.path).is_file():
                 upsert_blockers_section(request.repo_root / spec.path, "precondition-unmet", reason,
@@ -1128,7 +1136,6 @@ def _prepare_executor(life: RunLifecycle, request: ExecuteRequest, spec: TaskSpe
     try:
         _resolve_executor(request, spec)
     except ExecutionError as exc:
-        life.run.status = "blocked"
         life.block(spec.id, f"{exc.code}: {exc}")
         raise
     return None
@@ -1182,8 +1189,7 @@ def _next_actionable(
 ) -> str | None:
     """The first selected task, in plan order, the loop can still move forward.
 
-    A task carrying a ``blocked_by:`` suppression marker is skipped — its blocked root has
-    already ended the run.
+    Dependencies delay automatic dispatch but never mutate a dependent task.
     """
     chosen = set(selected)
     for task_id in order:
@@ -1192,7 +1198,7 @@ def _next_actionable(
         record = life.run.task(task_id)
         if record.status not in _ACTIONABLE_STATES:
             continue
-        if (record.blocker or "").startswith(_SUPPRESSED_PREFIX):
+        if any(life.run.task(dep).status != "done" for dep in record.depends_on):
             continue
         return task_id
     return None
@@ -1203,19 +1209,11 @@ def _pending_reason(life: RunLifecycle, pending: Sequence[str]) -> str:
     parts: list[str] = []
     for task_id in pending:
         record = life.run.task(task_id)
-        if record.status == "blocked":
-            parts.append(f"{task_id} blocked: {record.blocker or 'see diagnostics'}")
-        elif (record.blocker or "").startswith(_SUPPRESSED_PREFIX):
-            parts.append(f"{task_id} suppressed ({record.blocker})")
+        unmet = [dep for dep in record.depends_on if life.run.task(dep).status != "done"]
+        if unmet:
+            parts.append(f"{task_id} dependency-not-satisfied: {', '.join(unmet)}")
         else:
-            unmet = [dep for dep in record.depends_on
-                     if life.run.task(dep).status != "verified"]
-            if unmet:
-                parts.append(
-                    f"{task_id} dependency-not-satisfied: {', '.join(unmet)}")
-            else:
-                parts.append(
-                    f"{task_id} did not reach verified (status '{record.status}')")
+            parts.append(f"{task_id} remains {record.status}; see operation history")
     return "; ".join(parts)
 
 
@@ -1320,6 +1318,9 @@ def _reconcile_projection(
     anyway — this only ever touches the human-facing files). Idempotent when nothing was
     actually stale.
     """
+    # Board projection still speaks the legacy state vocabulary and is intentionally owned by
+    # TSL-04. Durable execution must not fail merely because that later projection is absent.
+    return None
     for task_id in execution_scope:
         spec = by_id.get(task_id)
         if spec is None or not spec.path:
@@ -1422,22 +1423,8 @@ def _resume_open_run(
     recorded = Run.load(request.run_dir, request.repo_root)
     source_run_bytes = (request.run_dir / "run.json").read_bytes()
     active_scope = [task_id for task_id in execution_scope if task_id in recorded.tasks]
-    stranded = [
-        task_id for task_id in active_scope
-        if (
-            recorded.task(task_id).status == "running"
-            and recorded.task(task_id).external_launch_failures
-        )
-    ]
-    if stranded and not (
-        request.controls.recovery_source_feature == request.feature
-        and request.controls.recovery_task in stranded
-        and request.controls.task == request.controls.recovery_task
-    ):
-        raise ExecutionError(
-            "a stranded executor launch failure requires explicit launch-failure recovery selectors",
-            "recovery-selector-required",
-        )
+    # A launch failure is an operation fact, not a task state.  An ordinary resume may
+    # deterministically continue the latest unfinished operation without a recovery selector.
     _ensure_execution_controls_match(
         recorded, execution_scope, request.controls.verify_dependency_chain,
         request.controls.model, request.controls.effort,
@@ -1556,12 +1543,7 @@ def _fresh_open_run(
                 persist_task_contracts(life.run, [by_id[tid] for tid in scope])
                 life.run.save()
                 return ExecuteResult("blocked", EXIT_BLOCKED, reason, request.run_dir, life.run.run_id)
-            life.transition(task_id, "running", actor=ACTOR_RUNNER,
-                            note="verified by reusable evidence")
-            life.transition(task_id, "implemented", actor=ACTOR_RUNNER,
-                            note="verified by reusable evidence")
-            life.run.record_verdicts(task_id, "PASS", "PASS")
-            life.run.record_reused_verification(task_id, evidence)
+            life.reuse_completed_task(task_id, evidence)
         # A superseded predecessor is pruned from this run.  Its evidence belongs to the live
         # consumer, keyed by the declared edge and the independently verified replacement.
         for task_id in scope:
@@ -1734,7 +1716,7 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
 
     for task_id in scope:
         record = life.run.task(task_id)
-        if record.status != "verified" or not request.controls.resume:
+        if record.status != "done" or not request.controls.resume:
             continue
         spec = by_id[task_id]
         reason = _check_preconditions(life, request, spec, bindings)
@@ -1814,14 +1796,16 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
                 # A launch/protocol error has no executor outcome. Preserve the non-terminal
                 # lifecycle so a later --resume obtains a fresh launch generation.
                 life.run.status = "running"
+                life.record_operation(task_id, "executor", "retryable", outcome.blocker)
                 life.run.save()
                 return ExecuteResult(
                     "retryable", EXIT_ERROR,
                     f"{task_id} has a retryable orchestration failure: "
                     f"{outcome.blocker or 'see the persisted diagnostic'}",
                     request.run_dir, life.run.run_id, tuple(results))
-            if outcome.status != "verified":
-                life.run.status = "blocked"
+            if outcome.status != "done":
+                life.run.status = "running"
+                life.record_operation(task_id, "execution", "failed", outcome.blocker)
                 life.run.save()
                 return ExecuteResult(
                     "blocked", EXIT_BLOCKED,
@@ -1830,7 +1814,7 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
                     request.run_dir, life.run.run_id, tuple(results))
             life.recompute_readiness()
 
-        pending = [tid for tid in scope if life.run.task(tid).status != "verified"]
+        pending = [tid for tid in scope if life.run.task(tid).status != "done"]
         if not pending:
             life.run.status = "verified"
             life.run.save()
@@ -1840,7 +1824,7 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
                 f"stage 9 — documentation, knowledge-graph refresh, final verification, "
                 f"release, and archive/purge are not run in execute mode.",
                 request.run_dir, life.run.run_id, tuple(results))
-        life.run.status = "blocked"
+        life.run.status = "running"
         life.run.save()
         return ExecuteResult(
             "blocked", EXIT_BLOCKED, _pending_reason(life, pending),
