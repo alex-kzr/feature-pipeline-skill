@@ -20,7 +20,10 @@ EXIT_LAUNCH_FAILED = "error"
 ACTOR_RUNNER = "runner"
 ACTOR_EXECUTOR = "executor"
 ACTOR_HUMAN = "human"
-TASK_TRANSITIONS = {"to_do": {"in_progress"}, "in_progress": {"done"}, "done": {"in_progress"}}
+#: Product-progress transitions. ``to_do`` may reach ``done`` directly only through an
+#: explicit human cancellation (an unstarted task that is no longer needed); completing work
+#: still requires having passed through ``in_progress`` (enforced in ``transition_task``).
+TASK_TRANSITIONS = {"to_do": {"in_progress", "done"}, "in_progress": {"done"}, "done": {"in_progress"}}
 
 #: Interrupted non-terminal states rolled back on resume. A ``running`` task lost its executor
 #: window and returns to ``ready`` for redispatch; a ``repairing`` task lost its repair window
@@ -353,10 +356,20 @@ class Run:
             raise TransitionError(f"cannot transition {task_id} from {record.status} to {to}", "illegal-transition")
         if to == "done" and resolution not in {"completed", "cancelled"}:
             raise TransitionError("a done task requires a resolution", "missing-task-resolution")
-        if to == "done" and resolution == "completed" and actor != ACTOR_RUNNER:
-            raise TransitionError("only the runner may record completed work", "unauthorized-transition")
-        if to == "done" and resolution == "cancelled" and actor != ACTOR_HUMAN:
-            raise TransitionError("only a human may cancel a task", "unauthorized-transition")
+        if to == "done" and resolution == "completed":
+            if actor != ACTOR_RUNNER:
+                raise TransitionError("only the runner may record completed work", "unauthorized-transition")
+            if record.status != "in_progress":
+                raise TransitionError(
+                    "completed resolution requires the task to have been in progress",
+                    "illegal-transition",
+                )
+        if to == "done" and resolution == "cancelled":
+            if actor != ACTOR_HUMAN:
+                raise TransitionError("only a human may cancel a task", "unauthorized-transition")
+            if not (note and note.strip()):
+                raise TransitionError(
+                    "cancelling a task requires a non-empty reason", "missing-cancellation-reason")
         if record.status == "done" and actor != ACTOR_HUMAN:
             raise TransitionError("only a human may reopen a done task", "unauthorized-transition")
         previous = record.status

@@ -49,9 +49,11 @@ from .vocabulary import Actor, DoneResolution, RunStatus, TaskStatus, Verdict
 # ==========================================================================================
 
 #: Product-progress transitions. Operation retries and failures are recorded as evidence,
-#: never as task states.
+#: never as task states. ``TO_DO`` may reach ``DONE`` directly only through an explicit human
+#: cancellation of a task that never started; completing work still requires having passed
+#: through ``IN_PROGRESS`` (enforced in :func:`_check_transition`).
 TASK_TRANSITIONS: Mapping[TaskStatus, frozenset[TaskStatus]] = {
-    TaskStatus.TO_DO: frozenset({TaskStatus.IN_PROGRESS}),
+    TaskStatus.TO_DO: frozenset({TaskStatus.IN_PROGRESS, TaskStatus.DONE}),
     TaskStatus.IN_PROGRESS: frozenset({TaskStatus.DONE}),
     TaskStatus.DONE: frozenset({TaskStatus.IN_PROGRESS}),
 }
@@ -453,6 +455,21 @@ def _check_transition(
         actor is Actor.RUNNER or (actor is Actor.HUMAN and resolution is DoneResolution.CANCELLED)
     ):
         raise UnauthorizedTransition("only the runner may record completed work")
+    if to is TaskStatus.DONE and resolution is DoneResolution.COMPLETED:
+        # Completed is the runner's exclusive, evidence-backed resolution: an executor cannot
+        # self-complete, and completing without having been in progress would manufacture
+        # verification that was never run.
+        if task.status is not TaskStatus.IN_PROGRESS:
+            raise IllegalTransition(
+                "completed resolution requires the task to have been in progress"
+            )
+        if not (
+            task.verification.task_verdict is Verdict.PASS
+            and task.verification.test_verdict is Verdict.PASS
+        ):
+            raise IllegalTransition(
+                "completed resolution requires two passing independent verifier verdicts"
+            )
 
 
 def _apply_transition(state: RunState, event: Transition) -> RunState:
