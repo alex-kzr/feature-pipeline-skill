@@ -608,6 +608,55 @@ class TaskEntryV3:
         out.update(self.extra)
         return out
 
+    def with_appended_operation(
+        self, operation: Mapping[str, object]
+    ) -> "TaskEntryV3":
+        """Append one immutable operation record without changing product status.
+
+        New writers identify an operation by ``operation_id``.  Replaying the exact
+        operation after an interruption is therefore a no-op, while attempting to
+        reuse an id for different evidence fails rather than silently rewriting
+        history.  Older records deliberately remain opaque and readable: they did
+        not carry an operation id and are historical source evidence, not a reason
+        to rewrite a source run in place.
+        """
+        entry = dict(operation)
+        operation_id = entry.get("operation_id")
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError("a new operation requires a non-empty operation_id")
+        for existing in self.operation_history:
+            if existing.get("operation_id") != operation_id:
+                continue
+            if existing == entry:
+                return self
+            raise ValueError(f"operation_id {operation_id!r} is already settled")
+        return replace(self, operation_history=self.operation_history + (entry,))
+
+    def with_status(
+        self,
+        status: str,
+        *,
+        resolution: str | None = None,
+        resolution_reason: str | None = None,
+    ) -> "TaskEntryV3":
+        """Return a status snapshot while leaving operation history untouched."""
+        if status not in _TASK_STATUSES:
+            raise ValueError(f"unsupported task status {status!r}")
+        if status == "done" and resolution not in _DONE_RESOLUTIONS:
+            raise ValueError("a done task requires a resolution")
+        if status != "done" and resolution is not None:
+            raise ValueError("only a done task may have a resolution")
+        if resolution == "cancelled" and not (
+            resolution_reason and resolution_reason.strip()
+        ):
+            raise ValueError("a cancelled task requires a non-empty reason")
+        return replace(
+            self,
+            status=status,
+            resolution=resolution if status == "done" else None,
+            resolution_reason=resolution_reason if status == "done" else None,
+        )
+
 
 @dataclass(frozen=True)
 class RunStateV3:
@@ -747,6 +796,31 @@ class RunStateV3:
         return replace(
             self,
             tasks=tuple(entry if task.id == entry.id else task for task in self.tasks),
+        )
+
+    def with_appended_task_operation(
+        self, task_id: str, operation: Mapping[str, object]
+    ) -> "RunStateV3":
+        """Append an idempotent operation record to one task, preserving task order."""
+        task = self.task(task_id)
+        updated = task.with_appended_operation(operation)
+        return self if updated is task else self.with_task(updated)
+
+    def with_task_status(
+        self,
+        task_id: str,
+        status: str,
+        *,
+        resolution: str | None = None,
+        resolution_reason: str | None = None,
+    ) -> "RunStateV3":
+        """Replace only the durable product status and its Done resolution."""
+        return self.with_task(
+            self.task(task_id).with_status(
+                status,
+                resolution=resolution,
+                resolution_reason=resolution_reason,
+            )
         )
 
     def with_appended_command(self, command: CommandRecordV3) -> "RunStateV3":

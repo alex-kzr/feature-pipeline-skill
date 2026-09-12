@@ -128,11 +128,12 @@ class MigrationTests(unittest.TestCase):
             run.record_event("continuation", to="noted", note="unrelated continuation")
             run.save()
             after_continuation_digest = hashlib.sha256(run_json.read_bytes()).hexdigest()
-            self.assertNotEqual(before_digest, after_continuation_digest)
+            self.assertEqual(before_digest, after_continuation_digest)
 
             reloaded = Run.load(run_dir, root)
             self.assertEqual(reloaded.task("LT-1").status, "done")
             self.assertEqual(reloaded.task("LT-1").resolution, "completed")
+            self.assertEqual(reloaded.history[-1]["scope"], "continuation")
 
 
 class RoundTripTests(unittest.TestCase):

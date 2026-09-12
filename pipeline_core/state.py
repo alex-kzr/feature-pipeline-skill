@@ -372,6 +372,16 @@ class Run:
                     "completed resolution requires the task to have been in progress",
                     "illegal-transition",
                 )
+            verification = record.verification
+            if not (
+                isinstance(verification, Mapping)
+                and verification.get("task_verdict") == "PASS"
+                and verification.get("test_verdict") == "PASS"
+            ):
+                raise TransitionError(
+                    "completed resolution requires two passing independent verifier verdicts",
+                    "missing-verification-evidence",
+                )
         if to == "done" and resolution == "cancelled":
             if actor != ACTOR_HUMAN:
                 raise TransitionError("only a human may cancel a task", "unauthorized-transition")
@@ -715,19 +725,49 @@ class Run:
     @classmethod
     def load(cls, run_dir: str | Path, repo_root: str | Path) -> "Run":
         directory = Path(run_dir)
+        state_path = directory / "run.json"
         try:
-            raw = read_json(directory / "run.json")
+            raw = read_json(state_path)
         except ArtifactReadError as exc:
             raise StateError(str(exc), "unreadable-state") from None
         data = migrate_run_state(raw)
+        # Compatibility reads must not turn into in-place migrations.  When normalising a
+        # legacy source would change its bytes, continue from a sibling checkpoint instead
+        # and retain a content-addressed pointer to the immutable source artifact.
+        active_directory = directory
+        recovery: dict[str, Any] | None = data.get("recovery")
+        if data != raw:
+            try:
+                source_bytes = state_path.read_bytes()
+            except OSError as exc:
+                raise StateError(str(exc), "unreadable-state") from None
+            source_digest = hashlib.sha256(source_bytes).hexdigest()
+            active_directory = directory.parent / f"{directory.name}.continuation-{source_digest[:12]}"
+            source_recovery = {
+                "source_run_id": raw.get("run_id"),
+                "source_run_sha256": f"sha256:{source_digest}",
+            }
+            checkpoint_path = active_directory / "run.json"
+            if checkpoint_path.is_file():
+                # The source path remains the durable identity for a legacy run.  Once a
+                # continuation exists, loading by that identity must resume its checkpoint
+                # rather than remigrating the immutable source and losing later history.
+                try:
+                    checkpoint = read_json(checkpoint_path)
+                except ArtifactReadError as exc:
+                    raise StateError(str(exc), "unreadable-state") from None
+                data = migrate_run_state(checkpoint)
+                recovery = data.get("recovery") or source_recovery
+            else:
+                recovery = source_recovery
         tasks = {entry["id"]: TaskRecord.from_dict(entry) for entry in data.get("tasks", [])}
         return cls(
-            data["feature"], data["prompt_path"], data.get("plan_path"), directory,
+            data["feature"], data["prompt_path"], data.get("plan_path"), active_directory,
             Path(os.path.abspath(repo_root)), data["run_id"], data.get("status", "pending"),
             tasks, data.get("history", []), data.get("commands", []),
             data.get("controls", {}), data.get("environment", {}),
             data.get("current_task"), data.get("stages", {}), data.get("artifacts", {}),
-            data.get("recovery"),
+            recovery,
         )
 
     def resume(self, *, feature: str, prompt_path: str | Path, plan_path: str | Path | None) -> None:

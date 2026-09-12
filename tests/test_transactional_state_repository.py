@@ -481,6 +481,88 @@ class TestOneCommitApi(unittest.TestCase):
         _, orphans = persistence.resume()
         self.assertEqual(orphans, ())
 
+    def test_status_and_operation_history_round_trip_independently(self) -> None:
+        persistence, loaded, _ = self._fresh()
+        operation = {
+            "operation_id": "verification:1",
+            "kind": "verification",
+            "outcome": "failed",
+            "evidence_refs": ["logs/command-1.log"],
+        }
+        recorded = persistence.record_task_operation(loaded, "T-1", operation)
+        settled = persistence.set_task_status(recorded, "T-1", "done", resolution="completed")
+
+        task = persistence.open().state.task("T-1")
+        self.assertEqual(task.status, "done")
+        self.assertEqual(task.resolution, "completed")
+        self.assertEqual(list(task.operation_history), [operation])
+        self.assertEqual(settled.revision, 2)
+
+    def test_replaying_a_settled_operation_is_idempotent(self) -> None:
+        persistence, loaded, _ = self._fresh()
+        operation = {"operation_id": "executor:1", "kind": "executor", "outcome": "failed"}
+        recorded = persistence.record_task_operation(loaded, "T-1", operation)
+
+        replayed = persistence.record_task_operation(recorded, "T-1", operation)
+
+        self.assertEqual(replayed.revision, recorded.revision)
+        self.assertEqual(
+            list(persistence.open().state.task("T-1").operation_history), [operation]
+        )
+
+    def test_reusing_a_settled_operation_id_with_different_evidence_is_rejected(self) -> None:
+        persistence, loaded, _ = self._fresh()
+        recorded = persistence.record_task_operation(
+            loaded, "T-1", {"operation_id": "executor:1", "kind": "executor", "outcome": "failed"}
+        )
+
+        with self.assertRaises(ValueError):
+            persistence.record_task_operation(
+                recorded, "T-1", {"operation_id": "executor:1", "kind": "executor", "outcome": "succeeded"}
+            )
+
+    def test_interrupted_status_and_operation_commits_resume_without_losing_evidence(self) -> None:
+        for method in ("record_task_operation", "set_task_status"):
+            for crash_step in ("reference", "commit"):
+                with self.subTest(method=method, crash_step=crash_step):
+                    persistence, loaded, _ = self._fresh()
+
+                    def crash(step: str) -> None:
+                        if step == crash_step:
+                            raise RuntimeError(f"killed at {step}")
+
+                    with self.assertRaises(RuntimeError):
+                        if method == "record_task_operation":
+                            persistence.record_task_operation(
+                                loaded, "T-1",
+                                {"operation_id": "verify:1", "kind": "verification",
+                                 "outcome": "failed", "evidence_refs": ["reports/T-1.md"]},
+                                on_step=crash,
+                            )
+                        else:
+                            persistence.set_task_status(
+                                loaded, "T-1", "done", resolution="completed", on_step=crash,
+                            )
+
+                    resumed, _ = persistence.resume()
+                    task = resumed.state.task("T-1")
+                    if crash_step == "reference":
+                        self.assertEqual(task.status, "in_progress")
+                        self.assertEqual(task.operation_history, ())
+                    else:
+                        self.assertEqual(
+                            task.status,
+                            "done" if method == "set_task_status" else "in_progress",
+                        )
+                        self.assertEqual(len(task.operation_history), 1 if method == "record_task_operation" else 0)
+                    if method == "record_task_operation":
+                        replayed = persistence.record_task_operation(
+                            resumed, "T-1",
+                            {"operation_id": "verify:1", "kind": "verification",
+                             "outcome": "failed", "evidence_refs": ["reports/T-1.md"]},
+                        )
+                        self.assertEqual(len(replayed.state.task("T-1").operation_history), 1)
+
 
 class TestArtifactNameValidation(unittest.TestCase):
     def test_names_that_escape_the_run_directory_are_rejected(self) -> None:

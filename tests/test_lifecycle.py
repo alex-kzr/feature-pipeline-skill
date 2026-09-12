@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sys
 import tempfile
 import unittest
@@ -211,6 +212,28 @@ class ResumeReconciliationTests(unittest.TestCase):
                 run = self._interrupted(root, status)
                 life = self._resume(root, run)
                 self.assertEqual(life.run.task("A-1").status, expected)
+
+    def test_legacy_resume_writes_a_checkpoint_without_rewriting_the_source_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = _run(root, plan="plan.md")
+            life = RunLifecycle.initialize(run, tasks=[("A-1", [])])
+            source = run.run_dir / "run.json"
+            payload = _stored(run.run_dir)
+            payload["tasks"][0]["status"] = "running"
+            source.write_text(json.dumps(payload), encoding="utf-8")
+            source_bytes = source.read_bytes()
+
+            resumed = self._resume(root, run)
+
+            self.assertEqual(source.read_bytes(), source_bytes)
+            self.assertNotEqual(resumed.run.run_dir, run.run_dir)
+            self.assertEqual(resumed.run.task("A-1").status, "in_progress")
+            self.assertEqual(
+                resumed.run.recovery["source_run_sha256"],
+                f"sha256:{hashlib.sha256(source_bytes).hexdigest()}",
+            )
+            self.assertTrue((resumed.run.run_dir / "run.json").is_file())
 
     def test_resume_rejects_a_changed_feature_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
