@@ -56,10 +56,10 @@ def _prose(status: str = "implemented", *, with_line: bool = True) -> str:
     return "\n".join(lines)
 
 
-def _envelope(status: str, task_id: str = "RDS-04", attempt: int = 1) -> str:
-    return json.dumps(
-        {"role": "executor", "status": status, "task_id": task_id, "attempt": attempt}
-    )
+def _envelope(status: str, task_id: str = "RDS-04", attempt: int = 1, **extra: object) -> str:
+    body = {"role": "executor", "status": status, "task_id": task_id, "attempt": attempt}
+    body.update(extra)
+    return json.dumps(body)
 
 
 class ScriptedAdapter:
@@ -104,7 +104,8 @@ class ScriptedAdapter:
     def launch(self, request):  # noqa: ANN001 - test double
         self.calls.append(
             {"role": request.role, "no_tools": request.no_tools,
-             "resume": request.resume_session_id, "prompt": request.prompt}
+             "resume": request.resume_session_id, "prompt": request.prompt,
+             "allowed_tools": request.allowed_tools}
         )
         if request.no_tools or request.resume_session_id:
             text = self.envelope_text if self.envelope_text is not None else _envelope(
@@ -216,7 +217,8 @@ class ProducerAttributionTests(unittest.TestCase):
     def test_settle_fails_closed_on_disagreement_and_records_prose_drift(self) -> None:
         with self.assertRaises(ReportError) as ctx:
             settle_executor_status(
-                prose_text="- Status: implemented", envelope_text=_envelope("blocked"),
+                prose_text="- Status: implemented",
+                envelope_text=_envelope("blocked", reason="declared check unavailable"),
                 role="executor", task_id="RDS-04", attempt=1,
             )
         self.assertEqual(ctx.exception.code, "status-envelope-mismatch")
@@ -334,6 +336,31 @@ class GenerationTests(unittest.TestCase):
 
 
 # --- adapter-facing role resolution (RDS-06) -----------------------------------------------------
+
+
+class CheckGrantDerivationTests(unittest.TestCase):
+    """RLC-01 AC-1: the executor launch is granted exact ``Bash(<argv>)`` allowances derived
+    only from this task's own declared, working-root-matching verification commands."""
+
+    def test_executor_launch_receives_only_its_own_qualifying_check_allowance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = _spec(
+                verification_commands=(
+                    {"cwd": ".", "command": "uv run python -m unittest"},
+                    {"cwd": "elsewhere", "command": "uv run pytest"},
+                ),
+            )
+            life = _running_life(root, spec)
+            adapter = ScriptedAdapter()
+            dispatch_executor(life, _request(spec, working_root="."), adapter)
+
+            self.assertEqual(
+                adapter.calls[0]["allowed_tools"],
+                ("Bash(uv run python -m unittest)",),
+            )
+            # The same-session status-envelope continuation is tool-free regardless.
+            self.assertEqual(adapter.calls[1]["allowed_tools"], ())
 
 
 class AdapterRoleResolutionTests(unittest.TestCase):
@@ -654,7 +681,10 @@ class RecoveryEvidenceTests(unittest.TestCase):
             root = Path(directory)
             spec = _spec()
             life = _running_life(root, spec)
-            adapter = ScriptedAdapter(prose_status="implemented", envelope_status="blocked")
+            adapter = ScriptedAdapter(
+                prose_status="implemented",
+                envelope_text=_envelope("blocked", spec.id, reason="declared check unavailable"),
+            )
             outcome = dispatch_executor(life, _request(spec), adapter)
 
             self.assertEqual(outcome.status, "retryable")
@@ -675,20 +705,62 @@ class RecoveryEvidenceTests(unittest.TestCase):
             self.assertIn("unparseable-status-envelope", outcome.failure or "")
             self.assertEqual(life.run.task(spec.id).status, "in_progress")
 
-    def test_executor_reported_blocked_blocks_without_a_launch_failure(self) -> None:
+    def test_executor_reported_blocked_without_a_reason_is_a_retryable_protocol_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             spec = _spec()
             life = _running_life(root, spec)
             adapter = ScriptedAdapter(prose_status="blocked", envelope_status="blocked")
+            adapter.requires_blocked_envelope_reason = True
+            outcome = dispatch_executor(life, _request(spec), adapter)
+
+            self.assertEqual(outcome.status, "retryable")
+            self.assertIsNone(outcome.settled_status)
+            self.assertTrue(outcome.artifacts.launch_failure.exists())
+            self.assertEqual(life.run.task(spec.id).status, "in_progress")
+            self.assertIsNone(life.run.task(spec.id).blocker)
+
+    def test_executor_blocked_reason_is_preserved_not_reduced_to_a_generic_string(
+        self,
+    ) -> None:
+        """RLC-01 AC-2: a Claude executor that supplies a non-empty blocked reason on the
+        status envelope must have that exact reason preserved into durable operation
+        history and the dispatch outcome, not the generic 'executor reported blocked'."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = _spec()
+            life = _running_life(root, spec)
+            adapter = ScriptedAdapter(
+                prose_status="blocked",
+                envelope_text=_envelope(
+                    "blocked", spec.id, reason="required credential is unavailable"),
+            )
             outcome = dispatch_executor(life, _request(spec), adapter)
 
             self.assertEqual(outcome.status, "blocked")
-            self.assertEqual(outcome.settled_status, "blocked")
-            self.assertFalse(outcome.artifacts.launch_failure.exists())
             wait = life.run.task(spec.id).operation_history[-1]
             self.assertEqual(wait["kind"], "wait")
-            self.assertIn("executor reported blocked", wait["detail"] or "")
+            self.assertEqual(wait["detail"], "required credential is unavailable")
+
+    def test_executor_blocked_with_malformed_reason_is_retryable_not_a_task_block(
+        self,
+    ) -> None:
+        """A blocked envelope that carries an empty/invalid 'reason' is a protocol error —
+        it must fail closed as retryable, never invent a reason to block the task on."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = _spec()
+            life = _running_life(root, spec)
+            adapter = ScriptedAdapter(
+                prose_status="blocked",
+                envelope_text=_envelope("blocked", spec.id, reason="   "),
+            )
+            outcome = dispatch_executor(life, _request(spec), adapter)
+
+            self.assertEqual(outcome.status, "retryable")
+            self.assertIn("unparseable-status-envelope", outcome.failure or "")
+            self.assertEqual(life.run.task(spec.id).status, "in_progress")
+            self.assertIsNone(life.run.task(spec.id).blocker)
 
 
 # --- state authority -------------------------------------------------------------------------
@@ -698,7 +770,10 @@ class StateAuthorityTests(unittest.TestCase):
     def test_dispatch_reaches_implemented_blocked_or_retryable(self) -> None:
         for adapter, expected in (
             (ScriptedAdapter(), "implemented"),
-            (ScriptedAdapter(prose_status="blocked", envelope_status="blocked"), "blocked"),
+            (ScriptedAdapter(
+                prose_status="blocked",
+                envelope_text=_envelope("blocked", reason="declared check unavailable"),
+            ), "blocked"),
             (ScriptedAdapter(launch_exit=1), "retryable"),
         ):
             with tempfile.TemporaryDirectory() as directory:

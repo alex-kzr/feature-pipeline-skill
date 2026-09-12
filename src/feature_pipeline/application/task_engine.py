@@ -250,8 +250,12 @@ class TaskEngine:
                         tuple(passes),
                     )
                 if dispatch.status != "implemented":
-                    blocker = (run.task(task_id).blocker
-                               or f"executor could not implement {task_id}: {dispatch.failure}")
+                    # A settled executor block is a protocol fact, not prose to decorate:
+                    # preserve its validated reason unchanged through the task-engine result
+                    # and durable operation history.  Generic context is only for the
+                    # impossible no-reason fallback (RLC-01 AC-2).
+                    blocker = (dispatch.failure or run.task(task_id).blocker
+                               or f"executor could not implement {task_id}")
                     life.record_operation(task_id, "executor", "failed", blocker, gate=gate)
                     passes.append(RepairPass(gate, "waiting", repair_of, None, None))
                     return TaskRunResult(task_id, "waiting", record.attempts, gates,

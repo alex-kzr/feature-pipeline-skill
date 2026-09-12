@@ -241,7 +241,15 @@ def migrate_run_state(payload: Mapping[str, object]) -> dict[str, object]:
         old_status = task.get("status")
         if old_status in legacy:
             task["status"] = legacy[old_status]
-            task.setdefault("resolution", "completed" if old_status == "verified" else None)
+            # A v1->v2 schema migration (above) already stamped an explicit
+            # ``resolution: None`` onto every task via `TaskRecord`'s own field default, so
+            # `setdefault` here is a no-op for a schema-v2-shaped legacy task: it never sees a
+            # missing key to fill in. A legacy 'verified' status must still resolve to a
+            # completed task, so assign it outright rather than relying on absence.
+            if old_status == "verified":
+                task["resolution"] = "completed"
+            else:
+                task.setdefault("resolution", None)
             task.setdefault("resolution_reason", None)
             task.setdefault("operation_history", []).append({"at": _now(), "kind": "legacy-state",
                                                                "outcome": "migrated", "detail": old_status})

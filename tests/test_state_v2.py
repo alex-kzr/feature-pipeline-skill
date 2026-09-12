@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -71,6 +72,9 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual(run.status, "running")
             self.assertEqual(list(run.tasks), ["LT-1", "LT-2"])
             self.assertEqual(run.task("LT-1").status, "done")
+            # RLC-01 AC-4: a legacy 'verified' status must load as 'done' *with* the
+            # completion resolution set — not just the status remapped.
+            self.assertEqual(run.task("LT-1").resolution, "completed")
             self.assertEqual(run.task("LT-1").attempts, 2)
             self.assertEqual(run.task("LT-2").status, "in_progress")
             self.assertEqual(run.task("LT-2").blocker, "dependency-not-satisfied: LT-1")
@@ -99,6 +103,36 @@ class MigrationTests(unittest.TestCase):
                 Run.load(run_dir, root)
             self.assertEqual(caught.exception.code, "unknown-schema-version")
             self.assertEqual((run_dir / "run.json").read_text(encoding="utf-8"), original)
+
+    def test_legacy_verified_load_preserves_source_bytes_through_load_and_continuation(
+        self,
+    ) -> None:
+        """RLC-01 AC-4: loading a legacy v1 'verified' fixture never rewrites the source file,
+        and the corrected done/completed resolution survives an unrelated, separately
+        committed continuation (not just the first in-memory load)."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_dir = root / "runs" / "legacy-feature"
+            run_dir.mkdir(parents=True)
+            run_json = run_dir / "run.json"
+            run_json.write_text(json.dumps(_V1_RUN, indent=2) + "\n", encoding="utf-8")
+            before_digest = hashlib.sha256(run_json.read_bytes()).hexdigest()
+
+            run = Run.load(run_dir, root)
+            after_load_digest = hashlib.sha256(run_json.read_bytes()).hexdigest()
+            self.assertEqual(before_digest, after_load_digest)
+            self.assertEqual(run.task("LT-1").status, "done")
+            self.assertEqual(run.task("LT-1").resolution, "completed")
+
+            # A separately committed continuation unrelated to LT-1 must not lose the fact.
+            run.record_event("continuation", to="noted", note="unrelated continuation")
+            run.save()
+            after_continuation_digest = hashlib.sha256(run_json.read_bytes()).hexdigest()
+            self.assertNotEqual(before_digest, after_continuation_digest)
+
+            reloaded = Run.load(run_dir, root)
+            self.assertEqual(reloaded.task("LT-1").status, "done")
+            self.assertEqual(reloaded.task("LT-1").resolution, "completed")
 
 
 class RoundTripTests(unittest.TestCase):

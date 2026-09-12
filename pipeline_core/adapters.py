@@ -562,6 +562,59 @@ def grant_tool_names(grant: Sequence[str]) -> tuple[str, ...]:
     return tuple(ordered)
 
 
+def _normalized_cwd(value: str) -> str:
+    """A comparable form of a task-declared or launch working root: forward slashes, no
+    leading/trailing separators, ``.`` for the root itself."""
+    text = (value or ".").replace("\\", "/").strip("/")
+    return text or "."
+
+
+def check_command_allowances(
+    commands: Sequence[tuple[str, Sequence[str]]],
+    *,
+    role_grant: Sequence[str],
+    working_root: str = ".",
+) -> tuple[str, ...]:
+    """Exact ``Bash(<argv>)`` allowances for this task's own declared checks (AC-1).
+
+    Each ``commands`` entry is ``(cwd, argv)`` — the task's own declared verification
+    commands, already shell-free by contract (:class:`~feature_pipeline.contracts.CommandSpec`
+    never accepts a shell metacharacter). A command is granted one exact allowance only when
+    every one of these holds:
+
+    * the role's grant carries ``run_checks`` — no grant means no allowance at all, regardless
+      of what the task declares;
+    * its declared ``cwd`` equals the executor's own ``working_root`` (normalized for slash
+      and case-of-empty-root differences only — never a prefix or an ancestor match);
+    * its ``argv`` is non-empty, carries no shell metacharacter, and is not a ``git push``
+      form.
+
+    A command failing any test is silently excluded — never approved on a partial match — so
+    the result is always a subset of what the task actually declared for its own root, one
+    allowance per qualifying command, in declaration order.
+    """
+    if "run_checks" not in set(role_grant):
+        return ()
+    root = _normalized_cwd(working_root)
+    allowed: list[str] = []
+    for cwd, argv in commands:
+        if _normalized_cwd(cwd) != root:
+            continue
+        argv = tuple(str(token) for token in argv)
+        if not argv:
+            continue
+        try:
+            _assert_shell_free(argv)
+        except AdapterError:
+            continue
+        if any(_is_push_token(token) for token in argv):
+            continue
+        entry = f"Bash({' '.join(argv)})"
+        if entry not in allowed:
+            allowed.append(entry)
+    return tuple(allowed)
+
+
 def scoped_add_dirs(
     request: LaunchRequest,
     scope_roots: Sequence[tuple[str, str | os.PathLike[str]]],
@@ -1019,6 +1072,9 @@ class ClaudeAdapter:
     """
 
     name = "claude"
+    #: Claude's RLC-01 status-envelope prompt requires a blocked diagnostic.  Other adapter
+    #: protocols retain compatibility with the historical four-key blocked envelope.
+    requires_blocked_envelope_reason = True
 
     def __init__(
         self,

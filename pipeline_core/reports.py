@@ -184,6 +184,12 @@ def build_status_envelope_prompt(
         "Reply with only the following JSON object and nothing else — no other text, no "
         "code fence, no explanation, no markdown:",
         shape,
+        '- If status is "blocked", add a non-empty "reason" string field describing why '
+        '(e.g. {"role": "'
+        + role
+        + '", "status": "blocked", "task_id": "'
+        + task_id
+        + f'", "attempt": {attempt}, "reason": "<why>"}}).',
         "",
     ]
     if observed_status is not None:
@@ -226,10 +232,15 @@ class StatusResolution:
     prose_token: str | None
     envelope_token: str
     drift: str | None  # set when the prose line was absent or malformed
+    #: A non-empty reason the executor supplied on the envelope for a 'blocked' token
+    #: (RLC-01 AC-2); ``None`` for 'implemented' or when no reason was supplied — never a
+    #: fabricated substitute.
+    reason: str | None = None
 
 
 def settle_executor_status(
-    *, prose_text: str, envelope_text: str, role: str, task_id: str, attempt: int
+    *, prose_text: str, envelope_text: str, role: str, task_id: str, attempt: int,
+    require_reason: bool = False,
 ) -> StatusResolution:
     """Reconcile the strict prose parser and the authoritative JSON envelope.
 
@@ -249,11 +260,13 @@ def settle_executor_status(
             role=role,
             task_id=task_id,
             attempt=attempt,
+            require_reason=require_reason,
         )
     except _ReportProtocolError as exc:
         raise _reraise(exc) from None
     return StatusResolution(
-        settled.token, settled.prose_token, settled.envelope_token, settled.drift
+        settled.token, settled.prose_token, settled.envelope_token, settled.drift,
+        settled.reason,
     )
 
 

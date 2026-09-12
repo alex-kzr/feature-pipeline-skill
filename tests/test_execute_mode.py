@@ -11,6 +11,7 @@ stage-9 stop (AC-5). ``AttestDependencyTests`` covers RDS-08's ``--attest-depend
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import subprocess
 import sys
@@ -35,7 +36,7 @@ from pipeline_core.lifecycle import RunLifecycle
 from pipeline_core.prompt_envelope import EnvelopeAnchors
 from pipeline_core.state import ACTOR_RUNNER, Run, pid_alive
 from pipeline_core.verification import VerifierAnchors, VerifierLaunchers
-from feature_pipeline.contracts import TaskSpec
+from feature_pipeline.contracts import CommandSpec, TaskSpec
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "execution"
 if str(FIXTURES) not in sys.path:
@@ -505,6 +506,72 @@ class ResumeAndSafetyTests(unittest.TestCase):
             self.assertEqual(run.task("EX-01").attempts, 1)  # not re-counted on resume
             self.assertEqual(run.controls["adapter_resolved"]["value"], "claude")
             self.assertTrue(executor.calls[0]["is_repair"])
+
+    def test_blocked_executor_resume_opens_a_new_generation_and_preserves_launch_one(self) -> None:
+        """RLC-01 AC-3 exercises the real execute/resume path, rather than a serialized
+        state fixture: an executor permission wait is non-terminal, and a compatible resume
+        must preserve all generation-one bytes/history while runner-owned checks and both
+        independent verifiers complete generation two."""
+        class PermissionBlockedExecutor(sa.ScriptedExecutor):
+            def launch(self, request):  # noqa: ANN001 - deterministic protocol fixture
+                result = super().launch(request)
+                if request.no_tools or request.resume_session_id:
+                    reasoned = json.dumps({
+                        "role": "executor", "status": "blocked", "task_id": request.task_id,
+                        "attempt": 1, "reason": "declared check requires an unavailable grant",
+                    })
+                    Path(request.report_path).write_text(reasoned, encoding="utf-8")
+                    return LaunchResult(exit_code=0, stdout=reasoned, session_id="exec-sess")
+                return result
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = replace(
+                _specs(("EX-01",))[0],
+                verification_commands=(CommandSpec(".", (sys.executable, "-c", "pass")),),
+            )
+            first = execute_run(_request(
+                root, (spec,), executor=PermissionBlockedExecutor(("blocked",)),
+                launchers=VerifierLaunchers(
+                    task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))),
+                controls=ExecuteControls(plan_approved=True), environment={"claude": True}))
+
+            self.assertEqual(first.status, "blocked")
+            initial = Run.load(first.run_dir, root)
+            record = initial.task("EX-01")
+            self.assertEqual(record.status, "in_progress")
+            self.assertEqual(record.operation_history[-2]["detail"],
+                             "declared check requires an unavailable grant")
+            first_history = json.loads(json.dumps(record.operation_history))
+            launch_one = first.run_dir / "reports" / "EX-01" / "launch-1"
+            first_bytes = {
+                path.relative_to(launch_one).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in launch_one.rglob("*") if path.is_file()
+            }
+
+            resumed_executor = sa.ScriptedExecutor(("implemented",))
+            resumed = execute_run(_request(
+                root, (spec,), executor=resumed_executor,
+                launchers=VerifierLaunchers(
+                    task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))),
+                controls=ExecuteControls(plan_approved=True, resume=True), environment={"claude": True}))
+
+            self.assertTrue(resumed.ok, resumed.message)
+            self.assertEqual(resumed_executor.launches, 1)
+            final = Run.load(resumed.run_dir, root)
+            self.assertEqual(final.task("EX-01").status, "done")
+            self.assertEqual(final.task("EX-01").next_executor_launch_generation, 3)
+            self.assertEqual(first_history, final.task("EX-01").operation_history[:len(first_history)])
+            self.assertEqual(first_bytes, {
+                path.relative_to(launch_one).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in launch_one.rglob("*") if path.is_file()
+            })
+            self.assertTrue(any(
+                entry["argv"][-2:] == ["-c", "pass"] and entry["exit_code"] == 0
+                for entry in final.commands
+            ))
+            self.assertEqual(final.task("EX-01").verification["task_verdict"], "PASS")
+            self.assertEqual(final.task("EX-01").verification["test_verdict"], "PASS")
 
     def test_plain_resume_rejects_codex_protocol_failure(self) -> None:
         class CodexSequenceExecutor:

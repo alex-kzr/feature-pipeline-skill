@@ -38,6 +38,7 @@ from .adapters import (
     AdapterError,
     LaunchRequest,
     LaunchResult,
+    check_command_allowances,
     parse_codex_final_result,
     grant_tool_names,
 )
@@ -291,6 +292,15 @@ def dispatch_executor(
         # separate `tools=` pass-through here is what let every real launch run `--tools ""`
         # while the role grant said read/run_checks/write (RDS-13).
         tools=grant_tool_names(request.role_grant),
+        # Claude's Bash capability remains inert unless its individual commands are also
+        # explicitly approved.  Derive those approvals from this task's parsed, shell-free
+        # declarations only; sibling-task commands and checks rooted elsewhere never cross
+        # this executor window (RLC-01 AC-1).
+        allowed_tools=check_command_allowances(
+            tuple((command.cwd, command.argv) for command in spec.verification_commands),
+            role_grant=request.role_grant,
+            working_root=request.working_root,
+        ),
         timeout=request.timeout,
         envelope_path=artifacts.status_envelope,
         model=request.model,
@@ -383,6 +393,9 @@ def dispatch_executor(
             role=EXECUTOR_ROLE,
             task_id=task_id,
             attempt=request.attempt,
+            # Claude opts into the RLC-01 reason-bearing envelope protocol. Generic and
+            # legacy adapters retain their four-key blocked-envelope compatibility.
+            require_reason=getattr(adapter, "requires_blocked_envelope_reason", False),
         )
     except ReportError as exc:
         return _retryable_failure(
@@ -391,10 +404,14 @@ def dispatch_executor(
         )
 
     if resolution.token == "blocked":
-        life.block(task_id, "executor reported blocked")
+        # A non-empty envelope-supplied reason is preserved verbatim (RLC-01 AC-2); when the
+        # executor supplied none, the generic fact stands rather than inventing detail it
+        # never gave.
+        reason = resolution.reason or "executor reported blocked"
+        life.block(task_id, reason)
         return DispatchOutcome(
             task_id, generation, "blocked", "blocked", artifacts, result, envelope_result,
-            report_text, resolution.drift,
+            report_text, resolution.drift, reason,
         )
 
     # Trusted 'implemented': attribute the executor window, record evidence, then the single

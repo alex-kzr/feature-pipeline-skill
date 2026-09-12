@@ -19,6 +19,7 @@ from pipeline_core.adapters import (
     LaunchRequest,
     build_codex_argv,
     build_claude_argv,
+    check_command_allowances,
     effective_grant,
     on_disk_agent_name,
     parse_result_text,
@@ -249,6 +250,76 @@ class ClaudeArgvTests(unittest.TestCase):
                                           tools=("Read", "Edit")))
         definition = json.loads(argv[argv.index("--agents") + 1])
         self.assertIn("executor", definition["frontend-executor"]["prompt"].lower())
+
+
+class CheckCommandAllowanceTests(unittest.TestCase):
+    """RLC-01 AC-1: a Claude executor with ``run_checks`` is granted only exact, task-declared,
+    shell-free ``Bash(<argv>)`` allowances whose CWD is its working root."""
+
+    def test_qualifying_command_yields_one_exact_bash_allowance(self) -> None:
+        allowed = check_command_allowances(
+            [(".", ("uv", "run", "python", "-m", "unittest"))],
+            role_grant=("read", "run_checks"), working_root=".",
+        )
+        self.assertEqual(allowed, ("Bash(uv run python -m unittest)",))
+
+    def test_command_from_a_different_cwd_than_the_working_root_is_excluded(self) -> None:
+        allowed = check_command_allowances(
+            [("other-package", ("uv", "run", "pytest"))],
+            role_grant=("read", "run_checks"), working_root="feature-pipeline-skill",
+        )
+        self.assertEqual(allowed, ())
+
+    def test_without_run_checks_the_role_gets_no_allowance_at_all(self) -> None:
+        allowed = check_command_allowances(
+            [(".", ("uv", "run", "python", "-m", "unittest"))],
+            role_grant=("read", "write"), working_root=".",
+        )
+        self.assertEqual(allowed, ())
+
+    def test_a_push_command_is_never_approved_even_if_declared(self) -> None:
+        allowed = check_command_allowances(
+            [(".", ("git", "push", "origin", "main"))],
+            role_grant=("read", "run_checks"), working_root=".",
+        )
+        self.assertEqual(allowed, ())
+
+    def test_a_command_carrying_a_shell_metacharacter_is_never_approved(self) -> None:
+        allowed = check_command_allowances(
+            [(".", ("bash", "-c", "rm -rf / && echo pwned"))],
+            role_grant=("read", "run_checks"), working_root=".",
+        )
+        self.assertEqual(allowed, ())
+
+    def test_multiple_qualifying_commands_each_get_their_own_exact_allowance(self) -> None:
+        allowed = check_command_allowances(
+            [
+                (".", ("uv", "run", "python", "-m", "unittest")),
+                (".", ("uv", "run", "ruff", "check")),
+                ("other", ("uv", "run", "pytest")),
+            ],
+            role_grant=("read", "run_checks"), working_root=".",
+        )
+        self.assertEqual(
+            allowed,
+            ("Bash(uv run python -m unittest)", "Bash(uv run ruff check)"),
+        )
+
+    def test_windows_backslash_cwd_normalizes_the_same_as_the_working_root(self) -> None:
+        allowed = check_command_allowances(
+            [("feature-pipeline-skill", ("uv", "run", "python", "-m", "unittest"))],
+            role_grant=("read", "run_checks"), working_root="feature-pipeline-skill\\",
+        )
+        self.assertEqual(allowed, ("Bash(uv run python -m unittest)",))
+
+    def test_derived_allowances_flow_through_build_claude_argv_and_still_deny_push(self) -> None:
+        request = _request(
+            "executor", role_grant=("read", "run_checks"), tools=("Read", "Bash"),
+            allowed_tools=("Bash(uv run python -m unittest)",),
+        )
+        argv = build_claude_argv(request)
+        self.assertIn("Bash(uv run python -m unittest)", argv[argv.index("--allowed-tools") + 1])
+        self.assertIn("Bash(git push:*)", argv[argv.index("--disallowed-tools") + 1])
 
 
 class ClaudeExecutorResolutionTests(unittest.TestCase):
