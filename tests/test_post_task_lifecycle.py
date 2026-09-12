@@ -86,7 +86,8 @@ def _life(root: Path, *, verified: bool = True, tasks=(("A-1", ()),)) -> RunLife
         for tid, _ in tasks:
             life.transition(tid, "running", actor=ACTOR_RUNNER)
             life.transition(tid, "implemented", actor=ACTOR_EXECUTOR)
-            life.transition(tid, "verified", actor=ACTOR_RUNNER)
+            life.run.record_verdicts(tid, "PASS", "PASS")
+            life.run.save()
     return life
 
 

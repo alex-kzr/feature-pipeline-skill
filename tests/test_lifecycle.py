@@ -176,7 +176,8 @@ class ResumeReconciliationTests(unittest.TestCase):
         if status in {"implemented", "verified", "verification_failed", "repairing"}:
             life.transition("A-1", "implemented", actor=ACTOR_EXECUTOR)
         if status == "verified":
-            life.transition("A-1", "verified", actor=ACTOR_RUNNER)
+            life.run.record_verdicts("A-1", "PASS", "PASS")
+            life.run.save()
         if status in {"verification_failed", "repairing"}:
             life.transition("A-1", "verification_failed", actor=ACTOR_RUNNER)
         if status == "repairing":
@@ -283,7 +284,8 @@ class ResumeReconciliationTests(unittest.TestCase):
                 life.transition(task_id, "ready", actor=ACTOR_RUNNER)
             life.transition(task_id, "running", actor=ACTOR_RUNNER)
             life.transition(task_id, "implemented", actor=ACTOR_EXECUTOR)
-            life.transition(task_id, "verified", actor=ACTOR_RUNNER)
+            life.run.record_verdicts(task_id, "PASS", "PASS")
+            life.run.save()
             life.recompute_readiness()
         life.transition("TC-04", "running", actor=ACTOR_RUNNER)
         life.block("TC-04", "max-repair-attempts-exhausted")
@@ -336,7 +338,8 @@ class ReadinessAndSuppressionTests(unittest.TestCase):
             life = RunLifecycle.initialize(run, tasks=[("A-1", []), ("A-2", ["A-1"])])
             life.transition("A-1", "running", actor=ACTOR_RUNNER)
             life.transition("A-1", "implemented", actor=ACTOR_EXECUTOR)
-            life.transition("A-1", "verified", actor=ACTOR_RUNNER)
+            life.run.record_verdicts("A-1", "PASS", "PASS")
+            life.run.save()
             # A-2 is still pending on disk; a fresh resume must promote it from the graph.
             reloaded = RunLifecycle.load(run.run_dir, root)
             reloaded.recompute_readiness()

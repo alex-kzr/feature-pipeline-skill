@@ -205,6 +205,29 @@ class PortableCompatibilityLayerCancellationTests(unittest.TestCase):
                 run.transition_task("T-1", "done", ACTOR_RUNNER, resolution="completed")
             self.assertEqual(caught.exception.code, "illegal-transition")
 
+    def test_completed_resolution_requires_two_passing_verdicts(self) -> None:
+        from pipeline_core.state import ACTOR_RUNNER, TransitionError
+
+        with tempfile.TemporaryDirectory() as directory:
+            run = self._run(Path(directory))
+            run.transition_task("T-1", "in_progress", ACTOR_RUNNER)
+            with self.assertRaises(TransitionError) as caught:
+                run.transition_task("T-1", "done", ACTOR_RUNNER, resolution="completed")
+            self.assertEqual(caught.exception.code, "missing-verification-evidence")
+            self.assertEqual(run.task("T-1").status, "in_progress")
+
+    def test_completed_resolution_rejects_failed_verdict_evidence(self) -> None:
+        from pipeline_core.state import ACTOR_RUNNER, TransitionError
+
+        with tempfile.TemporaryDirectory() as directory:
+            run = self._run(Path(directory))
+            run.transition_task("T-1", "in_progress", ACTOR_RUNNER)
+            run.record_verdicts("T-1", "FAIL", "PASS")
+            with self.assertRaises(TransitionError) as caught:
+                run.transition_task("T-1", "done", ACTOR_RUNNER, resolution="completed")
+            self.assertEqual(caught.exception.code, "missing-verification-evidence")
+            self.assertEqual(run.task("T-1").status, "in_progress")
+
 
 if __name__ == "__main__":
     unittest.main()

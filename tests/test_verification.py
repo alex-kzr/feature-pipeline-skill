@@ -702,7 +702,7 @@ class NoFalseVerifiedTests(unittest.TestCase):
     def test_guard_rejects_a_task_that_is_not_implemented(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             run = _implemented_run(Path(directory))
-            run.transition_task("VR-02", "verified")
+            run.record_verdicts("VR-02", "PASS", "PASS")
             with self.assertRaises(VerificationError):
                 _orchestrate(run, _spec(), FakeVerifier(), FakeVerifier())
 

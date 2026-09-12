@@ -276,8 +276,7 @@ class ActorAuthorizationTests(unittest.TestCase):
     def test_only_the_runner_may_record_done(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             run = self._in_progress(Path(directory))
-            self.assertEqual(run.transition_task("EX-1", "done", ACTOR_RUNNER,
-                                                 resolution="completed"), "done")
+            self.assertEqual(run.record_verdicts("EX-1", "PASS", "PASS"), "done")
             # done is terminal: no further transition is defined.
             with self.assertRaises(StateError) as caught:
                 run.transition_task("EX-1", "in_progress", ACTOR_RUNNER)

@@ -332,7 +332,12 @@ def run_command(command: RunCommand) -> PipelineResult:
     prompt_rel = _logical_relative(command.prompt, "--prompt") if command.prompt else plan_rel
     _resolve_under(project_dir, prompt_rel, "--prompt")
 
-    if command.mode == "execute" and not command.dry_run:
+    # ``--status`` is a read-only inspector even when the caller also supplies
+    # ``--mode execute`` and delivery-gate flags: it must never reach ``run_execute`` (which
+    # evaluates the plan gate, initializes/reconciles a run, and can dispatch an executor).
+    # Execute-mode controls, adapter/model/effort, and approval flags stay inert compatibility
+    # inputs for a status query; only the shared, read-only preview resolution below runs.
+    if command.mode == "execute" and not command.dry_run and not command.status:
         return run_execute(command, anchors, agents_root, project_dir, profile, plan_path,
                             prompt_rel)
 

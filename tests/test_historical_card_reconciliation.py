@@ -61,7 +61,6 @@ class HistoricalCardReconciliationTests(unittest.TestCase):
             RunLifecycle.initialize(source, tasks=[("REC-01", ()), ("REC-02", ())])
             persist_task_contracts(source, (intermediate, verified_successor))
             source.transition_task("REC-02", "in_progress", actor=ACTOR_RUNNER)
-            source.transition_task("REC-02", "done", actor=ACTOR_RUNNER, resolution="completed")
             source.record_verdicts("REC-02", "PASS", "PASS")
             source.status = "verified"
             source.save()
@@ -107,7 +106,6 @@ class HistoricalCardReconciliationTests(unittest.TestCase):
             source_life = RunLifecycle.initialize(source, tasks=[("NEW-01", ()), ("NEW-02", ())])
             persist_task_contracts(source, (replacement, unfinished_replacement))
             source.transition_task("NEW-01", "in_progress", actor=ACTOR_RUNNER)
-            source.transition_task("NEW-01", "done", actor=ACTOR_RUNNER, resolution="completed")
             source.transition_task("NEW-02", "in_progress", actor=ACTOR_RUNNER)
             source.record_verdicts("NEW-01", "PASS", "PASS")
             source.record_verdicts("NEW-02", "FAIL", "PASS")

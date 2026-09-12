@@ -988,6 +988,102 @@ class ExecuteModeTests(unittest.TestCase):
                 (seed["project_dir"] / ".pipeline" / "runs" / "sample-feature"
                  / "run.json").exists())
 
+    def test_status_with_execute_and_approve_plan_stays_read_only_for_an_existing_run(
+        self,
+    ) -> None:
+        """SIR-01: ``--status`` must never cross into ``run_execute`` — not even with
+        ``--mode execute --approve-plan`` and adapter/model/effort controls — and must
+        report the recorded run's bytes unchanged, with no adapter invocation."""
+        calls: list[object] = []
+
+        def _spy_execute_adapters(project_dir, agents_root, core_root=None):
+            calls.append((project_dir, agents_root, core_root))
+            return _fake_execute_adapters(project_dir, agents_root, core_root)
+
+        with TemporaryDirectory() as directory:
+            seed = self._seed_rich(directory, [RICH_EXECUTE_TASK])
+            run_dir = seed["project_dir"] / ".pipeline" / "runs" / "sample-feature"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            run_state = {
+                "schema_version": 1, "feature": "sample-feature",
+                "prompt_path": "plan.json", "plan_path": "plan.json",
+                "run_id": "fixed-run-id", "status": "verified",
+                "tasks": [{"id": "TSK-01", "status": "done", "depends_on": [],
+                           "attempts": 1, "blocker": None}],
+                "history": [], "commands": [],
+            }
+            run_json_path = run_dir / "run.json"
+            run_json_path.write_text(json.dumps(run_state, indent=2) + "\n", encoding="utf-8")
+            before_bytes = run_json_path.read_bytes()
+            before_tree = sorted(
+                str(p.relative_to(seed["dest"])) for p in seed["dest"].rglob("*")
+            )
+
+            with patch.object(use_cases, "make_execute_adapters", _spy_execute_adapters):
+                code, out, err = _run(seed["anchors"] + [
+                    "--profile", seed["profile_rel"], "--plan", "plan.json",
+                    "--mode", "execute", "--approve-plan", "--adapter", "claude",
+                    "--model", "sonnet", "--effort", "medium", "--status",
+                ])
+
+            self.assertEqual(code, 0, err)
+            self.assertIn("status: verified", out)
+            self.assertIn("TSK-01", out)
+            self.assertEqual(run_json_path.read_bytes(), before_bytes)
+            after_tree = sorted(
+                str(p.relative_to(seed["dest"])) for p in seed["dest"].rglob("*")
+            )
+            self.assertEqual(before_tree, after_tree)
+            self.assertEqual(calls, [])
+
+    def test_status_with_no_recorded_run_creates_no_artifact_even_with_execute_controls(
+        self,
+    ) -> None:
+        calls: list[object] = []
+
+        def _spy_execute_adapters(project_dir, agents_root, core_root=None):
+            calls.append((project_dir, agents_root, core_root))
+            return _fake_execute_adapters(project_dir, agents_root, core_root)
+
+        with TemporaryDirectory() as directory:
+            seed = self._seed_rich(directory, [RICH_EXECUTE_TASK])
+            run_dir = seed["project_dir"] / ".pipeline" / "runs" / "sample-feature"
+            before_tree = sorted(
+                str(p.relative_to(seed["dest"])) for p in seed["dest"].rglob("*")
+            )
+
+            with patch.object(use_cases, "make_execute_adapters", _spy_execute_adapters):
+                code, out, err = _run(seed["anchors"] + [
+                    "--profile", seed["profile_rel"], "--plan", "plan.json",
+                    "--mode", "execute", "--approve-plan", "--status",
+                ])
+
+            self.assertEqual(code, 0, err)
+            self.assertIn("no recorded run", out)
+            self.assertFalse(run_dir.exists())
+            after_tree = sorted(
+                str(p.relative_to(seed["dest"])) for p in seed["dest"].rglob("*")
+            )
+            self.assertEqual(before_tree, after_tree)
+            self.assertEqual(calls, [])
+
+    def test_execute_without_status_still_evaluates_the_plan_gate(self) -> None:
+        """Control for SIR-01: without ``--status``, ``--mode execute`` retains its normal
+        gate/dispatch behavior (unchanged by the read-only status route)."""
+        with TemporaryDirectory() as directory:
+            seed = self._seed_rich(directory, [RICH_EXECUTE_TASK])
+            with patch.object(use_cases, "make_execute_adapters", _fake_execute_adapters):
+                code, out, err = _run(seed["anchors"] + [
+                    "--profile", seed["profile_rel"], "--plan", "plan.json",
+                    "--mode", "execute", "--approve-plan",
+                ])
+            self.assertEqual(code, 0, err)
+            self.assertIn("verified", out)
+            run = json.loads(
+                (seed["project_dir"] / ".pipeline" / "runs" / "sample-feature" / "run.json")
+                .read_text(encoding="utf-8"))
+            self.assertEqual(run["tasks"][0]["status"], "done")
+
 
 def _plan_request() -> LaunchRequest:
     """A minimal read-only request, just enough to render an argv via ``adapter.plan``."""
