@@ -107,6 +107,11 @@ class TaskExecution:
     #: repository-relative for a Markdown-backed task — resolves the task file to project onto.
     board_path: Path | None = None
     pre_dispatch: Callable[[], str | None] | None = None
+    #: TAM-01: an optional pre-flight, pre-dispatch baseline diagnosis. Called only on the
+    #: task's very first gate (``attempts == 0``), before any executor launch or repair
+    #: budget is spent. A non-``None`` return produces the ``amendment_required`` terminal
+    #: status below rather than a dispatch or a spent repair attempt (AC-4).
+    baseline_diagnosis: Callable[[], object | None] | None = None
 
 
 @dataclass(frozen=True)
@@ -217,6 +222,14 @@ class TaskEngine:
             gate = record.attempts + 1
 
             if not skip_executor:
+                if record.attempts == 0 and request.baseline_diagnosis is not None:
+                    finding = request.baseline_diagnosis()
+                    if finding is not None:
+                        reason = getattr(finding, "reason", str(finding))
+                        life.record_operation(
+                            task_id, "baseline", "amendment_required", reason)
+                        return TaskRunResult(task_id, "amendment_required", record.attempts,
+                                             gates, reason, None, tuple(passes))
                 if request.pre_dispatch is not None:
                     blocker = request.pre_dispatch()
                     if blocker:

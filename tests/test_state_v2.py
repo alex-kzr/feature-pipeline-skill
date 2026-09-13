@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from pipeline_core.plan import AmendmentError, AmendmentRevision
 from pipeline_core.state import (
     ACTOR_EXECUTOR,
     ACTOR_RUNNER,
@@ -337,6 +338,84 @@ class AttestationTests(unittest.TestCase):
             self.assertEqual(record.task_path, "docs/plans/tasks/EX-1.md")
             self.assertEqual(record.task_contract_digest, "sha256:contract")
             self.assertEqual(record.reused_verification, [{"dependency_id": "EX-0", "source_run_id": "source"}])
+
+
+class AmendmentRevisionPersistenceTests(unittest.TestCase):
+    """TAM-01 AC-2/AC-3: an approved amendment is an immutable, revision-scoped record."""
+
+    def _revision(self, task_id: str = "AM-1", revision: int = 1) -> AmendmentRevision:
+        return AmendmentRevision(
+            task_id=task_id, revision=revision, prior_digest="sha256:before",
+            new_digest="sha256:after", changed_fields=("allowed_scope",),
+            added_paths=("tests/test_new_fixture.py",), rationale="baseline exposed scope gap",
+            approved_by="a-human", source_evidence="report:launch-2",
+            created_at="2026-09-12T00:00:00Z", epoch=1,
+        )
+
+    def test_apply_amendment_appends_revision_and_resets_the_repair_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = _run(root)
+            run.add_task("AM-1")
+            run.transition_task("AM-1", "in_progress")
+            run.begin_repair("AM-1", maximum=2)
+            run.record_verdicts("AM-1", "FAIL", "FAIL")
+            self.assertEqual(run.task("AM-1").attempts, 1)
+
+            revision = self._revision()
+            run.apply_amendment(revision, new_digest="sha256:canonical-after",
+                                new_digest_version="tam01-amendment-v1")
+
+            record = run.task("AM-1")
+            self.assertEqual(record.current_revision, 1)
+            self.assertEqual(record.attempts, 0)
+            self.assertEqual(record.verification["task_verdict"], None)
+            self.assertEqual(record.task_contract_digest, "sha256:canonical-after")
+            self.assertEqual(len(record.amendment_revisions), 1)
+            self.assertEqual(record.amendment_revisions[0]["approved_by"], "a-human")
+            self.assertEqual(record.revision_history, [
+                {"revision": 0, "attempts": 1,
+                 "verification": {"task_verdict": "FAIL", "test_verdict": "FAIL",
+                                  "verified_at": record.revision_history[0]["verification"]["verified_at"]},
+                 "contract_digest": None},
+            ])
+
+    def test_apply_amendment_rejects_a_task_that_is_already_done(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = _run(root)
+            run.add_task("AM-1")
+            run.transition_task("AM-1", "in_progress")
+            run.record_verdicts("AM-1", "PASS", "PASS")
+            self.assertEqual(run.task("AM-1").status, "done")
+            with self.assertRaises(AmendmentError) as ctx:
+                run.apply_amendment(self._revision(), new_digest="sha256:x",
+                                    new_digest_version="tam01-amendment-v1")
+            self.assertEqual(ctx.exception.code, "task-already-done")
+
+    def test_apply_amendment_rejects_an_out_of_order_revision_number(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = _run(root)
+            run.add_task("AM-1")
+            with self.assertRaises(AmendmentError) as ctx:
+                run.apply_amendment(self._revision(revision=2), new_digest="sha256:x",
+                                    new_digest_version="tam01-amendment-v1")
+            self.assertEqual(ctx.exception.code, "revision-out-of-order")
+
+    def test_amendment_revisions_and_new_fields_round_trip_through_save_and_load(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = _run(root)
+            run.add_task("AM-1")
+            run.apply_amendment(self._revision(), new_digest="sha256:canonical-after",
+                                new_digest_version="tam01-amendment-v1")
+            run.save()
+            reloaded = Run.load(run.run_dir, root)
+            record = reloaded.task("AM-1")
+            self.assertEqual(record.current_revision, 1)
+            self.assertEqual(len(record.amendment_revisions), 1)
+            self.assertEqual(record.amendment_revisions[0]["revision"], 1)
 
 
 if __name__ == "__main__":

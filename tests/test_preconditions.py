@@ -241,7 +241,14 @@ class DispatchPreconditionsTests(unittest.TestCase):
                 )
 
                 def launch(launch_request):
-                    self.assertEqual(adapter._cwd_for(launch_request), root / "workspace/task")
+                    # Dispatch promotes from an isolated executor workspace.  The adapter
+                    # must receive that resolved copy of the selected logical root, rather
+                    # than falling back to its primary-worktree default.
+                    expected = Path(launch_request.working_root).resolve()
+                    self.assertEqual(adapter._cwd_for(launch_request), expected)
+                    self.assertEqual(expected.name, "task")
+                    self.assertEqual(expected.parent.name, "workspace")
+                    self.assertNotEqual(expected, root / "workspace/task")
                     self.assertEqual(launch_request.role, "release-manager")
                     return scripted.launch(launch_request)
 

@@ -15,6 +15,7 @@ from pipeline_core.adapters import (
     EXIT_TIMEOUT,
     AdapterError,
     ClaudeAdapter,
+    CompletedProcess,
     CodexAdapter,
     LaunchRequest,
     build_codex_argv,
@@ -456,6 +457,32 @@ class CodexArgvTests(unittest.TestCase):
 
 
 class ClaudeLaunchTests(unittest.TestCase):
+    def test_executor_launch_passes_exact_granted_check_argv_to_the_worker(self) -> None:
+        """The actual production launcher argv, not only ``plan()``, carries the narrow
+        command grant needed for a runner-declared executor check."""
+        observed: list[list[str]] = []
+
+        def runner(argv, **_kwargs):
+            observed.append(list(argv))
+            return CompletedProcess(
+                0,
+                json.dumps({"result": "implemented", "session_id": "session-1"}),
+                "",
+            )
+
+        adapter = ClaudeAdapter(executable="claude", runner=runner)
+        adapter.launch(_request(
+            "executor",
+            role_grant=("read", "write", "run_checks"),
+            tools=("Read", "Edit", "Bash"),
+            allowed_tools=("Bash(uv run python -m unittest)",),
+        ))
+
+        self.assertEqual(len(observed), 1)
+        argv = observed[0]
+        self.assertEqual(argv[argv.index("--allowed-tools") + 1], "Bash(uv run python -m unittest)")
+        self.assertEqual(argv[argv.index("--disallowed-tools") + 1], "Bash(git push:*)")
+
     def test_characterized_launch_returns_exit_output_and_session(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             executable = _fake_executable(Path(directory), _FAKE_CLAUDE, "fake_claude.py")

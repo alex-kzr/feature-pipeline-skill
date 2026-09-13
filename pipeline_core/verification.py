@@ -148,6 +148,10 @@ class VerificationEvidence:
     missing_evidence: tuple[Mapping[str, object], ...] = ()
     unrun_commands: tuple[Mapping[str, object], ...] = ()
     external_blocker: str | None = None
+    #: The approved amendment revision currently governing this verification pass.  It is
+    #: separate from an out-of-scope observation: the latter is a reason to request an
+    #: amendment, never proof that one was approved.
+    amendment: Mapping[str, object] | None = None
     #: The immutable identity of the isolated worktree snapshot the recorded commands ran
     #: against (:class:`pipeline_core.snapshot.SnapshotIdentity` as a dict), or ``None`` when
     #: the pass was not run against an isolated snapshot. An unrelated later worktree edit
@@ -160,11 +164,13 @@ class VerificationEvidence:
         return self.external_blocker is None and not self.unrun_commands
 
     def as_dict(self) -> dict[str, object]:
-        amendment_paths = [
+        observed_paths = [
             str(entry.get("path", ""))
             for entry in self.changed_files
             if entry.get("classification") == "out_of_scope"
         ]
+        amendment = dict(self.amendment) if self.amendment is not None else {}
+        approved_paths = [str(path) for path in amendment.get("added_paths", ())]
         return {
             "task_id": self.task_id,
             "attempt": self.attempt,
@@ -181,12 +187,15 @@ class VerificationEvidence:
             "unrun_commands": [dict(entry) for entry in self.unrun_commands],
             "external_blocker": self.external_blocker,
             "scope_amendment": {
-                "present": bool(amendment_paths),
-                "observed_paths": amendment_paths,
-                "rationale": (
+                "present": bool(amendment or observed_paths),
+                "revision": amendment.get("revision"),
+                "epoch": amendment.get("epoch"),
+                "approved_by": amendment.get("approved_by"),
+                "approved_paths": approved_paths,
+                "observed_paths": observed_paths,
+                "rationale": amendment.get("rationale") or (
                     "executor-owned paths outside the initial estimate require independent "
-                    "amendment-justification review"
-                    if amendment_paths else None
+                    "amendment-justification review" if observed_paths else None
                 ),
             },
             "snapshot": dict(self.snapshot) if self.snapshot is not None else None,
@@ -248,6 +257,18 @@ def build_verification_evidence(
             row = dict(entry)
             row["task_id"] = owner_id
             runner_writes.append(row)
+    amendment = None
+    if record.current_revision:
+        amendment = next(
+            (dict(revision) for revision in record.amendment_revisions
+             if revision.get("revision") == record.current_revision),
+            None,
+        )
+        if amendment is None:
+            raise VerificationError(
+                f"task {task_id} has active amendment revision {record.current_revision} "
+                "without its immutable revision record")
+
     return VerificationEvidence(
         task_id=task_id,
         attempt=attempt,
@@ -264,6 +285,7 @@ def build_verification_evidence(
         unrun_commands=unrun,
         external_blocker=commands_run.stopped_reason,
         snapshot=commands_run.snapshot,
+        amendment=amendment,
     )
 
 
@@ -427,7 +449,8 @@ _VERIFIER_RULES: dict[str, tuple[str, ...]] = {
         "Do not tick acceptance-criteria checkboxes.",
         "Your report must include a separate 'Amendment-justification finding:' that states "
         "whether the structured scope-amendment rationale and observed paths support the "
-        "claimed functionality (or that no amendment is present).",
+        "claimed functionality (or that no amendment is present). When amendment evidence is "
+        "present, repeat its exact 'revision N' and 'epoch N' identities and its rationale.",
         "For an acceptance criterion marked CURRENT-RUN ONLY, assess mutations only from "
         "the current_run_boundary in the runner-owned evidence: its verification snapshot, "
         "implementation manifest/diff and changed files, captured commands, and external "
@@ -444,7 +467,8 @@ _VERIFIER_RULES: dict[str, tuple[str, ...]] = {
         "passed.",
         "Your report must include a separate 'Amendment-justification finding:' that states "
         "whether the structured scope-amendment rationale and observed paths support the "
-        "claimed functionality (or that no amendment is present).",
+        "claimed functionality (or that no amendment is present). When amendment evidence is "
+        "present, repeat its exact 'revision N' and 'epoch N' identities and its rationale.",
     ),
 }
 
@@ -563,6 +587,29 @@ def _explicit_report_verdicts(text: str) -> frozenset[str]:
     return frozenset(match.group(1).upper() for match in _EXPLICIT_REPORT_VERDICT.finditer(text))
 
 
+def _amendment_assessment_failure(
+    report_text: str, amendment: Mapping[str, object] | None,
+) -> str | None:
+    """Require a PASS report to identify and assess its governing amendment revision."""
+    if not amendment:
+        return None
+    normalized = report_text.casefold()
+    if "amendment-justification finding:" not in normalized:
+        return "missing-amendment-justification-finding"
+    # Revision identity and epoch are immutable runner-owned evidence. A verifier must repeat
+    # the exact governing pair; otherwise a PASS could settle a different amendment epoch.
+    revision = amendment.get("revision")
+    epoch = amendment.get("epoch")
+    markup = r"[\s*_`]*"
+    identity = re.compile(
+        rf"revision{markup}{re.escape(str(revision))}{markup},{markup}epoch{markup}{re.escape(str(epoch))}\b",
+        re.IGNORECASE,
+    )
+    if not identity.search(report_text):
+        return "amendment-justification-missing-revision-identity"
+    return None
+
+
 def _settle_text(path: Path, fallback_stdout: str, run: Run) -> str:
     """Read the artifact the adapter wrote (or fall back to its stdout), redact it, return it —
     so the committed artifact and the text the runner reasons about are the same bytes."""
@@ -606,6 +653,7 @@ def _run_one_verifier(
     run: Run, spec: object, role: str, adapter: Adapter, artifacts: object,
     anchors: VerifierAnchors, evidence_payload: str, attempt: int, plan_path: str | None,
     model: str | None = None, effort: str | None = None,
+    amendment: Mapping[str, object] | None = None,
 ) -> _SettledVerifier:
     normalized = normalize_role(role)
     tool_less = normalized == "test_verifier"
@@ -710,6 +758,14 @@ def _run_one_verifier(
                     f"{sorted(explicit_verdicts)!r}, envelope reported {resolution.token!r}"),
             result=result, envelope_result=envelope_result, report_text=report_text)
 
+    if resolution.token == "PASS":
+        assessment_failure = _amendment_assessment_failure(report_text, amendment)
+        if assessment_failure:
+            return _diagnose(
+                run, spec, artifacts, role=normalized, attempt=attempt,
+                reason=assessment_failure, result=result,
+                envelope_result=envelope_result, report_text=report_text)
+
     return _SettledVerifier(
         token=resolution.token, result=result, envelope_result=envelope_result,
         report_text=report_text, drift=resolution.drift, failure=None, diagnostic=None,
@@ -768,7 +824,7 @@ def orchestrate_verification(
 
     task_settled = _run_one_verifier(
         run, spec, "task_verifier", launchers.task, artifacts, anchors, payload, attempt,
-        plan_path, model, effort)
+        plan_path, model, effort, evidence.amendment)
     if task_settled.failure:
         status = _block(run, task_id, f"task_verifier: {task_settled.failure}")
         return VerificationOutcome(
@@ -778,7 +834,7 @@ def orchestrate_verification(
 
     test_settled = _run_one_verifier(
         run, spec, "test_verifier", launchers.test, artifacts, anchors, payload, attempt,
-        plan_path, model, effort)
+        plan_path, model, effort, evidence.amendment)
     if test_settled.failure:
         status = _block(run, task_id, f"test_verifier: {test_settled.failure}")
         return VerificationOutcome(

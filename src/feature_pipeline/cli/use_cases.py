@@ -73,9 +73,18 @@ from feature_pipeline.domain.errors import DomainError
 from feature_pipeline.domain.graph import TaskGraph
 from feature_pipeline.contracts import SchemaError, validate_preconditions, validate_relative_path
 
+from feature_pipeline.bootstrap import (
+    AmendmentError,
+    AmendmentRequest,
+    build_amendment_revision,
+    canonical_amendment_fields,
+    contract_digest,
+)
+
 from .commands import RunCommand
 from .errors import CliError
 from .parser import (
+    AMEND_MODE,
     EXIT_BLOCKED,
     EXIT_ERROR,
     EXIT_GATE_PENDING,
@@ -291,8 +300,88 @@ def _substitute_superseded(
     return tuple(task_id for task_id in order if task_id in resolved)
 
 
+def run_amend(command: RunCommand) -> PipelineResult:
+    """Persist one explicit, human-approved amendment revision (TAM-01).
+
+    Deliberately independent of profile/plan resolution and task selection: an amendment is
+    a control-plane act on the already-persisted run, not a dispatch. It requires only the
+    project root (the run's repository root) and the run's feature name to locate
+    ``run.json`` at the runner's standard storage layout, plus the explicit amendment inputs
+    below. Fails closed — via :class:`~pipeline_core.plan.AmendmentError` — for a missing
+    rationale or approval, a completed task, a task-id change, or an amendment that touches
+    a forbidden control-plane path; nothing is persisted on any rejection.
+    """
+    project_root = Path(_require(command.project_root, "--project-root"))
+    feature = _require(command.feature, "--feature")
+    task_id = _require(command.amend_task, "--amend-task")
+    rationale = _require(command.amend_rationale, "--amend-rationale")
+    approved_by = _require(command.amend_approved_by, "--amend-approved-by")
+    evidence = _require(command.amend_evidence, "--amend-evidence")
+    contract_rel = _require(command.amend_contract, "--amend-contract")
+    contract_path = project_root / contract_rel
+    try:
+        payload = json.loads(contract_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise CliError(EXIT_ERROR, f"--amend-contract could not be read: {exc}") from None
+    except json.JSONDecodeError as exc:
+        raise CliError(EXIT_ERROR, f"--amend-contract is not valid JSON: {exc}") from None
+    if not isinstance(payload, dict) or not isinstance(payload.get("new_contract"), dict):
+        raise CliError(EXIT_ERROR, "--amend-contract must declare a 'new_contract' object")
+    new_contract = payload["new_contract"]
+    prior_contract = payload.get("prior_contract")
+    if not isinstance(prior_contract, dict):
+        prior_contract = {}
+    added_paths = payload.get("added_paths", [])
+    if not isinstance(added_paths, list):
+        raise CliError(EXIT_ERROR, "--amend-contract 'added_paths' must be a list")
+
+    lease_dir = project_root / ".pipeline" / "runs" / feature
+    try:
+        run = Run.load(lease_dir, project_root)
+    except StateError as exc:
+        raise CliError(EXIT_ERROR, f"amendment target run could not be loaded: {exc}") from None
+    try:
+        record = run.task(task_id)
+    except StateError as exc:
+        raise CliError(EXIT_ERROR, str(exc)) from None
+
+    request = AmendmentRequest(
+        task_id=task_id, task_status=record.status, prior_contract=prior_contract,
+        new_contract=new_contract, rationale=rationale, approved_by=approved_by,
+        source_evidence=evidence, added_paths=tuple(str(item) for item in added_paths),
+    )
+    try:
+        revision = build_amendment_revision(
+            request, next_revision=record.current_revision + 1,
+            next_epoch=record.current_revision + 1,
+        )
+        new_digest = contract_digest(canonical_amendment_fields(new_contract))
+        run.apply_amendment(
+            revision, new_digest=new_digest, new_digest_version="tam01-amendment-v1")
+        # An amendment creates a new execution epoch.  Keep the strict-resume
+        # fingerprint aligned with amendment-governed repair policy, otherwise
+        # a legitimate bound change is rejected before that epoch can dispatch.
+        if "max_repair_attempts" in new_contract:
+            repair_bound = int(new_contract["max_repair_attempts"])
+            fingerprint = dict(run.controls.get("plan_fingerprint", {}).get("value") or {})
+            prefix = f"task.{task_id}"
+            fingerprint[f"{prefix}.repair_bound"] = repr(repair_bound)
+            fingerprint[f"{prefix}.control.max_repair_attempts"] = f"{repair_bound} (default)"
+            run.set_control("plan_fingerprint", fingerprint, sourced="amendment")
+    except AmendmentError as exc:
+        raise CliError(EXIT_BLOCKED, f"amendment rejected ({exc.code}): {exc}") from None
+    run.save()
+    return _result(
+        f"amendment applied: {task_id} revision {revision.revision} approved by "
+        f"{approved_by}; changed fields: {', '.join(revision.changed_fields) or 'none'}\n",
+        EXIT_OK,
+    )
+
+
 def run_command(command: RunCommand) -> PipelineResult:
     """Resolve anchors and profile, then dispatch to status, dry-run, or execute."""
+    if command.mode == AMEND_MODE:
+        return run_amend(command)
     project_root = Path(_require(command.project_root, "--project-root"))
     agents_root = Path(_require(command.agents_root, "--agents-root"))
     core_root = Path(_require(command.core_root, "--core-root"))
@@ -617,5 +706,6 @@ __all__ = [
     "dispatch",
     "run_command",
     "run_execute",
+    "run_amend",
     "make_execute_adapters",
 ]

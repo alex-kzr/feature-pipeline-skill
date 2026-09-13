@@ -115,7 +115,7 @@ class ScriptedAdapter:
         if self.raise_code:
             raise AdapterError("scripted adapter failure", self.raise_code)
         if self.on_launch is not None:
-            self.on_launch()
+            self.on_launch(request)
         text = self.prose_text if self.prose_text is not None else _prose(self.prose_status)
         return self._deliver(
             request, text, self.launch_exit, self.write_report, self.written_report_text)
@@ -468,6 +468,9 @@ class PromptEnvelopeTests(unittest.TestCase):
         self.assertIn("  - feature-pipeline-skill -> uv run python -m unittest", text)
         self.assertIn("- separate", text)
         self.assertIn("- Role grant: read, run_checks, write", text)
+        self.assertIn("The listed verification commands are runner-owned evidence.", text)
+        self.assertIn("Do not run or report them", text)
+        self.assertNotIn("- Run every verification command", text)
         self.assertNotIn("Report path:", text)
         self.assertIn("- Status: implemented | blocked", text)
 
@@ -877,8 +880,8 @@ class DispatchAttributionTests(unittest.TestCase):
             life.run.record_runner_projection("TC-01", protected[:2])
             life.run.record_runner_projection("TC-02", (protected[2],))
 
-            def executor_writes_review() -> None:
-                review = root / "reviews" / "TC-03.md"
+            def executor_writes_review(request) -> None:  # noqa: ANN001
+                review = Path(request.working_root) / "reviews" / "TC-03.md"
                 review.parent.mkdir(parents=True, exist_ok=True)
                 review.write_text("TC-03 review\n", encoding="utf-8")
 
@@ -911,8 +914,9 @@ class DispatchAttributionTests(unittest.TestCase):
             life = _running_life(root, spec)
             life.run.record_runner_projection(spec.id, (protected,))
 
-            def executor_changes_protected() -> None:
-                path.write_text("executor overwrite\n", encoding="utf-8")
+            def executor_changes_protected(request) -> None:  # noqa: ANN001
+                (Path(request.working_root) / protected).write_text(
+                    "executor overwrite\n", encoding="utf-8")
 
             outcome = dispatch_executor(
                 life, _request(spec), ScriptedAdapter(on_launch=executor_changes_protected))
@@ -928,9 +932,10 @@ class DispatchAttributionTests(unittest.TestCase):
             spec = _spec(allowed_scope=("src.py",))
             life = _running_life(root, spec)
 
-            def mutate() -> None:
-                (root / "src.py").write_text("print('changed by executor')\n", encoding="utf-8")
-                (root / "stray.txt").write_text("out of scope\n", encoding="utf-8")
+            def mutate(request) -> None:  # noqa: ANN001
+                workspace = Path(request.working_root)
+                (workspace / "src.py").write_text("print('changed by executor')\n", encoding="utf-8")
+                (workspace / "stray.txt").write_text("out of scope\n", encoding="utf-8")
 
             outcome = dispatch_executor(
                 life, _request(spec), ScriptedAdapter(on_launch=mutate))
@@ -963,8 +968,9 @@ class DispatchAttributionTests(unittest.TestCase):
             spec = _spec(allowed_scope=("src.py", "untouched.py"))
             life = _running_life(root, spec)
 
-            def mutate() -> None:
-                (root / "src.py").write_text("print('executor went further')\n", encoding="utf-8")
+            def mutate(request) -> None:  # noqa: ANN001
+                (Path(request.working_root) / "src.py").write_text(
+                    "print('executor went further')\n", encoding="utf-8")
 
             outcome = dispatch_executor(
                 life, _request(spec), ScriptedAdapter(on_launch=mutate))
@@ -997,11 +1003,12 @@ class DispatchAttributionTests(unittest.TestCase):
             spec = _spec(allowed_scope=("src.py",))
             life = _running_life(root, spec)
 
-            def mutate() -> None:
-                (root / "src.py").write_text("print('committed by executor')\n", encoding="utf-8")
-                _git(root, "add", "src.py")
-                _git(root, "commit", "-qm", "executor commit")
-                _git(root, "tag", "executor-tag")
+            def mutate(request) -> None:  # noqa: ANN001
+                workspace = Path(request.working_root)
+                (workspace / "src.py").write_text("print('committed by executor')\n", encoding="utf-8")
+                _git(workspace, "add", "src.py")
+                _git(workspace, "commit", "-qm", "executor commit")
+                _git(workspace, "tag", "executor-tag")
 
             outcome = dispatch_executor(
                 life, _request(spec), ScriptedAdapter(on_launch=mutate))
@@ -1020,13 +1027,59 @@ class DispatchAttributionTests(unittest.TestCase):
             spec = _spec(allowed_scope=("src.py",))
             life = _running_life(root, spec)
 
-            def mutate() -> None:
+            def mutate(request) -> None:  # noqa: ANN001
                 (life.run.run_dir / "runner-note.txt").write_text("churn\n", encoding="utf-8")
 
             outcome = dispatch_executor(
                 life, _request(spec), ScriptedAdapter(on_launch=mutate))
 
             self.assertEqual(outcome.attribution.state, "known-empty")
+
+    def test_runner_artifact_directory_is_never_attributed_or_promoted(self) -> None:
+        """TAM-01: executor-window artifacts are runner output, not task changes."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _init_repo(root)
+            spec = _spec(allowed_scope=("src.py",))
+            life = _running_life(root, spec)
+            artifact = ".pipeline-artifacts/TAM-01/launch-8/executor-8.md"
+
+            def write_runner_artifact(request) -> None:  # noqa: ANN001
+                path = Path(request.working_root) / artifact
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("runner-owned artifact\n", encoding="utf-8")
+
+            outcome = dispatch_executor(
+                life, _request(spec), ScriptedAdapter(on_launch=write_runner_artifact))
+
+            self.assertEqual(outcome.attribution.state, "known-empty")
+            self.assertEqual(outcome.attribution.changed_files, [])
+            self.assertFalse((root / artifact).exists())
+
+    def test_repair_report_is_available_in_the_isolated_executor_workspace(self) -> None:
+        """TAM-01 repair findings must be readable at the exact prompt path."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _init_repo(root)
+            spec = _spec(allowed_scope=("src.py",))
+            life = _running_life(root, spec)
+            repair_path = ".pipeline/runs/dispatch/reports/RDS-04/repair-1.md"
+            source = root / repair_path
+            source.parent.mkdir(parents=True)
+            source.write_text("# Repair findings\n\n- Fix this.\n", encoding="utf-8")
+
+            def repair_report_is_readable(request) -> None:  # noqa: ANN001
+                visible = Path(request.working_root) / repair_path
+                self.assertEqual(visible.read_text(encoding="utf-8"), source.read_text(encoding="utf-8"))
+
+            outcome = dispatch_executor(
+                life,
+                _request(spec, repair_report_path=repair_path),
+                ScriptedAdapter(on_launch=repair_report_is_readable),
+            )
+
+            self.assertEqual(outcome.status, "implemented")
+            self.assertFalse((root / repair_path).is_symlink())
 
 
 if __name__ == "__main__":

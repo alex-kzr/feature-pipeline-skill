@@ -1255,7 +1255,10 @@ class BoardProjectionWiringTests(unittest.TestCase):
         class ScopeAmendmentExecutor(sa.ScriptedExecutor):
             def launch(self, request):  # noqa: ANN001 - test double
                 if not (request.no_tools or request.resume_session_id):
-                    amended = root / "fixtures/execution/tasks/EX-01_direct-success.md"
+                    amended = (
+                        Path(request.working_root)
+                        / "fixtures/execution/tasks/EX-01_direct-success.md"
+                    )
                     amended.write_text(
                         amended.read_text(encoding="utf-8")
                         + "\n## Repair Scope Amendment\n\n"

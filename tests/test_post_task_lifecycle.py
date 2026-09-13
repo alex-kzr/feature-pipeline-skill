@@ -489,5 +489,41 @@ class RestartSafetyTests(unittest.TestCase):
             self.assertEqual(documenter.calls, 1)  # stage 10 was already PASS on run.json
 
 
+class AmendedTaskCompletesThePostTaskLifecycleTests(unittest.TestCase):
+    """TAM-01: a task carrying an approved amendment revision is otherwise an ordinary
+    ``done`` task from stage 10 onward — its revision evidence just rides along unchanged."""
+
+    def test_an_amended_and_completed_task_reaches_stage_10_and_survives_reload(self) -> None:
+        from pipeline_core.plan import AmendmentRevision
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            life = _life(root, verified=False)
+            life.transition("A-1", "running", actor=ACTOR_RUNNER)
+            life.transition("A-1", "implemented", actor=ACTOR_EXECUTOR)
+            life.run.apply_amendment(
+                AmendmentRevision(
+                    task_id="A-1", revision=1, prior_digest="sha256:a", new_digest="sha256:b",
+                    changed_fields=("allowed_scope",), added_paths=("README.md",),
+                    rationale="documentation scope required an additional path",
+                    approved_by="a-human", source_evidence="report:launch-1",
+                    created_at="2026-09-12T00:00:00Z", epoch=1,
+                ),
+                new_digest="sha256:b", new_digest_version="tam01-amendment-v1",
+            )
+            life.run.record_verdicts("A-1", "PASS", "PASS")
+            life.run.save()
+            self.assertEqual(life.run.task("A-1").status, "done")
+
+            request = _request(root, life)
+            outcome = run_post_task_lifecycle(life, request)
+            self.assertEqual(outcome.status, "complete")
+
+            reloaded = RunLifecycle.load(life.run.run_dir, root)
+            record = reloaded.run.task("A-1")
+            self.assertEqual(record.current_revision, 1)
+            self.assertEqual(len(record.amendment_revisions), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

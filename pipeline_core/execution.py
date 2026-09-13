@@ -96,6 +96,13 @@ from .concurrency import pipeline_lease, pipeline_lock_path, task_lease, task_lo
 from .dispatch import DispatchError
 from .lease import LeaseHeldError
 from .lifecycle import RunLifecycle
+from .plan import (
+    AmendmentRequiredResult,
+    CLASSIFICATION_AMENDMENT_REQUIRED,
+    classify_baseline_failure,
+    canonical_amendment_fields,
+    contract_digest as amendment_contract_digest,
+)
 from .prompt_envelope import EnvelopeAnchors
 from .state import ACTOR_RUNNER, ResumeError, Run, StateError, pid_alive, read_lease, repo_relative
 from .preconditions import GitRunner, bind_refs, evaluate_preconditions
@@ -104,6 +111,7 @@ from .verification import (
     VerifierAnchors,
     VerifierLaunchers,
 )
+from .worktree import _in_allowed_scope
 
 #: Process exit codes, byte-identical to :mod:`pipeline_core.runner_cli` — ``execute`` mode
 #: shares the baseline compatibility table so one exit code means one thing across modes.
@@ -149,6 +157,13 @@ def _utcnow() -> str:
 def persist_task_contracts(run: Run, specs: Sequence[TaskSpec]) -> None:
     """Record the reusable identity for every task in the current run."""
     for spec in specs:
+        record = run.task(spec.id)
+        # An approved TAM-01 revision has its own, deliberately narrower contract
+        # identity.  Do not overwrite it while reopening the run: the compatibility
+        # check below has already established that the current task definition matches
+        # this exact approved amendment.
+        if _matches_approved_amendment(record, spec):
+            continue
         run.set_task_contract(
             spec.id,
             canonical_task_path(spec, run.repo_root),
@@ -364,7 +379,7 @@ class ExecuteRequest:
 class ExecuteResult:
     """The terminal outcome of one ``execute`` invocation."""
 
-    status: str  # 'ok' | 'gate-pending' | 'retryable' | 'blocked' | 'error'
+    status: str  # 'ok' | 'gate-pending' | 'retryable' | 'blocked' | 'error' | 'amendment_required'
     exit_code: int
     message: str
     run_dir: Path | None
@@ -1068,12 +1083,34 @@ def _ensure_precondition_contracts_match(run: Run, specs: Sequence[TaskSpec]) ->
             continue
         record = run.task(spec.id)
         digest = record.task_contract_digest
-        if (record.task_contract_version != CANONICAL_CONTRACT_VERSION
-                or digest != task_contract_digest(spec)):
+        canonical_match = (
+            record.task_contract_version == CANONICAL_CONTRACT_VERSION
+            and digest == task_contract_digest(spec)
+        )
+        if not canonical_match and not _matches_approved_amendment(record, spec):
             raise ExecutionError(
                 f"resume task contract changed for {spec.id}; start a fresh reviewed run",
                 "task-contract-mismatch",
             )
+
+
+def _matches_approved_amendment(record, spec: TaskSpec) -> bool:
+    """Return whether ``spec`` is the exact current approved amendment revision.
+
+    Normal resume remains strict: only a current revision created through the explicit
+    amendment control can use the amendment digest, and its entire amendable surface must
+    match the reloaded task definition.
+    """
+    return (
+        record.current_revision > 0
+        and record.amendment_revisions
+        and record.task_contract_version == "tam01-amendment-v1"
+        and record.task_contract_digest == amendment_contract_digest(
+            canonical_amendment_fields(spec)
+        )
+        and record.amendment_revisions[-1].get("revision") == record.current_revision
+        and record.amendment_revisions[-1].get("new_digest") == record.task_contract_digest
+    )
 
 
 def _check_preconditions(life: RunLifecycle, request: ExecuteRequest, spec: TaskSpec,
@@ -1128,6 +1165,73 @@ def _resolve_executor(request: ExecuteRequest, spec: TaskSpec) -> None:
             f"{spec.id}: executor '{spec.executor}' has no available adapter or agent",
             "unresolved-executor",
         )
+
+
+#: Bound on one baseline diagnosis command; a pre-dispatch check must never hang the run.
+BASELINE_DIAGNOSIS_TIMEOUT = 600.0
+
+_TRACEBACK_FILE_RE = re.compile(r'File "([^"]+)"')
+
+
+def _baseline_observed_paths(output: str, repo_root: Path) -> tuple[str, ...]:
+    """Best-effort repository-relative paths named in a failing command's own output."""
+    found: set[str] = set()
+    for raw in _TRACEBACK_FILE_RE.findall(output):
+        try:
+            candidate = Path(raw)
+            relative = (candidate if candidate.is_absolute() else (repo_root / candidate)).resolve().relative_to(repo_root.resolve())
+        except (ValueError, OSError):
+            continue
+        found.add(relative.as_posix())
+    return tuple(sorted(found))
+
+
+def diagnose_baseline(spec: TaskSpec, repo_root: Path) -> AmendmentRequiredResult | None:
+    """Run this task's declared verification commands against the current worktree *before*
+    the executor window opens, and classify any failure (TAM-01 AC-4).
+
+    A command whose own working directory does not exist is an environmental gap, not this
+    task's fault, and is silently skipped here (the ordinary verification gate still reports
+    it). A command that fails with none of its observed evidence paths inside the task's
+    current ``allowed_scope`` is ``amendment_required`` — this never spends a repair attempt
+    and never dispatches the executor. Anything else is left for the ordinary repair loop.
+    """
+    root = Path(repo_root).resolve()
+    observed: set[str] = set()
+    causal: list[str] = []
+    for command in spec.verification_commands:
+        cwd = (root / command.cwd).resolve()
+        if not cwd.is_dir():
+            continue
+        try:
+            result = subprocess.run(
+                list(command.argv), cwd=cwd, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=BASELINE_DIAGNOSIS_TIMEOUT,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode == 0:
+            continue
+        paths = _baseline_observed_paths((result.stdout or "") + (result.stderr or ""), root)
+        covered = any(_in_allowed_scope(path, spec.allowed_scope) for path in paths) if paths else True
+        classification = classify_baseline_failure(
+            exit_code=result.returncode, cwd_paths_exist=True, path_covered_by_scope=covered,
+        )
+        if classification == CLASSIFICATION_AMENDMENT_REQUIRED:
+            observed.update(paths)
+            causal.append(" ".join(["cd", repo_relative(cwd, root) or "."] + [">"] + list(command.argv)))
+    if not causal:
+        return None
+    return AmendmentRequiredResult(
+        task_id=spec.id,
+        observed_paths=tuple(sorted(observed)),
+        causal_commands=tuple(causal),
+        reason=(
+            "a declared verification command fails on evidence outside this task's current "
+            "allowed scope; an approved amendment is required before dispatch"
+        ),
+    )
 
 
 def _prepare_executor(life: RunLifecycle, request: ExecuteRequest, spec: TaskSpec,
@@ -1822,6 +1926,11 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
                             effort=request.controls.effort,
                             board_path=request.board_path,
                             pre_dispatch=lambda: _prepare_executor(life, request, spec, bindings),
+                            # This is deliberately before the executor window and before the
+                            # repair loop consumes an attempt.  A failure attributable to a
+                            # path outside the current revision therefore becomes an explicit
+                            # human amendment decision, never a futile repair dispatch.
+                            baseline_diagnosis=lambda: diagnose_baseline(spec, request.repo_root),
                         ),
                     )
             except (ExecutionError, DispatchError) as exc:
@@ -1841,6 +1950,19 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
                 return ExecuteResult(
                     "retryable", EXIT_ERROR,
                     f"{task_id} has a retryable orchestration failure: "
+                    f"{outcome.blocker or 'see the persisted diagnostic'}",
+                    request.run_dir, life.run.run_id, tuple(results))
+            if outcome.status == "amendment_required":
+                # A pre-dispatch baseline diagnosis found declared-command evidence outside
+                # this task's current scope (TAM-01 AC-4). The active task card is retained
+                # unchanged and no repair attempt was spent reaching this outcome; only an
+                # explicit, approved amendment (never a futile repair) can proceed.
+                life.run.status = "running"
+                life.record_operation(task_id, "baseline", "amendment_required", outcome.blocker)
+                life.run.save()
+                return ExecuteResult(
+                    "amendment_required", EXIT_BLOCKED,
+                    f"{task_id} requires an approved amendment before it can be dispatched: "
                     f"{outcome.blocker or 'see the persisted diagnostic'}",
                     request.run_dir, life.run.run_id, tuple(results))
             if outcome.status != "done":

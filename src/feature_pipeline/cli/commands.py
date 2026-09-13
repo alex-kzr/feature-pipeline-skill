@@ -49,6 +49,11 @@ class RunCommand:
     operational_unblock_task: str | None = None
     human_authorized_operational_unblock: bool = False
     uv_cache_dir: str | None = None
+    amend_task: str | None = None
+    amend_rationale: str | None = None
+    amend_approved_by: str | None = None
+    amend_evidence: str | None = None
+    amend_contract: str | None = None
 
     # Delivery gates.
     approve_plan: bool = False
@@ -96,6 +101,11 @@ class RunCommand:
             operational_unblock_task=args.operational_unblock_task,
             human_authorized_operational_unblock=args.human_authorized_operational_unblock,
             uv_cache_dir=args.uv_cache_dir,
+            amend_task=args.amend_task,
+            amend_rationale=args.amend_rationale,
+            amend_approved_by=args.amend_approved_by,
+            amend_evidence=args.amend_evidence,
+            amend_contract=args.amend_contract,
             approve_plan=args.approve_plan,
             approve_final_diff=args.approve_final_diff,
             commit=args.commit,

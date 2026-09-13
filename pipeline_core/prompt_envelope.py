@@ -88,9 +88,9 @@ def build_executor_envelope(
         "- Read required skills first.",
         "- Read the task file before editing.",
         "- Write only inside Allowed scope; never inside Out of scope.",
-        "- Run every verification command from its declared working directory, one at a time.",
-        "- Report each command with its working directory and exit code. Never report a "
-        "command you did not run.",
+        "- The listed verification commands are runner-owned evidence. Do not run or report them; "
+        "the runner captures their working directory, argv, exit code, and output after your "
+        "implemented result.",
         "- Do not verify your own work and do not tick acceptance-criteria checkboxes.",
         "- Terminal state is `implemented`: stop after reporting. The orchestrator dispatches "
         "verification and moves the board.",

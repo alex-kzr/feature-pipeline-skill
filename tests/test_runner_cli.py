@@ -1436,3 +1436,79 @@ class ReleaseDryRunModeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AmendModeTests(unittest.TestCase):
+    """TAM-01: ``--mode amend`` persists one explicit, human-approved revision and nothing
+    else — it never resolves a profile/plan or reaches the executor dispatch path."""
+
+    def _run_for(self, project_root: Path, feature: str, task_id: str = "T-1"):
+        prompt = project_root / "prompt.md"
+        prompt.write_text("feature", encoding="utf-8")
+        run = Run.create(feature, prompt, None, project_root / ".pipeline" / "runs" / feature,
+                         project_root)
+        run.add_task(task_id)
+        run.save()
+        return run
+
+    def _contract(self, project_root: Path, **payload) -> str:
+        payload.setdefault("new_contract", {"allowed_scope": ["tests/**"], "max_repair_attempts": 2})
+        path = project_root / "amendment.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return "amendment.json"
+
+    def test_an_approved_amendment_persists_a_new_revision(self) -> None:
+        with TemporaryDirectory() as directory:
+            project_root = Path(directory)
+            run = self._run_for(project_root, "amend-feature")
+            contract_rel = self._contract(project_root)
+            code, out, err = _run([
+                "--project-root", str(project_root), "--mode", "amend",
+                "--feature", "amend-feature", "--amend-task", "T-1",
+                "--amend-rationale", "baseline exposed an out-of-scope failure",
+                "--amend-approved-by", "a-human", "--amend-evidence", "report:launch-1",
+                "--amend-contract", contract_rel,
+            ])
+            self.assertEqual(code, 0, err)
+            self.assertIn("amendment applied", out)
+            reloaded = Run.load(run.run_dir, project_root)
+            record = reloaded.task("T-1")
+            self.assertEqual(record.current_revision, 1)
+            self.assertEqual(len(record.amendment_revisions), 1)
+            self.assertEqual(record.amendment_revisions[0]["approved_by"], "a-human")
+
+    def test_missing_approval_is_rejected_before_any_mutation(self) -> None:
+        with TemporaryDirectory() as directory:
+            project_root = Path(directory)
+            run = self._run_for(project_root, "amend-feature")
+            before = (run.run_dir / "run.json").read_bytes()
+            contract_rel = self._contract(project_root)
+            code, _out, err = _run([
+                "--project-root", str(project_root), "--mode", "amend",
+                "--feature", "amend-feature", "--amend-task", "T-1",
+                "--amend-rationale", "baseline exposed an out-of-scope failure",
+                "--amend-evidence", "report:launch-1", "--amend-contract", contract_rel,
+            ])
+            self.assertNotEqual(code, 0)
+            self.assertIn("--amend-approved-by", err)
+            self.assertEqual((run.run_dir / "run.json").read_bytes(), before)
+
+    def test_a_done_task_cannot_be_amended(self) -> None:
+        with TemporaryDirectory() as directory:
+            project_root = Path(directory)
+            run = self._run_for(project_root, "amend-feature")
+            run.transition_task("T-1", "in_progress")
+            run.record_verdicts("T-1", "PASS", "PASS")
+            run.save()
+            before = (run.run_dir / "run.json").read_bytes()
+            contract_rel = self._contract(project_root)
+            code, _out, err = _run([
+                "--project-root", str(project_root), "--mode", "amend",
+                "--feature", "amend-feature", "--amend-task", "T-1",
+                "--amend-rationale", "baseline exposed an out-of-scope failure",
+                "--amend-approved-by", "a-human", "--amend-evidence", "report:launch-1",
+                "--amend-contract", contract_rel,
+            ])
+            self.assertNotEqual(code, 0)
+            self.assertIn("task-already-done", err)
+            self.assertEqual((run.run_dir / "run.json").read_bytes(), before)

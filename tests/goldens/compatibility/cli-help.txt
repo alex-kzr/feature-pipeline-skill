@@ -11,9 +11,11 @@ usage: run_pipeline.py [-h] [--project-root DIR] [--agents-root DIR]
                        [--human-authorize-operational-unblock]
                        [--uv-cache-dir REL] [--grant GRANT]
                        [--approve APPROVE] [--published-ref SOURCE=REF]
-                       [--mode {plan-only,unattended,execute,release-dry-run}]
-                       [--feature NAME] [--prompt REL] [--approve-plan]
-                       [--approve-final-diff] [--commit]
+                       [--mode {plan-only,unattended,execute,release-dry-run,amend}]
+                       [--feature NAME] [--prompt REL] [--amend-task ID]
+                       [--amend-rationale TEXT] [--amend-approved-by NAME]
+                       [--amend-evidence REF] [--amend-contract PATH]
+                       [--approve-plan] [--approve-final-diff] [--commit]
                        [--commit-approved-manifest] [--dry-run] [--push]
                        [--status] [--unattended] [--adapter NAME]
                        [--model MODEL] [--effort LEVEL]
@@ -78,7 +80,7 @@ run selection and scope:
   --published-ref SOURCE=REF
                         bind a ref-published precondition to refs/heads/* or
                         refs/tags/*
-  --mode {plan-only,unattended,execute,release-dry-run}
+  --mode {plan-only,unattended,execute,release-dry-run,amend}
                         run mode (default: plan-only). 'execute' runs stages
                         5-9 — executor dispatch, independent verification, and
                         bounded repair — and stops before
@@ -86,10 +88,28 @@ run selection and scope:
                         plan-only dry run with the post-task lifecycle (stages
                         10–16) and its gates in the C4/C6 plan, then stops at
                         the final-diff / release dry-run boundary; it still
-                        writes nothing
+                        writes nothing. 'amend' persists one explicit, human-
+                        approved amendment revision on an existing non-done
+                        task (TAM-01) and dispatches no executor
   --feature NAME        override the plan's feature name
   --prompt REL          prompt file, relative to the resolved project
                         directory (defaults to the plan file)
+
+amendment (--mode amend only; TAM-01):
+  --amend-task ID       the existing, non-done task id this amendment revises
+  --amend-rationale TEXT
+                        why the additional scope is required (non-empty)
+  --amend-approved-by NAME
+                        the human who approved this amendment (explicit
+                        approval)
+  --amend-evidence REF  a reference to the runner-owned or verifier evidence
+                        that justifies the amendment (a report path, run id,
+                        or command id)
+  --amend-contract PATH
+                        a JSON file with 'new_contract' (required),
+                        'prior_contract' (optional, defaults to an empty
+                        comparison baseline), and 'added_paths' (optional
+                        list) keys
 
 delivery gates (all closed by default):
   --approve-plan        satisfy the plan gate

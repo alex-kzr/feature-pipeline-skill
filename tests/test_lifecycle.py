@@ -10,6 +10,12 @@ import unittest
 from pathlib import Path
 
 from pipeline_core.lifecycle import CORE_VERSION, RunLifecycle
+from pipeline_core.plan import (
+    AmendmentError,
+    AmendmentRequest,
+    build_amendment_revision,
+    validate_amendment_request,
+)
 from pipeline_core.state import (
     ACTOR_EXECUTOR,
     ACTOR_HUMAN,
@@ -401,6 +407,160 @@ class ReadinessAndSuppressionTests(unittest.TestCase):
             life = RunLifecycle.initialize(run, tasks=[("A-1", []), ("A-2", [])])
             life.block("A-1", "blocked-for-test")
             self.assertEqual(life.eligible_tasks(), ["A-2"])
+
+
+class AmendmentRequestValidationTests(unittest.TestCase):
+    """RED/GREEN coverage for TAM-01's fail-closed amendment validation (AC-1, AC-2)."""
+
+    def _request(self, **overrides):
+        base = dict(
+            task_id="TAM-EX",
+            task_status="in_progress",
+            prior_contract={"allowed_scope": ["a.py"], "max_repair_attempts": 2},
+            new_contract={"allowed_scope": ["a.py", "b.py"], "max_repair_attempts": 2},
+            rationale="baseline exposed b.py failures out of scope",
+            approved_by="a-human",
+            source_evidence="report:launch-3",
+        )
+        base.update(overrides)
+        return AmendmentRequest(**base)
+
+    def test_rejects_missing_approval(self) -> None:
+        with self.assertRaises(AmendmentError) as ctx:
+            validate_amendment_request(self._request(approved_by=""), expected_task_id="TAM-EX")
+        self.assertEqual(ctx.exception.code, "missing-approval")
+
+    def test_rejects_missing_rationale(self) -> None:
+        with self.assertRaises(AmendmentError) as ctx:
+            validate_amendment_request(self._request(rationale=""), expected_task_id="TAM-EX")
+        self.assertEqual(ctx.exception.code, "missing-rationale")
+
+    def test_rejects_task_id_change(self) -> None:
+        with self.assertRaises(AmendmentError) as ctx:
+            validate_amendment_request(self._request(), expected_task_id="OTHER-1")
+        self.assertEqual(ctx.exception.code, "task-id-changed")
+
+    def test_rejects_amendment_of_a_done_task(self) -> None:
+        with self.assertRaises(AmendmentError) as ctx:
+            validate_amendment_request(
+                self._request(task_status="done"), expected_task_id="TAM-EX")
+        self.assertEqual(ctx.exception.code, "task-already-done")
+
+    def test_rejects_a_forbidden_scope_path(self) -> None:
+        request = self._request(
+            new_contract={"allowed_scope": [".pipeline/runs/foo"], "max_repair_attempts": 2})
+        with self.assertRaises(AmendmentError) as ctx:
+            validate_amendment_request(request, expected_task_id="TAM-EX")
+        self.assertEqual(ctx.exception.code, "forbidden-scope-path")
+
+    def test_rejects_an_absolute_scope_path(self) -> None:
+        request = self._request(
+            new_contract={"allowed_scope": ["C:/outside.py"], "max_repair_attempts": 2})
+        with self.assertRaises(AmendmentError) as ctx:
+            validate_amendment_request(request, expected_task_id="TAM-EX")
+        self.assertEqual(ctx.exception.code, "unsafe-path")
+
+    def test_rejects_an_immutable_contract_field(self) -> None:
+        request = self._request(new_contract={
+            "allowed_scope": ["a.py", "b.py"], "max_repair_attempts": 2, "id": "OTHER-1"})
+        with self.assertRaises(AmendmentError) as ctx:
+            validate_amendment_request(request, expected_task_id="TAM-EX")
+        self.assertEqual(ctx.exception.code, "immutable-contract-field")
+
+    def test_rejects_a_no_op_amendment(self) -> None:
+        request = self._request(new_contract=dict(self._request().prior_contract))
+        with self.assertRaises(AmendmentError) as ctx:
+            validate_amendment_request(request, expected_task_id="TAM-EX")
+        self.assertEqual(ctx.exception.code, "no-op-amendment")
+
+    def test_approved_amendment_builds_an_immutable_revision_with_digests(self) -> None:
+        revision = build_amendment_revision(self._request(), next_revision=1, next_epoch=1)
+        self.assertEqual(revision.task_id, "TAM-EX")
+        self.assertEqual(revision.revision, 1)
+        self.assertNotEqual(revision.prior_digest, revision.new_digest)
+        self.assertIn("allowed_scope", revision.changed_fields)
+        self.assertEqual(revision.approved_by, "a-human")
+        self.assertTrue(revision.rationale)
+
+
+def _git(root: Path, *argv: str) -> None:
+    import subprocess
+    subprocess.run(["git", *argv], cwd=root, check=True, capture_output=True, text=True)
+
+
+class ScopeBoundaryEnforcementTests(unittest.TestCase):
+    """TAM-01 AC-5: an out-of-scope executor write cannot alter the primary worktree,
+    including a pre-existing dirty file — a real filesystem/Git production-boundary fixture,
+    not an adapter double."""
+
+    def _repo(self, root: Path) -> None:
+        _git(root, "init", "-q")
+        _git(root, "config", "user.email", "t@example.com")
+        _git(root, "config", "user.name", "Test")
+        (root / "clean.py").write_text("clean before\n", encoding="utf-8")
+        _git(root, "add", "-A")
+        _git(root, "commit", "-qm", "base")
+
+    def test_executor_workspace_excludes_the_agent_runtime_tree(self) -> None:
+        """A disposable executor workspace must not recursively copy the host agent runtime.
+
+        Apart from being executor-inaccessible by contract, a Python environment beneath
+        ``.agents`` can exceed Windows' path limit when copied below a temporary workspace.
+        """
+        from pipeline_core.dispatch import _isolated_workspace
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "source.py").write_text("value = 1\n", encoding="utf-8")
+            (root / ".agents" / "runtime" / "very" / "deep").mkdir(parents=True)
+            (root / ".agents" / "runtime" / "very" / "deep" / "runtime.txt").write_text(
+                "host-only", encoding="utf-8"
+            )
+
+            workspace = _isolated_workspace(root)
+
+            self.assertTrue((workspace / "source.py").is_file())
+            self.assertFalse((workspace / ".agents").exists())
+
+    def test_a_new_out_of_scope_addition_never_reaches_the_worktree(self) -> None:
+        from pipeline_core.dispatch import _enforce_scope_boundary
+        from pipeline_core.worktree import attribute_window, capture_snapshot
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._repo(root)
+            before = capture_snapshot(root)
+            (root / "in_scope.py").write_text("in scope work\n", encoding="utf-8")
+            (root / "secret_leak.py").write_text("leaked\n", encoding="utf-8")
+            after = capture_snapshot(root)
+            attribution = attribute_window(before, after, allowed_scope=("in_scope.py",))
+
+            reverted = _enforce_scope_boundary(root, before, attribution)
+
+            self.assertIn("secret_leak.py", reverted)
+            self.assertFalse((root / "secret_leak.py").exists())
+            self.assertEqual((root / "in_scope.py").read_text(encoding="utf-8"), "in scope work\n")
+
+    def test_a_pre_existing_dirty_out_of_scope_file_survives_byte_for_byte(self) -> None:
+        from pipeline_core.dispatch import _enforce_scope_boundary
+        from pipeline_core.worktree import attribute_window, capture_snapshot
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._repo(root)
+            (root / "dirty.py").write_text("pre-existing dirty content\n", encoding="utf-8")
+            before = capture_snapshot(root)
+            (root / "dirty.py").write_text("executor overwrote the dirty file\n", encoding="utf-8")
+            after = capture_snapshot(root)
+            attribution = attribute_window(before, after, allowed_scope=("in_scope.py",))
+
+            reverted = _enforce_scope_boundary(root, before, attribution)
+
+            self.assertIn("dirty.py", reverted)
+            self.assertEqual(
+                (root / "dirty.py").read_text(encoding="utf-8"),
+                "pre-existing dirty content\n",
+            )
 
 
 if __name__ == "__main__":

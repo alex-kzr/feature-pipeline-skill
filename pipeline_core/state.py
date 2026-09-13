@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .artifacts import ArtifactReadError, read_json, write_json_atomic
+from .plan import AmendmentError, AmendmentRevision
 
 SCHEMA_VERSION = 2
 EXIT_TIMEOUT = "timeout"
@@ -184,6 +185,17 @@ class TaskRecord:
     next_executor_launch_generation: int = 1
     next_task_verifier_launch_generation: int = 1
     next_test_verifier_launch_generation: int = 1
+    #: Append-only, immutable amendment revisions (TAM-01) — each a dict shaped like
+    #: :meth:`pipeline_core.plan.AmendmentRevision.as_dict`. Never rewritten or removed;
+    #: a later amendment only ever appends.
+    amendment_revisions: list[dict[str, Any]] = field(default_factory=list)
+    #: The active contract/execution/verification epoch. ``0`` is the task's original,
+    #: unamended contract; each approved amendment increments it by one.
+    current_revision: int = 0
+    #: Repair attempts and independent-verifier evidence recorded *before* the most recent
+    #: amendment, snapshotted verbatim at amendment time so historical evidence stays
+    #: readable without being able to validate the expanded revision (AC-3).
+    revision_history: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "TaskRecord":
@@ -671,6 +683,56 @@ class Run:
             f"repair-attempt:{task_id}", frm=str(previous), to=str(record.attempts),
             note="repair attempt consumed")
         return True
+
+    def apply_amendment(self, revision: AmendmentRevision, *, new_digest: str,
+                        new_digest_version: str) -> dict[str, Any]:
+        """Persist one approved, already-validated :class:`AmendmentRevision`.
+
+        Fails closed a second time on the durable record itself — a task that reached
+        ``done`` between validation and persistence, a task-id mismatch, or a revision
+        number that does not immediately follow the task's current revision are all
+        rejected rather than silently reordered or duplicated (AC-1, AC-2). On success:
+        appends the revision (append-only; never rewritten), snapshots the pre-amendment
+        repair count and verifier evidence into ``revision_history`` so it stays readable
+        without being able to validate the new revision, resets the repair budget and
+        verification manifest for a fresh epoch, and updates the recorded contract digest
+        so ordinary strict-resume compares against the amended contract from now on
+        (AC-3, AC-6).
+        """
+        record = self.task(revision.task_id)
+        if record.status == "done":
+            raise AmendmentError(
+                f"'{revision.task_id}' is already done; a completed task cannot be amended",
+                "task-already-done",
+            )
+        if revision.revision != record.current_revision + 1:
+            raise AmendmentError(
+                f"amendment revision {revision.revision} does not follow the current "
+                f"revision {record.current_revision} for '{revision.task_id}'",
+                "revision-out-of-order",
+            )
+        record.revision_history.append({
+            "revision": record.current_revision,
+            "attempts": record.attempts,
+            "verification": dict(record.verification),
+            "contract_digest": record.task_contract_digest,
+        })
+        record.amendment_revisions.append(revision.as_dict())
+        record.current_revision = revision.revision
+        record.attempts = 0
+        record.verification = _empty_verification()
+        record.task_contract_digest = new_digest
+        record.task_contract_version = new_digest_version
+        self.record_operation(
+            revision.task_id, "amendment", "approved",
+            f"revision {revision.revision} approved by {revision.approved_by}: {revision.rationale}",
+        )
+        self.record_event(
+            f"amendment:{revision.task_id}", frm=str(revision.revision - 1),
+            to=str(revision.revision), actor=ACTOR_HUMAN,
+            note=f"approved by {revision.approved_by}",
+        )
+        return revision.as_dict()
 
     def record_stage_outcome(
         self,

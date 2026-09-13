@@ -27,8 +27,12 @@ Standard library only.
 from __future__ import annotations
 
 import json
+import shutil
+import tempfile
+from dataclasses import replace
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 from feature_pipeline.contracts import TaskSpec
 from feature_pipeline.application.work_items import WorkItemError, require_active_work_item
@@ -213,7 +217,8 @@ def _unsafe_scope_amendment_path(path: str) -> bool:
     )
 
 
-def _record_scope_amendment(run: Run, task_id: str, attribution: AttributionResult) -> None:
+def _record_scope_amendment(run: Run, task_id: str, attribution: AttributionResult,
+                            *, reverted_paths: Sequence[str] = ()) -> None:
     """Attach reviewable, runner-observed amendment facts without changing the manifest."""
     observed_paths = [
         str(row["path"])
@@ -226,8 +231,160 @@ def _record_scope_amendment(run: Run, task_id: str, attribution: AttributionResu
     implementation["scope_amendment"] = {
         "present": True,
         "observed_paths": observed_paths,
+        "reverted_paths": list(reverted_paths),
         "rationale": "executor-owned paths outside the initial estimate require independent amendment-justification review",
     }
+
+
+def _revert_worktree_path(repo_root: Path, before_snapshot, path: str) -> bool:
+    """Restore one repository-relative path to its pre-window content, or remove it if it
+    did not exist before the window opened. Returns ``True`` on a successful revert."""
+    absolute = Path(repo_root) / path
+    entry = before_snapshot.files.get(path) if before_snapshot is not None else None
+    if entry is not None:
+        if entry.unreadable:
+            return False
+        if entry.data is None:
+            try:
+                absolute.unlink()
+            except FileNotFoundError:
+                pass
+            return True
+        absolute.parent.mkdir(parents=True, exist_ok=True)
+        absolute.write_bytes(entry.data)
+        return True
+    # Not in the bounded before-snapshot: the path was clean and tracked, unchanged at
+    # window open, so its pre-window content is exactly Git's committed blob.
+    try:
+        shown = GitPort(repo_root).run(["show", f"HEAD:{path}"])
+    except GitSafetyError:
+        return False
+    if shown.returncode != 0:
+        try:
+            absolute.unlink()
+        except FileNotFoundError:
+            pass
+        return True
+    absolute.parent.mkdir(parents=True, exist_ok=True)
+    absolute.write_text(shown.stdout, encoding="utf-8", errors="surrogateescape")
+    return True
+
+
+def _enforce_scope_boundary(
+    repo_root: Path, before_snapshot, attribution: AttributionResult,
+) -> list[str]:
+    """Prevent every out-of-scope executor write from reaching the primary worktree
+    (TAM-01 AC-5). Historical evidence (the manifest and diff already persisted) is never
+    edited — only the live worktree bytes for an out-of-scope path are reverted, restoring
+    a pre-existing dirty file byte-for-byte or removing a wholly new out-of-scope addition.
+    """
+    reverted: list[str] = []
+    for row in attribution.changed_files:
+        classification = (
+            row.get("classification") if isinstance(row, dict) else row.classification
+        )
+        if classification != "out_of_scope":
+            continue
+        path = str(row["path"] if isinstance(row, dict) else row.path)
+        if _revert_worktree_path(repo_root, before_snapshot, path):
+            reverted.append(path)
+    return reverted
+
+
+def _isolated_workspace(repo_root: Path) -> Path:
+    """Copy the repository into a disposable executor-only worktree.
+
+    The runner's ``.pipeline`` control plane is intentionally absent.  Executor output is
+    attributed in this copy and only an allowed delta is later promoted to ``repo_root``.
+    """
+    target = Path(tempfile.mkdtemp(prefix="feature-pipeline-executor-")) / "workspace"
+    shutil.copytree(
+        repo_root, target,
+        ignore=shutil.ignore_patterns(".agents", ".pipeline", "__pycache__"),
+    )
+    return target
+
+
+def _copy_repair_report_to_workspace(
+    primary: Path, workspace: Path, repair_report_path: str | None,
+) -> None:
+    """Make the one runner-owned repair report named in the prompt readable to the worker.
+
+    Isolated workspaces omit the runner's ``.pipeline`` control plane.  A repair prompt still
+    names its immutable report there, so copy that single pre-existing file before the snapshot
+    opens.  It is baseline context, never executor output eligible for attribution or promotion.
+    """
+    if repair_report_path is None:
+        return
+    relative = repo_relative(repair_report_path, primary)
+    source = primary / relative
+    if source.is_symlink() or not source.is_file():
+        raise DispatchError(
+            f"repair report is unavailable: {relative}", "repair-report-unavailable"
+        )
+    destination = workspace / relative
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, destination)
+
+
+def _workspace_artifacts(artifacts: LaunchArtifacts, root: Path) -> LaunchArtifacts:
+    """Mirror attribution artifacts inside an isolated workspace before promotion."""
+    directory = root / ".pipeline-artifacts" / artifacts.task_id / f"launch-{artifacts.generation}"
+    def at(path: Path) -> Path:
+        return directory / path.relative_to(artifacts.directory)
+    return replace(
+        artifacts, directory=directory, executor_report=at(artifacts.executor_report),
+        status_envelope=at(artifacts.status_envelope), prompt_envelope=at(artifacts.prompt_envelope),
+        implementation_manifest=at(artifacts.implementation_manifest),
+        implementation_diff=at(artifacts.implementation_diff), launch_failure=at(artifacts.launch_failure),
+        result_protocol_invalid=at(artifacts.result_protocol_invalid), recovery_patch=at(artifacts.recovery_patch),
+        recovery_proof=at(artifacts.recovery_proof),
+    )
+
+
+def _promote_allowed_paths(primary: Path, workspace: Path, attribution: AttributionResult) -> list[str]:
+    """Apply only executor-owned, approved files from an isolated workspace."""
+    promoted: list[str] = []
+    for row in attribution.changed_files:
+        if row.get("classification") != "in_allowed_scope":
+            continue
+        relative = Path(str(row["path"]))
+        source, destination = workspace / relative, primary / relative
+        if row.get("status") == "deleted":
+            destination.unlink(missing_ok=True)
+        else:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, destination)
+        promoted.append(relative.as_posix())
+    return promoted
+
+
+def _attribute_isolated_window(
+    *, workspace: Path, primary: Path, before_snapshot, artifacts: LaunchArtifacts,
+    task_id: str, allowed_scope: Sequence[str], attempt: int, generation: int,
+) -> AttributionResult:
+    """Persist isolated attribution as normal runner artifacts, then promote safe paths."""
+    isolated_artifacts = _workspace_artifacts(artifacts, workspace)
+    isolated_artifacts.directory.mkdir(parents=True, exist_ok=True)
+    if artifacts.executor_report.exists():
+        shutil.copyfile(artifacts.executor_report, isolated_artifacts.executor_report)
+    attribution = attribute_executor_window(
+        before_snapshot, workspace, artifacts=isolated_artifacts, task_id=task_id,
+        allowed_scope=allowed_scope, attempt=attempt, generation=generation,
+        executor_report=isolated_artifacts.executor_report,
+        # These are copied into the disposable workspace only after the executor returns so
+        # attribution can persist its evidence there. They are runner output, never executor
+        # changes eligible for scope review or promotion.
+        exclude_roots=(workspace / ".pipeline-artifacts",),
+    )
+    shutil.copyfile(isolated_artifacts.implementation_manifest, artifacts.implementation_manifest)
+    shutil.copyfile(isolated_artifacts.implementation_diff, artifacts.implementation_diff)
+    _promote_allowed_paths(primary, workspace, attribution)
+    return replace(
+        attribution,
+        manifest=repo_relative(artifacts.implementation_manifest, primary),
+        diff=repo_relative(artifacts.implementation_diff, primary),
+    )
 
 
 def dispatch_executor(
@@ -266,6 +423,15 @@ def dispatch_executor(
             raise DispatchError(str(exc), exc.code) from None
         runner_evidence_satisfied = True
 
+    primary_root = Path(run.repo_root)
+    repair_report_path = request.repair_report_path
+    if repair_report_path is not None:
+        try:
+            available = (primary_root / repo_relative(repair_report_path, primary_root)).is_file()
+        except ValueError:
+            available = False
+        if not available:
+            repair_report_path = None
     envelope = build_executor_envelope(
         spec,
         anchors=request.anchors,
@@ -274,17 +440,25 @@ def dispatch_executor(
         report_path=repo_relative(artifacts.executor_report, run.repo_root),
         attempt=request.attempt,
         plan_path=request.plan_path,
-        repair_report_path=request.repair_report_path,
+        repair_report_path=repair_report_path,
         runner_evidence_satisfied=runner_evidence_satisfied,
     )
     write_text_atomic(artifacts.prompt_envelope, envelope, repo_root=run.repo_root)
+
+    primary_root = Path(run.repo_root)
+    # This is a security boundary, not an adapter capability.  Every executor runs in a
+    # disposable copy; an adapter flag would let a new or test adapter silently write the
+    # primary worktree before attribution had decided what is promotable.
+    workspace = _isolated_workspace(primary_root)
+    _copy_repair_report_to_workspace(primary_root, workspace, repair_report_path)
+    launch_working_root = str(workspace / request.working_root)
 
     launch_request = LaunchRequest(
         role=spec.executor,
         task_id=task_id,
         prompt=envelope,
         report_path=artifacts.executor_report,
-        working_root=request.working_root,
+        working_root=launch_working_root,
         role_grant=tuple(request.role_grant),
         allowed_scope=tuple(spec.allowed_scope),
         fresh_session=request.fresh_session,
@@ -310,8 +484,9 @@ def dispatch_executor(
     # launch, with the runner's own run/lock/report directory excluded. Subtracting this
     # after the launch attributes exactly this generation's changes, independent of both
     # executor claims and pre-existing workspace dirt.
-    before_snapshot = capture_snapshot(run.repo_root, exclude_roots=(run.run_dir,))
-    git_boundary = _capture_git_mutation_boundary(run.repo_root)
+    before_snapshot = capture_snapshot(
+        workspace, exclude_roots=(workspace / ".pipeline-artifacts",))
+    git_boundary = _capture_git_mutation_boundary(workspace)
 
     try:
         result = adapter.launch(launch_request)
@@ -341,7 +516,8 @@ def dispatch_executor(
 
     if getattr(adapter, "name", None) == "codex":
         return _settle_codex_final_result(
-            life, request, artifacts, generation, result, before_snapshot, git_boundary)
+            life, request, artifacts, generation, result, before_snapshot, git_boundary,
+            workspace=workspace)
 
     # The strict JSON status envelope: one same-session, tool-free continuation. Codex cannot
     # resume with its read-only sandbox and resolved anchor grants, so it declares that its
@@ -363,7 +539,7 @@ def dispatch_executor(
         task_id=task_id,
         prompt=envelope_prompt,
         report_path=artifacts.status_envelope,
-        working_root=request.working_root,
+        working_root=launch_working_root,
         role_grant=tuple(request.role_grant),
         resume_session_id=result.session_id,
         no_tools=True,
@@ -416,16 +592,17 @@ def dispatch_executor(
 
     # Trusted 'implemented': attribute the executor window, record evidence, then the single
     # legal transition.
-    attribution = attribute_executor_window(
-        before_snapshot,
-        run.repo_root,
-        artifacts=artifacts,
-        task_id=task_id,
-        allowed_scope=spec.allowed_scope,
-        attempt=request.attempt,
-        generation=generation,
-        executor_report=artifacts.executor_report,
-        exclude_roots=(run.run_dir,),
+    attribution = (
+        _attribute_isolated_window(
+            workspace=workspace, primary=primary_root, before_snapshot=before_snapshot,
+            artifacts=artifacts, task_id=task_id, allowed_scope=spec.allowed_scope,
+            attempt=request.attempt, generation=generation,
+        )
+        if workspace != primary_root else attribute_executor_window(
+            before_snapshot, run.repo_root, artifacts=artifacts, task_id=task_id,
+            allowed_scope=spec.allowed_scope, attempt=request.attempt, generation=generation,
+            executor_report=artifacts.executor_report, exclude_roots=(run.run_dir,),
+        )
     )
     run.record_executor_evidence(
         task_id,
@@ -436,7 +613,7 @@ def dispatch_executor(
         reserved_manifest=repo_relative(artifacts.implementation_manifest, run.repo_root),
         reserved_diff=repo_relative(artifacts.implementation_diff, run.repo_root),
         external_actions=_git_mutation_actions(
-            git_boundary, _capture_git_mutation_boundary(run.repo_root)),
+            git_boundary, _capture_git_mutation_boundary(workspace)),
     )
     run.record_implementation_attribution(
         task_id,
@@ -448,7 +625,9 @@ def dispatch_executor(
         changed_files=attribution.changed_files,
         reason=attribution.reason,
     )
-    _record_scope_amendment(run, task_id, attribution)
+    reverted_paths = [] if workspace != primary_root else _enforce_scope_boundary(
+        primary_root, before_snapshot, attribution)
+    _record_scope_amendment(run, task_id, attribution, reverted_paths=reverted_paths)
     scope_block = _scope_or_provenance_block(attribution)
     if scope_block:
         life.block(task_id, scope_block)
@@ -496,6 +675,7 @@ def _retryable_failure(
 def _settle_codex_final_result(
     life: RunLifecycle, request: DispatchRequest, artifacts: LaunchArtifacts, generation: int,
     result: LaunchResult, before_snapshot, git_boundary: _GitMutationBoundary | None,
+    *, workspace: Path,
 ) -> DispatchOutcome:
     """Accept only Codex's one canonical event; prose never supplies a status."""
     run = life.run
@@ -522,20 +702,30 @@ def _settle_codex_final_result(
         life.block(request.spec.id, final.reason or "")
         return DispatchOutcome(request.spec.id, generation, "blocked", "blocked", artifacts,
                                result, None, report_text)
-    attribution = attribute_executor_window(
-        before_snapshot, run.repo_root, artifacts=artifacts, task_id=request.spec.id,
-        allowed_scope=request.spec.allowed_scope, attempt=request.attempt, generation=generation,
-        executor_report=artifacts.executor_report, exclude_roots=(run.run_dir,))
+    primary_root = Path(run.repo_root)
+    attribution = (
+        _attribute_isolated_window(
+            workspace=workspace, primary=primary_root, before_snapshot=before_snapshot,
+            artifacts=artifacts, task_id=request.spec.id,
+            allowed_scope=request.spec.allowed_scope, attempt=request.attempt, generation=generation,
+        )
+        if workspace != primary_root else attribute_executor_window(
+            before_snapshot, run.repo_root, artifacts=artifacts, task_id=request.spec.id,
+            allowed_scope=request.spec.allowed_scope, attempt=request.attempt, generation=generation,
+            executor_report=artifacts.executor_report, exclude_roots=(run.run_dir,))
+    )
     run.record_executor_evidence(request.spec.id, attempt=request.attempt, generation=generation,
         report_path=artifacts.executor_report, session_id=result.session_id,
         reserved_manifest=repo_relative(artifacts.implementation_manifest, run.repo_root),
         reserved_diff=repo_relative(artifacts.implementation_diff, run.repo_root),
         external_actions=_git_mutation_actions(
-            git_boundary, _capture_git_mutation_boundary(run.repo_root)))
+            git_boundary, _capture_git_mutation_boundary(workspace)))
     run.record_implementation_attribution(request.spec.id, generation=generation,
         attempt=request.attempt, attribution_state=attribution.state, manifest=attribution.manifest,
         diff=attribution.diff, changed_files=attribution.changed_files, reason=attribution.reason)
-    _record_scope_amendment(run, request.spec.id, attribution)
+    reverted_paths = [] if workspace != primary_root else _enforce_scope_boundary(
+        primary_root, before_snapshot, attribution)
+    _record_scope_amendment(run, request.spec.id, attribution, reverted_paths=reverted_paths)
     scope_block = _scope_or_provenance_block(attribution)
     if scope_block:
         life.block(request.spec.id, scope_block)

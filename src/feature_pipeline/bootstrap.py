@@ -56,6 +56,13 @@ from pipeline_core.plan_md import MarkdownPlanError, load_markdown_plan
 from pipeline_core.post_task import POST_TASK_STAGES
 from pipeline_core.profiles import Anchors
 from pipeline_core.project_profile import load_runnable_profile
+from pipeline_core.plan import (
+    AmendmentError,
+    AmendmentRequest,
+    build_amendment_revision,
+    canonical_amendment_fields,
+    contract_digest,
+)
 from pipeline_core.prompt_envelope import EnvelopeAnchors
 from pipeline_core.redaction import build_rules, redact_text
 from pipeline_core.release import ReleasePolicy, load_release_policy

@@ -249,6 +249,54 @@ Deterministic fake-adapter acceptance fixtures live in
 [`fixtures/execution/`](../fixtures/execution/); the accepted slice and every deferred
 mode/stage are enumerated in `docs/acceptance/core-execution-engine.md` (parent repository).
 
+### `--mode amend` — authorized in-task amendments (TAM-01)
+
+`execute` mode also runs a pre-dispatch baseline diagnosis on a task's very first gate:
+before the executor window opens (and before any repair attempt is spent), it runs the
+task's own declared verification commands against the current worktree. A command that
+fails on evidence outside the task's `allowed_scope` (a stack traceback path, for example)
+never dispatches the executor and never spends a repair attempt; the task ends the run as
+`amendment_required` — a durable, distinct outcome, not a `blocked` verdict — retaining the
+same task card and stating the minimal observed paths and the causal command(s). A command
+whose own working directory does not exist is `environmental` and is left to the ordinary
+gate; a failure whose evidence is already inside scope is `task_attributable` and follows
+the normal repair loop.
+
+An `amendment_required` (or any other) outcome is resolved only by an explicit, separately
+run **`--mode amend`** invocation — never by a plain `--resume`, which continues to reject
+any task/plan contract drift outright. `--mode amend` never resolves a profile or plan and
+never dispatches an executor; it needs only:
+
+- `--project-root DIR` — the run's repository root.
+- `--feature NAME` — the run whose `<project>/.pipeline/runs/<feature>/run.json` is amended.
+- `--amend-task ID` — the existing, **not-yet-`done`** task the revision targets. The task id
+  itself can never change.
+- `--amend-rationale TEXT` and `--amend-approved-by NAME` — both required and non-empty;
+  together they are the explicit human approval gate. Missing either fails closed with no
+  mutation.
+- `--amend-evidence REF` — a reference to the runner-owned or verifier evidence (a report
+  path, run id, or `command-N` id) that justifies the expansion.
+- `--amend-contract PATH` — a project-root-relative JSON file with a required `new_contract`
+  object (any of `allowed_scope`, `out_of_scope`, `verification_commands`,
+  `max_repair_attempts`, `documentation_impact`), an optional `prior_contract` object for the
+  diff signal, and an optional `added_paths` list. A no-op amendment (an identical contract)
+  is rejected.
+
+On success the runner appends one immutable `AmendmentRevision` to the task's durable record
+(prior/new contract digests, the changed fields, rationale, approver, source evidence, and a
+timestamp), snapshots the pre-amendment repair count and verifier evidence into
+`revision_history` (readable, but it can never validate the new revision), resets the
+repair budget and verification manifest for a fresh execution/verification epoch, and updates
+the recorded contract digest so an ordinary resume compares against the amended contract from
+then on. Every prior report, command record, and verdict from the original attempt is
+preserved unchanged; the amendment never creates, completes, or replaces a different task.
+
+The executor's own out-of-scope write is a second, independent safety net: closing an
+executor window reverts any changed path classified `out_of_scope` against the task's
+*current* (possibly just-amended) scope back to its exact pre-window bytes — a pre-existing
+dirty file included — before that write can ever reach the primary worktree or be recorded
+as implementation evidence.
+
 ### Compatibility surface (flags forwarded from the legacy CLI)
 
 The compatibility launcher forwards the legacy `run` operational surface verbatim. Every

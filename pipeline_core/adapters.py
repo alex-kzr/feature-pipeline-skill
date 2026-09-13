@@ -458,9 +458,9 @@ def on_disk_agent_name(role: str) -> str:
 #: ``rust-executor``, …) shares the executor charter; anything unrecognized gets the generic one.
 _ROLE_CHARTER: dict[str, str] = {
     "executor": (
-        "Feature-pipeline executor. Implement only the selected task's allowed scope, run the "
-        "declared verification commands, and report the required status envelope. Do not verify "
-        "your own work and do not tick acceptance checkboxes."
+        "Feature-pipeline executor. Implement only the selected task's allowed scope and report "
+        "the required status envelope. The runner owns declared verification commands and "
+        "independent verification, so do not run them or tick acceptance checkboxes."
     ),
     "task_verifier": (
         "Feature-pipeline task verifier. Read-only: never edit files. Judge the task's "
@@ -1072,6 +1072,8 @@ class ClaudeAdapter:
     """
 
     name = "claude"
+    #: Executor windows are run in a disposable copy and promoted by the dispatcher.
+    isolated_workspace = True
     #: Claude's RLC-01 status-envelope prompt requires a blocked diagnostic.  Other adapter
     #: protocols retain compatibility with the historical four-key blocked envelope.
     requires_blocked_envelope_reason = True
@@ -1224,6 +1226,8 @@ class CodexAdapter:
     """Adapter over the non-interactive ``codex exec`` CLI."""
 
     name = "codex"
+    #: Executor windows are run in a disposable copy and promoted by the dispatcher.
+    isolated_workspace = True
     # ``codex exec resume`` cannot carry the sandbox or resolved-directory flags required for
     # the runner's tool-free status continuation. The coordinator supplies only the parsed
     # report token to this fresh, read-only context.

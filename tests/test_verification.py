@@ -33,6 +33,14 @@ from pipeline_core.commands import (
     run_verification_commands,
     verification_stage,
 )
+from pipeline_core.plan import (
+    AmendmentError,
+    AmendmentRequiredResult,
+    CLASSIFICATION_AMENDMENT_REQUIRED,
+    CLASSIFICATION_ENVIRONMENTAL,
+    CLASSIFICATION_TASK_ATTRIBUTABLE,
+    classify_baseline_failure,
+)
 from pipeline_core.reports import build_verdict_envelope_prompt, verifier_artifacts
 from pipeline_core.snapshot import SnapshotError
 from pipeline_core.state import Run, StateError
@@ -557,6 +565,43 @@ class VerifierAttributionRulesTests(unittest.TestCase):
 
 
 class ProseEnvelopeSettlementTests(unittest.TestCase):
+    def test_amended_revision_requires_both_verifiers_to_assess_its_identity_and_rationale(self) -> None:
+        amendment = {"revision": 1, "epoch": 1, "rationale": "suite fixture is outside scope"}
+        prose = (
+            "# verifier\n\n- Verdict: PASS\n\n- Findings: none\n"
+            "- Amendment-justification finding: revision 1, epoch 1: suite fixture is outside scope\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            run = _implemented_run(Path(directory))
+            outcome = _orchestrate(
+                run, _spec(), FakeVerifier(prose=prose), FakeVerifier(prose=prose),
+                evidence_kw={"amendment": amendment},
+            )
+        self.assertEqual(outcome.status, "done")
+
+    def test_amended_revision_cannot_settle_pass_without_the_required_assessment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run = _implemented_run(Path(directory))
+            outcome = _orchestrate(
+                run, _spec(), FakeVerifier(), FakeVerifier(),
+                evidence_kw={"amendment": {"revision": 1, "rationale": "outside scope"}},
+            )
+        self.assertIn("missing-amendment-justification-finding", outcome.failure or "")
+        self.assertNotEqual(outcome.status, "done")
+
+    def test_amended_revision_cannot_settle_pass_with_another_revision_identity(self) -> None:
+        prose = (
+            "# verifier\n\n- Verdict: PASS\n\n- Findings: none\n"
+            "- Amendment-justification finding: revision 2, epoch 1: outside scope\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            run = _implemented_run(Path(directory))
+            outcome = _orchestrate(
+                run, _spec(), FakeVerifier(prose=prose), FakeVerifier(prose=prose),
+                evidence_kw={"amendment": {"revision": 1, "epoch": 1, "rationale": "outside scope"}},
+            )
+        self.assertIn("amendment-justification-missing-revision-identity", outcome.failure or "")
+
     def test_agreeing_prose_and_envelope_leave_no_drift(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             run = _implemented_run(Path(directory))
@@ -837,6 +882,49 @@ class IsolatedVerificationSnapshotTests(unittest.TestCase):
                 run, (self._command(),), stage=stage, task_id="VR-02", attempt=1)
             self.assertIsNone(result.snapshot)
             self.assertNotIn("snapshot", result.records[0])
+
+
+class BaselineFailureClassificationTests(unittest.TestCase):
+    """TAM-01 AC-4: a pre-dispatch baseline failure is task-attributable, amendment-required,
+    or environmental — never silently folded into an implementation defect."""
+
+    def test_environmental_when_the_commands_own_working_directory_is_unavailable(self) -> None:
+        self.assertEqual(
+            classify_baseline_failure(exit_code=1, cwd_paths_exist=False,
+                                      path_covered_by_scope=True),
+            CLASSIFICATION_ENVIRONMENTAL,
+        )
+
+    def test_amendment_required_when_the_causal_evidence_is_outside_declared_scope(self) -> None:
+        self.assertEqual(
+            classify_baseline_failure(exit_code=1, cwd_paths_exist=True,
+                                      path_covered_by_scope=False),
+            CLASSIFICATION_AMENDMENT_REQUIRED,
+        )
+
+    def test_task_attributable_when_the_failure_is_inside_declared_scope(self) -> None:
+        self.assertEqual(
+            classify_baseline_failure(exit_code=1, cwd_paths_exist=True,
+                                      path_covered_by_scope=True),
+            CLASSIFICATION_TASK_ATTRIBUTABLE,
+        )
+
+    def test_a_passing_command_has_nothing_to_classify(self) -> None:
+        with self.assertRaises(AmendmentError):
+            classify_baseline_failure(exit_code=0, cwd_paths_exist=True,
+                                      path_covered_by_scope=True)
+
+    def test_amendment_required_result_retains_the_active_task_card(self) -> None:
+        result = AmendmentRequiredResult(
+            task_id="SIR-01", observed_paths=("tests/lifecycle/fixture_a.py",),
+            causal_commands=("cd . > uv run python -m unittest discover -s tests -t .",),
+            reason="declared suite fails outside the task's current scope",
+        )
+        payload = result.as_dict()
+        self.assertEqual(payload["outcome"], "AMENDMENT_REQUIRED")
+        self.assertEqual(payload["task_id"], "SIR-01")
+        self.assertTrue(payload["requires_human_decision"])
+        self.assertIn("tests/lifecycle/fixture_a.py", payload["observed_paths"])
 
 
 if __name__ == "__main__":

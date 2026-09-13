@@ -229,5 +229,35 @@ class PortableCompatibilityLayerCancellationTests(unittest.TestCase):
             self.assertEqual(run.task("T-1").status, "in_progress")
 
 
+class AmendmentRevisionStaysWithinThreeProductStatesTests(unittest.TestCase):
+    """TAM-01: an amendment revises a task's *contract*, never its product-progress status —
+    the three-state policy (``to_do``/``in_progress``/``done``) is unaffected (AC-2, AC-3)."""
+
+    def test_amendment_lifecycle_adds_no_fourth_product_status(self) -> None:
+        self.assertEqual(TaskStatus.values(), ("to_do", "in_progress", "done"))
+
+    def test_apply_amendment_leaves_an_in_progress_task_in_progress(self) -> None:
+        from pipeline_core.plan import AmendmentRevision
+        from pipeline_core.state import Run
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prompt = root / "prompt.md"
+            prompt.write_text("feature", encoding="utf-8")
+            run = Run.create("demo", prompt, None, root / "runs" / "demo", root)
+            run.add_task("T-1")
+            run.transition_task("T-1", "in_progress")
+            revision = AmendmentRevision(
+                task_id="T-1", revision=1, prior_digest="sha256:a", new_digest="sha256:b",
+                changed_fields=("allowed_scope",), added_paths=("tests/new_fixture.py",),
+                rationale="baseline exposed an out-of-scope failure",
+                approved_by="a-human", source_evidence="report:launch-1",
+                created_at="2026-09-12T00:00:00Z", epoch=1,
+            )
+            run.apply_amendment(revision, new_digest="sha256:b",
+                                new_digest_version="tam01-amendment-v1")
+            self.assertEqual(run.task("T-1").status, "in_progress")
+
+
 if __name__ == "__main__":
     unittest.main()

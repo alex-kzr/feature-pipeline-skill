@@ -34,6 +34,10 @@ DELIVERY_GATES = ("plan", "final-diff", "commit", "verification-verdict")
 #: nothing and always stops at the release dry-run boundary.
 POST_TASK_MODE = "release-dry-run"
 
+#: The ``--mode`` value that persists one explicit, human-approved amendment revision (see
+#: ``pipeline_core.plan``) instead of dispatching an executor or a preview.
+AMEND_MODE = "amend"
+
 # One-line meaning of each exit code, for the C5 line of the dry-run plan.
 EXIT_MEANINGS = {
     EXIT_OK: "ok",
@@ -106,17 +110,34 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--published-ref", action="append", default=[], metavar="SOURCE=REF",
                      help="bind a ref-published precondition to refs/heads/* or refs/tags/*")
     run.add_argument("--mode", default="plan-only",
-                     choices=["plan-only", "unattended", "execute", POST_TASK_MODE],
+                     choices=["plan-only", "unattended", "execute", POST_TASK_MODE, AMEND_MODE],
                      help="run mode (default: plan-only). 'execute' runs stages 5-9 — executor "
                           "dispatch, independent verification, and bounded repair — and stops "
                           "before documentation/delivery. 'release-dry-run' extends the "
                           "plan-only dry run with the post-task lifecycle (stages 10–16) and "
                           "its gates in the C4/C6 plan, then stops at the final-diff / release "
-                          "dry-run boundary; it still writes nothing")
+                          "dry-run boundary; it still writes nothing. 'amend' persists one "
+                          "explicit, human-approved amendment revision on an existing "
+                          "non-done task (TAM-01) and dispatches no executor")
     run.add_argument("--feature", metavar="NAME", help="override the plan's feature name")
     run.add_argument("--prompt", metavar="REL",
                      help="prompt file, relative to the resolved project directory "
                           "(defaults to the plan file)")
+
+    amend = parser.add_argument_group("amendment (--mode amend only; TAM-01)")
+    amend.add_argument("--amend-task", metavar="ID",
+                       help="the existing, non-done task id this amendment revises")
+    amend.add_argument("--amend-rationale", metavar="TEXT",
+                       help="why the additional scope is required (non-empty)")
+    amend.add_argument("--amend-approved-by", metavar="NAME",
+                       help="the human who approved this amendment (explicit approval)")
+    amend.add_argument("--amend-evidence", metavar="REF",
+                       help="a reference to the runner-owned or verifier evidence that "
+                            "justifies the amendment (a report path, run id, or command id)")
+    amend.add_argument("--amend-contract", metavar="PATH",
+                       help="a JSON file with 'new_contract' (required), 'prior_contract' "
+                            "(optional, defaults to an empty comparison baseline), and "
+                            "'added_paths' (optional list) keys")
 
     gates = parser.add_argument_group("delivery gates (all closed by default)")
     gates.add_argument("--approve-plan", action="store_true", help="satisfy the plan gate")
@@ -178,6 +199,7 @@ __all__ = [
     "PUSH_DENIED_MESSAGE",
     "DELIVERY_GATES",
     "POST_TASK_MODE",
+    "AMEND_MODE",
     "EXIT_MEANINGS",
     "FEATURE_RE",
     "SOURCE_FEATURE_RE",
