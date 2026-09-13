@@ -20,7 +20,7 @@ from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from pipeline_core.concurrency import pipeline_lock_path
+from pipeline_core.concurrency import pipeline_lock_path, task_lock_path
 from pipeline_core.execution import (
     EXIT_BLOCKED,
     EXIT_ERROR,
@@ -668,6 +668,42 @@ class ResumeAndSafetyTests(unittest.TestCase):
             self.assertEqual(result.status, "blocked")
             self.assertEqual(result.exit_code, EXIT_BLOCKED)
             self.assertIn("lease-held", result.message)
+            reloaded = Run.load(result.run_dir, root) if result.run_dir else None
+            # No task was ever selected under a pipeline-wide contention: the run-level
+            # history records the wait; no task operation history exists to check.
+            self.assertTrue(
+                any("lease" in (entry.get("scope") or "") for entry in reloaded.history)
+                if reloaded is not None else True)
+
+    def test_a_live_foreign_task_lease_is_a_durable_unfinished_operation(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            lock = task_lock_path(root, "EX-01")
+            lock.parent.mkdir(parents=True, exist_ok=True)
+            lock.write_text(
+                json.dumps({"run_id": "other-run", "pid": os.getpid(),
+                            "task_id": "EX-01", "started_at": "2026-09-01T00:00:00Z"}),
+                encoding="utf-8")
+
+            result = self._run_once(
+                root, executor=sa.ScriptedExecutor(("implemented",)),
+                task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",)),
+                controls=ExecuteControls(plan_approved=True))
+
+            self.assertEqual(result.status, "blocked")
+            self.assertEqual(result.exit_code, EXIT_BLOCKED)
+            self.assertIn("lease-held", result.message)
+
+            reloaded = Run.load(result.run_dir, root)
+            # The task stays unfinished — never a terminal/blocked task status — while the
+            # lease contention is durably recorded as a specific operation outcome.
+            self.assertEqual(reloaded.task("EX-01").status, "to_do")
+            operations = reloaded.task("EX-01").operation_history
+            self.assertTrue(
+                any(entry.get("kind") == "lease" and entry.get("outcome") == "blocked"
+                    for entry in operations),
+                operations,
+            )
 
     def test_unattended_opt_in_satisfies_the_plan_gate(self) -> None:
         with TemporaryDirectory() as directory:

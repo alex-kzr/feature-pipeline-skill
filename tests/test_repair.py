@@ -198,6 +198,13 @@ class ExternalBlockedTests(unittest.TestCase):
             self.assertEqual(executor.launches, 1)  # no repair redispatch
             self.assertEqual(_repair_reports(life.run, "VR-03"), [])
             self.assertEqual(life.run.task("VR-03").attempts, 0)
+            # A verifier-reported external wait is unfinished operation-level evidence, never
+            # a task state: the public task status stays 'in_progress'.
+            self.assertEqual(life.run.task("VR-03").status, "in_progress")
+            self.assertEqual(
+                life.run.task("VR-03").operation_history[-1]["kind"], "verification")
+            self.assertEqual(
+                life.run.task("VR-03").operation_history[-1]["outcome"], "blocked")
 
     def test_an_executor_that_cannot_implement_blocks_before_any_gate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -214,6 +221,14 @@ class ExternalBlockedTests(unittest.TestCase):
             self.assertEqual(result.gates, 0)
             self.assertEqual(result.attempts, 0)
             self.assertEqual(task.calls, [])
+            # An implementation failure is unfinished operation-level evidence, never a task
+            # state: the public task status stays 'in_progress' with the failure durably
+            # recorded on its operation history.
+            self.assertEqual(life.run.task("VR-03").status, "in_progress")
+            self.assertEqual(
+                life.run.task("VR-03").operation_history[-1]["kind"], "executor")
+            self.assertEqual(
+                life.run.task("VR-03").operation_history[-1]["outcome"], "failed")
 
 
 # --- durable blocker + transitive dependent suppression ------------------------------

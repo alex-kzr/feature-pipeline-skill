@@ -1883,6 +1883,12 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
     try:
         lease.acquire()
     except LeaseHeldError as exc:
+        # No task has been selected yet under pipeline-wide contention: record the wait as
+        # durable run-level evidence rather than a task operation. The run itself stays
+        # 'running' — external lease contention is operation-level, never a terminal state.
+        life.run.record_event(
+            "lease:pipeline", to="blocked", note=f"{exc.code}: {exc}")
+        life.run.save()
         return ExecuteResult(
             "blocked", EXIT_BLOCKED, f"{exc.code}: {exc}",
             request.run_dir, life.run.run_id)
@@ -1905,6 +1911,9 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
             try:
                 t_lease.acquire(task_id)
             except LeaseHeldError as exc:
+                # Lease contention is operation-level evidence on an otherwise-unfinished
+                # task, never a task state change: the task stays exactly where it was.
+                life.record_operation(task_id, "lease", "blocked", f"{exc.code}: {exc}")
                 return ExecuteResult(
                     "blocked", EXIT_BLOCKED, f"{exc.code}: {exc}",
                     request.run_dir, life.run.run_id, tuple(results))
