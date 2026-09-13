@@ -1421,20 +1421,21 @@ def _reconcile_projection(
     A crash between a durable transition and its Markdown projection leaves the human view
     stale; replaying :func:`~feature_pipeline.infrastructure.board_projection.project_task_state`
     for each selected task's *current* persisted status repairs that view without redispatching
-    an already-``verified`` task's executor (the loop below never selects a terminal task
+    an already-``done`` task's executor (the loop below never selects a terminal task
     anyway — this only ever touches the human-facing files). Idempotent when nothing was
     actually stale.
     """
-    # Board projection still speaks the legacy state vocabulary and is intentionally owned by
-    # TSL-04. Durable execution must not fail merely because that later projection is absent.
-    return None
     for task_id in execution_scope:
         spec = by_id.get(task_id)
         if spec is None or not spec.path:
             continue
         record = life.run.task(task_id)
+        if record.resolution_reason == "independently completed reusable evidence":
+            # A reused dependency is fast-forwarded from *another* run's evidence; it was
+            # never dispatched here and never carried a board card of its own to repair.
+            continue
         evidence = (
-            build_completion_evidence(life.run, spec) if record.status == "verified" else None
+            build_completion_evidence(life.run, spec) if record.status == "done" else None
         )
         try:
             project_task_state(

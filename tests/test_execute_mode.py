@@ -1355,7 +1355,11 @@ class BoardProjectionWiringTests(unittest.TestCase):
             self.assertIn("- [x] In Progress", task_text)
             self.assertNotIn("## Blockers", task_text)
 
-    def test_resume_preserves_completed_task_without_legacy_projection(self) -> None:
+    def test_resume_reconciles_a_stale_active_card_from_durable_done_evidence(self) -> None:
+        """KLC-03. A crash between a durable transition and its Markdown projection leaves a
+        terminal task's board card and task-file checkbox stale. A real ``--resume`` against
+        that persisted run must repair the human-facing files from durable evidence alone —
+        without redispatching an executor or verifier for the already-``done`` task."""
         with TemporaryDirectory() as directory:
             root = Path(directory)
             board = _seed_board(root)
@@ -1371,23 +1375,52 @@ class BoardProjectionWiringTests(unittest.TestCase):
                         task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))),
                     controls=ExecuteControls(plan_approved=True), environment={"claude": True}))
             self.assertTrue(first.ok, first.message)
-            self.assertIn("EX-01", board.read_text(encoding="utf-8"))
+            run = Run.load(first.run_dir, root)
+            self.assertEqual(run.task("EX-01").status, "done")
+            reports_dir = first.run_dir / "reports"
+            source_report_bytes = {
+                path.relative_to(reports_dir): path.read_bytes()
+                for path in sorted(reports_dir.rglob("*")) if path.is_file()
+            } if reports_dir.is_dir() else {}
 
-            # A resume does not redispatch the completed executor.
+            # The board and task file still show the pre-completion state — the stale
+            # projection this resume must repair.
+            stale_board_text = board.read_text(encoding="utf-8")
+            self.assertIn("EX-01", stale_board_text)
+            self.assertIn("- [ ] Done", task_path.read_text(encoding="utf-8"))
+
+            # A resume does not redispatch the completed executor or verifiers.
             executor = sa.ScriptedExecutor(("implemented",))
+            task_verifier = sa.ScriptedVerifier(("PASS",))
+            test_verifier = sa.ScriptedVerifier(("PASS",))
             resumed = execute_run(
                 _request(
                     root, _specs(("EX-01",)), executor=executor,
-                    launchers=VerifierLaunchers(
-                        task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))),
+                    launchers=VerifierLaunchers(task=task_verifier, test=test_verifier),
                     controls=ExecuteControls(plan_approved=True, resume=True),
                     environment={"claude": True}, board_path=board))
 
             self.assertTrue(resumed.ok, resumed.message)
             self.assertEqual(executor.launches, 0)
+            self.assertEqual(task_verifier.calls, [])
+            self.assertEqual(test_verifier.calls, [])
+
             board_text = board.read_text(encoding="utf-8")
-            self.assertIn("EX-01", board_text)
-            self.assertIn("- [ ] Done", task_path.read_text(encoding="utf-8"))
+            self.assertNotIn("EX-01", board_text)
+
+            task_text = task_path.read_text(encoding="utf-8")
+            self.assertIn("- [x] Done", task_text)
+            self.assertEqual(task_text.count("## Result"), 1)
+
+            # The resume's own reconciliation is a durable-evidence projection, not a
+            # rewrite of the original completed task's report evidence.
+            resumed_report_bytes = {
+                path.relative_to(reports_dir): path.read_bytes()
+                for path in sorted(reports_dir.rglob("*")) if path.is_file()
+            } if reports_dir.is_dir() else {}
+            self.assertEqual(resumed_report_bytes, source_report_bytes)
+            self.assertEqual(Run.load(first.run_dir, root).task("EX-01").verification,
+                              run.task("EX-01").verification)
 
     def test_fresh_reuse_projects_the_reused_dependency_after_pruning_its_ancestor(self) -> None:
         """A pruned ancestor is not a lifecycle record, but its reused dependent is."""
