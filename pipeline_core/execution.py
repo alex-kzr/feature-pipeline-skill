@@ -1291,6 +1291,18 @@ def _controls_map(
     }
 
 
+def _dependency_satisfied(life: RunLifecycle, dep_id: str) -> bool:
+    """Whether ``dep_id`` is compatible completed-resolution evidence for a dependent.
+
+    A task only satisfies a dependent's dependency once it is durably ``done`` with the
+    ``completed`` resolution. A human cancellation still reaches ``done``, but it is an
+    explicit decision that the functionality is no longer needed, never verified
+    implementation — it must not silently satisfy a functional dependency (ROC-02 AC-3).
+    """
+    dependency = life.run.task(dep_id)
+    return dependency.status == "done" and dependency.resolution == "completed"
+
+
 def _next_actionable(
     life: RunLifecycle, selected: Sequence[str], order: Sequence[str]
 ) -> str | None:
@@ -1305,7 +1317,7 @@ def _next_actionable(
         record = life.run.task(task_id)
         if record.status not in _ACTIONABLE_STATES:
             continue
-        if any(life.run.task(dep).status != "done" for dep in record.depends_on):
+        if any(not _dependency_satisfied(life, dep) for dep in record.depends_on):
             continue
         return task_id
     return None
@@ -1316,7 +1328,7 @@ def _pending_reason(life: RunLifecycle, pending: Sequence[str]) -> str:
     parts: list[str] = []
     for task_id in pending:
         record = life.run.task(task_id)
-        unmet = [dep for dep in record.depends_on if life.run.task(dep).status != "done"]
+        unmet = [dep for dep in record.depends_on if not _dependency_satisfied(life, dep)]
         if unmet:
             parts.append(f"{task_id} dependency-not-satisfied: {', '.join(unmet)}")
         else:

@@ -20,8 +20,9 @@ from feature_pipeline.application.verified_reuse import (
 )
 from feature_pipeline.contracts import AcceptanceCriterionSpec, CommandSpec, Precondition, TaskSpec
 from feature_pipeline.domain.models import MARKDOWN_TASK_FILE, TaskDefinition
-from pipeline_core.execution import persist_task_contracts
-from pipeline_core.state import Run
+from pipeline_core.execution import _next_actionable, _pending_reason, persist_task_contracts
+from pipeline_core.lifecycle import RunLifecycle
+from pipeline_core.state import ACTOR_HUMAN, Run
 
 
 def _definition(
@@ -403,6 +404,73 @@ class SupersessionReuseDenialTests(unittest.TestCase):
                     resolve_default_reuse(VerifiedEvidenceStore(root / "runs", root), definitions,
                         ["TC-04", "TC-05"], ["TC-05"], root)
                 self.assertEqual(denied.exception.code, "evidence-supersession-invalid")
+
+
+class CancelledResolutionReuseDenialTests(unittest.TestCase):
+    """ROC-02 AC-3 — a cancelled prerequisite is not verified functionality and must never
+    silently satisfy a functional dependency, whether read from persisted evidence or seen
+    live in the same run."""
+
+    def test_cancelled_done_task_is_not_reusable_verified_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            definition = _definition()
+            source = _source(root, run_id="cancelled-src", definition=definition, status="done")
+            payload = json.loads(source.read_text())
+            payload["tasks"][0]["resolution"] = "cancelled"
+            payload["tasks"][0]["resolution_reason"] = "no longer needed"
+            source.write_text(json.dumps(payload), encoding="utf-8")
+            before = source.read_bytes()
+
+            with self.assertRaises(EvidenceEligibilityError) as denied:
+                VerifiedEvidenceStore(root / "runs", root).find(definition)
+            self.assertEqual(denied.exception.code, "evidence-source-task-not-verified")
+            self.assertEqual(source.read_bytes(), before)  # never touched
+
+    def test_completed_done_task_is_reusable_verified_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            definition = _definition()
+            source = _source(root, run_id="completed-src", definition=definition, status="done")
+            payload = json.loads(source.read_text())
+            payload["tasks"][0]["resolution"] = "completed"
+            source.write_text(json.dumps(payload), encoding="utf-8")
+
+            evidence = VerifiedEvidenceStore(root / "runs", root).find(definition)
+            self.assertEqual(evidence["task_verdict"], "PASS")
+            self.assertEqual(evidence["test_verdict"], "PASS")
+
+    def _life(self, root: Path) -> RunLifecycle:
+        run = Run.create("f", root / "prompt.md", None, root / "runs" / "r1", root)
+        return RunLifecycle(run)
+
+    def test_a_cancelled_dependency_keeps_the_dependent_waiting_not_dispatched(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            life = self._life(Path(directory))
+            life.run.add_task("A")
+            life.run.add_task("B", depends_on=["A"])
+            life.run.transition_task("A", "in_progress")
+            life.run.transition_task(
+                "A", "done", actor=ACTOR_HUMAN, resolution="cancelled",
+                note="no longer needed")
+
+            # B's dependency is 'done' but cancelled — not compatible completed-resolution
+            # evidence, so B must stay unfinished and undispatched, never terminal.
+            self.assertIsNone(_next_actionable(life, ["A", "B"], ["A", "B"]))
+            self.assertEqual(life.run.task("B").status, "to_do")
+            reason = _pending_reason(life, ["B"])
+            self.assertIn("B dependency-not-satisfied: A", reason)
+
+    def test_a_completed_dependency_frees_the_dependent_for_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            life = self._life(Path(directory))
+            life.run.add_task("A")
+            life.run.add_task("B", depends_on=["A"])
+            life.run.transition_task("A", "in_progress")
+            self.assertEqual(life.run.record_verdicts("A", "PASS", "PASS"), "done")
+            self.assertEqual(life.run.task("A").resolution, "completed")
+
+            self.assertEqual(_next_actionable(life, ["A", "B"], ["A", "B"]), "B")
 
 
 class ContractPersistenceTests(unittest.TestCase):
