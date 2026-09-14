@@ -1894,7 +1894,7 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
     if request.board_path is not None:
         try:
             reconcile_historical_cards(life, request.board_path, by_id)
-            if not request.controls.resume:
+            if request.controls.resume:
                 recorded_scope = [
                     task_id for task_id in execution_scope if task_id in life.run.tasks
                 ]
