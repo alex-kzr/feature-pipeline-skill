@@ -20,7 +20,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from feature_pipeline.bootstrap import build_bootstrap, build_required_input_dirs
+from feature_pipeline.bootstrap import build_bootstrap, build_required_input_dirs, build_scope_dirs
 from feature_pipeline.contracts import TaskSpec
 from pipeline_core.adapters import (
     REQUIRED_INPUT_INVALID,
@@ -293,6 +293,170 @@ class ProductionCompositionTests(unittest.TestCase):
         argv = self._composed(project, "claude").plan(_request(task_id="OTHER"))
 
         self.assertNotIn("--add-dir", argv)
+
+
+# --- CSR-01: declared cross-root allowed-scope grants ------------------------------------
+
+
+class _CrossRootProject:
+    """A nested Python route whose allowed scope also names repository-root documentation."""
+
+    IN_ROOT_FILE = "feature-pipeline-skill/pipeline_core/adapters.py"
+    DOC_FILE = "docs/agents/execution-notes.md"
+    SIBLING_DOC_FILE = "docs/contracts/unrelated-contract.md"
+
+    def __init__(self) -> None:
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "feature-pipeline-skill" / "pipeline_core").mkdir(parents=True)
+        (self.root / "feature-pipeline-skill" / "pipeline_core" / "adapters.py").write_text(
+            "code\n", encoding="utf-8"
+        )
+        (self.root / "docs" / "agents").mkdir(parents=True)
+        (self.root / "docs" / "agents" / "execution-notes.md").write_text(
+            "notes\n", encoding="utf-8"
+        )
+        (self.root / "docs" / "contracts").mkdir(parents=True)
+        (self.root / "docs" / "contracts" / "unrelated-contract.md").write_text(
+            "contract\n", encoding="utf-8"
+        )
+
+    def spec(self, **overrides: object) -> TaskSpec:
+        base: dict[str, object] = dict(
+            id="CSR-01",
+            task_type="python",
+            executor="python-executor",
+            allowed_scope=[self.IN_ROOT_FILE, self.DOC_FILE],
+            acceptance_criteria=["done"],
+            path=self.IN_ROOT_FILE,
+        )
+        base.update(overrides)
+        return TaskSpec.build(**base)  # type: ignore[arg-type]
+
+    def dirs(self, spec: TaskSpec | None = None) -> dict[str, tuple[str, ...]]:
+        return build_scope_dirs(
+            [spec or self.spec()],
+            project_dir=self.root,
+            working_root_by_id={"CSR-01": "feature-pipeline-skill"},
+        )
+
+    def docs_agents_dir(self) -> str:
+        return str((self.root / "docs" / "agents").resolve())
+
+    def docs_contracts_dir(self) -> str:
+        return str((self.root / "docs" / "contracts").resolve())
+
+    def in_root_dir(self) -> str:
+        return str((self.root / "feature-pipeline-skill" / "pipeline_core").resolve())
+
+
+class ScopeDirsDerivationTests(unittest.TestCase):
+    def test_a_repository_root_scope_entry_outside_the_nested_root_is_granted(self) -> None:
+        project = _CrossRootProject()
+
+        grants = project.dirs()
+
+        self.assertEqual(grants, {"CSR-01": (project.docs_agents_dir(),)})
+
+    def test_an_undeclared_sibling_directory_is_never_granted(self) -> None:
+        project = _CrossRootProject()
+
+        grants = project.dirs()
+
+        self.assertNotIn(project.docs_contracts_dir(), grants.get("CSR-01", ()))
+
+    def test_a_project_root_worker_needs_no_grant_at_all(self) -> None:
+        project = _CrossRootProject()
+
+        grants = build_scope_dirs(
+            [project.spec()],
+            project_dir=project.root,
+            working_root_by_id={"CSR-01": "."},
+        )
+
+        self.assertEqual(grants, {})
+
+    def test_an_in_root_declared_path_contributes_no_grant(self) -> None:
+        project = _CrossRootProject()
+        spec = project.spec(allowed_scope=[project.IN_ROOT_FILE])
+
+        grants = project.dirs(spec=spec)
+
+        self.assertEqual(grants, {})
+
+
+def _cross_root_request(role: str = "python-executor", **overrides: object) -> LaunchRequest:
+    base: dict[str, object] = dict(
+        role=role,
+        task_id="CSR-01",
+        prompt="EXECUTE THE TASK",
+        report_path=Path("report.md"),
+        working_root="feature-pipeline-skill",
+        role_grant=("read", "write", "run_checks"),
+        allowed_scope=(
+            _CrossRootProject.IN_ROOT_FILE,
+            _CrossRootProject.DOC_FILE,
+        ),
+        tools=("Read", "Edit", "Bash"),
+    )
+    base.update(overrides)
+    return LaunchRequest(**base)  # type: ignore[arg-type]
+
+
+class ScopeDirsProductionCompositionTests(unittest.TestCase):
+    def _composed(self, project: _CrossRootProject, adapter: str):
+        composition = build_bootstrap(
+            project.root,
+            project.root / ".agents",
+            project.root / "core",
+            scope_dirs=project.dirs(),
+        )
+        executor, _launchers, _environment = composition.make_execute_adapters(adapter)
+        return executor
+
+    def test_claude_nested_executor_argv_carries_only_the_declared_documentation_root(
+        self,
+    ) -> None:
+        project = _CrossRootProject()
+
+        argv = self._composed(project, "claude").plan(_cross_root_request())
+
+        add_dirs = _add_dirs(argv)
+        self.assertIn(project.docs_agents_dir(), add_dirs)
+        self.assertNotIn(project.docs_contracts_dir(), add_dirs)
+
+    def test_codex_nested_executor_argv_carries_only_the_declared_documentation_root(
+        self,
+    ) -> None:
+        project = _CrossRootProject()
+
+        argv = self._composed(project, "codex").plan(_cross_root_request())
+
+        add_dirs = _add_dirs(argv)
+        self.assertIn(project.docs_agents_dir(), add_dirs)
+        self.assertNotIn(project.docs_contracts_dir(), add_dirs)
+
+    def test_read_only_verifier_gets_no_scope_derived_write_expansion(self) -> None:
+        project = _CrossRootProject()
+        request = _cross_root_request(
+            role="task_verifier",
+            read_only=True,
+            role_grant=("read",),
+            tools=("Read",),
+        )
+
+        argv = self._composed(project, "claude").plan(request)
+
+        add_dirs = _add_dirs(argv)
+        self.assertNotIn(project.docs_agents_dir(), add_dirs)
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "manual")
+        self.assertEqual(effective_grant(request), ("read",))
+
+    def test_a_different_task_id_receives_none_of_the_injected_scope_dirs(self) -> None:
+        project = _CrossRootProject()
+
+        argv = self._composed(project, "claude").plan(_cross_root_request(task_id="OTHER"))
+
+        self.assertNotIn(project.docs_agents_dir(), _add_dirs(argv))
 
 
 if __name__ == "__main__":  # pragma: no cover

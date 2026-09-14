@@ -1091,6 +1091,7 @@ class ClaudeAdapter:
         working_root: str | os.PathLike[str] | None = None,
         executor_contexts: Mapping[str, ExecutorContextBundle] | None = None,
         required_input_dirs: Mapping[str, Sequence[str]] | None = None,
+        task_scope_dirs: Mapping[str, Sequence[str]] | None = None,
     ) -> None:
         self._executable = executable
         self._resolver = resolver or (lambda: shutil.which("claude"))
@@ -1105,6 +1106,13 @@ class ClaudeAdapter:
         #: nested working root can read its task/plan/prompt/skill files (REC-05).
         self._required_input_dirs: dict[str, tuple[str, ...]] = {
             key: tuple(value) for key, value in dict(required_input_dirs or {}).items()
+        }
+        #: Runner-owned minimal declared-``allowed_scope`` directory grants outside this
+        #: task's own working root, keyed by task id (CSR-01). Distinct from
+        #: ``required_input_dirs``: these lower to ``--add-dir`` only for a write-capable,
+        #: non-read-only request, never for a read-only verifier launch.
+        self._task_scope_dirs: dict[str, tuple[str, ...]] = {
+            key: tuple(value) for key, value in dict(task_scope_dirs or {}).items()
         }
         #: Runner-owned immutable context, keyed by task id. Merged into the child's stdin
         #: prompt on its first (session-opening) launch so a nested working root gets exact
@@ -1222,7 +1230,11 @@ class ClaudeAdapter:
         return None
 
     def _add_dirs_for(self, request: LaunchRequest) -> tuple[str, ...]:
-        return scoped_add_dirs(request, self._scope_roots)
+        external = scoped_add_dirs(request, self._scope_roots)
+        if request_is_read_only(request) or not set(effective_grant(request)) & WRITE_CAPABILITIES:
+            return external
+        task_dirs = self._task_scope_dirs.get(request.task_id, ())
+        return tuple(dict.fromkeys((*external, *task_dirs)))
 
 
 class CodexAdapter:
@@ -1247,6 +1259,7 @@ class CodexAdapter:
         timeout: float = DEFAULT_TIMEOUT_S,
         working_root: str | os.PathLike[str] | None = None,
         required_input_dirs: Mapping[str, Sequence[str]] | None = None,
+        task_scope_dirs: Mapping[str, Sequence[str]] | None = None,
     ) -> None:
         self._executable = executable
         self._resolver = resolver or (lambda: shutil.which("codex"))
@@ -1258,6 +1271,12 @@ class CodexAdapter:
         #: Runner-owned minimal mandatory-input directory grants, keyed by task id (REC-05).
         self._required_input_dirs: dict[str, tuple[str, ...]] = {
             key: tuple(value) for key, value in dict(required_input_dirs or {}).items()
+        }
+        #: Runner-owned minimal declared-``allowed_scope`` directory grants outside this
+        #: task's own working root, keyed by task id (CSR-01). Write-only, like the working
+        #: root's own ``--add-dir`` grant; never applied to a read-only verifier launch.
+        self._task_scope_dirs: dict[str, tuple[str, ...]] = {
+            key: tuple(value) for key, value in dict(task_scope_dirs or {}).items()
         }
 
     def resolved_executable(self) -> str | Sequence[str] | None:
@@ -1324,14 +1343,13 @@ class CodexAdapter:
 
     def _add_dirs_for(self, request: LaunchRequest) -> tuple[str, ...]:
         external_roots = scoped_add_dirs(request, self._scope_roots)
-        working_root = self._cwd_for(request)
-        if (
-            working_root is None
-            or request_is_read_only(request)
-            or not set(effective_grant(request)) & WRITE_CAPABILITIES
-        ):
+        if request_is_read_only(request) or not set(effective_grant(request)) & WRITE_CAPABILITIES:
             return external_roots
+        task_dirs = self._task_scope_dirs.get(request.task_id, ())
+        working_root = self._cwd_for(request)
+        if working_root is None:
+            return tuple(dict.fromkeys((*external_roots, *task_dirs)))
         # Codex's workspace-write sandbox does not consistently treat --cd as a writable
         # grant on Windows. Explicitly grant the runner-selected disposable worktree.
         root = str(working_root)
-        return tuple(dict.fromkeys((root, *external_roots)))
+        return tuple(dict.fromkeys((root, *external_roots, *task_dirs)))

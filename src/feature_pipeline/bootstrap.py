@@ -94,6 +94,11 @@ class AdapterRuntime:
     #: Runner-owned minimal mandatory-input directory grants, keyed by task id (REC-05).
     #: Empty unless ``run_execute`` derived them for a nested-root task.
     required_input_dirs: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    #: Runner-owned minimal declared-``allowed_scope`` directory grants outside a task's own
+    #: working root, keyed by task id (CSR-01). Empty unless ``run_execute`` derived them for
+    #: a nested-root task whose allowed scope names a repository-internal path it cannot
+    #: otherwise reach.
+    scope_dirs: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -131,6 +136,7 @@ class BootstrapComposition:
     adapter_registry: AdapterRegistry
     executor_contexts: Mapping[str, ExecutorContextBundle] = field(default_factory=dict)
     required_input_dirs: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    scope_dirs: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
     def make_execute_adapters(
         self, adapter_name: str | None = None
@@ -149,6 +155,7 @@ class BootstrapComposition:
             ),
             executor_contexts=self.executor_contexts,
             required_input_dirs=self.required_input_dirs,
+            scope_dirs=self.scope_dirs,
         )
         factory = next(factory for factory in self.factories if factory.name == resolved.name)
         executor = factory.create(runtime)
@@ -169,6 +176,7 @@ def codex_factory(
             working_root=runtime.project_dir,
             scope_roots=runtime.scope_roots,
             required_input_dirs=runtime.required_input_dirs,
+            task_scope_dirs=runtime.scope_dirs,
         )
 
     def codex_available() -> bool:
@@ -191,6 +199,7 @@ def _production_factories() -> tuple[AdapterFactory, ...]:
             scope_roots=runtime.scope_roots,
             executor_contexts=runtime.executor_contexts,
             required_input_dirs=runtime.required_input_dirs,
+            task_scope_dirs=runtime.scope_dirs,
         )
 
     def claude_available() -> bool:
@@ -218,6 +227,7 @@ def build_bootstrap(
     logical_paths: Mapping[str, str] | None = None,
     executor_contexts: Mapping[str, ExecutorContextBundle] | None = None,
     required_input_dirs: Mapping[str, Sequence[str]] | None = None,
+    scope_dirs: Mapping[str, Sequence[str]] | None = None,
 ) -> BootstrapComposition:
     registered_factories = tuple(factories) if factories is not None else _production_factories()
     paths = logical_paths or {"agents": ".agents", "core": "core"}
@@ -230,6 +240,7 @@ def build_bootstrap(
         AdapterRegistry(tuple(factory.capabilities() for factory in registered_factories)),
         dict(executor_contexts or {}),
         {key: tuple(value) for key, value in dict(required_input_dirs or {}).items()},
+        {key: tuple(value) for key, value in dict(scope_dirs or {}).items()},
     )
 
 
@@ -650,6 +661,79 @@ def build_required_input_dirs(
     return grants
 
 
+def _scope_entry_directory(entry: str) -> tuple[str, ...] | None:
+    """The safe path-segment prefix ``entry`` names, stripped of its leaf or wildcard part.
+
+    Mirrors the wildcard handling :func:`scoped_add_dirs` already applies to an external
+    scope root: a segment carrying ``*``/``?`` truncates the directory there, otherwise only
+    the entry's own leaf (the file, or the final concrete segment) is dropped. Returns
+    ``None`` for an entry with no directory component at all (a bare project-root file), since
+    that never needs an ``--add-dir`` grant of its own.
+    """
+    normalized = str(entry).replace("\\", "/").strip("/")
+    parts = tuple(part for part in normalized.split("/") if part)
+    if len(parts) <= 1:
+        return None
+    wildcard = next(
+        (index for index, part in enumerate(parts) if "*" in part or "?" in part), None
+    )
+    safe_parts = parts[:wildcard] if wildcard is not None else parts[:-1]
+    return safe_parts or None
+
+
+def build_scope_dirs(
+    specs: Sequence[TaskSpec],
+    *,
+    project_dir: Path,
+    working_root_by_id: Mapping[str, str] | None = None,
+    task_ids: Sequence[str] | None = None,
+) -> dict[str, tuple[str, ...]]:
+    """Derive each selected task's minimal declared ``allowed_scope`` directories that sit
+    outside its own (possibly nested) working root, but inside the project anchor (CSR-01).
+
+    A task routed to a nested working root may legitimately declare an allowed-scope path
+    that is not reachable from that root at all — for example, repository-root documentation
+    alongside a nested Python route. This grants only the smallest directory needed to reach
+    each such declared entry; it never grants a path the task did not declare, and it is kept
+    entirely separate from :func:`build_required_input_dirs` so callers can apply the
+    write-capability and read-only-verifier rules that only apply to declared scope.
+
+    A task whose working root already reaches an entry contributes no grant for it. An entry
+    that resolves outside the project anchor entirely is left to the existing external
+    ``scope_roots`` mechanism and is not granted here.
+    """
+    project_dir = Path(project_dir).resolve()
+    working_roots = dict(working_root_by_id or {})
+    wanted = set(task_ids) if task_ids is not None else {spec.id for spec in specs}
+    grants: dict[str, tuple[str, ...]] = {}
+    for spec in specs:
+        if spec.id not in wanted:
+            continue
+        working_root = (project_dir / working_roots.get(spec.id, ".")).resolve()
+        kept: list[Path] = []
+        for entry in spec.allowed_scope:
+            safe_parts = _scope_entry_directory(entry)
+            if not safe_parts:
+                continue
+            candidate = project_dir.joinpath(*safe_parts).resolve()
+            try:
+                candidate.relative_to(project_dir)
+            except ValueError:
+                continue
+            if candidate == working_root or working_root in candidate.parents:
+                continue
+            if any(candidate == existing or existing in candidate.parents for existing in kept):
+                continue
+            kept = [
+                existing for existing in kept
+                if not (existing == candidate or candidate in existing.parents)
+            ]
+            kept.append(candidate)
+        if kept:
+            grants[spec.id] = tuple(str(directory) for directory in kept)
+    return grants
+
+
 def make_execute_adapters(
     project_dir: Path,
     agents_root: Path,
@@ -780,6 +864,14 @@ def run_execute(
             task_ids=execution_scope,
             agents_logical_prefix=profile.logical_paths.agents,
         )
+        scope_dirs = build_scope_dirs(
+            specs,
+            project_dir=project_dir,
+            working_root_by_id={
+                spec.id: _compiled_working_root(compiled_plan, spec.id) for spec in specs
+            },
+            task_ids=execution_scope,
+        )
     except AdapterError as exc:
         raise CliError(EXIT_ERROR, f"{exc.code}: {exc}") from None
     composition = replace(
@@ -793,6 +885,7 @@ def run_execute(
             task_ids=execution_scope,
         ),
         required_input_dirs=required_input_dirs,
+        scope_dirs=scope_dirs,
     )
 
     if executor is None or launchers is None or environment is None:
@@ -873,6 +966,7 @@ __all__ = [
     "build_bootstrap",
     "build_executor_context_bundles",
     "build_required_input_dirs",
+    "build_scope_dirs",
     "codex_factory",
     "load_markdown_plan",
     "MarkdownPlanError",
