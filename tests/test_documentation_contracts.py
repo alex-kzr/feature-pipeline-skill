@@ -213,6 +213,7 @@ class DocumentationContractTests(unittest.TestCase):
             + _text("feature-pipeline-skill/scripts/README.md")
             + _text("docs/agents/README.md")
             + _text("docs/agents/task-metadata-contract.md")
+            + _text("docs/agents/hermes-operator.md")
             + _text("docs/contracts/feature-pipeline.md")
         )
         for obsolete_description in (
@@ -222,9 +223,26 @@ class DocumentationContractTests(unittest.TestCase):
             "blocked predecessor",
             "unblock procedure",
             "unblock transition",
+            "unblock a task",
+            "unblock the task",
+            "treat cancellation as verified",
+            "cancellation as verified implementation",
         ):
             with self.subTest(obsolete_description=obsolete_description):
                 self.assertNotIn(obsolete_description, text)
+
+    def test_metadata_contract_documents_advisory_repair_and_operational_blocking_conditions(
+        self,
+    ) -> None:
+        """PAC-02 AC-3: repair limits are advisory and blocking conditions are operational,
+        never a terminal task state or an unblock transition."""
+        text = _text("docs/agents/task-metadata-contract.md")
+        for token in (
+            "amendable execution estimates",
+            "do not determine whether the product task is terminal",
+        ):
+            with self.subTest(token=token):
+                self.assertIn(token, text)
 
     def test_runtime_contract_mentions_reuse_scope_protocol_and_recovery(self) -> None:
         text = _text("docs/contracts/feature-pipeline.md") + _text("docs/architecture/feature-pipeline.md")

@@ -376,6 +376,18 @@ class LoadTaskSpecHistoricalTests(unittest.TestCase):
         self.assertIn("task_type", spec.defaults_applied)
         self.assertIn("acceptance_criteria", spec.defaults_applied)
 
+    def test_historical_affected_paths_share_the_declared_path_safety_boundary(self) -> None:
+        """AC-1: a legacy '## Affected Files / Components' path is normalized by the same
+        :func:`feature_pipeline.contracts.validate_relative_path` boundary a declared
+        'Allowed scope' entry uses — an unsafe legacy path still fails closed."""
+        unsafe = HISTORICAL_TASK_MD.replace(
+            "- `tools/export/writer.py`", "- `../outside/writer.py`"
+        )
+        with TemporaryDirectory() as raw:
+            path = _write(Path(raw), "LT-09_legacy.md", unsafe)
+            with self.assertRaises(TaskFileError):
+                load_task_spec(path, defaults=HISTORICAL_DEFAULTS)
+
     def test_a_historical_file_without_a_resolvable_scope_is_rejected(self) -> None:
         no_scope = HISTORICAL_TASK_MD.replace(
             "## Affected Files / Components\n- `tools/export/writer.py`\n- `tools/export/schema.py`\n",
