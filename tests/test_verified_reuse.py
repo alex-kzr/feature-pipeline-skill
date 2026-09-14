@@ -20,6 +20,7 @@ from feature_pipeline.application.verified_reuse import (
 )
 from feature_pipeline.contracts import AcceptanceCriterionSpec, CommandSpec, Precondition, TaskSpec
 from feature_pipeline.domain.models import MARKDOWN_TASK_FILE, TaskDefinition
+from pipeline_core.plan import canonical_amendment_fields, contract_digest
 from pipeline_core.execution import _next_actionable, _pending_reason, persist_task_contracts
 from pipeline_core.lifecycle import RunLifecycle
 from pipeline_core.state import ACTOR_HUMAN, Run
@@ -214,6 +215,26 @@ class VerifiedEvidenceStoreTests(unittest.TestCase):
                 VerifiedEvidenceStore(root / "runs", root).find(definition)
 
             self.assertEqual(denied.exception.code, "evidence-canonical-identity-missing")
+
+    def test_approved_amendment_contract_is_eligible_for_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            definition = _definition()
+            source = _source(root, run_id="amended-source", definition=definition)
+            payload = json.loads(source.read_text(encoding="utf-8"))
+            task = payload["tasks"][0]
+            digest = contract_digest(canonical_amendment_fields(definition.spec))
+            task.update({
+                "task_contract_version": "tam01-amendment-v1",
+                "task_contract_digest": digest,
+                "current_revision": 1,
+                "amendment_revisions": [{"revision": 1, "new_digest": digest}],
+            })
+            source.write_text(json.dumps(payload), encoding="utf-8")
+
+            evidence = VerifiedEvidenceStore(root / "runs", root).find(definition.spec)
+
+        self.assertEqual(evidence["source_run_id"], "amended-source")
 
     def test_exact_path_and_digest_match_returns_immutable_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

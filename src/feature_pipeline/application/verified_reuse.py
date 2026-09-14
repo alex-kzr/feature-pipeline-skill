@@ -10,6 +10,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
 
+from pipeline_core.plan import canonical_amendment_fields, contract_digest
 from feature_pipeline.contracts import TaskSpec
 from feature_pipeline.domain.models import TaskDefinition
 
@@ -19,9 +20,11 @@ from feature_pipeline.domain.models import TaskDefinition
 # for the versioned evidence newly emitted by this release.
 LEGACY_CANONICAL_CONTRACT_VERSION = "rec09-v1"
 CANONICAL_CONTRACT_VERSION = "rec09-v2"
+AMENDMENT_CONTRACT_VERSION = "tam01-amendment-v1"
 _SUPPORTED_CONTRACT_VERSIONS = frozenset({
     LEGACY_CANONICAL_CONTRACT_VERSION,
     CANONICAL_CONTRACT_VERSION,
+    AMENDMENT_CONTRACT_VERSION,
 })
 
 
@@ -223,6 +226,28 @@ class VerifiedEvidenceStore:
             raise EvidenceEligibilityError(
                 "source task path does not match", "evidence-task-path-mismatch"
             )
+        if version == AMENDMENT_CONTRACT_VERSION:
+            revision = task.get("current_revision")
+            revisions = task.get("amendment_revisions")
+            expected_digest = contract_digest(canonical_amendment_fields(
+                definition.spec if isinstance(definition, TaskDefinition) else definition
+            ))
+            matching_revision = (
+                isinstance(revision, int)
+                and revision > 0
+                and isinstance(revisions, list)
+                and any(
+                    isinstance(item, Mapping)
+                    and item.get("revision") == revision
+                    and item.get("new_digest") == task.get("task_contract_digest")
+                    for item in revisions
+                )
+            )
+            if not matching_revision or task.get("task_contract_digest") != expected_digest:
+                raise EvidenceEligibilityError(
+                    "source amendment contract does not match", "evidence-contract-digest-mismatch"
+                )
+            return version
         if task.get("task_contract_digest") != task_contract_digest(definition, version=version):
             raise EvidenceEligibilityError(
                 "source task contract digest does not match", "evidence-contract-digest-mismatch"

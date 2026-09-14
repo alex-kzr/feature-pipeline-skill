@@ -57,7 +57,15 @@ def _migrate_task_statuses(payload: dict[str, object]) -> None:
             continue
         product_status, resolution = _LEGACY_TASK_STATUS_COMPATIBILITY[status]
         task["status"] = product_status
-        task.setdefault("resolution", resolution)
+        # Schema-v2 writers serialized ``resolution: null`` for every task.  A
+        # legacy ``verified`` value is the one compatibility value that carries
+        # a Done resolution, so ``setdefault`` is insufficient: the key is
+        # present but null.  Keep diagnostics/history intact while making the
+        # product-status snapshot valid for the strict v3 reader.
+        if resolution is not None:
+            task["resolution"] = resolution
+        else:
+            task.setdefault("resolution", None)
         task.setdefault("resolution_reason", None)
         history = task.setdefault("operation_history", [])
         if isinstance(history, list):

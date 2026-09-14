@@ -83,6 +83,36 @@ class HappyPathTests(unittest.TestCase):
             self.assertEqual(result.status, "done")
             self.assertEqual(executor.launches, 1)
 
+    def test_resume_continues_interrupted_verification_without_reimplementing(self) -> None:
+        """A verifier wait is an operation boundary, not a reason to repeat implementation."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            life = _run(root)
+            spec = _spec()
+            first_executor = ScriptedExecutor(("implemented",))
+            first = run_task(
+                life,
+                _execution(spec, first_executor, StubVerifier(("BLOCKED",)),
+                           StubVerifier(("PASS",))),
+            )
+            self.assertEqual(first.status, "waiting")
+            self.assertEqual(first_executor.launches, 1)
+
+            resumed_executor = ScriptedExecutor(("implemented",))
+            reloaded = Run.load(life.run.run_dir, root)
+            resumed = run_task(
+                RunLifecycle(reloaded),
+                _execution(spec, resumed_executor, StubVerifier(("PASS",)),
+                           StubVerifier(("PASS",))),
+            )
+
+            self.assertEqual(resumed.status, "done")
+            self.assertEqual(resumed_executor.launches, 0)
+            self.assertTrue(any(
+                entry["outcome"] == "resumed"
+                for entry in reloaded.task("VR-03").operation_history
+            ))
+
     def test_an_illegal_entry_state_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -451,9 +451,10 @@ def _check_transition(
         )
     if task.status is TaskStatus.DONE and actor is not Actor.HUMAN:
         raise UnauthorizedTransition("only a human may reopen a done task")
-    if to is TaskStatus.DONE and not (
-        actor is Actor.RUNNER or (actor is Actor.HUMAN and resolution is DoneResolution.CANCELLED)
-    ):
+    if to is TaskStatus.DONE and resolution is DoneResolution.CANCELLED:
+        if actor is not Actor.HUMAN:
+            raise UnauthorizedTransition("only a human may cancel a task")
+    elif to is TaskStatus.DONE and actor is not Actor.RUNNER:
         raise UnauthorizedTransition("only the runner may record completed work")
     if to is TaskStatus.DONE and resolution is DoneResolution.COMPLETED:
         # Completed is the runner's exclusive, evidence-backed resolution: an executor cannot

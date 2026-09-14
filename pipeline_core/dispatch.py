@@ -217,22 +217,38 @@ def _unsafe_scope_amendment_path(path: str) -> bool:
     )
 
 
-def _record_scope_amendment(run: Run, task_id: str, attribution: AttributionResult,
+def _record_scope_amendment(run: Run, spec: TaskSpec, attribution: AttributionResult,
                             *, reverted_paths: Sequence[str] = ()) -> None:
-    """Attach reviewable, runner-observed amendment facts without changing the manifest."""
-    observed_paths = [
-        str(row["path"])
+    """Attach reviewable expansion facts without silently changing the task contract.
+
+    This is deliberately an observation, not an approval: only the amendment lifecycle can
+    create an approved revision.  It gives both independent verifiers the complete observed
+    attribution and the original estimate they must assess.
+    """
+    observed_changes = [
+        dict(row)
         for row in attribution.changed_files
         if row.get("classification") == "out_of_scope"
     ]
-    if not observed_paths:
+    if not observed_changes:
         return
-    implementation = run.task(task_id).execution_evidence["implementation"]
+    implementation = run.task(spec.id).execution_evidence["implementation"]
     implementation["scope_amendment"] = {
         "present": True,
-        "observed_paths": observed_paths,
+        "observed_paths": [str(row["path"]) for row in observed_changes],
+        "observed_changes": observed_changes,
         "reverted_paths": list(reverted_paths),
-        "rationale": "executor-owned paths outside the initial estimate require independent amendment-justification review",
+        "original_allowed_scope": list(spec.allowed_scope),
+        "original_out_of_scope": list(spec.out_of_scope),
+        "original_acceptance_criteria": [
+            {"id": getattr(criterion, "id", ""), "text": getattr(criterion, "text", str(criterion))}
+            for criterion in spec.acceptance_criteria
+        ],
+        "rationale": (
+            "executor-owned paths outside the initial estimate require independent "
+            "amendment-justification review"
+        ),
+        "approval": "pending-independent-verification",
     }
 
 
@@ -342,13 +358,24 @@ def _workspace_artifacts(artifacts: LaunchArtifacts, root: Path) -> LaunchArtifa
     )
 
 
-def _promote_allowed_paths(primary: Path, workspace: Path, attribution: AttributionResult) -> list[str]:
-    """Apply only executor-owned, approved files from an isolated workspace."""
+def _promote_reviewable_paths(
+    primary: Path,
+    workspace: Path,
+    attribution: AttributionResult,
+    before_snapshot,
+) -> list[str]:
+    """Apply every non-safety executor delta so independent verification sees the work.
+
+    Allowed scope is an initial estimate, rather than a pre-verification write boundary.
+    Callers must run :func:`_scope_or_provenance_block` first; it alone rejects unsafe paths.
+    """
     promoted: list[str] = []
     for row in attribution.changed_files:
-        if row.get("classification") != "in_allowed_scope":
-            continue
         relative = Path(str(row["path"]))
+        # The disposable workspace starts as a copy of the primary worktree. A path in the
+        # opening snapshot was already dirty or untracked, so promotion must preserve it.
+        if relative.as_posix() in before_snapshot.files:
+            continue
         source, destination = workspace / relative, primary / relative
         if row.get("status") == "deleted":
             destination.unlink(missing_ok=True)
@@ -363,7 +390,7 @@ def _attribute_isolated_window(
     *, workspace: Path, primary: Path, before_snapshot, artifacts: LaunchArtifacts,
     task_id: str, allowed_scope: Sequence[str], attempt: int, generation: int,
 ) -> AttributionResult:
-    """Persist isolated attribution as normal runner artifacts, then promote safe paths."""
+    """Persist isolated attribution without changing the primary worktree yet."""
     isolated_artifacts = _workspace_artifacts(artifacts, workspace)
     isolated_artifacts.directory.mkdir(parents=True, exist_ok=True)
     if artifacts.executor_report.exists():
@@ -377,9 +404,29 @@ def _attribute_isolated_window(
         # changes eligible for scope review or promotion.
         exclude_roots=(workspace / ".pipeline-artifacts",),
     )
-    shutil.copyfile(isolated_artifacts.implementation_manifest, artifacts.implementation_manifest)
-    shutil.copyfile(isolated_artifacts.implementation_diff, artifacts.implementation_diff)
-    _promote_allowed_paths(primary, workspace, attribution)
+    unsafe = [
+        str(row.get("path", "<unknown>"))
+        for row in attribution.changed_files
+        if row.get("classification") == "out_of_scope"
+        and _unsafe_scope_amendment_path(str(row.get("path", "")))
+    ]
+    if unsafe:
+        # Do not copy an executor-controlled diff containing a secret into runner reports.
+        # The stable path-only diagnostic is sufficient to explain the refusal.
+        write_json_atomic(artifacts.implementation_manifest, {
+            "state": attribution.state,
+            "reason": "scope-safety-violation: unsafe executor-owned path: " + ", ".join(unsafe),
+            "changed_files": attribution.changed_files,
+        }, repo_root=primary)
+        write_text_atomic(
+            artifacts.implementation_diff,
+            "# attribution: unsafe-path-redacted\n"
+            "# executor-controlled content was excluded from runner evidence\n",
+            repo_root=primary,
+        )
+    else:
+        shutil.copyfile(isolated_artifacts.implementation_manifest, artifacts.implementation_manifest)
+        shutil.copyfile(isolated_artifacts.implementation_diff, artifacts.implementation_diff)
     return replace(
         attribution,
         manifest=repo_relative(artifacts.implementation_manifest, primary),
@@ -451,6 +498,9 @@ def dispatch_executor(
     # primary worktree before attribution had decided what is promotable.
     workspace = _isolated_workspace(primary_root)
     _copy_repair_report_to_workspace(primary_root, workspace, repair_report_path)
+    repair_input_dirs: tuple[str, ...] = ()
+    if repair_report_path is not None:
+        repair_input_dirs = (str((workspace / repo_relative(repair_report_path, primary_root)).parent),)
     launch_working_root = str(workspace / request.working_root)
 
     launch_request = LaunchRequest(
@@ -479,6 +529,10 @@ def dispatch_executor(
         envelope_path=artifacts.status_envelope,
         model=request.model,
         effort=request.effort,
+        # A repair report is runner-owned evidence copied into the disposable workspace.
+        # Its prompt path remains .pipeline/...; grant only its copied parent so Claude can
+        # read the diagnosis without access to the primary runner control plane.
+        required_input_dirs=repair_input_dirs,
     )
     # Runner-owned evidence: content snapshot of the whole worktree immediately before the
     # launch, with the runner's own run/lock/report directory excluded. Subtracting this
@@ -627,7 +681,7 @@ def dispatch_executor(
     )
     reverted_paths = [] if workspace != primary_root else _enforce_scope_boundary(
         primary_root, before_snapshot, attribution)
-    _record_scope_amendment(run, task_id, attribution, reverted_paths=reverted_paths)
+    _record_scope_amendment(run, spec, attribution, reverted_paths=reverted_paths)
     scope_block = _scope_or_provenance_block(attribution)
     if scope_block:
         life.block(task_id, scope_block)
@@ -635,6 +689,8 @@ def dispatch_executor(
             task_id, generation, "blocked", "blocked", artifacts, result, envelope_result,
             report_text, resolution.drift, scope_block, attribution,
         )
+    if workspace != primary_root:
+        _promote_reviewable_paths(primary_root, workspace, attribution, before_snapshot)
     if resolution.drift:
         run.record_event(
             f"executor:{task_id}", to=str(generation), note=resolution.drift)
@@ -725,13 +781,15 @@ def _settle_codex_final_result(
         diff=attribution.diff, changed_files=attribution.changed_files, reason=attribution.reason)
     reverted_paths = [] if workspace != primary_root else _enforce_scope_boundary(
         primary_root, before_snapshot, attribution)
-    _record_scope_amendment(run, request.spec.id, attribution, reverted_paths=reverted_paths)
+    _record_scope_amendment(run, request.spec, attribution, reverted_paths=reverted_paths)
     scope_block = _scope_or_provenance_block(attribution)
     if scope_block:
         life.block(request.spec.id, scope_block)
         return DispatchOutcome(request.spec.id, generation, "blocked", "blocked", artifacts,
                                result, None, report_text, failure=scope_block,
                                attribution=attribution)
+    if workspace != primary_root:
+        _promote_reviewable_paths(primary_root, workspace, attribution, before_snapshot)
     life.record_operation(request.spec.id, "executor", "succeeded",
                           f"executor launch-{generation} reported implemented",
                           generation=generation)

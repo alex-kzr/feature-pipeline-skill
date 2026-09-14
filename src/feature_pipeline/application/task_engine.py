@@ -324,7 +324,26 @@ class TaskEngine:
             self._project(run, request, "in_progress")
         if record.status == "in_progress":
             report = newest_repair_report(run.run_dir, task_id)
-            return (repo_relative(report, run.repo_root) if report else None), False
+            # An executor which already reported ``implemented`` is settled work.  If the
+            # next unfinished boundary is verification (for example a verifier was
+            # unavailable after runner-owned commands had completed), continue that gate
+            # rather than manufacturing another implementation operation.  A failed gate,
+            # repair escalation, or an executor failure has a different latest operation and
+            # deliberately starts a fresh executor window.
+            history = record.operation_history
+            latest = history[-1] if history else None
+            implemented = any(
+                entry.get("kind") == "executor" and entry.get("outcome") == "succeeded"
+                for entry in history
+            )
+            verification_pending = (
+                isinstance(latest, dict)
+                and latest.get("kind") == "verification"
+                and latest.get("outcome") == "blocked"
+            )
+            return (repo_relative(report, run.repo_root) if report else None), (
+                implemented and verification_pending
+            )
         if record.status == "done":
             self._project(run, request, "done", build_completion_evidence(run, request.spec))
             return None, True

@@ -152,11 +152,18 @@ class VerificationEvidence:
     #: separate from an out-of-scope observation: the latter is a reason to request an
     #: amendment, never proof that one was approved.
     amendment: Mapping[str, object] | None = None
+    #: Runner-observed expansion facts from the executor window.  Unlike ``amendment``, this
+    #: cannot authorize anything; it remains visible so missing approval is reviewable.
+    scope_observation: Mapping[str, object] | None = None
     #: The immutable identity of the isolated worktree snapshot the recorded commands ran
     #: against (:class:`pipeline_core.snapshot.SnapshotIdentity` as a dict), or ``None`` when
     #: the pass was not run against an isolated snapshot. An unrelated later worktree edit
     #: cannot move this value — it is a frozen field over a captured content digest.
     snapshot: Mapping[str, object] | None = None
+    #: Durable, runner-owned operation transitions for this logical task.  Tool-less
+    #: verifiers need these facts to assess resume/escalation criteria without treating
+    #: historical Markdown projections as evidence.
+    operation_history: tuple[Mapping[str, object], ...] = ()
 
     @property
     def complete(self) -> bool:
@@ -170,6 +177,7 @@ class VerificationEvidence:
             if entry.get("classification") == "out_of_scope"
         ]
         amendment = dict(self.amendment) if self.amendment is not None else {}
+        observation = dict(self.scope_observation) if self.scope_observation is not None else {}
         approved_paths = [str(path) for path in amendment.get("added_paths", ())]
         return {
             "task_id": self.task_id,
@@ -186,14 +194,21 @@ class VerificationEvidence:
             "missing_evidence": [dict(entry) for entry in self.missing_evidence],
             "unrun_commands": [dict(entry) for entry in self.unrun_commands],
             "external_blocker": self.external_blocker,
+            "durable_operation_history": [dict(entry) for entry in self.operation_history],
             "scope_amendment": {
-                "present": bool(amendment or observed_paths),
+                "present": bool(amendment or observation or observed_paths),
                 "revision": amendment.get("revision"),
                 "epoch": amendment.get("epoch"),
                 "approved_by": amendment.get("approved_by"),
                 "approved_paths": approved_paths,
-                "observed_paths": observed_paths,
-                "rationale": amendment.get("rationale") or (
+                "observed_paths": observation.get("observed_paths", observed_paths),
+                "observed_changes": observation.get("observed_changes", []),
+                "original_allowed_scope": observation.get("original_allowed_scope", []),
+                "original_out_of_scope": observation.get("original_out_of_scope", []),
+                "original_acceptance_criteria": observation.get(
+                    "original_acceptance_criteria", []),
+                "approval": observation.get("approval"),
+                "rationale": amendment.get("rationale") or observation.get("rationale") or (
                     "executor-owned paths outside the initial estimate require independent "
                     "amendment-justification review" if observed_paths else None
                 ),
@@ -208,6 +223,7 @@ class VerificationEvidence:
                 },
                 "runner_owned_writes": [dict(entry) for entry in self.runner_owned_writes],
                 "captured_commands": [dict(entry) for entry in self.commands],
+                "durable_operation_history": [dict(entry) for entry in self.operation_history],
                 "external_actions": [dict(entry) for entry in self.external_actions],
             },
             "complete": self.complete,
@@ -286,6 +302,13 @@ def build_verification_evidence(
         external_blocker=commands_run.stopped_reason,
         snapshot=commands_run.snapshot,
         amendment=amendment,
+        scope_observation=(
+            dict(implementation["scope_amendment"])
+            if isinstance(implementation.get("scope_amendment"), Mapping) else None
+        ),
+        operation_history=tuple(
+            dict(entry) for entry in getattr(record, "operation_history", ())
+        ),
     )
 
 
@@ -447,6 +470,9 @@ _VERIFIER_RULES: dict[str, tuple[str, ...]] = {
         "to the executor; only changes attributed inside this executor window may be scope "
         "violations. An unavailable executor attribution is BLOCKED.",
         "Do not tick acceptance-criteria checkboxes.",
+        "Do not require the outcome of this same verification pass as evidence. Evaluate "
+        "failure, escalation, and resume criteria from durable runner-owned operation history "
+        "and task-scoped regression evidence; your fresh verdict is the output being settled.",
         "Your report must include a separate 'Amendment-justification finding:' that states "
         "whether the structured scope-amendment rationale and observed paths support the "
         "claimed functionality (or that no amendment is present). When amendment evidence is "
@@ -465,6 +491,16 @@ _VERIFIER_RULES: dict[str, tuple[str, ...]] = {
         "never a prompt to re-run the check.",
         "Judge whether the recorded command evidence shows the task's verification commands "
         "passed.",
+        "Do not require a PASS from either verifier in this same verification pass as evidence: "
+        "your verdict and the companion verifier's verdict are the outputs being independently "
+        "settled. Assess historical lifecycle criteria from durable runner-owned history and "
+        "task-scoped regression evidence instead.",
+        "Your verdict is limited to runner-recorded verification-command evidence: PASS when "
+        "every declared command has a matching record with exit code 0 and there are no "
+        "missing, unrun, or externally blocked commands; otherwise FAIL or BLOCKED as the "
+        "evidence requires. Do not fail because the command records alone do not demonstrate "
+        "functional failure/resume scenarios; the independent task verifier assesses those "
+        "acceptance criteria from the durable operation evidence.",
         "Your report must include a separate 'Amendment-justification finding:' that states "
         "whether the structured scope-amendment rationale and observed paths support the "
         "claimed functionality (or that no amendment is present). When amendment evidence is "
@@ -589,13 +625,19 @@ def _explicit_report_verdicts(text: str) -> frozenset[str]:
 
 def _amendment_assessment_failure(
     report_text: str, amendment: Mapping[str, object] | None,
+    scope_observation: Mapping[str, object] | None = None,
 ) -> str | None:
     """Require a PASS report to identify and assess its governing amendment revision."""
-    if not amendment:
+    if not amendment and not scope_observation:
         return None
     normalized = report_text.casefold()
     if "amendment-justification finding:" not in normalized:
         return "missing-amendment-justification-finding"
+    if not amendment:
+        # An observation never authorizes the executor by itself. It is the runner-owned
+        # record the independent verifier must assess; a PASS with the required finding is
+        # that assessment, rather than an external wait.
+        return None
     # Revision identity and epoch are immutable runner-owned evidence. A verifier must repeat
     # the exact governing pair; otherwise a PASS could settle a different amendment epoch.
     revision = amendment.get("revision")
@@ -654,6 +696,7 @@ def _run_one_verifier(
     anchors: VerifierAnchors, evidence_payload: str, attempt: int, plan_path: str | None,
     model: str | None = None, effort: str | None = None,
     amendment: Mapping[str, object] | None = None,
+    scope_observation: Mapping[str, object] | None = None,
 ) -> _SettledVerifier:
     normalized = normalize_role(role)
     tool_less = normalized == "test_verifier"
@@ -759,7 +802,8 @@ def _run_one_verifier(
             result=result, envelope_result=envelope_result, report_text=report_text)
 
     if resolution.token == "PASS":
-        assessment_failure = _amendment_assessment_failure(report_text, amendment)
+        assessment_failure = _amendment_assessment_failure(
+            report_text, amendment, scope_observation)
         if assessment_failure:
             return _diagnose(
                 run, spec, artifacts, role=normalized, attempt=attempt,
@@ -818,13 +862,16 @@ def orchestrate_verification(
         raise VerificationError(
             "verification evidence does not match the task/attempt being verified")
 
-    artifacts = verifier_artifacts(run.run_dir, task_id, attempt)
+    revision = None
+    if evidence.amendment is not None:
+        revision = evidence.amendment.get("revision")
+    artifacts = verifier_artifacts(run.run_dir, task_id, attempt, revision=revision)
     artifacts.directory.mkdir(parents=True, exist_ok=True)
     payload = verifier_evidence_payload(evidence)
 
     task_settled = _run_one_verifier(
         run, spec, "task_verifier", launchers.task, artifacts, anchors, payload, attempt,
-        plan_path, model, effort, evidence.amendment)
+        plan_path, model, effort, evidence.amendment, evidence.scope_observation)
     if task_settled.failure:
         status = _block(run, task_id, f"task_verifier: {task_settled.failure}")
         return VerificationOutcome(
@@ -834,7 +881,7 @@ def orchestrate_verification(
 
     test_settled = _run_one_verifier(
         run, spec, "test_verifier", launchers.test, artifacts, anchors, payload, attempt,
-        plan_path, model, effort, evidence.amendment)
+        plan_path, model, effort, evidence.amendment, evidence.scope_observation)
     if test_settled.failure:
         status = _block(run, task_id, f"test_verifier: {test_settled.failure}")
         return VerificationOutcome(

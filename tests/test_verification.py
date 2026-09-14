@@ -41,7 +41,10 @@ from pipeline_core.plan import (
     CLASSIFICATION_TASK_ATTRIBUTABLE,
     classify_baseline_failure,
 )
-from pipeline_core.reports import build_verdict_envelope_prompt, verifier_artifacts
+from pipeline_core.reports import (
+    build_verdict_envelope_prompt,
+    verifier_artifacts,
+)
 from pipeline_core.snapshot import SnapshotError
 from pipeline_core.state import Run, StateError
 from pipeline_core.verification import (
@@ -65,6 +68,15 @@ ANCHORS = VerifierAnchors(project_root="/repo", agents_root="/repo/.agents")
 
 
 class FreshEnvelopePromptTests(unittest.TestCase):
+    def test_amended_revision_uses_a_distinct_verifier_artifact_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            original = verifier_artifacts(directory, "ROC-01", 2)
+            amended = verifier_artifacts(directory, "ROC-01", 2, revision=3)
+
+        self.assertEqual(original.directory.name, "verify-2")
+        self.assertEqual(amended.directory.name, "verify-2-revision-3")
+        self.assertNotEqual(original.task_report, amended.task_report)
+
     def test_fresh_continuation_receives_runner_observed_verdict(self) -> None:
         prompt = build_verdict_envelope_prompt(
             role="task_verifier", task_id="VR-02", attempt=1, observed_verdict="PASS"
@@ -107,6 +119,28 @@ class ScopeAmendmentVerifierEvidenceTests(unittest.TestCase):
         for prompt in (task_prompt, test_prompt):
             self.assertIn("Amendment-justification finding:", prompt)
             self.assertIn("observed paths", prompt)
+
+    def test_observation_retains_original_contract_without_claiming_approval(self) -> None:
+        evidence = VerificationEvidence(
+            "VR-02", 1,
+            scope_observation={
+                "observed_paths": ["new/module.py"],
+                "observed_changes": [{"path": "new/module.py", "status": "added"}],
+                "original_allowed_scope": ["src/**"],
+                "original_out_of_scope": [".pipeline/**"],
+                "original_acceptance_criteria": [{"id": "AC-1", "text": "works"}],
+                "approval": "pending-independent-verification",
+                "rationale": None,
+            },
+        )
+
+        amendment = json.loads(evidence.serialized())["scope_amendment"]
+
+        self.assertTrue(amendment["present"])
+        self.assertEqual(amendment["observed_paths"], ["new/module.py"])
+        self.assertEqual(amendment["original_allowed_scope"], ["src/**"])
+        self.assertEqual(amendment["approval"], "pending-independent-verification")
+        self.assertIsNone(amendment["rationale"])
 
 
 def _spec(**overrides: object) -> TaskSpec:
@@ -443,6 +477,9 @@ class FreshReadOnlyToollessTests(unittest.TestCase):
             evidence_payload="{}", attempt=1)
         self.assertIn("no tools", prompt.lower())
         self.assertIn("no matching runner-recorded command is a FAIL", prompt)
+        self.assertIn("Do not require a PASS from either verifier", prompt)
+        self.assertIn("limited to runner-recorded verification-command evidence", prompt)
+        self.assertIn("functional failure/resume scenarios", prompt)
 
 
 class CurrentRunMutationEvidenceTests(unittest.TestCase):
@@ -525,6 +562,29 @@ class CurrentRunMutationEvidenceTests(unittest.TestCase):
 
 
 class VerifierAttributionRulesTests(unittest.TestCase):
+    def test_payload_carries_durable_operation_history_for_toolless_verifiers(self) -> None:
+        evidence = VerificationEvidence(
+            "VR-02", 2,
+            operation_history=({
+                "kind": "verification", "outcome": "failed",
+                "detail": "task_verdict=PASS test=FAIL",
+            },),
+        )
+
+        payload = json.loads(evidence.serialized())
+
+        self.assertEqual(
+            payload["durable_operation_history"],
+            [{
+                "kind": "verification", "outcome": "failed",
+                "detail": "task_verdict=PASS test=FAIL",
+            }],
+        )
+        self.assertEqual(
+            payload["current_run_boundary"]["durable_operation_history"],
+            payload["durable_operation_history"],
+        )
+
     def test_evidence_carries_prior_runner_projection_owners(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -76,6 +76,19 @@ class MigrationPreservesEveryRecordedFact(unittest.TestCase):
             self.assertIn(after["status"], {"to_do", "in_progress", "done"})
             self.assertEqual(after["operation_history"][-1]["legacy_status"], before["status"])
 
+    def test_verified_legacy_status_replaces_v2_null_resolution(self) -> None:
+        source = _read(_FIXTURES / "v2" / "run-state-basic.json")
+        verified = source["tasks"][0]
+        verified["status"] = "verified"
+        verified["resolution"] = None
+
+        state = load_state(source)
+
+        task = state.task(verified["id"])
+        self.assertEqual(task.status, "done")
+        self.assertEqual(task.resolution, "completed")
+        self.assertEqual(task.operation_history[-1]["legacy_status"], "verified")
+
     def test_run_level_facts_survive_migration(self) -> None:
         for path in _V2_FIXTURES:
             with self.subTest(path.name):

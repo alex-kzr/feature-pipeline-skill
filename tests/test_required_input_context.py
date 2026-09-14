@@ -160,6 +160,22 @@ class AdapterInjectionTests(unittest.TestCase):
             _add_dirs(runner.argv), ["/proj/docs/plans", "/agents/skills/tdd"]
         )
 
+    def test_claude_adapter_preserves_runtime_repair_grants_when_injecting_task_inputs(self) -> None:
+        runner = _CapturingRunner()
+        adapter = ClaudeAdapter(
+            executable="claude",
+            runner=runner,
+            required_input_dirs={"REC-05": ("/proj/docs/plans",)},
+        )
+
+        adapter.launch(_request(required_input_dirs=("/workspace/.pipeline/reports/REC-05",)))
+
+        assert runner.argv is not None
+        self.assertEqual(
+            _add_dirs(runner.argv),
+            ["/workspace/.pipeline/reports/REC-05", "/proj/docs/plans"],
+        )
+
     def test_a_different_task_id_receives_no_injected_grants(self) -> None:
         runner = _CapturingRunner()
         adapter = ClaudeAdapter(
@@ -191,7 +207,10 @@ class AdapterInjectionTests(unittest.TestCase):
             required_input_dirs={"REC-05": ("/proj/docs/plans",)},
         )
         argv = adapter.plan(_request(working_root="feature-pipeline-skill"))
-        self.assertEqual(_add_dirs(argv), ["/proj/docs/plans"])
+        self.assertEqual(
+            _add_dirs(argv),
+            [str(Path("/proj") / "feature-pipeline-skill"), "/proj/docs/plans"],
+        )
 
 
 # --- RED: fail-closed validation ---------------------------------------------------------

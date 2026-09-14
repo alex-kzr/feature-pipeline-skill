@@ -1150,9 +1150,12 @@ class ClaudeAdapter:
         if request.resume_session_id:
             return request
         dirs = self._required_input_dirs.get(request.task_id, ())
-        if not dirs or tuple(request.required_input_dirs) == tuple(dirs):
+        if not dirs:
             return request
-        return replace(request, required_input_dirs=tuple(dirs))
+        merged = tuple(dict.fromkeys((*request.required_input_dirs, *dirs)))
+        if merged == tuple(request.required_input_dirs):
+            return request
+        return replace(request, required_input_dirs=merged)
 
     def plan(self, request: LaunchRequest) -> list[str]:
         """The argv this request would run — used by a dry run and by the tests, so what is
@@ -1268,9 +1271,12 @@ class CodexAdapter:
         if request.resume_session_id:
             return request
         dirs = self._required_input_dirs.get(request.task_id, ())
-        if not dirs or tuple(request.required_input_dirs) == tuple(dirs):
+        if not dirs:
             return request
-        return replace(request, required_input_dirs=tuple(dirs))
+        merged = tuple(dict.fromkeys((*request.required_input_dirs, *dirs)))
+        if merged == tuple(request.required_input_dirs):
+            return request
+        return replace(request, required_input_dirs=merged)
 
     def plan(self, request: LaunchRequest) -> list[str]:
         request = self._with_required_inputs(request)
@@ -1317,4 +1323,15 @@ class CodexAdapter:
         return None
 
     def _add_dirs_for(self, request: LaunchRequest) -> tuple[str, ...]:
-        return scoped_add_dirs(request, self._scope_roots)
+        external_roots = scoped_add_dirs(request, self._scope_roots)
+        working_root = self._cwd_for(request)
+        if (
+            working_root is None
+            or request_is_read_only(request)
+            or not set(effective_grant(request)) & WRITE_CAPABILITIES
+        ):
+            return external_roots
+        # Codex's workspace-write sandbox does not consistently treat --cd as a writable
+        # grant on Windows. Explicitly grant the runner-selected disposable worktree.
+        root = str(working_root)
+        return tuple(dict.fromkeys((root, *external_roots)))

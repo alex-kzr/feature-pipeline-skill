@@ -924,6 +924,12 @@ class DispatchAttributionTests(unittest.TestCase):
             self.assertEqual(outcome.status, "implemented")
             amendment = life.run.task(spec.id).execution_evidence["implementation"]["scope_amendment"]
             self.assertEqual(amendment["observed_paths"], [protected])
+            self.assertEqual(amendment["approval"], "pending-independent-verification")
+            self.assertEqual(amendment["original_allowed_scope"], ["reviews/TC-03.md"])
+            # The executor's safe expansion is retained in immutable attribution for the
+            # independent verifier, but cannot overwrite pre-existing runner-owned bytes in
+            # the primary worktree before that review.
+            self.assertEqual(path.read_text(encoding="utf-8"), "runner lifecycle projection\n")
 
     def test_known_delta_captures_the_executor_edit_and_classifies_scope(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -951,6 +957,7 @@ class DispatchAttributionTests(unittest.TestCase):
             implementation = life.run.task(spec.id).execution_evidence["implementation"]
             self.assertEqual(
                 implementation["scope_amendment"]["observed_paths"], ["stray.txt"])
+            self.assertEqual((root / "stray.txt").read_text(encoding="utf-8"), "out of scope\n")
 
             diff = outcome.artifacts.implementation_diff.read_text(encoding="utf-8")
             self.assertIn("# attribution: known", diff)
@@ -1071,6 +1078,7 @@ class DispatchAttributionTests(unittest.TestCase):
             def repair_report_is_readable(request) -> None:  # noqa: ANN001
                 visible = Path(request.working_root) / repair_path
                 self.assertEqual(visible.read_text(encoding="utf-8"), source.read_text(encoding="utf-8"))
+                self.assertEqual(request.required_input_dirs, (str(visible.parent),))
 
             outcome = dispatch_executor(
                 life,

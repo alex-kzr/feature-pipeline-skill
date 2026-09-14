@@ -88,6 +88,12 @@ class ThreeStateTransitionsTests(unittest.TestCase):
                                             resolution=DoneResolution.CANCELLED,
                                             note="not my call"))
 
+    def test_runner_cannot_cancel_a_task(self) -> None:
+        with self.assertRaises(UnauthorizedTransition):
+            apply(self._state(), Transition("T-1", TaskStatus.DONE, actor=Actor.RUNNER,
+                                            resolution=DoneResolution.CANCELLED,
+                                            note="not the runner's decision"))
+
     def test_executor_cannot_complete_a_task(self) -> None:
         state = apply(self._state(), Transition("T-1", TaskStatus.IN_PROGRESS))
         state = apply(state, RecordVerdicts("T-1", Verdict.PASS, Verdict.PASS))
@@ -117,7 +123,7 @@ class ThreeStateTransitionsTests(unittest.TestCase):
     def test_cancellation_requires_a_human_readable_reason(self) -> None:
         state = apply(self._state(), Transition("T-1", TaskStatus.IN_PROGRESS))
         with self.assertRaises(IllegalTransition):
-            apply(state, Transition("T-1", TaskStatus.DONE,
+            apply(state, Transition("T-1", TaskStatus.DONE, actor=Actor.HUMAN,
                                     resolution=DoneResolution.CANCELLED, note="  "))
 
     def test_done_cannot_be_constructed_without_a_resolution(self) -> None:
@@ -176,6 +182,7 @@ class PortableCompatibilityLayerCancellationTests(unittest.TestCase):
             self.assertEqual(record.status, "done")
             self.assertEqual(record.resolution, "cancelled")
             self.assertEqual(record.resolution_reason, "no longer needed")
+            self.assertEqual(run.history[-1]["actor"], ACTOR_HUMAN)
 
     def test_cancelling_a_task_that_has_not_started_requires_a_reason(self) -> None:
         from pipeline_core.state import ACTOR_HUMAN, TransitionError

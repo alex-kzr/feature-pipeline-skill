@@ -1853,6 +1853,19 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
     except (StateError, ExecutionError) as exc:
         return _error(f"{getattr(exc, 'code', 'state-error')}: {exc}", request)
 
+    # A fresh invocation has no authority to reuse a run identity.  In particular, do this
+    # before ``_open_run`` creates and saves a new Run: otherwise a second plain execute can
+    # replace the durable record (and its independently verified dependency evidence) merely
+    # because it selected the same feature/run directory.  Resume is the sole explicit path
+    # that may continue an existing identity; recovery has an additional, stricter guard in
+    # ``recovery_provenance``.
+    if not request.controls.resume and request.run_dir.exists():
+        return _error(
+            "run-identity-collision: fresh execute refuses an existing run directory; "
+            "use --resume to continue its immutable run identity",
+            request,
+        )
+
     # 3. Durable lifecycle: initialize a fresh run, or resume the persisted one. A fresh run's
     #    attestations are resolved against their source runs before any run.json exists
     #    (AC-2's "no partial state" on a denial); a resume trusts whatever was recorded.

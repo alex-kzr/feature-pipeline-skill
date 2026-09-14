@@ -395,7 +395,22 @@ class CodexArgvTests(unittest.TestCase):
 
         self.assertEqual(
             [argv[index + 1] for index, value in enumerate(argv) if value == "--add-dir"],
-            [str(Path("C:/agents/skills/example"))],
+            [str(Path("C:/repo")), str(Path("C:/agents/skills/example"))],
+        )
+
+    def test_writing_launch_grants_its_working_root_for_the_workspace_sandbox(self) -> None:
+        """A Codex executor explicitly grants its disposable --cd workspace.
+
+        On Windows, workspace-write alone does not consistently make the --cd path
+        writable. The actual production adapter must carry that path through --add-dir.
+        """
+        adapter = CodexAdapter(executable="codex", working_root="C:/executor/workspace")
+
+        argv = adapter.plan(_request("executor", role_grant=("read", "write")))
+
+        self.assertEqual(
+            [argv[index + 1] for index, value in enumerate(argv) if value == "--add-dir"],
+            [str(Path("C:/executor/workspace"))],
         )
 
     def test_read_only_launch_does_not_grant_external_roots(self) -> None:

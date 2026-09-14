@@ -50,7 +50,7 @@ from feature_pipeline.infrastructure.state.run_layout import (
     write_latest,
 )
 from feature_pipeline.infrastructure.state.schema_v3 import CommandRecordV3, RunStateV3
-from feature_pipeline.ports.artifacts import ArtifactNameError
+from feature_pipeline.ports.artifacts import ArtifactNameError, ArtifactRef
 from feature_pipeline.ports.clock import ManualClock
 from feature_pipeline.ports.state_repository import LoadedState, StateRevisionConflict
 
@@ -483,20 +483,64 @@ class TestOneCommitApi(unittest.TestCase):
 
     def test_status_and_operation_history_round_trip_independently(self) -> None:
         persistence, loaded, _ = self._fresh()
-        operation = {
+        verification = {
             "operation_id": "verification:1",
             "kind": "verification",
             "outcome": "failed",
             "evidence_refs": ["logs/command-1.log"],
         }
-        recorded = persistence.record_task_operation(loaded, "T-1", operation)
-        settled = persistence.set_task_status(recorded, "T-1", "done", resolution="completed")
+        executor = {
+            "operation_id": "executor:2",
+            "kind": "executor",
+            "outcome": "succeeded",
+            "evidence_refs": ["reports/T-1-executor-2.md"],
+        }
+        recorded = persistence.record_task_operation(loaded, "T-1", verification)
+        recorded = persistence.record_task_operation(recorded, "T-1", executor)
+        settled = persistence.set_task_status(
+            recorded, "T-1", "done", resolution="completed"
+        )
 
         task = persistence.open().state.task("T-1")
         self.assertEqual(task.status, "done")
         self.assertEqual(task.resolution, "completed")
-        self.assertEqual(list(task.operation_history), [operation])
-        self.assertEqual(settled.revision, 2)
+        self.assertEqual(list(task.operation_history), [verification, executor])
+        self.assertEqual(
+            [operation["operation_id"] for operation in task.operation_history],
+            ["verification:1", "executor:2"],
+        )
+        self.assertEqual(settled.revision, 3)
+
+    def test_resume_keeps_report_referenced_only_by_settled_operation(self) -> None:
+        persistence, loaded, layout = self._fresh()
+
+        def attach_operation(state: RunStateV3, ref: object) -> RunStateV3:
+            entry = state.task("T-1").with_appended_operation({
+                "operation_id": "verification:1",
+                "kind": "verification",
+                "outcome": "succeeded",
+                "evidence_refs": [ref.relative_path],  # type: ignore[attr-defined]
+            })
+            return state.with_task(entry)
+
+        persistence.record_report(
+            loaded,
+            key="verification:T-1",
+            name="T-1-verification-1.md",
+            content="# verification\npassed\n",
+            mutate=attach_operation,
+        )
+
+        evidence_path = layout.reports_dir / "T-1-verification-1.md"
+        self.assertTrue(evidence_path.is_file())
+        resumed, orphans = persistence.resume()
+
+        self.assertEqual(orphans, ())
+        self.assertTrue(evidence_path.is_file())
+        self.assertIn(
+            "reports/T-1-verification-1.md",
+            resumed.state.referenced_artifacts(),
+        )
 
     def test_replaying_a_settled_operation_is_idempotent(self) -> None:
         persistence, loaded, _ = self._fresh()
@@ -562,6 +606,79 @@ class TestOneCommitApi(unittest.TestCase):
                              "outcome": "failed", "evidence_refs": ["reports/T-1.md"]},
                         )
                         self.assertEqual(len(replayed.state.task("T-1").operation_history), 1)
+
+    def test_interrupted_report_to_operation_commit_preserves_or_reconciles_evidence(self) -> None:
+        """Exercise every publish/reference boundary for operation-owned report evidence."""
+        for crash_step in ("reserve", "publish", "reference", "commit"):
+            with self.subTest(crash_step=crash_step):
+                persistence, loaded, layout = self._fresh()
+
+                def attach_operation(state: RunStateV3, ref: ArtifactRef) -> RunStateV3:
+                    task = state.task("T-1").with_appended_operation({
+                        "operation_id": "verification:1",
+                        "kind": "verification",
+                        "outcome": "succeeded",
+                        "evidence_refs": [ref.relative_path],
+                    })
+                    return state.with_task(task)
+
+                def crash(step: str) -> None:
+                    if step == crash_step:
+                        raise RuntimeError(f"killed at {step}")
+
+                with self.assertRaises(RuntimeError):
+                    persistence.record_report(
+                        loaded,
+                        key="verification:T-1",
+                        name="T-1-verification-1.md",
+                        content="# verification\npassed\n",
+                        mutate=attach_operation,
+                        on_step=crash,
+                    )
+
+                evidence = layout.reports_dir / "T-1-verification-1.md"
+                resumed, orphans = persistence.resume()
+                task = resumed.state.task("T-1")
+
+                if crash_step == "commit":
+                    self.assertTrue(evidence.is_file())
+                    self.assertEqual(len(task.operation_history), 1)
+                    self.assertIn(
+                        "reports/T-1-verification-1.md",
+                        resumed.state.referenced_artifacts(),
+                    )
+                    replayed = persistence.record_task_operation(
+                        resumed,
+                        "T-1",
+                        task.operation_history[0],
+                    )
+                    self.assertEqual(
+                        len(replayed.state.task("T-1").operation_history), 1
+                    )
+                    self.assertEqual(orphans, ())
+                else:
+                    self.assertEqual(task.operation_history, ())
+                    self.assertNotIn(
+                        "reports/T-1-verification-1.md",
+                        resumed.state.referenced_artifacts(),
+                    )
+                    if crash_step == "reserve":
+                        self.assertFalse(evidence.exists())
+                        self.assertEqual(orphans, ())
+                    else:
+                        self.assertFalse(evidence.exists())
+                        self.assertEqual(len(orphans), 1)
+                        self.assertEqual(
+                            orphans[0].original,
+                            "reports/T-1-verification-1.md",
+                        )
+                        self.assertTrue(
+                            (
+                                layout.orphans_dir
+                                / "reports"
+                                / "T-1-verification-1.md"
+                            ).is_file()
+                        )
 
 
 class TestArtifactNameValidation(unittest.TestCase):

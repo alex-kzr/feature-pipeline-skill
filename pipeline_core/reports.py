@@ -328,15 +328,28 @@ class VerifierArtifacts:
 
 
 def verifier_artifacts(
-    run_dir: str | Path, task_id: str, attempt: int
+    run_dir: str | Path, task_id: str, attempt: int, *, revision: int | None = None,
 ) -> VerifierArtifacts:
-    """Resolve every artifact path for ``task_id``'s ``attempt``-th independent verification."""
+    """Resolve immutable artifacts for one independent verification pass.
+
+    An amended task may reuse its repair attempt while its governing contract revision
+    changes.  That revision receives a distinct directory so stale verifier reports cannot
+    be read as evidence for the new contract.
+    """
     if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
         raise ReportError(
             f"verification attempt must be a positive integer, got {attempt!r}",
             "invalid-verification-attempt",
         )
-    directory = Path(run_dir) / REPORTS_DIRNAME / str(task_id) / f"verify-{attempt}"
+    suffix = f"verify-{attempt}"
+    if revision is not None:
+        if not isinstance(revision, int) or isinstance(revision, bool) or revision < 1:
+            raise ReportError(
+                f"verification revision must be a positive integer, got {revision!r}",
+                "invalid-verification-revision",
+            )
+        suffix += f"-revision-{revision}"
+    directory = Path(run_dir) / REPORTS_DIRNAME / str(task_id) / suffix
     return VerifierArtifacts(
         task_id=str(task_id),
         attempt=attempt,
@@ -582,8 +595,9 @@ def write_repair_report(
         "",
         f"- Write only inside: {scope}",
         f"- Never touch: {out_of_scope}",
-        "- Do not widen scope to satisfy a finding; an out-of-scope need is a blocker or a "
-        "discovery, never a change in this task.",
+        "- Treat the declared scope as the original estimate. If functionality needs another "
+        "safe path, preserve its attribution and provide a rationale and amended acceptance "
+        "criteria for independent review; never use an amendment to authorize a safety boundary.",
         "",
         "## Task-verifier report (verbatim)",
         "",

@@ -705,6 +705,66 @@ class ResumeAndSafetyTests(unittest.TestCase):
                 operations,
             )
 
+    def test_an_unsafe_scope_amendment_path_is_rejected_without_a_verifier_launch(self) -> None:
+        """ROC-03 AC-3: an amendment can widen the *reviewed* scope, never a safety category.
+
+        An executor-owned path that looks like a secret is refused mechanically, before any
+        verifier ever runs — so a secret value can never reach a verifier prompt or report —
+        and the task stays unfinished (never a terminal task status, never unblocked).
+        """
+
+        class UnsafeScopeExecutor(sa.ScriptedExecutor):
+            def launch(self, request):  # noqa: ANN001 - test double
+                if not (request.no_tools or request.resume_session_id):
+                    unsafe = Path(request.working_root) / "fixtures/execution/work/secrets.txt"
+                    unsafe.parent.mkdir(parents=True, exist_ok=True)
+                    unsafe.write_text(
+                        "token=do-not-leak-this-secret-value", encoding="utf-8")
+                return super().launch(request)
+
+        class UnreachedVerifier(sa.ScriptedVerifier):
+            def launch(self, request):  # noqa: ANN001 - test double
+                raise AssertionError(
+                    "an amendment can never authorize a safety category; no verifier may "
+                    "launch over an unsafe executor-owned path")
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(("git", "init", "-q"), cwd=root, check=True)
+            (root / "fixtures" / "execution" / "work").mkdir(parents=True, exist_ok=True)
+            (root / ".gitkeep").write_text("", encoding="utf-8")
+            subprocess.run(("git", "add", "."), cwd=root, check=True)
+            subprocess.run(
+                ("git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                 "commit", "-qm", "fixture baseline"),
+                cwd=root,
+                check=True,
+            )
+            result = self._run_once(
+                root,
+                executor=UnsafeScopeExecutor(("implemented",)),
+                task=UnreachedVerifier(("PASS",)),
+                test=UnreachedVerifier(("PASS",)),
+                controls=ExecuteControls(plan_approved=True))
+
+            self.assertEqual(result.status, "blocked")
+            self.assertEqual(result.exit_code, EXIT_BLOCKED)
+            self.assertIn("scope-safety-violation", result.message)
+            self.assertIn("secrets.txt", result.message)
+
+            run = Run.load(result.run_dir, root)
+            record = run.task("EX-01")
+            # Safety is never authorized by an amendment: the task stays at its non-terminal
+            # public status, and no unblock transition is ever recorded.
+            self.assertEqual(record.status, "in_progress")
+            self.assertNotIn(
+                "unblock", " ".join(entry["outcome"] for entry in record.operation_history))
+            self.assertTrue(
+                any(entry.get("kind") == "wait" and entry.get("outcome") == "blocked"
+                    for entry in record.operation_history),
+                record.operation_history,
+            )
+
     def test_unattended_opt_in_satisfies_the_plan_gate(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

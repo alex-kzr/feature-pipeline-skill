@@ -546,5 +546,58 @@ class ResumeAtRepairBoundaryTests(unittest.TestCase):
             self.assertEqual(result.status, "done")
 
 
+# --- ROC-01 AC-2: escalate at the advisory threshold, then resume without unblocking --------
+
+
+class ResumeAfterEscalationReachesCompletionTests(unittest.TestCase):
+    """ROC-01 AC-2 — crossing ``max_repair_attempts`` stops a bounded invocation with a
+    truthful non-zero exit while the task stays unfinished (``in_progress``, no blocker, no
+    task-set replacement). A later authorized invocation resumes the very same task record and
+    reaches independently verified ``done`` without any unblock transition."""
+
+    def test_escalation_then_resume_reaches_verified_completion_without_unblock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            life = _run(root)
+            spec = _spec(max_repair_attempts=0)
+
+            escalated = run_task(
+                life,
+                _execution(spec, ScriptedExecutor(("implemented",)),
+                           StubVerifier(("FAIL",)), StubVerifier(("PASS",))),
+            )
+
+            # A bounded invocation stops truthfully; the underlying task record is neither
+            # blocked nor terminal, and history explains why.
+            self.assertEqual(escalated.status, "escalated")
+            self.assertNotEqual(escalated.exit_code, 0)
+            record = life.run.task("VR-03")
+            self.assertEqual(record.status, "in_progress")
+            self.assertIsNone(record.blocker)
+            self.assertEqual(record.operation_history[-1]["outcome"], "escalated")
+            history_before = len(record.operation_history)
+
+            # A later authorized continuation performs another operation on the identical
+            # record — no reset, no cancellation/replacement, no unblock call — and this time
+            # reaches independently verified completion.
+            reloaded = Run.load(life.run.run_dir, root)
+            self.assertEqual(reloaded.task("VR-03").status, "in_progress")
+            resumed = run_task(
+                RunLifecycle(reloaded),
+                _execution(spec, ScriptedExecutor(("implemented",)),
+                           StubVerifier(("PASS",)), StubVerifier(("PASS",))),
+            )
+
+            self.assertEqual(resumed.status, "done")
+            self.assertEqual(reloaded.task("VR-03").status, "done")
+            self.assertEqual(reloaded.task("VR-03").resolution, "completed")
+            # The escalation's operation history is preserved, not erased or replaced.
+            self.assertGreater(len(reloaded.task("VR-03").operation_history), history_before)
+            self.assertEqual(
+                reloaded.task("VR-03").operation_history[history_before - 1]["outcome"],
+                "escalated",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

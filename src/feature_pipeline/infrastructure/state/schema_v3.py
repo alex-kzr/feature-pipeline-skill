@@ -836,9 +836,10 @@ class RunStateV3:
     def referenced_artifacts(self) -> frozenset[str]:
         """Every run-relative evidence path this state names.
 
-        The union of the :attr:`artifacts` registry values and each task's
-        ``execution_evidence.executor_report`` — the paths orphan reconciliation
-        (``docs/adr/004``) must keep.
+        The union of the :attr:`artifacts` registry values, each task's
+        ``execution_evidence.executor_report``, and operation-history
+        ``evidence_refs`` — the paths orphan reconciliation (``docs/adr/004``)
+        must keep.
         """
         refs: set[str] = {
             value for value in self.artifacts.values() if isinstance(value, str)
@@ -847,6 +848,14 @@ class RunStateV3:
             report = task.execution_evidence.executor_report
             if isinstance(report, str) and report:
                 refs.add(report)
+            for operation in task.operation_history:
+                evidence_refs = operation.get("evidence_refs")
+                if isinstance(evidence_refs, (list, tuple)):
+                    refs.update(
+                        reference
+                        for reference in evidence_refs
+                        if isinstance(reference, str) and reference
+                    )
         return frozenset(refs)
 
 
