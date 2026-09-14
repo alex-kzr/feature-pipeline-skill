@@ -10,7 +10,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from pipeline_core.adapters import AdapterError, ClaudeAdapter, LaunchResult
+from pipeline_core.adapters import (
+    AdapterError,
+    ClaudeAdapter,
+    CodexAdapter,
+    CompletedProcess,
+    LaunchResult,
+)
 from pipeline_core.dispatch import DispatchError, DispatchRequest, dispatch_executor as _dispatch_executor
 from pipeline_core.lifecycle import RunLifecycle
 from pipeline_core.prompt_envelope import EnvelopeAnchors, build_executor_envelope
@@ -1088,6 +1094,81 @@ class DispatchAttributionTests(unittest.TestCase):
 
             self.assertEqual(outcome.status, "implemented")
             self.assertFalse((root / repair_path).is_symlink())
+
+
+class CodexIsolatedWorkspaceCompositionTests(unittest.TestCase):
+    """Windows Codex executor-workspace handoff regression (PAC-03 amendment).
+
+    Runner evidence ``pac03-codex-20260914`` recorded ``Access denied`` for the
+    disposable Codex workspace on Windows. This exercises the *actual*
+    ``dispatch_executor`` -> :class:`CodexAdapter` -> subprocess composition — not a
+    hand-built :func:`build_codex_argv` fixture — so the effective routed working
+    root, its matching ``--add-dir`` grant, and the runner's own post-window read
+    access are all proven together, without weakening sandbox isolation.
+    """
+
+    def test_codex_executor_reads_and_writes_its_routed_isolated_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _init_repo(root)
+            spec = _spec(allowed_scope=("src.py",))
+            life = _running_life(root, spec)
+
+            observed: dict[str, object] = {}
+
+            def fake_runner(argv, *, prompt, cwd, timeout, env):  # noqa: ANN001
+                cd_value = argv[argv.index("--cd") + 1]
+                add_dirs = [
+                    argv[index + 1] for index, token in enumerate(argv) if token == "--add-dir"
+                ]
+                observed["cd"] = cd_value
+                observed["cwd"] = cwd
+                observed["add_dirs"] = add_dirs
+                # Prove the granted directory is actually writable and readable by the
+                # launched process: the exact failure mode ("Access denied") recorded
+                # against the disposable Codex workspace on Windows.
+                target = Path(cd_value) / "src.py"
+                target.write_text("print('written by codex')\n", encoding="utf-8")
+                observed["read_back"] = target.read_text(encoding="utf-8")
+                payload = {
+                    "role": "executor", "status": "implemented",
+                    "task_id": spec.id, "attempt": 1,
+                }
+                events = [
+                    json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+                    json.dumps({
+                        "type": "item.completed",
+                        "item": {"type": "agent_message", "text": json.dumps(payload)},
+                    }),
+                    json.dumps({"type": "turn.completed"}),
+                ]
+                return CompletedProcess(0, "\n".join(events), "")
+
+            adapter = CodexAdapter(executable="codex", runner=fake_runner)
+            outcome = dispatch_executor(life, _request(spec), adapter)
+
+            self.assertEqual(outcome.status, "implemented")
+            # The launched process could read back exactly what it wrote: no
+            # Windows sandbox "Access denied" against the routed workspace.
+            self.assertEqual(observed["read_back"], "print('written by codex')\n")
+            # The `--cd` argv value is exactly the process cwd, and it carries its own
+            # `--add-dir` grant (the Windows workspace-write fix).
+            self.assertEqual(str(observed["cwd"]), observed["cd"])
+            self.assertIn(observed["cd"], observed["add_dirs"])
+            # The routed workspace is disposable and isolated from the primary
+            # worktree, never the primary worktree itself or a subpath of it.
+            self.assertNotEqual(Path(str(observed["cd"])), root)
+            self.assertFalse(str(observed["cd"]).startswith(str(root)))
+            # The runner can subsequently read the attributed delta: this is the
+            # scoped sentinel/attributed-delta half of the handoff, proven through
+            # the real attribution and promotion path rather than a bespoke fixture.
+            self.assertEqual(
+                (root / "src.py").read_text(encoding="utf-8"), "print('written by codex')\n")
+            self.assertEqual(outcome.attribution.state, "known")
+            self.assertEqual(
+                [row["path"] for row in outcome.attribution.changed_files], ["src.py"])
+            # The task status remains inside the three-state model throughout.
+            self.assertEqual(life.run.task(spec.id).status, "in_progress")
 
 
 if __name__ == "__main__":
