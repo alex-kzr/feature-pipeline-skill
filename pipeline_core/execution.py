@@ -104,6 +104,7 @@ from .plan import (
     contract_digest as amendment_contract_digest,
 )
 from .prompt_envelope import EnvelopeAnchors
+from .reconciliation_registry import reconciliation_supersession_graph
 from .state import ACTOR_RUNNER, ResumeError, Run, StateError, pid_alive, read_lease, repo_relative
 from .preconditions import GitRunner, bind_refs, evaluate_preconditions
 from .task_files import upsert_blockers_section
@@ -1475,17 +1476,38 @@ def _reconcile_projection(
 def reconcile_historical_cards(
     life: RunLifecycle, board_path: Path, by_id: Mapping[str, TaskSpec],
 ) -> tuple[str, ...]:
-    """Retire stale cards only when declared replacements have verified evidence."""
+    """Retire stale cards only when declared replacements have verified evidence.
+
+    Two independent sources of a declared replacement are consulted: each task file's own
+    ``## Supersession`` grammar, and the project-declared legacy reconciliation registry
+    (:mod:`pipeline_core.reconciliation_registry`) — used for a direct mapping whose completed
+    replacement contract cannot be edited to add its own declaration without invalidating its
+    recorded PASS/PASS evidence. Either source failing to validate (malformed, cyclic, self,
+    duplicate, or an unknown task) contributes no edges rather than raising; a card is only
+    ever retired by an edge whose replacement carries its own exact eligible evidence.
+    """
 
     graph = supersession_graph(by_id, life.run.repo_root)
-    if graph is None:
+    registry = reconciliation_supersession_graph(life.run.repo_root)
+    if graph is None and registry is None:
         return ()
     store = VerifiedEvidenceStore(life.run.run_dir.parent, life.run.repo_root)
     replacements: dict[str, tuple[str, Mapping[str, str]]] = {}
-    for edge in graph.edges:
-        evidence = find_superseding_evidence(store, graph, edge.superseded, by_id)
-        if evidence is not None:
-            replacements[edge.superseded] = evidence
+    if graph is not None:
+        for edge in graph.edges:
+            evidence = find_superseding_evidence(store, graph, edge.superseded, by_id)
+            if evidence is not None:
+                replacements[edge.superseded] = evidence
+    if registry is not None:
+        registry_graph, registry_definitions = registry
+        for edge in registry_graph.edges:
+            if edge.superseded in replacements:
+                continue
+            evidence = find_superseding_evidence(
+                store, registry_graph, edge.superseded, registry_definitions
+            )
+            if evidence is not None:
+                replacements[edge.superseded] = evidence
     try:
         removed = remove_historical_cards(board_path, tuple(replacements))
     except BoardProjectionError as exc:
