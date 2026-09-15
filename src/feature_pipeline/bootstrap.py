@@ -850,6 +850,55 @@ def run_execute(
         (project_dir / storage_rel) if storage_rel else project_dir / ".pipeline" / "runs"
     ) / feature
 
+    # A resumed run owns its model/effort pair.  Hydrate an entirely omitted pair before
+    # recompiling so the immutable plan fingerprint and the dispatched runtime agree.
+    if command.resume and command.model is None and command.effort is None:
+        try:
+            recorded = Run.load(run_dir, project_dir)
+        except StateError:
+            recorded = None
+        if recorded is not None:
+            model = (recorded.controls.get("model", {}) or {}).get("value")
+            effort = (recorded.controls.get("effort", {}) or {}).get("value")
+            if model is not None or effort is not None:
+                if not isinstance(model, str) or not isinstance(effort, str):
+                    raise CliError(
+                        EXIT_ERROR,
+                        "runtime-control-invalid: recorded model and effort controls "
+                        "must be a complete string pair",
+                    )
+                command = replace(command, model=model, effort=effort)
+                try:
+                    compiled_plan = compile_run_plan(
+                        feature=feature,
+                        definitions=[
+                            ShallowTaskInput(
+                                s.id, s.task_type, tuple(s.depends_on), s.executor,
+                                tuple(s.allowed_scope), tuple(s.out_of_scope),
+                                s.max_repair_attempts, s.preconditions,
+                            )
+                            for s in specs
+                        ],
+                        profile=compiled_profile_from_core(profile),
+                        overrides=ControlOverrides(
+                            max_repair_attempts=command.max_repair_attempts,
+                            routine_output_byte_budget=command.routine_output_byte_budget,
+                            diagnostic_output_byte_budget=command.diagnostic_output_byte_budget,
+                            adapter=command.adapter,
+                            model=command.model,
+                            effort=command.effort,
+                            verify_dependency_chain=command.verify_dependency_chain,
+                        ),
+                        adapters=adapter_registry,
+                        task=command.task,
+                        through=command.through,
+                        allow_unavailable_adapter=True,
+                    )
+                except DomainError as exc:
+                    raise CliError(
+                        EXIT_ERROR, f"{getattr(exc, 'code', 'plan-error')}: {exc}"
+                    ) from None
+
     try:
         execution_scope = tuple(compiled_plan.execution_scope)
         required_input_dirs = build_required_input_dirs(

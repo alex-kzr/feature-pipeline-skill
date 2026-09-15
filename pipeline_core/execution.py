@@ -1610,6 +1610,29 @@ def _resolve_unset_dependency_chain_control(request: ExecuteRequest) -> ExecuteR
     return replace(request, controls=replace(request.controls, verify_dependency_chain=value))
 
 
+def _hydrate_resume_runtime_controls(request: ExecuteRequest) -> ExecuteRequest:
+    """Restore an omitted model/effort pair from the immutable run record.
+
+    A resume may deliberately omit both runtime flags.  Supplying only one remains an
+    invalid override and is left for normal validation; it must never combine a caller value
+    with a persisted value.
+    """
+    controls = request.controls
+    if not controls.resume or controls.model is not None or controls.effort is not None:
+        return request
+    recorded = Run.load(request.run_dir, request.repo_root)
+    model = (recorded.controls.get("model", {}) or {}).get("value")
+    effort = (recorded.controls.get("effort", {}) or {}).get("value")
+    if model is None and effort is None:
+        return request
+    if not isinstance(model, str) or not isinstance(effort, str):
+        raise ExecutionError(
+            "recorded model and effort controls must be a complete string pair",
+            "runtime-control-invalid",
+        )
+    return replace(request, controls=replace(controls, model=model, effort=effort))
+
+
 def _substitute_superseded_scope(
     scope: Sequence[str], selected: Sequence[str], order: Sequence[str],
     definitions: Mapping[str, TaskSpec], repo_root: Path,
@@ -1852,6 +1875,7 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
     verification, release, archive, purge, or recovery code is called from here.
     """
     try:
+        request = _hydrate_resume_runtime_controls(request)
         request = _resolve_unset_dependency_chain_control(request)
     except (StateError, ExecutionError) as exc:
         return _error(f"{getattr(exc, 'code', 'state-error')}: {exc}", request)

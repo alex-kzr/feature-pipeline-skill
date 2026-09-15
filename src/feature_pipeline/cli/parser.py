@@ -54,11 +54,19 @@ FEATURE_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 SOURCE_FEATURE_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
+class _StableHelpFormatter(argparse.HelpFormatter):
+    """Keep the frozen CLI help surface independent of the terminal environment."""
+
+    def __init__(self, prog: str) -> None:
+        super().__init__(prog, width=78)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="run_pipeline.py",
         description="Portable feature-pipeline core runner. Every path is an explicit anchor "
                     "or a logical path resolved below one; nothing is inferred.",
+        formatter_class=_StableHelpFormatter,
     )
     anchors = parser.add_argument_group("explicit anchors (filesystem roots)")
     anchors.add_argument("--project-root", metavar="DIR",

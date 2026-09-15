@@ -507,6 +507,41 @@ class ResumeAndSafetyTests(unittest.TestCase):
             self.assertEqual(run.controls["adapter_resolved"]["value"], "claude")
             self.assertTrue(executor.calls[0]["is_repair"])
 
+    def test_resume_hydrates_the_persisted_codex_model_and_effort(self) -> None:
+        """An omitted runtime pair resumes with the exact persisted Codex settings."""
+        class CapturingExecutor(sa.ScriptedExecutor):
+            def launch(self, request):  # noqa: ANN001 - deterministic protocol fixture
+                self.runtime = (request.model, request.effort)
+                return super().launch(request)
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = execute_run(_request(
+                root, _specs(("EX-01",)), executor=sa.ScriptedExecutor(("implemented",)),
+                launchers=VerifierLaunchers(
+                    task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))),
+                controls=ExecuteControls(
+                    plan_approved=True, adapter="codex", adapter_explicit=True,
+                    model="gpt-5.6-terra", effort="medium",
+                ), environment={"codex": True}))
+            self.assertTrue(first.ok, first.message)
+            persisted = Run.load(first.run_dir, root)
+            persisted.task("EX-01").status = "in_progress"
+            persisted.status = "running"
+            persisted.save()
+
+            executor = CapturingExecutor(("implemented",))
+            resumed = execute_run(_request(
+                root, _specs(("EX-01",)), executor=executor,
+                launchers=VerifierLaunchers(
+                    task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))),
+                controls=ExecuteControls(
+                    plan_approved=True, resume=True, adapter="codex", adapter_explicit=True,
+                ), environment={"codex": True}))
+
+            self.assertTrue(resumed.ok, resumed.message)
+            self.assertEqual(executor.runtime, ("gpt-5.6-terra", "medium"))
+
     def test_blocked_executor_resume_opens_a_new_generation_and_preserves_launch_one(self) -> None:
         """RLC-01 AC-3 exercises the real execute/resume path, rather than a serialized
         state fixture: an executor permission wait is non-terminal, and a compatible resume
