@@ -1108,6 +1108,22 @@ class AttestDependencyTests(unittest.TestCase):
             self.assertEqual(resumed.status, "error")
             self.assertIn("verify-dependency-chain-mismatch", resumed.message)
 
+    def test_resume_retains_persisted_false_dependency_chain_when_unset(self) -> None:
+        with TemporaryDirectory() as directory:
+            root, prompt, plan = self._seed(directory)
+            first = execute_run(self._request(
+                root, prompt, plan, task_ids=("EX-01", "EX-02"),
+                executor=sa.ScriptedExecutor(("implemented", "implemented")),
+                controls=ExecuteControls(plan_approved=True, task="EX-02",
+                    verify_dependency_chain=False)))
+            self.assertTrue(first.ok, first.message)
+
+            resumed = execute_run(self._request(
+                root, prompt, plan, task_ids=("EX-01", "EX-02"),
+                controls=ExecuteControls(plan_approved=True, task="EX-02", resume=True,
+                    verify_dependency_chain=None)))
+            self.assertTrue(resumed.ok, resumed.message)
+
 
 class RuntimeSupersessionDefaultReuseTests(unittest.TestCase):
     """REC-14: execute must consume the same default-reuse resolution as preview."""

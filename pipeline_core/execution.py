@@ -315,7 +315,9 @@ class ExecuteControls:
     #: only alongside ``task`` — ``--through`` resolves its own dependency closure and must
     #: never trust an external attestation instead.
     attested_dependencies: tuple[tuple[str, str], ...] = ()
-    verify_dependency_chain: bool = False
+    #: ``None`` means the CLI supplied no chain-policy control.  On resume it inherits the
+    #: durable value; on a fresh run it resolves to the documented ``False`` default.
+    verify_dependency_chain: bool | None = False
     grants: tuple[str, ...] = ()
     approvals: tuple[str, ...] = ()
     published_refs: tuple[tuple[str, str], ...] = ()
@@ -1591,6 +1593,23 @@ def _resolve_selection_and_scope(
     return selected, [task_id for task_id in order if task_id in closure]
 
 
+def _resolve_unset_dependency_chain_control(request: ExecuteRequest) -> ExecuteRequest:
+    """Materialize an omitted chain-policy control before selection or resume validation."""
+    if request.controls.verify_dependency_chain is not None:
+        return request
+    if not request.controls.resume:
+        value = False
+    else:
+        recorded = Run.load(request.run_dir, request.repo_root)
+        value = (recorded.controls.get("verify_dependency_chain", {}) or {}).get("value", False)
+        if not isinstance(value, bool):
+            raise ExecutionError(
+                "recorded verify-dependency-chain control is invalid",
+                "verify-dependency-chain-invalid",
+            )
+    return replace(request, controls=replace(request.controls, verify_dependency_chain=value))
+
+
 def _substitute_superseded_scope(
     scope: Sequence[str], selected: Sequence[str], order: Sequence[str],
     definitions: Mapping[str, TaskSpec], repo_root: Path,
@@ -1832,6 +1851,11 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
     Stages 10–16 are never reached: no documentation, knowledge-graph refresh, final
     verification, release, archive, purge, or recovery code is called from here.
     """
+    try:
+        request = _resolve_unset_dependency_chain_control(request)
+    except (StateError, ExecutionError) as exc:
+        return _error(f"{getattr(exc, 'code', 'state-error')}: {exc}", request)
+
     specs = list(request.specs)
     if not specs:
         return _error("execute mode needs at least one task in the plan", request)
