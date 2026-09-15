@@ -887,7 +887,9 @@ def run_execute(
                             adapter=command.adapter,
                             model=command.model,
                             effort=command.effort,
-                            verify_dependency_chain=command.verify_dependency_chain,
+                            verify_dependency_chain=(
+                                True if command.verify_dependency_chain else None
+                            ),
                         ),
                         adapters=adapter_registry,
                         task=command.task,

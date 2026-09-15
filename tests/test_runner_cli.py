@@ -922,6 +922,38 @@ class ExecuteModeTests(unittest.TestCase):
                 .read_text(encoding="utf-8"))
             self.assertEqual(run["tasks"][0]["status"], "done")
 
+    def test_cli_resume_inherits_persisted_false_dependency_chain_control(self) -> None:
+        """An omitted CLI flag must not override the durable false chain policy on resume."""
+        feature = "three-state-task-lifecycle-tsl02-retry2"
+        with TemporaryDirectory() as directory:
+            seed = self._seed_rich(directory, [RICH_EXECUTE_TASK])
+            plan_path = seed["project_dir"] / "plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["feature"] = feature
+            plan_path.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+            args = seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.json",
+                "--mode", "execute", "--approve-plan",
+            ]
+            with patch.object(use_cases, "make_execute_adapters", _fake_execute_adapters):
+                first_code, _out, first_err = _run(args + [
+                    "--adapter", "claude", "--model", "sonnet", "--effort", "medium",
+                ])
+                self.assertEqual(first_code, 0, first_err)
+
+                run_dir = seed["project_dir"] / ".pipeline" / "runs" / feature
+                recorded = Run.load(run_dir, seed["project_dir"])
+                recorded.task("TSK-01").status = "in_progress"
+                recorded.status = "running"
+                recorded.save()
+
+                resumed_code, resumed_out, resumed_err = _run(
+                    args + ["--resume", "--adapter", "claude"]
+                )
+
+            self.assertEqual(resumed_code, 0, resumed_err)
+            self.assertIn("verified", resumed_out)
+
     def test_execute_rejects_an_id_and_type_only_plan(self) -> None:
         with TemporaryDirectory() as directory:
             seed = self._seed_rich(directory, [{"id": "TSK-01", "type": "docs"}])
