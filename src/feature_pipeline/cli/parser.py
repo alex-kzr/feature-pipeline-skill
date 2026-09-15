@@ -96,7 +96,9 @@ def build_parser() -> argparse.ArgumentParser:
                           "without dispatching it in this run. Repeatable; real control for "
                           "--mode execute and for --dry-run (both resolve and validate the "
                           "source run read-only), accepted as a no-op otherwise")
-    run.add_argument("--verify-dependency-chain", action="store_true",
+    # Keep omission distinct from an explicit chain-verification request.  A resumed run
+    # inherits the durable policy when this is ``None``; ``False`` is the fresh-run default.
+    run.add_argument("--verify-dependency-chain", action="store_true", default=None,
                      help="verify the selected task's full dependency closure in this run; "
                           "by default eligible verified dependencies are reused")
     run.add_argument("--resume", action="store_true",

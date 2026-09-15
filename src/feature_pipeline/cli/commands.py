@@ -36,7 +36,9 @@ class RunCommand:
     task: str | None
     through: str | None
     attest_dependency: list[str] = field(default_factory=list)
-    verify_dependency_chain: bool = False
+    # ``None`` means the switch was omitted.  This is significant on ``--resume``, where
+    # execution inherits the immutable value from run.json.
+    verify_dependency_chain: bool | None = None
     resume: bool = False
     mode: str = "plan-only"
     feature: str | None = None

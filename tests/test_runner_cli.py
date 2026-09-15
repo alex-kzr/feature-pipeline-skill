@@ -19,6 +19,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from feature_pipeline.cli import use_cases
+from feature_pipeline import bootstrap
 from feature_pipeline.cli.commands import RunCommand
 from feature_pipeline.cli.parser import build_parser
 from feature_pipeline.ports.adapters import AdapterCapabilities, AdapterRegistry
@@ -922,11 +923,12 @@ class ExecuteModeTests(unittest.TestCase):
                 .read_text(encoding="utf-8"))
             self.assertEqual(run["tasks"][0]["status"], "done")
 
-    def test_cli_resume_inherits_persisted_false_dependency_chain_control(self) -> None:
-        """An omitted CLI flag must not override the durable false chain policy on resume."""
+    def test_tsl02_cli_resume_inherits_persisted_false_dependency_chain_control(self) -> None:
+        """TSL-02's historical false policy survives an omitted CLI switch on resume."""
         feature = "three-state-task-lifecycle-tsl02-retry2"
         with TemporaryDirectory() as directory:
-            seed = self._seed_rich(directory, [RICH_EXECUTE_TASK])
+            task = dict(RICH_EXECUTE_TASK, id="TSL-02")
+            seed = self._seed_rich(directory, [task])
             plan_path = seed["project_dir"] / "plan.json"
             plan = json.loads(plan_path.read_text(encoding="utf-8"))
             plan["feature"] = feature
@@ -943,16 +945,29 @@ class ExecuteModeTests(unittest.TestCase):
 
                 run_dir = seed["project_dir"] / ".pipeline" / "runs" / feature
                 recorded = Run.load(run_dir, seed["project_dir"])
-                recorded.task("TSK-01").status = "in_progress"
+                self.assertIs(
+                    recorded.controls["verify_dependency_chain"]["value"], False
+                )
+                recorded.task("TSL-02").status = "in_progress"
                 recorded.status = "running"
                 recorded.save()
 
-                resumed_code, resumed_out, resumed_err = _run(
-                    args + ["--resume", "--adapter", "claude"]
-                )
+                resume_args = args + ["--resume", "--adapter", "claude"]
+                parsed = RunCommand.from_args(build_parser().parse_args(resume_args))
+                self.assertIsNone(parsed.verify_dependency_chain)
+                captured = []
+                original_execute_run = bootstrap.execute_run
+
+                def capture_execute_run(request):  # noqa: ANN001 - boundary probe
+                    captured.append(request.controls.verify_dependency_chain)
+                    return original_execute_run(request)
+
+                with patch.object(bootstrap, "execute_run", capture_execute_run):
+                    resumed_code, resumed_out, resumed_err = _run(resume_args)
 
             self.assertEqual(resumed_code, 0, resumed_err)
             self.assertIn("verified", resumed_out)
+            self.assertEqual(captured, [None])
 
     def test_execute_rejects_an_id_and_type_only_plan(self) -> None:
         with TemporaryDirectory() as directory:

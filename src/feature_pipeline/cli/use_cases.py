@@ -633,7 +633,9 @@ def run_command(command: RunCommand) -> PipelineResult:
                 post_task=post_task,
                 post_task_lines=post_task_lines,
                 post_task_transition_line=post_task_transition_line,
-                verify_dependency_chain=command.verify_dependency_chain,
+                # Preview renders the documented resolved value; ``None`` only carries the
+                # omitted-switch provenance into execute/resume.
+                verify_dependency_chain=bool(command.verify_dependency_chain),
                 execution_scope=(
                     execution_scope
                 ),
