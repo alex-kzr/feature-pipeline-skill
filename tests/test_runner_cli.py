@@ -969,6 +969,44 @@ class ExecuteModeTests(unittest.TestCase):
             self.assertIn("verified", resumed_out)
             self.assertEqual(captured, [None])
 
+    def test_tsl02_cli_resume_inherits_recorded_codex_runtime_before_compile(self) -> None:
+        """A bare resume must not compile a recorded Codex run against Claude defaults."""
+        feature = "three-state-task-lifecycle-tsl02-retry2"
+        with TemporaryDirectory() as directory:
+            task = dict(RICH_EXECUTE_TASK, id="TSL-02")
+            seed = self._seed_rich(directory, [task])
+            plan_path = seed["project_dir"] / "plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["feature"] = feature
+            plan_path.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+            args = seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.json",
+                "--mode", "execute", "--approve-plan",
+            ]
+
+            def codex_adapters(_project_dir, _agents_root, _core_root=None):
+                executor = ScriptedExecutor(("implemented",))
+                launchers = VerifierLaunchers(
+                    task=StubVerifier(("PASS",)), test=StubVerifier(("PASS",)))
+                return executor, launchers, {"claude": True, "codex": True}
+
+            with patch.object(use_cases, "make_execute_adapters", codex_adapters):
+                first_code, _out, first_err = _run(args + [
+                    "--adapter", "codex", "--model", "gpt-5.6-terra", "--effort", "medium",
+                ])
+                self.assertEqual(first_code, 0, first_err)
+
+                run_dir = seed["project_dir"] / ".pipeline" / "runs" / feature
+                recorded = Run.load(run_dir, seed["project_dir"])
+                recorded.task("TSL-02").status = "in_progress"
+                recorded.status = "running"
+                recorded.save()
+
+                resumed_code, resumed_out, resumed_err = _run(args + ["--resume"])
+
+            self.assertEqual(resumed_code, 0, resumed_err)
+            self.assertIn("verified", resumed_out)
+
     def test_execute_rejects_an_id_and_type_only_plan(self) -> None:
         with TemporaryDirectory() as directory:
             seed = self._seed_rich(directory, [{"id": "TSK-01", "type": "docs"}])

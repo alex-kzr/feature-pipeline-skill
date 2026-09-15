@@ -858,8 +858,13 @@ def run_execute(
         except StateError:
             recorded = None
         if recorded is not None:
+            recorded_adapter = (
+                recorded.controls.get("adapter_requested", {}) or {}
+            ).get("value")
             model = (recorded.controls.get("model", {}) or {}).get("value")
             effort = (recorded.controls.get("effort", {}) or {}).get("value")
+            if command.adapter is None and recorded_adapter in {"claude", "codex"}:
+                command = replace(command, adapter=recorded_adapter)
             if model is not None or effort is not None:
                 if not isinstance(model, str) or not isinstance(effort, str):
                     raise CliError(
