@@ -13,6 +13,7 @@ from pipeline_core.adapters import LaunchResult
 from pipeline_core.execution import persist_task_contracts, reconcile_historical_cards
 from pipeline_core.lifecycle import RunLifecycle
 from pipeline_core.state import ACTOR_RUNNER, Run
+from pipeline_core.task_files import load_task_spec
 from pipeline_core.verification import (
     VerificationEvidence,
     VerifierAnchors,
@@ -43,6 +44,76 @@ def _write_task(root: Path, spec: TaskSpec, supersedes: str | None = None) -> No
 
 
 class HistoricalCardReconciliationTests(unittest.TestCase):
+    def test_rec01_recovery_identity_retires_only_tc04_without_a_dispatch(self) -> None:
+        """REC-18: the immutable REC-01 source is enough to project TC-04 away."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = Path(__file__).resolve().parents[2]
+            rec01_path = (
+                "docs/plans/tasks/REC-01_executor-context-and-catalog-recovery.md"
+            )
+            rec01_file = root / rec01_path
+            rec01_file.parent.mkdir(parents=True, exist_ok=True)
+            rec01_file.write_bytes((repository / rec01_path).read_bytes())
+            tc04 = _spec("TC-04")
+            audit = _spec("AUD-01")
+            _write_task(root, tc04)
+            _write_task(root, audit)
+
+            board = root / "board.md"
+            board.write_text(
+                "## To Do\n"
+                "- [TC-04: stale historical task](tasks/TC-04.md)\n"
+                "- [OTHER-01: unrelated task](tasks/OTHER-01.md)\n\n"
+                "## In Progress\n"
+                "- [OTHER-02: unrelated active task](tasks/OTHER-02.md)\n",
+                encoding="utf-8",
+            )
+            source_path = root / ".pipeline/runs/rec01-verified/run.json"
+            source_path.parent.mkdir(parents=True)
+            source_path.write_text(json.dumps({
+                "schema_version": 2,
+                "run_id": "rec01-verified",
+                "status": "verified",
+                "tasks": [{
+                    "id": "REC-01",
+                    "status": "verified",
+                    "task_path": rec01_path,
+                    "task_contract_digest": (
+                        "sha256:e2bf7ced1852e5288638b2e76f28dcb190aa7447f2724514a7714581cf386e03"
+                    ),
+                    "verification": {
+                        "task_verdict": "PASS",
+                        "test_verdict": "PASS",
+                        "verified_at": "2026-09-10T14:51:14Z",
+                    },
+                }],
+            }, sort_keys=True), encoding="utf-8")
+            source_bytes = source_path.read_bytes()
+
+            current = Run.create(
+                "reconciliation", root / "prompt.md", None,
+                root / ".pipeline/runs/reconciliation", root,
+            )
+            life = RunLifecycle.initialize(current, tasks=[("AUD-01", ())])
+            rec01 = load_task_spec(rec01_file)
+            definitions = {spec.id: spec for spec in (tc04, audit)}
+            definitions[rec01.id] = rec01
+
+            self.assertEqual(
+                reconcile_historical_cards(life, board, definitions), ("TC-04",)
+            )
+            rendered = board.read_text(encoding="utf-8")
+            self.assertNotIn("TC-04", rendered)
+            self.assertIn("OTHER-01", rendered)
+            self.assertIn("OTHER-02", rendered)
+            self.assertEqual(source_path.read_bytes(), source_bytes)
+            self.assertNotIn("TC-04", current.tasks)
+            self.assertNotIn("REC-01", current.tasks)
+            event = next(entry for entry in current.history if entry["scope"] == "board-reconciliation:historical")
+            self.assertEqual(event["to"], "TC-04=REC-01")
+            self.assertIn("rec01-verified", event["note"])
+
     def test_does_not_retire_a_card_through_an_unverified_intermediate_replacement(self) -> None:
         """Each retirement needs PASS/PASS evidence for its direct formal replacement."""
         with tempfile.TemporaryDirectory() as directory:

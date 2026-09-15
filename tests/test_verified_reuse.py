@@ -13,6 +13,7 @@ from feature_pipeline.application.verified_reuse import (
     CANONICAL_CONTRACT_VERSION,
     EvidenceEligibilityError,
     LEGACY_CANONICAL_CONTRACT_VERSION,
+    REC01_RECOVERY_CONTRACT_VERSION,
     VerifiedEvidenceStore,
     canonical_task_contract,
     resolve_default_reuse,
@@ -24,6 +25,7 @@ from pipeline_core.plan import canonical_amendment_fields, contract_digest
 from pipeline_core.execution import _next_actionable, _pending_reason, persist_task_contracts
 from pipeline_core.lifecycle import RunLifecycle
 from pipeline_core.state import ACTOR_HUMAN, Run
+from pipeline_core.task_files import load_task_spec
 
 
 def _definition(
@@ -376,6 +378,60 @@ class TerminalBlockedSourceReuseTests(unittest.TestCase):
             with self.assertRaises(EvidenceEligibilityError) as denied:
                 VerifiedEvidenceStore(root / "runs", root).find(definition)
             self.assertEqual(denied.exception.code, "evidence-source-run-not-closed")
+
+
+class Rec01HistoricalEvidenceRecoveryTests(unittest.TestCase):
+    """REC-18 preserves one exact REC-01 source without trusting active peers."""
+
+    _REC01_PATH = "docs/plans/tasks/REC-01_executor-context-and-catalog-recovery.md"
+    _REC01_HISTORICAL_DIGEST = (
+        "sha256:e2bf7ced1852e5288638b2e76f28dcb190aa7447f2724514a7714581cf386e03"
+    )
+
+    @classmethod
+    def _definition(cls) -> TaskDefinition:
+        repository = Path(__file__).resolve().parents[2]
+        return TaskDefinition(
+            spec=load_task_spec(repository / cls._REC01_PATH),
+            source_format=MARKDOWN_TASK_FILE,
+        )
+
+    @classmethod
+    def _source(cls, root: Path, run_id: str, definition: TaskDefinition, *, run_status: str = "verified") -> Path:
+        source = _source(
+            root, run_id=run_id, definition=definition, run_status=run_status,
+            digest=cls._REC01_HISTORICAL_DIGEST, version=None,
+        )
+        payload = json.loads(source.read_text(encoding="utf-8"))
+        payload["tasks"][0]["task_path"] = cls._REC01_PATH
+        source.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        return source
+
+    def test_closed_exact_rec01_source_is_selected_despite_nonterminal_rec01_peer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            definition = self._definition()
+            self._source(root, "active-rec01", definition, run_status="running")
+            closed = self._source(root, "closed-rec01", definition)
+            before = closed.read_bytes()
+
+            evidence = VerifiedEvidenceStore(root / "runs", Path(__file__).resolve().parents[2]).find(definition)
+
+            self.assertEqual(evidence["source_run_id"], "closed-rec01")
+            self.assertEqual(evidence["evidence_contract_version"], REC01_RECOVERY_CONTRACT_VERSION)
+            self.assertEqual(closed.read_bytes(), before)
+
+    def test_multiple_closed_exact_rec01_sources_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            definition = self._definition()
+            for run_id in ("closed-rec01-a", "closed-rec01-b"):
+                self._source(root, run_id, definition)
+
+            with self.assertRaises(EvidenceEligibilityError) as denied:
+                VerifiedEvidenceStore(root / "runs", Path(__file__).resolve().parents[2]).find(definition)
+
+            self.assertEqual(denied.exception.code, "evidence-exact-ambiguous")
 
 
 class SupersessionReuseDenialTests(unittest.TestCase):

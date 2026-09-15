@@ -55,6 +55,8 @@ from feature_pipeline.application.task_engine import (
 from feature_pipeline.application.verified_reuse import (
     CANONICAL_CONTRACT_VERSION,
     EvidenceEligibilityError,
+    _REC01_RECOVERY_TASK_ID,
+    _REC01_RECOVERY_TASK_PATH,
     VerifiedEvidenceStore,
     canonical_task_path,
     find_superseding_evidence,
@@ -107,7 +109,7 @@ from .prompt_envelope import EnvelopeAnchors
 from .reconciliation_registry import reconciliation_supersession_graph
 from .state import ACTOR_RUNNER, ResumeError, Run, StateError, pid_alive, read_lease, repo_relative
 from .preconditions import GitRunner, bind_refs, evaluate_preconditions
-from .task_files import upsert_blockers_section
+from .task_files import TaskFileError, load_task_spec, upsert_blockers_section
 from .verification import (
     VerifierAnchors,
     VerifierLaunchers,
@@ -1519,7 +1521,10 @@ def reconcile_historical_cards(
     ever retired by an edge whose replacement carries its own exact eligible evidence.
     """
 
-    graph = supersession_graph(by_id, life.run.repo_root)
+    reconciliation_definitions = _with_rec01_recovery_definitions(
+        by_id, life.run.repo_root,
+    )
+    graph = supersession_graph(reconciliation_definitions, life.run.repo_root)
     registry = reconciliation_supersession_graph(life.run.repo_root)
     if graph is None and registry is None:
         return ()
@@ -1527,7 +1532,9 @@ def reconcile_historical_cards(
     replacements: dict[str, tuple[str, Mapping[str, str]]] = {}
     if graph is not None:
         for edge in graph.edges:
-            evidence = find_superseding_evidence(store, graph, edge.superseded, by_id)
+            evidence = find_superseding_evidence(
+                store, graph, edge.superseded, reconciliation_definitions,
+            )
             if evidence is not None:
                 replacements[edge.superseded] = evidence
     if registry is not None:
@@ -1565,6 +1572,33 @@ def reconcile_historical_cards(
     )
     life.run.save()
     return removed
+
+
+def _with_rec01_recovery_definitions(
+    by_id: Mapping[str, TaskSpec], repo_root: Path,
+) -> Mapping[str, TaskSpec]:
+    """Expose the fixed REC-01 -> TC-04 declaration to runner-only projection.
+
+    A focused recovery plan does not include either historical task in its executable
+    selection.  Read their immutable task contracts solely to evaluate the already-declared
+    replacement; neither definition is added to the run scope or dispatch set.
+    """
+    recovery_paths = {
+        "TC-04": "docs/plans/tasks/TC-04_task-kind-catalog.md",
+        _REC01_RECOVERY_TASK_ID: _REC01_RECOVERY_TASK_PATH,
+    }
+    definitions = dict(by_id)
+    for task_id, relative_path in recovery_paths.items():
+        if task_id in definitions:
+            continue
+        try:
+            spec = load_task_spec(repo_root / relative_path)
+        except (OSError, TaskFileError):
+            return by_id
+        if spec.id != task_id:
+            return by_id
+        definitions[task_id] = spec
+    return definitions
 
 
 def _resolve_selection_and_scope(

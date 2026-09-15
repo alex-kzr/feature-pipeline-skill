@@ -21,6 +21,18 @@ from feature_pipeline.domain.models import TaskDefinition
 LEGACY_CANONICAL_CONTRACT_VERSION = "rec09-v1"
 CANONICAL_CONTRACT_VERSION = "rec09-v2"
 AMENDMENT_CONTRACT_VERSION = "tam01-amendment-v1"
+# REC-01 completed before canonical-contract versions were persisted.  Its retained digest
+# is therefore useful only together with the one current canonical contract below; this is a
+# recovery identity, not a general fallback for unversioned evidence.
+REC01_RECOVERY_CONTRACT_VERSION = "rec01-recovery-v1"
+_REC01_RECOVERY_TASK_ID = "REC-01"
+_REC01_RECOVERY_TASK_PATH = "docs/plans/tasks/REC-01_executor-context-and-catalog-recovery.md"
+_REC01_RECOVERY_SOURCE_DIGEST = (
+    "sha256:e2bf7ced1852e5288638b2e76f28dcb190aa7447f2724514a7714581cf386e03"
+)
+_REC01_RECOVERY_CURRENT_DIGEST = (
+    "sha256:fa22da413eeb11d686c1b0e1787f83007593b2bf5f612ea93c36d1f554617a9e"
+)
 _SUPPORTED_CONTRACT_VERSIONS = frozenset({
     LEGACY_CANONICAL_CONTRACT_VERSION,
     CANONICAL_CONTRACT_VERSION,
@@ -217,6 +229,14 @@ class VerifiedEvidenceStore:
     ) -> str:
         """Validate the source identity using its declared digest format, never a guess."""
         version = task.get("task_contract_version")
+        if version is None and (
+            definition.id == _REC01_RECOVERY_TASK_ID
+            and expected_path == _REC01_RECOVERY_TASK_PATH
+            and task.get("task_path") == _REC01_RECOVERY_TASK_PATH
+            and task.get("task_contract_digest") == _REC01_RECOVERY_SOURCE_DIGEST
+            and task_contract_digest(definition) == _REC01_RECOVERY_CURRENT_DIGEST
+        ):
+            return REC01_RECOVERY_CONTRACT_VERSION
         if not isinstance(version, str) or version not in _SUPPORTED_CONTRACT_VERSIONS:
             raise EvidenceEligibilityError(
                 "source task has no recognized canonical contract version",
@@ -460,7 +480,7 @@ def resolve_default_reuse(
 
 
 __all__ = [
-    "CANONICAL_CONTRACT_VERSION", "LEGACY_CANONICAL_CONTRACT_VERSION", "CanonicalTaskContract", "EvidenceEligibilityError", "VerifiedEvidenceStore",
+    "CANONICAL_CONTRACT_VERSION", "LEGACY_CANONICAL_CONTRACT_VERSION", "REC01_RECOVERY_CONTRACT_VERSION", "CanonicalTaskContract", "EvidenceEligibilityError", "VerifiedEvidenceStore",
     "canonical_task_contract",
     "canonical_task_path", "find_superseding_evidence", "resolve_default_reuse", "supersession_graph", "task_contract_digest",
 ]
