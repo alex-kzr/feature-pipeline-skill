@@ -21,19 +21,39 @@ loaders).
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
 from feature_pipeline.contracts import TaskSpec
-from pipeline_core.supersession import Supersession, SupersessionError, SupersessionGraph
+from pipeline_core.supersession import SupersessionError, SupersessionGraph
 from pipeline_core.task_files import TaskFileError, load_task_spec
 
 __all__ = [
     "ReconciliationRegistryError",
+    "RegistryMapping",
     "default_registry_path",
     "load_reconciliation_registry",
     "reconciliation_supersession_graph",
 ]
+
+
+@dataclass(frozen=True)
+class RegistryMapping:
+    """One declared ``replacement`` supersedes ``superseded`` registry edge.
+
+    ``source_run`` optionally binds the edge to exactly one named source run directory
+    (under the runner's ``.pipeline/runs`` storage) — used when the replacement's own
+    verified evidence would otherwise be ambiguous across more than one closed run. It
+    names an identity for evidence resolution only; it is never itself mutated or used to
+    rewrite a run's recorded bytes. Duck-type compatible with
+    :class:`pipeline_core.supersession.Supersession` (``replacement``/``superseded``
+    attributes) so it can be used directly as a :class:`SupersessionGraph` edge.
+    """
+
+    replacement: str
+    superseded: str
+    source_run: str | None = None
 
 
 class ReconciliationRegistryError(Exception):
@@ -49,13 +69,15 @@ def default_registry_path(repo_root: str | Path) -> Path:
     return Path(repo_root) / "tools" / "feature-pipeline" / "config" / "legacy_reconciliation_registry.json"
 
 
-def load_reconciliation_registry(path: str | Path) -> tuple[Supersession, ...]:
+def load_reconciliation_registry(path: str | Path) -> tuple[RegistryMapping, ...]:
     """Parse the project registry file into ``(replacement, superseded)`` edges.
 
     A missing registry file declares no mappings. Any malformed record — the file is not a
     JSON object with a ``mappings`` array of ``{"historical_task", "replacement_task"}``
-    string pairs, a self-mapping, or a historical task named more than once — fails closed
-    with a stable diagnostic code.
+    string pairs, a self-mapping, a historical task named more than once, or a non-string /
+    blank ``"source_run"`` — fails closed with a stable diagnostic code. ``source_run`` is
+    optional; when present it names exactly one source run directory that resolves an
+    otherwise ambiguous replacement's evidence.
     """
     registry_path = Path(path)
     if not registry_path.is_file():
@@ -75,7 +97,7 @@ def load_reconciliation_registry(path: str | Path) -> tuple[Supersession, ...]:
             "reconciliation-registry-malformed",
         )
     seen_historical: set[str] = set()
-    edges: list[Supersession] = []
+    edges: list[RegistryMapping] = []
     for index, entry in enumerate(data["mappings"]):
         if not isinstance(entry, Mapping):
             raise ReconciliationRegistryError(
@@ -106,7 +128,30 @@ def load_reconciliation_registry(path: str | Path) -> tuple[Supersession, ...]:
                 "reconciliation-registry-duplicate",
             )
         seen_historical.add(historical)
-        edges.append(Supersession(replacement=replacement, superseded=historical))
+        raw_source_run = entry.get("source_run")
+        source_run: str | None
+        if raw_source_run is None:
+            source_run = None
+        elif isinstance(raw_source_run, str) and raw_source_run.strip():
+            source_run = raw_source_run.strip()
+            if (
+                "/" in source_run or "\\" in source_run
+                or source_run in {".", ".."}
+            ):
+                raise ReconciliationRegistryError(
+                    f"legacy reconciliation registry mapping {index} declares a "
+                    "'source_run' that is not a bare run directory name",
+                    "reconciliation-registry-malformed",
+                )
+        else:
+            raise ReconciliationRegistryError(
+                f"legacy reconciliation registry mapping {index} declares a 'source_run' "
+                "that is not a non-empty string",
+                "reconciliation-registry-malformed",
+            )
+        edges.append(RegistryMapping(
+            replacement=replacement, superseded=historical, source_run=source_run,
+        ))
     return tuple(edges)
 
 

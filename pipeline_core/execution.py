@@ -1473,6 +1473,36 @@ def _reconcile_projection(
             ) from exc
 
 
+def _find_bound_source_evidence(
+    store: VerifiedEvidenceStore,
+    definitions: Mapping[str, TaskSpec],
+    replacement_id: str,
+    source_run: str,
+) -> tuple[str, Mapping[str, str]] | None:
+    """``(replacement_id, evidence)`` from exactly the registry-named ``source_run``.
+
+    A registry mapping may bind an otherwise-ambiguous replacement (more than one closed
+    run independently carries matching exact evidence) to one explicitly named source run.
+    A missing/unreadable run directory, an unknown replacement definition, or evidence that
+    is not eligible from that exact run (wrong contract, run not closed, no PASS/PASS
+    verdicts) fails closed to ``None`` — never falling back to the ambiguous default lookup
+    and never touching any run's recorded bytes.
+    """
+    definition = definitions.get(replacement_id)
+    if definition is None:
+        return None
+    run_dir = (store.runs_root / source_run).resolve()
+    try:
+        run_dir.relative_to(store.runs_root.resolve())
+    except ValueError:
+        return None
+    try:
+        evidence = store.find_at(run_dir, definition)
+    except EvidenceEligibilityError:
+        return None
+    return replacement_id, evidence
+
+
 def reconcile_historical_cards(
     life: RunLifecycle, board_path: Path, by_id: Mapping[str, TaskSpec],
 ) -> tuple[str, ...]:
@@ -1503,9 +1533,15 @@ def reconcile_historical_cards(
         for edge in registry_graph.edges:
             if edge.superseded in replacements:
                 continue
-            evidence = find_superseding_evidence(
-                store, registry_graph, edge.superseded, registry_definitions
-            )
+            source_run = getattr(edge, "source_run", None)
+            if source_run is not None:
+                evidence = _find_bound_source_evidence(
+                    store, registry_definitions, edge.replacement, source_run,
+                )
+            else:
+                evidence = find_superseding_evidence(
+                    store, registry_graph, edge.superseded, registry_definitions
+                )
             if evidence is not None:
                 replacements[edge.superseded] = evidence
     try:
