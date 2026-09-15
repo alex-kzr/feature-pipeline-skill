@@ -13,7 +13,6 @@ from pipeline_core.adapters import LaunchResult
 from pipeline_core.execution import persist_task_contracts, reconcile_historical_cards
 from pipeline_core.lifecycle import RunLifecycle
 from pipeline_core.state import ACTOR_RUNNER, Run
-from pipeline_core.task_files import load_task_spec
 from pipeline_core.verification import (
     VerificationEvidence,
     VerifierAnchors,
@@ -53,11 +52,14 @@ class HistoricalCardReconciliationTests(unittest.TestCase):
                 "docs/plans/tasks/REC-01_executor-context-and-catalog-recovery.md"
             )
             rec01_file = root / rec01_path
+            tc04_recovery_path = "docs/plans/tasks/TC-04_task-kind-catalog.md"
+            tc04_recovery_file = root / tc04_recovery_path
             rec01_file.parent.mkdir(parents=True, exist_ok=True)
             rec01_file.write_bytes((repository / rec01_path).read_bytes())
-            tc04 = _spec("TC-04")
+            tc04_recovery_file.write_bytes(
+                (repository / tc04_recovery_path).read_bytes()
+            )
             audit = _spec("AUD-01")
-            _write_task(root, tc04)
             _write_task(root, audit)
 
             board = root / "board.md"
@@ -69,6 +71,26 @@ class HistoricalCardReconciliationTests(unittest.TestCase):
                 "- [OTHER-02: unrelated active task](tasks/OTHER-02.md)\n",
                 encoding="utf-8",
             )
+            active_source_path = root / ".pipeline/runs/rec01-active/run.json"
+            active_source_path.parent.mkdir(parents=True)
+            active_source_path.write_text(json.dumps({
+                "schema_version": 2,
+                "run_id": "rec01-active",
+                "status": "running",
+                "tasks": [{
+                    "id": "REC-01",
+                    "status": "verified",
+                    "task_path": rec01_path,
+                    "task_contract_digest": (
+                        "sha256:e2bf7ced1852e5288638b2e76f28dcb190aa7447f2724514a7714581cf386e03"
+                    ),
+                    "verification": {
+                        "task_verdict": "PASS",
+                        "test_verdict": "PASS",
+                        "verified_at": "2026-09-10T14:51:14Z",
+                    },
+                }],
+            }, sort_keys=True), encoding="utf-8")
             source_path = root / ".pipeline/runs/rec01-verified/run.json"
             source_path.parent.mkdir(parents=True)
             source_path.write_text(json.dumps({
@@ -96,9 +118,10 @@ class HistoricalCardReconciliationTests(unittest.TestCase):
                 root / ".pipeline/runs/reconciliation", root,
             )
             life = RunLifecycle.initialize(current, tasks=[("AUD-01", ())])
-            rec01 = load_task_spec(rec01_file)
-            definitions = {spec.id: spec for spec in (tc04, audit)}
-            definitions[rec01.id] = rec01
+            # A focused recovery run contains neither historical task.  The production
+            # reconciliation boundary must discover their immutable contracts without
+            # adding either one to the run's executable selection or dispatch set.
+            definitions = {audit.id: audit}
 
             self.assertEqual(
                 reconcile_historical_cards(life, board, definitions), ("TC-04",)
