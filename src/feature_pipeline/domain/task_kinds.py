@@ -254,7 +254,32 @@ def _str_tuple(value: object, *, field_name: str) -> tuple[str, ...]:
         isinstance(value, list) and all(isinstance(item, str) for item in value),
         f"'{field_name}' must be a list of strings",
     )
+    assert isinstance(value, list)
     return tuple(value)  # type: ignore[arg-type]
+
+
+def _require_str(value: object, *, field_name: str) -> str:
+    _require(isinstance(value, str), f"'{field_name}' must be a string")
+    assert isinstance(value, str)
+    return value
+
+
+def _require_str_or_none(value: object, *, field_name: str) -> str | None:
+    _require(value is None or isinstance(value, str), f"'{field_name}' must be a string or null")
+    assert value is None or isinstance(value, str)
+    return value
+
+
+def _require_bool(value: object, *, field_name: str) -> bool:
+    _require(isinstance(value, bool), f"'{field_name}' must be a boolean")
+    assert isinstance(value, bool)
+    return value
+
+
+def _require_mapping(value: object, *, field_name: str) -> Mapping[str, object]:
+    _require(isinstance(value, Mapping), f"'{field_name}' must be a mapping")
+    assert isinstance(value, Mapping)
+    return value
 
 
 def _merged(raw: Mapping[str, object]) -> dict[str, object]:
@@ -270,7 +295,7 @@ def _parse_constraints(value: object) -> CatalogConstraints:
     _require(not unknown, f"unknown constraints key(s): {sorted(unknown)}")
     merged = dict(_CONSTRAINTS_DEFAULTS)
     merged.update(value)
-    session_policy = merged["session_policy"]
+    session_policy = _require_str(merged["session_policy"], field_name="constraints.session_policy")
     _require(
         session_policy in SESSION_POLICIES,
         f"constraints.session_policy '{session_policy}' is not one of {sorted(SESSION_POLICIES)}",
@@ -306,40 +331,48 @@ def _parse_record(raw: object, *, schema_version: int, catalog_version: str) -> 
     kind_id = merged["id"]
     _require(isinstance(kind_id, str) and kind_id.strip() == kind_id and kind_id != "",
              "'id' must be a non-empty, unpadded string")
-    for text_field in ("version", "title", "summary", "owner", "notes"):
-        _require(isinstance(merged[text_field], str), f"'{text_field}' must be a string")
+    assert isinstance(kind_id, str)
+    version = _require_str(merged["version"], field_name="version")
+    title = _require_str(merged["title"], field_name="title")
+    summary = _require_str(merged["summary"], field_name="summary")
+    owner = _require_str(merged["owner"], field_name="owner")
+    notes = _require_str(merged["notes"], field_name="notes")
 
-    lifecycle = merged["lifecycle"]
-    _require(isinstance(lifecycle, Mapping) and isinstance(lifecycle.get("stage"), str),
-             "'lifecycle.stage' must be a string")
+    lifecycle = _require_mapping(merged["lifecycle"], field_name="lifecycle")
+    _require(isinstance(lifecycle.get("stage"), str), "'lifecycle.stage' must be a string")
+    lifecycle_stage = lifecycle["stage"]
+    assert isinstance(lifecycle_stage, str)
 
-    status = merged["status"]
+    status = _require_str(merged["status"], field_name="status")
     _require(status in STATUS_VALUES, f"status '{status}' is not one of {sorted(STATUS_VALUES)}")
-    role = merged["role"]
+    role = _require_str(merged["role"], field_name="role")
     _require(role in ROLE_VALUES, f"role '{role}' is not one of {sorted(ROLE_VALUES)}")
+    levels: dict[str, str] = {}
     for level_field in ("risk", "complexity"):
-        _require(merged[level_field] in RISK_VALUES,
-                 f"{level_field} '{merged[level_field]}' is not one of {sorted(RISK_VALUES)}")
-    for bool_field in ("routable", "dispatchable"):
-        _require(isinstance(merged[bool_field], bool), f"'{bool_field}' must be a boolean")
+        levels[level_field] = _require_str(merged[level_field], field_name=level_field)
+        _require(levels[level_field] in RISK_VALUES,
+                 f"{level_field} '{levels[level_field]}' is not one of {sorted(RISK_VALUES)}")
+    risk = levels["risk"]
+    complexity = levels["complexity"]
+    routable = _require_bool(merged["routable"], field_name="routable")
+    dispatchable = _require_bool(merged["dispatchable"], field_name="dispatchable")
 
-    context = merged["context"]
-    _require(isinstance(context, Mapping), "'context' must be a mapping")
+    context = _require_mapping(merged["context"], field_name="context")
     unknown_ctx = set(context) - {"requires", "output_byte_budget"}
     _require(not unknown_ctx, f"unknown context key(s): {sorted(unknown_ctx)}")
     budget = context.get("output_byte_budget", "routine")
     _require(budget in BUDGET_VALUES,
              f"context.output_byte_budget '{budget}' is not one of {sorted(BUDGET_VALUES)}")
+    assert isinstance(budget, str)
 
-    independence = merged["independence"]
-    _require(isinstance(independence, Mapping), "'independence' must be a mapping")
+    independence = _require_mapping(merged["independence"], field_name="independence")
     unknown_ind = set(independence) - {"parallelizable"}
     _require(not unknown_ind, f"unknown independence key(s): {sorted(unknown_ind)}")
-    parallelizable = independence.get("parallelizable", False)
-    _require(isinstance(parallelizable, bool), "independence.parallelizable must be a boolean")
+    parallelizable = _require_bool(
+        independence.get("parallelizable", False), field_name="independence.parallelizable"
+    )
 
-    repair = merged["repair"]
-    _require(isinstance(repair, Mapping), "'repair' must be a mapping")
+    repair = _require_mapping(merged["repair"], field_name="repair")
     unknown_rep = set(repair) - {"max_repair_attempts", "retryable"}
     _require(not unknown_rep, f"unknown repair key(s): {sorted(unknown_rep)}")
     max_repair_attempts = repair.get("max_repair_attempts", None)
@@ -349,21 +382,23 @@ def _parse_record(raw: object, *, schema_version: int, catalog_version: str) -> 
             and max_repair_attempts >= 0),
         "repair.max_repair_attempts must be a non-negative integer or null",
     )
-    retryable = repair.get("retryable", False)
-    _require(isinstance(retryable, bool), "repair.retryable must be a boolean")
+    assert max_repair_attempts is None or (
+        isinstance(max_repair_attempts, int) and not isinstance(max_repair_attempts, bool)
+    )
+    retryable = _require_bool(repair.get("retryable", False), field_name="repair.retryable")
 
-    verification = merged["verification"]
-    _require(isinstance(verification, Mapping), "'verification' must be a mapping")
+    verification = _require_mapping(merged["verification"], field_name="verification")
     unknown_ver = set(verification) - {"tier", "verifiers"}
     _require(not unknown_ver, f"unknown verification key(s): {sorted(unknown_ver)}")
     tier = verification.get("tier", "none")
     _require(tier in VERIFICATION_TIERS,
              f"verification.tier '{tier}' is not one of {sorted(VERIFICATION_TIERS)}")
+    assert isinstance(tier, str)
 
-    namespace = merged["namespace"]
+    namespace = _require_str_or_none(merged["namespace"], field_name="namespace")
     extends = merged.get("extends")
     if namespace is not None:
-        _require(isinstance(namespace, str) and namespace != "", "'namespace' must be a non-empty string")
+        _require(namespace != "", "'namespace' must be a non-empty string")
         _require(
             kind_id.startswith(f"{namespace}:"),
             f"namespaced record id '{kind_id}' must start with '{namespace}:'",
@@ -380,26 +415,24 @@ def _parse_record(raw: object, *, schema_version: int, catalog_version: str) -> 
     else:
         _require(extends is None, "'extends' is only valid on a namespaced record")
 
-    replaced_by = merged["replaced_by"]
-    _require(replaced_by is None or isinstance(replaced_by, str),
-             "'replaced_by' must be a string or null")
+    replaced_by = _require_str_or_none(merged["replaced_by"], field_name="replaced_by")
 
     return TaskKind(
         id=kind_id,
-        version=merged["version"],
-        title=merged["title"],
-        summary=merged["summary"],
-        owner=merged["owner"],
+        version=version,
+        title=title,
+        summary=summary,
+        owner=owner,
         call_sites=_str_tuple(merged["call_sites"], field_name="call_sites"),
         provenance=_str_tuple(merged["provenance"], field_name="provenance"),
-        lifecycle_stage=lifecycle["stage"],
+        lifecycle_stage=lifecycle_stage,
         status=status,
         role=role,
-        routable=merged["routable"],
-        dispatchable=merged["dispatchable"],
+        routable=routable,
+        dispatchable=dispatchable,
         constraints=_parse_constraints(merged["constraints"]),
-        risk=merged["risk"],
-        complexity=merged["complexity"],
+        risk=risk,
+        complexity=complexity,
         context_requires=_str_tuple(context.get("requires", []), field_name="context.requires"),
         output_byte_budget=budget,
         parallelizable=parallelizable,
@@ -411,7 +444,7 @@ def _parse_record(raw: object, *, schema_version: int, catalog_version: str) -> 
         replaces=_str_tuple(merged["replaces"], field_name="replaces"),
         replaced_by=replaced_by,
         namespace=namespace,
-        notes=merged["notes"],
+        notes=notes,
     )
 
 

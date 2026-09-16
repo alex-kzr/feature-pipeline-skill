@@ -18,9 +18,10 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 #: Contract fields an amendment is permitted to expand. Anything else (the task id, its
 #: type, or its executor role) is immutable across every revision.
@@ -59,17 +60,32 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _normalize_commands(commands: Sequence[object]) -> list[list[Any]]:
+def _normalize_commands(commands: Iterable[object]) -> list[list[Any]]:
     normalized: list[list[Any]] = []
     for command in commands:
         if isinstance(command, Mapping):
             normalized.append([command.get("cwd"), list(command.get("argv", []))])
         elif hasattr(command, "cwd") and hasattr(command, "argv"):
             normalized.append([command.cwd, list(command.argv)])
-        else:
+        elif isinstance(command, Sequence) and not isinstance(command, (str, bytes)):
             cwd, argv = command
             normalized.append([cwd, list(argv)])
+        else:
+            raise AmendmentError(
+                f"verification command entry must be a mapping, object with cwd/argv, "
+                f"or (cwd, argv) pair, got {type(command).__name__}",
+                "amendment-malformed-command",
+            )
     return normalized
+
+
+def _as_iterable(value: object) -> Iterable[object]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
+        raise AmendmentError(
+            f"contract field must be an iterable, got {type(value).__name__}",
+            "amendment-malformed-field",
+        )
+    return value
 
 
 def canonical_amendment_fields(contract: Mapping[str, Any] | object) -> dict[str, Any]:
@@ -78,11 +94,11 @@ def canonical_amendment_fields(contract: Mapping[str, Any] | object) -> dict[str
         return contract.get(name, default) if isinstance(contract, Mapping) else getattr(contract, name, default)
 
     return {
-        "allowed_scope": sorted(str(item) for item in value("allowed_scope")),
-        "out_of_scope": sorted(str(item) for item in value("out_of_scope")),
-        "verification_commands": _normalize_commands(value("verification_commands")),
+        "allowed_scope": sorted(str(item) for item in _as_iterable(value("allowed_scope"))),
+        "out_of_scope": sorted(str(item) for item in _as_iterable(value("out_of_scope"))),
+        "verification_commands": _normalize_commands(_as_iterable(value("verification_commands"))),
         "max_repair_attempts": value("max_repair_attempts", None),
-        "documentation_impact": sorted(str(item) for item in value("documentation_impact")),
+        "documentation_impact": sorted(str(item) for item in _as_iterable(value("documentation_impact"))),
     }
 
 

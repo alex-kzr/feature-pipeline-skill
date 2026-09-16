@@ -8,17 +8,21 @@ import unittest
 from pathlib import Path
 
 from feature_pipeline.contracts import TaskSpec
+from feature_pipeline.application import verified_reuse
 from feature_pipeline.application.work_items import activate_work_item, register_work_items
 from pipeline_core.adapters import LaunchResult
 from pipeline_core.execution import persist_task_contracts, reconcile_historical_cards
 from pipeline_core.lifecycle import RunLifecycle
 from pipeline_core.state import ACTOR_RUNNER, Run
+from pipeline_core.task_files import load_task_spec
 from pipeline_core.verification import (
     VerificationEvidence,
     VerifierAnchors,
     VerifierLaunchers,
     orchestrate_verification,
 )
+
+_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "historical_cards"
 
 
 def _spec(task_id: str) -> TaskSpec:
@@ -47,7 +51,11 @@ class HistoricalCardReconciliationTests(unittest.TestCase):
         """REC-18: the immutable REC-01 source is enough to project TC-04 away."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            repository = Path(__file__).resolve().parents[2]
+            # Self-contained in-repository fixtures (REC-29): the two historical task
+            # contracts, byte-identical in every parsed field to the real recovery
+            # evidence, live under ``tests/fixtures`` so this test never depends on an
+            # umbrella-only ``docs/`` tree existing above the standalone core checkout.
+            fixtures = _FIXTURES
             rec01_path = (
                 "docs/plans/tasks/REC-01_executor-context-and-catalog-recovery.md"
             )
@@ -55,9 +63,11 @@ class HistoricalCardReconciliationTests(unittest.TestCase):
             tc04_recovery_path = "docs/plans/tasks/TC-04_task-kind-catalog.md"
             tc04_recovery_file = root / tc04_recovery_path
             rec01_file.parent.mkdir(parents=True, exist_ok=True)
-            rec01_file.write_bytes((repository / rec01_path).read_bytes())
+            rec01_file.write_bytes(
+                (fixtures / "REC-01_executor-context-and-catalog-recovery.md").read_bytes()
+            )
             tc04_recovery_file.write_bytes(
-                (repository / tc04_recovery_path).read_bytes()
+                (fixtures / "TC-04_task-kind-catalog.md").read_bytes()
             )
             audit = _spec("AUD-01")
             _write_task(root, audit)
@@ -322,3 +332,28 @@ class AmendedSourceRunEvidenceStaysUnchangedTests(unittest.TestCase):
             self.assertEqual(len(reloaded.task("SIR-01").amendment_revisions), 1)
             self.assertEqual(reloaded.task("SIR-01").status, "done")
             self.assertEqual(reloaded.task("SIR-01").verification["task_verdict"], "PASS")
+
+
+class HistoricalCardFixtureSelfContainmentTests(unittest.TestCase):
+    """REC-29: the REC-01/TC-04 historical evidence fixture needs no umbrella ``docs/`` tree.
+
+    ``tests/fixtures/historical_cards`` carries an in-repository copy of the two historical
+    task contracts. Loading it must reproduce exactly the same parsed identity the runner's
+    fixed REC-01 recovery digests were computed from, entirely within the standalone core
+    checkout.
+    """
+
+    def test_fixture_rec01_contract_digest_matches_the_recorded_recovery_identity(self) -> None:
+        spec = load_task_spec(_FIXTURES / "REC-01_executor-context-and-catalog-recovery.md")
+
+        self.assertEqual(spec.id, "REC-01")
+        self.assertEqual(
+            verified_reuse.task_contract_digest(spec),
+            verified_reuse._REC01_RECOVERY_CURRENT_DIGEST,
+        )
+
+    def test_fixture_tc04_contract_parses_as_the_superseded_historical_task(self) -> None:
+        spec = load_task_spec(_FIXTURES / "TC-04_task-kind-catalog.md")
+
+        self.assertEqual(spec.id, "TC-04")
+        self.assertEqual(spec.title, "Define and package the versioned task-kind catalog")

@@ -431,9 +431,8 @@ def supersession_graph(definitions: Mapping[str, Any], repo_root: str | Path) ->
     root = Path(repo_root)
     edges: list[Any] = []
     for task_id, definition in definitions.items():
-        source = Path(
-            getattr(definition, "source_path", None) or getattr(definition, "path", "")
-        )
+        raw_source = getattr(definition, "source_path", None) or getattr(definition, "path", "")
+        source = Path(str(raw_source))
         if not source.is_absolute():
             source = root / source
         if not source.is_file():

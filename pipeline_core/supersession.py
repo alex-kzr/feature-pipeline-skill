@@ -29,13 +29,35 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from typing import Protocol
 
 __all__ = [
     "Supersession",
+    "SupersessionEdge",
     "SupersessionError",
     "SupersessionGraph",
     "parse_supersedes",
 ]
+
+
+class SupersessionEdge(Protocol):
+    """The structural shape ``SupersessionGraph`` needs from one edge.
+
+    :class:`Supersession` is the canonical in-file-declaration edge.
+    ``pipeline_core.reconciliation_registry.RegistryMapping`` is a distinct, unrelated
+    dataclass carrying the same two required fields (plus registry-only metadata); this
+    protocol is the explicit, mypy-checked contract that lets either be used here without
+    an unsound cast or a nominal subclass relationship neither type actually has.
+    """
+
+    @property
+    def replacement(self) -> str:
+        """The task that replaces another task."""
+
+    @property
+    def superseded(self) -> str:
+        """The task replaced by ``replacement``."""
+
 
 _SPLIT_RE = re.compile(r"[,\s]+")
 _NONE_TOKENS = {"", "-", "—", "–", "(none)", "none", "n/a"}
@@ -110,7 +132,7 @@ class SupersessionGraph:
 
     def __init__(
         self,
-        edges: Iterable[Supersession],
+        edges: Iterable[SupersessionEdge],
         *,
         known_ids: Iterable[str],
         dependencies: Mapping[str, Iterable[str]] | None = None,
@@ -118,7 +140,7 @@ class SupersessionGraph:
         known = set(known_ids)
         seen_pairs: set[tuple[str, str]] = set()
         by_superseded: dict[str, str] = {}
-        ordered: list[Supersession] = []
+        ordered: list[SupersessionEdge] = []
 
         for edge in edges:
             for role, task_id in (("replacement", edge.replacement),
@@ -156,7 +178,7 @@ class SupersessionGraph:
                         "supersession-cycle",
                     )
 
-        self._edges = tuple(ordered)
+        self._edges: tuple[SupersessionEdge, ...] = tuple(ordered)
         self._by_superseded = by_superseded
 
     # --- construction -------------------------------------------------------------------
@@ -179,7 +201,7 @@ class SupersessionGraph:
         return cls(edges, known_ids=known, dependencies=dependencies)
 
     @staticmethod
-    def _detect_cycle(edges: list[Supersession]) -> None:
+    def _detect_cycle(edges: list[SupersessionEdge]) -> None:
         adjacency: dict[str, list[str]] = {}
         for edge in edges:
             adjacency.setdefault(edge.replacement, []).append(edge.superseded)
@@ -209,7 +231,7 @@ class SupersessionGraph:
     # --- queries -----------------------------------------------------------------------
 
     @property
-    def edges(self) -> tuple[Supersession, ...]:
+    def edges(self) -> tuple[SupersessionEdge, ...]:
         return self._edges
 
     def replacement_for(self, superseded: str) -> str | None:

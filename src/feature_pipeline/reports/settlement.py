@@ -161,13 +161,18 @@ def _parse_envelope_data(
     # A caller may require the reason key for an eligible token. A reason key next to any
     # other token is always contradictory and rejected.
     token_peek = data.get(contract.token_field)
-    reason_eligible = bool(contract.reason_field) and token_peek in contract.reason_eligible_tokens
-    expected_keys = (
-        base_keys | {contract.reason_field}
-        if reason_eligible and require_reason
+    reason_field = contract.reason_field
+    reason_eligible = reason_field is not None and token_peek in contract.reason_eligible_tokens
+    expected_keys: set[str] = (
+        base_keys | {reason_field}
+        if reason_eligible and require_reason and reason_field is not None
         else base_keys
     )
-    allowed_keys = base_keys | ({contract.reason_field} if reason_eligible else set())
+    allowed_keys: set[str] = (
+        base_keys | {reason_field}
+        if reason_eligible and reason_field is not None
+        else base_keys
+    )
     if (not present <= allowed_keys) or (require_reason and present != expected_keys):
         raise ReportProtocolError(
             f"{contract.envelope_noun} has keys {sorted(present)}, expected exactly "

@@ -445,18 +445,30 @@ class TerminalBlockedSourceReuseTests(unittest.TestCase):
 
 
 class Rec01HistoricalEvidenceRecoveryTests(unittest.TestCase):
-    """REC-18 preserves one exact REC-01 source without trusting active peers."""
+    """REC-18 preserves one exact REC-01 source without trusting active peers.
+
+    REC-29: the historical REC-01 contract used to compute the recovery identity is
+    loaded from an in-repository fixture (byte-identical to the real recovery evidence),
+    not from an umbrella-only ``docs/`` tree above this standalone core checkout. Its
+    ``spec.path`` is then normalized to the fixed logical task path the recovery contract
+    was declared against, matching how a real run records ``task_path``.
+    """
 
     _REC01_PATH = "docs/plans/tasks/REC-01_executor-context-and-catalog-recovery.md"
     _REC01_HISTORICAL_DIGEST = (
         "sha256:e2bf7ced1852e5288638b2e76f28dcb190aa7447f2724514a7714581cf386e03"
     )
+    _FIXTURES = Path(__file__).resolve().parent / "fixtures" / "historical_cards"
 
     @classmethod
-    def _definition(cls) -> TaskDefinition:
-        repository = Path(__file__).resolve().parents[2]
+    def _definition(cls, root: Path) -> TaskDefinition:
+        task_path = root / cls._REC01_PATH
+        task_path.parent.mkdir(parents=True, exist_ok=True)
+        task_path.write_bytes(
+            (cls._FIXTURES / "REC-01_executor-context-and-catalog-recovery.md").read_bytes()
+        )
         return TaskDefinition(
-            spec=load_task_spec(repository / cls._REC01_PATH),
+            spec=load_task_spec(task_path),
             source_format=MARKDOWN_TASK_FILE,
         )
 
@@ -474,12 +486,12 @@ class Rec01HistoricalEvidenceRecoveryTests(unittest.TestCase):
     def test_closed_exact_rec01_source_is_selected_despite_nonterminal_rec01_peer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            definition = self._definition()
+            definition = self._definition(root)
             self._source(root, "active-rec01", definition, run_status="running")
             closed = self._source(root, "closed-rec01", definition)
             before = closed.read_bytes()
 
-            evidence = VerifiedEvidenceStore(root / "runs", Path(__file__).resolve().parents[2]).find(definition)
+            evidence = VerifiedEvidenceStore(root / "runs", root).find(definition)
 
             self.assertEqual(evidence["source_run_id"], "closed-rec01")
             self.assertEqual(evidence["evidence_contract_version"], REC01_RECOVERY_CONTRACT_VERSION)
@@ -488,12 +500,12 @@ class Rec01HistoricalEvidenceRecoveryTests(unittest.TestCase):
     def test_multiple_closed_exact_rec01_sources_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            definition = self._definition()
+            definition = self._definition(root)
             for run_id in ("closed-rec01-a", "closed-rec01-b"):
                 self._source(root, run_id, definition)
 
             with self.assertRaises(EvidenceEligibilityError) as denied:
-                VerifiedEvidenceStore(root / "runs", Path(__file__).resolve().parents[2]).find(definition)
+                VerifiedEvidenceStore(root / "runs", root).find(definition)
 
             self.assertEqual(denied.exception.code, "evidence-exact-ambiguous")
 
