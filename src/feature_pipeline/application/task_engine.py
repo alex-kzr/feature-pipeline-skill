@@ -27,7 +27,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
 
 from feature_pipeline.contracts import TaskSpec
 from feature_pipeline.infrastructure.board_projection import (
@@ -102,6 +102,9 @@ class TaskExecution:
     #: Executor-claimed checks, so :func:`build_verification_evidence` can surface a claim
     #: with no runner-recorded command as a fact-only ``FAIL``.
     claimed_checks: tuple[object, ...] = ()
+    #: Runner-only read port for remote acceptance facts.  It receives neither executor
+    #: capability nor a write path; absent observations must settle as a verification failure.
+    remote_observer: Callable[[TaskSpec, int], Sequence[Mapping[str, object]]] | None = None
     #: **KLC-03**. The Markdown active board's path (``docs/kanban.md``); ``None`` keeps this
     #: run projection-free (boardless JSON plans). When set, ``spec.path`` — already
     #: repository-relative for a Markdown-backed task — resolves the task file to project onto.
@@ -371,6 +374,7 @@ class TaskEngine:
                 model=request.model,
                 effort=request.effort,
                 claimed_checks=request.claimed_checks,
+                remote_observer=request.remote_observer,
             ),
         )
 

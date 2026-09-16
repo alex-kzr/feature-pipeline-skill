@@ -37,7 +37,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence, cast
+from typing import Any, Callable, Mapping, Sequence, cast
 
 from feature_pipeline.application.pipeline_engine import (
     CallableStage,
@@ -379,6 +379,9 @@ class ExecuteRequest:
     board_path: Path | None = None
     core_root: Path | None = None
     precondition_runner: GitRunner = subprocess.run
+    #: Optional runner-wired, read-only remote observation port. It is deliberately separate
+    #: from executor dispatch and cannot grant an executor a push or remote-inspection path.
+    remote_observer: Callable[[TaskSpec, int], Sequence[Mapping[str, object]]] | None = None
 
 
 @dataclass(frozen=True)
@@ -1982,6 +1985,7 @@ def _run_scoped_tasks(
                         plan_path=request.plan_prompt_path,
                         working_root=_task_working_root(request, spec), timeout=request.timeout,
                         model=request.controls.model, effort=request.controls.effort,
+                        remote_observer=request.remote_observer,
                         board_path=request.board_path,
                         pre_dispatch=lambda: _prepare_executor(life, request, spec, bindings),
                         baseline_diagnosis=lambda: diagnose_baseline(spec, request.repo_root),

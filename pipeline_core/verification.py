@@ -121,6 +121,83 @@ def missing_command_evidence(
     return tuple(missing)
 
 
+def remote_evidence_required(spec: object) -> bool:
+    """Whether the task's acceptance contract requires a remote observation.
+
+    Executors never obtain push or remote-inspection authority.  This deliberately narrow
+    classifier identifies the acceptance language that instead needs a runner observation.
+    It is intentionally based on the task contract, not on an executor report.
+    """
+    terms = ("push", "pull request", "github actions", "required check", "remote")
+    criteria = getattr(spec, "acceptance_criteria", ()) or ()
+    return any(any(term in str(criterion).casefold() for term in terms) for criterion in criteria)
+
+
+def _executor_claims_remote_action(report: str | None) -> bool:
+    if not report:
+        return False
+    text = report.casefold()
+    return bool(re.search(
+        r"\bpushed\b|\b(?:github actions|required checks?)\b.{0,80}\b(?:green|pass(?:ed)?|success)\b|"
+        r"\b(?:pull request|pr)\b.{0,80}\b(?:publish(?:ed)?|create(?:d)?|update(?:d)?)\b",
+        text,
+    ))
+
+
+def _executor_report_claimed_remote_action(run: object, report_reference: object) -> bool:
+    """Read the runner-recorded executor report only to reject an unbacked remote claim.
+
+    The report remains executor-controlled prose and is never evidence of a remote action.
+    A missing or unreadable report returns ``False`` here; required remote evidence still fails
+    closed independently, without inventing a claim or an observation.
+    """
+    if not isinstance(report_reference, str) or not report_reference:
+        return False
+    try:
+        root = Path(run.repo_root).resolve()
+        report = (root / report_reference).resolve()
+        report.relative_to(root)
+        return _executor_claims_remote_action(report.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def remote_evidence_failure(spec: object, evidence: "VerificationEvidence") -> str | None:
+    """Validate runner-owned remote evidence required by an acceptance contract.
+
+    Remote facts must be explicit, successful observations recorded by the runner.  Missing,
+    malformed, or executor-only evidence is a fail-closed condition; no report prose can stand
+    in for a remote readback.
+    """
+    if not remote_evidence_required(spec):
+        return None
+    if not evidence.remote_evidence:
+        if evidence.executor_remote_claimed or _executor_claims_remote_action(evidence.executor_report):
+            return "executor reported remote action without runner-recorded remote evidence"
+        return "required remote acceptance evidence is missing"
+    for record in evidence.remote_evidence:
+        if (
+            record.get("observed_by") != "runner"
+            or record.get("outcome") != "succeeded"
+            or not isinstance(record.get("kind"), str)
+            or not record.get("kind")
+            or not isinstance(record.get("subject"), str)
+            or not record.get("subject")
+            or not isinstance(record.get("recorded_at"), str)
+            or not record.get("recorded_at")
+        ):
+            return "remote acceptance evidence is missing or inconsistent"
+    criteria = "\n".join(str(criterion).casefold() for criterion in (
+        getattr(spec, "acceptance_criteria", ()) or ()
+    ))
+    kinds = {str(record["kind"]) for record in evidence.remote_evidence}
+    if ("push" in criteria or "pull request" in criteria) and "pull-request-publication" not in kinds:
+        return "remote acceptance evidence is missing or inconsistent"
+    if ("github actions" in criteria or "required check" in criteria) and "required-checks" not in kinds:
+        return "remote acceptance evidence is missing or inconsistent"
+    return None
+
+
 @dataclass(frozen=True)
 class VerificationEvidence:
     """Runner-captured facts supplied, byte-for-byte, to both independent verifiers.
@@ -135,6 +212,9 @@ class VerificationEvidence:
     attempt: int
     commands: tuple[Mapping[str, object], ...] = ()
     executor_report: str | None = None
+    #: The runner's rejection-only classification of the recorded executor report.  It never
+    #: proves a remote fact; it prevents executor prose from being mistaken for one.
+    executor_remote_claimed: bool = False
     implementation_manifest: str | None = None
     implementation_diff: str | None = None
     changed_files: tuple[Mapping[str, object], ...] = ()
@@ -145,6 +225,9 @@ class VerificationEvidence:
     #: example a push, tag, or remote-ruleset mutation).  It is deliberately explicit
     #: even when empty: task history and ambient Git state are not substitutes for it.
     external_actions: tuple[Mapping[str, object], ...] = ()
+    #: Read-only observations made and persisted by the runner after executor work.  These are
+    #: facts about a remote system, never executor claims or capabilities.
+    remote_evidence: tuple[Mapping[str, object], ...] = ()
     missing_evidence: tuple[Mapping[str, object], ...] = ()
     unrun_commands: tuple[Mapping[str, object], ...] = ()
     external_blocker: str | None = None
@@ -183,6 +266,7 @@ class VerificationEvidence:
             "task_id": self.task_id,
             "attempt": self.attempt,
             "executor_report": self.executor_report,
+            "executor_remote_claimed": self.executor_remote_claimed,
             "implementation": {
                 "manifest": self.implementation_manifest,
                 "diff": self.implementation_diff,
@@ -191,6 +275,7 @@ class VerificationEvidence:
             "runner_owned_writes": [dict(entry) for entry in self.runner_owned_writes],
             "commands": [dict(entry) for entry in self.commands],
             "external_actions": [dict(entry) for entry in self.external_actions],
+            "remote_evidence": [dict(entry) for entry in self.remote_evidence],
             "missing_evidence": [dict(entry) for entry in self.missing_evidence],
             "unrun_commands": [dict(entry) for entry in self.unrun_commands],
             "external_blocker": self.external_blocker,
@@ -225,6 +310,8 @@ class VerificationEvidence:
                 "captured_commands": [dict(entry) for entry in self.commands],
                 "durable_operation_history": [dict(entry) for entry in self.operation_history],
                 "external_actions": [dict(entry) for entry in self.external_actions],
+                "remote_evidence": [dict(entry) for entry in self.remote_evidence],
+                "executor_remote_claimed": self.executor_remote_claimed,
             },
             "complete": self.complete,
         }
@@ -290,12 +377,17 @@ def build_verification_evidence(
         attempt=attempt,
         commands=references,
         executor_report=execution.get("executor_report"),
+        executor_remote_claimed=_executor_report_claimed_remote_action(
+            run, execution.get("executor_report")),
         implementation_manifest=implementation.get("manifest"),
         implementation_diff=implementation.get("diff"),
         changed_files=tuple(dict(entry) for entry in implementation.get("changed_files") or ()),
         runner_owned_writes=tuple(runner_writes),
         external_actions=tuple(
             dict(entry) for entry in execution.get("external_actions") or ()
+        ),
+        remote_evidence=tuple(
+            dict(entry) for entry in execution.get("remote_evidence") or ()
         ),
         missing_evidence=missing_command_evidence(claimed_checks, commands_run.records),
         unrun_commands=unrun,
@@ -462,6 +554,8 @@ _VERIFIER_RULES: dict[str, tuple[str, ...]] = {
         "Re-read the feature prompt, the task file, and the acceptance criteria yourself.",
         "Judge task requirements and acceptance criteria from the task-relevant snapshot and "
         "runner-owned command evidence below, not whole-worktree git diff as a completion proxy.",
+        "Remote publication and required-check facts must come from runner-owned remote_evidence; "
+        "executor report prose is never remote evidence.",
         "You may read the worktree; you may not modify anything and you may not run the "
         "verification commands — their outcomes are the runner-owned evidence below.",
         "Treat implementation manifest/diff deltas only as supplementary allowed-scope checks; "
@@ -489,6 +583,8 @@ _VERIFIER_RULES: dict[str, tuple[str, ...]] = {
         "You have no tools. Interpret only the runner-owned evidence below; run nothing.",
         "A declared verification command with no matching runner-recorded command is a FAIL, "
         "never a prompt to re-run the check.",
+        "When remote acceptance is required, missing or inconsistent runner-owned remote_evidence "
+        "is a FAIL; never infer it from executor report prose.",
         "Judge whether the recorded command evidence shows the task's verification commands "
         "passed.",
         "Do not require a PASS from either verifier in this same verification pass as evidence: "
@@ -893,9 +989,14 @@ def orchestrate_verification(
     test_verdict = test_settled.token
     mutation_forced = current_run_mutation_reason(spec, evidence)
     test_forced = evidence_forces_fail(evidence)
+    remote_forced = remote_evidence_failure(spec, evidence)
     forced_reason: str | None = None
     if mutation_forced and (task_verdict != "FAIL" or test_verdict != "FAIL"):
         forced_reason = mutation_forced
+        task_verdict = "FAIL"
+        test_verdict = "FAIL"
+    elif remote_forced and (task_verdict != "FAIL" or test_verdict != "FAIL"):
+        forced_reason = remote_forced
         task_verdict = "FAIL"
         test_verdict = "FAIL"
     elif test_forced and test_verdict != "FAIL":

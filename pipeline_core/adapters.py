@@ -460,7 +460,8 @@ _ROLE_CHARTER: dict[str, str] = {
     "executor": (
         "Feature-pipeline executor. Implement only the selected task's allowed scope and report "
         "the required status envelope. The runner owns declared verification commands and "
-        "independent verification, so do not run them or tick acceptance checkboxes."
+        "independent verification, including any remote publication or check observation, so do "
+        "not run them, report remote actions, or tick acceptance checkboxes."
     ),
     "task_verifier": (
         "Feature-pipeline task verifier. Read-only: never edit files. Judge the task's "
