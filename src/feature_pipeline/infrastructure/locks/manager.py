@@ -47,6 +47,15 @@ from feature_pipeline.ports.locks import (
 #: contender loop terminates with a verdict instead of spinning forever.
 _MAX_ZERO_TIMEOUT_SPINS = 10_000
 
+#: A competing creator's read of the winner's just-created lock file can, on Windows,
+#: transiently raise ``OSError`` (a brief sharing violation) even though the file is a
+#: genuinely live, well-formed lease — the write that created it already completed before the
+#: link was published. Retrying a *read-level* failure this briefly distinguishes that timing
+#: race from a truly malformed record (bad JSON, wrong shape), which the first read already
+#: parsed successfully and never needs a retry for.
+_UNREADABLE_RETRY_ATTEMPTS = 5
+_UNREADABLE_RETRY_DELAY_S = 0.01
+
 
 def _unlink_quietly(path: Path) -> None:
     try:
@@ -97,7 +106,7 @@ class _FileLease:
                 os.link(temporary, self._path)
             except FileExistsError:
                 _unlink_quietly(temporary)
-                record = read_holder(self._path)
+                record = self._read_holder_past_transient_races()
                 if record is None:
                     # Freed between the failed create and the read - retry the create.
                     spins = self._bump_spins(spins)
@@ -163,6 +172,23 @@ class _FileLease:
         self.release()
 
     # -- internals ------------------------------------------------------------------------
+
+    def _read_holder_past_transient_races(self) -> HolderRecord | None:
+        """Read the peer's lock, retrying briefly past a transient read-level failure.
+
+        A record that fails to *parse* (bad JSON, wrong shape) comes back ``unreadable`` on
+        the very first read and stays that way — re-reading identical bytes changes nothing.
+        Only a genuinely transient race (the file could not even be opened/read a moment
+        after a peer's create) resolves itself within a few short retries; bound them so a
+        truly corrupt lock still fails closed, just after ruling the race out.
+        """
+        record = read_holder(self._path)
+        attempts = 0
+        while record is not None and record.unreadable and attempts < _UNREADABLE_RETRY_ATTEMPTS:
+            time.sleep(_UNREADABLE_RETRY_DELAY_S)
+            record = read_holder(self._path)
+            attempts += 1
+        return record
 
     def _bump_spins(self, spins: int) -> int:
         spins += 1

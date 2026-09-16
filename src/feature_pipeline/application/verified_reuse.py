@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,6 +12,7 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from pipeline_core.plan import canonical_amendment_fields, contract_digest
+from pipeline_core.reports import verifier_artifacts
 from feature_pipeline.contracts import TaskSpec
 from feature_pipeline.domain.models import TaskDefinition
 
@@ -167,6 +169,60 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+_DONE_CHECKBOX_RE = re.compile(r"^- \[([ xX])\] Done\s*$", re.MULTILINE)
+
+
+def _definition_source_path(definition: "TaskDefinition | TaskSpec") -> Path:
+    return Path(definition.source_path if isinstance(definition, TaskDefinition) else definition.path)
+
+
+def _markdown_already_marks_done(definition: "TaskDefinition | TaskSpec") -> bool:
+    """Whether ``definition``'s own task file already presents a Markdown ``Done`` record.
+
+    A task whose own file has never been projected ``Done`` (still ``To Do`` /
+    ``In Progress``, or a JSON-only entry with no backing file) carries no attempt-bearing
+    Markdown ``## Result`` to distrust or trust — only a *recorded historical* completion is
+    ever held to the stricter artifact-presence bar below.
+    """
+    source = _definition_source_path(definition)
+    if not source.is_file():
+        return False
+    try:
+        text = source.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    match = _DONE_CHECKBOX_RE.search(text)
+    return match is not None and match.group(1) in ("x", "X")
+
+
+def _require_final_artifacts_when_attempt_bearing(
+    run_dir: Path, task: Mapping[str, Any],
+) -> None:
+    """Fail closed when a Markdown ``Done`` task's named run has no final verifier evidence.
+
+    Only a task carrying a durable attempt identity (an ``attempts`` count, persisted by
+    every run this project itself creates) can even name a deterministic final-report path;
+    a pre-attempt legacy record has no such identity and is intentionally left to the
+    existing (run.json-only) eligibility policy — it cannot be held to a bar it has no way
+    to name.
+    """
+    attempts = task.get("attempts")
+    if not isinstance(attempts, int) or isinstance(attempts, bool):
+        return
+    revision = task.get("current_revision")
+    revision_value = (
+        revision if isinstance(revision, int) and not isinstance(revision, bool) and revision > 0
+        else None
+    )
+    artifacts = verifier_artifacts(run_dir, str(task["id"]), attempts + 1, revision=revision_value)
+    missing = [path for path in (artifacts.task_report, artifacts.test_report) if not path.is_file()]
+    if missing:
+        raise EvidenceEligibilityError(
+            "source task's named final verifier report is absent from disk",
+            "evidence-final-artifacts-missing",
+        )
+
+
 class VerifiedEvidenceStore:
     """Find reusable evidence without changing any source run artifact."""
 
@@ -183,9 +239,12 @@ class VerifiedEvidenceStore:
         exact: list[Mapping[str, str]] = []
         denials: list[EvidenceEligibilityError] = []
         expected_path = canonical_task_path(definition, self.repo_root)
+        markdown_marks_done = _markdown_already_marks_done(definition)
         for path, raw, data in sources:
             try:
                 task = self._eligible_task(data, definition.id)
+                if markdown_marks_done:
+                    _require_final_artifacts_when_attempt_bearing(path.parent, task)
                 version = self._canonical_identity(task, definition, expected_path)
                 exact.append(self._evidence(
                     path, raw, data, task, definition.id,
@@ -210,6 +269,8 @@ class VerifiedEvidenceStore:
         """Evaluate one explicitly selected source run with the default lookup policy."""
         path, raw, data = self._read_source(Path(run_dir) / "run.json")
         task = self._eligible_task(data, definition.id)
+        if _markdown_already_marks_done(definition):
+            _require_final_artifacts_when_attempt_bearing(path.parent, task)
         version = self._canonical_identity(
             task, definition, canonical_task_path(definition, self.repo_root)
         )

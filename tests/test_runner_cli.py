@@ -659,6 +659,10 @@ class DryRunAttestationTests(unittest.TestCase):
             source_life = RunLifecycle.initialize(source, tasks=[("RE-01", [])])
             self._force_verified(source_life, "RE-01")
             persist_task_contracts(source, (load_task_spec(dependency),))
+            reports_dir = source.run_dir / "reports" / "RE-01" / "verify-1"
+            reports_dir.mkdir(parents=True)
+            (reports_dir / "task-verifier-1.md").write_text("PASS\n", encoding="utf-8")
+            (reports_dir / "test-verifier-1.md").write_text("PASS\n", encoding="utf-8")
             source.status = "verified"
             source.save()
             source_bytes = (source.run_dir / "run.json").read_bytes()

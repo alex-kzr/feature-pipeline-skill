@@ -16,6 +16,7 @@ from feature_pipeline.application.verified_reuse import (
     REC01_RECOVERY_CONTRACT_VERSION,
     VerifiedEvidenceStore,
     canonical_task_contract,
+    canonical_task_path,
     resolve_default_reuse,
     task_contract_digest,
 )
@@ -24,6 +25,7 @@ from feature_pipeline.domain.models import MARKDOWN_TASK_FILE, TaskDefinition
 from pipeline_core.plan import canonical_amendment_fields, contract_digest
 from pipeline_core.execution import _next_actionable, _pending_reason, persist_task_contracts
 from pipeline_core.lifecycle import RunLifecycle
+from pipeline_core.reports import verifier_artifacts
 from pipeline_core.state import ACTOR_HUMAN, Run
 from pipeline_core.task_files import load_task_spec
 
@@ -307,6 +309,68 @@ class VerifiedEvidenceStoreTests(unittest.TestCase):
             with self.assertRaises(EvidenceEligibilityError) as denied:
                 VerifiedEvidenceStore(root / "runs", root).find(definition)
             self.assertEqual(denied.exception.code, "evidence-canonical-identity-missing")
+
+
+class MarkdownDoneFinalArtifactTests(unittest.TestCase):
+    """REC-19 AC-1: an attempt-bearing Markdown ``Done`` record must name evidence that is
+    actually still on disk before it can be reused or reconciled — a Markdown Done/Result
+    citing a run whose final verifier reports are absent is non-reconcilable, never verified
+    evidence. A record with no durable attempt identity (no ``attempts`` count) keeps its
+    established eligibility, since it cannot even name a deterministic final-artifact path."""
+
+    @staticmethod
+    def _done_task_file(root: Path) -> Path:
+        task_file = root / "tasks" / "VR-01.md"
+        task_file.parent.mkdir(parents=True)
+        task_file.write_text(
+            "# VR-01\n\n## Status\n- [ ] To Do\n- [ ] In Progress\n- [x] Done\n",
+            encoding="utf-8",
+        )
+        return task_file
+
+    def test_markdown_done_dependency_without_final_verifier_reports_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            definition = _definition(path=str(self._done_task_file(root)))
+            source = _source(root, run_id="rec-19-source", definition=definition)
+            payload = json.loads(source.read_text(encoding="utf-8"))
+            payload["tasks"][0]["attempts"] = 0
+            source.write_text(json.dumps(payload), encoding="utf-8")
+
+            with self.assertRaises(EvidenceEligibilityError) as denied:
+                VerifiedEvidenceStore(root / "runs", root).find(definition)
+            self.assertEqual(denied.exception.code, "evidence-final-artifacts-missing")
+
+    def test_markdown_done_dependency_with_final_verifier_reports_is_eligible(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            definition = _definition(path=str(self._done_task_file(root)))
+            source = _source(root, run_id="rec-19-source", definition=definition)
+            payload = json.loads(source.read_text(encoding="utf-8"))
+            payload["tasks"][0]["attempts"] = 0
+            payload["tasks"][0]["task_path"] = canonical_task_path(definition, root)
+            source.write_text(json.dumps(payload), encoding="utf-8")
+            artifacts = verifier_artifacts(source.parent, "VR-01", 1)
+            artifacts.directory.mkdir(parents=True)
+            artifacts.task_report.write_text("- Verdict: PASS\n", encoding="utf-8")
+            artifacts.test_report.write_text("- Verdict: PASS\n", encoding="utf-8")
+
+            evidence = VerifiedEvidenceStore(root / "runs", root).find(definition)
+            self.assertEqual(evidence["source_run_id"], "rec-19-source")
+
+    def test_pre_attempt_legacy_markdown_done_record_keeps_existing_eligibility(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            definition = _definition(path=str(self._done_task_file(root)))
+            # No 'attempts' field is written: a pre-attempt legacy record with no durable
+            # attempt identity, so it cannot name a deterministic final-artifact path.
+            source = _source(root, run_id="rec-19-legacy-source", definition=definition)
+            payload = json.loads(source.read_text(encoding="utf-8"))
+            payload["tasks"][0]["task_path"] = canonical_task_path(definition, root)
+            source.write_text(json.dumps(payload), encoding="utf-8")
+
+            evidence = VerifiedEvidenceStore(root / "runs", root).find(definition)
+            self.assertEqual(evidence["source_run_id"], "rec-19-legacy-source")
 
 
 class TerminalBlockedSourceReuseTests(unittest.TestCase):
