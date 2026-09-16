@@ -474,6 +474,56 @@ class Run:
             actor=ACTOR_EXECUTOR, note="executor report recorded as execution evidence")
         return evidence
 
+    def record_remote_evidence(
+        self,
+        task_id: str,
+        *,
+        attempt: int,
+        observations: Sequence[Mapping[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Append deterministic, runner-owned read-only remote observations.
+
+        This is the only lifecycle path for remote acceptance facts.  It accepts observations
+        only for the executor attempt that produced the current evidence, rejects malformed
+        rows before persisting any of them, and never infers an observation from executor prose.
+        """
+        record = self.task(task_id)
+        evidence = record.execution_evidence
+        if not evidence or evidence.get("attempt") != attempt:
+            raise StateError(
+                f"remote evidence for {task_id} does not match an executor attempt",
+                "remote-evidence-attempt-mismatch",
+            )
+        rows: list[dict[str, Any]] = []
+        for observation in observations:
+            row = dict(observation)
+            if (
+                row.get("observed_by") != ACTOR_RUNNER
+                or row.get("outcome") != "succeeded"
+                or not isinstance(row.get("kind"), str)
+                or not row["kind"]
+                or not isinstance(row.get("subject"), str)
+                or not row["subject"]
+                or not isinstance(row.get("recorded_at"), str)
+                or not row["recorded_at"]
+            ):
+                raise StateError(
+                    "remote evidence must be a successful runner observation with kind, "
+                    "subject, and recorded_at",
+                    "invalid-remote-evidence",
+                )
+            rows.append(row)
+        if not rows:
+            raise StateError("remote evidence observations cannot be empty", "invalid-remote-evidence")
+        existing = list(evidence.get("remote_evidence") or ())
+        evidence["remote_evidence"] = [*existing, *rows]
+        self.record_event(
+            f"remote-evidence:{task_id}", to=str(attempt), actor=ACTOR_RUNNER,
+            note="runner recorded remote observations: " + ", ".join(
+                str(row["kind"]) for row in rows),
+        )
+        return rows
+
     def record_runner_projection(
         self, task_id: str, paths: Sequence[str | Path], *, operation: str = "lifecycle-projection",
     ) -> list[dict[str, Any]]:

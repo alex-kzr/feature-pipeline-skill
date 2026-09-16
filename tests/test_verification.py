@@ -60,8 +60,11 @@ from pipeline_core.verification import (
     evidence_forces_fail,
     missing_command_evidence,
     orchestrate_verification,
+    remote_evidence_failure,
+    remote_evidence_required,
 )
 from feature_pipeline.contracts import CommandSpec, TaskSpec
+from feature_pipeline.application.verification_service import VerificationRequest, VerificationService
 from feature_pipeline.application.work_items import activate_work_item, register_work_items
 
 ANCHORS = VerifierAnchors(project_root="/repo", agents_root="/repo/.agents")
@@ -558,6 +561,157 @@ class CurrentRunMutationEvidenceTests(unittest.TestCase):
         self.assertEqual(
             outcome.forced_fail_reason,
             "runner captured current-run external action: commit",
+        )
+
+
+class RemoteEvidenceLifecycleTests(unittest.TestCase):
+    """REC-30 — remote acceptance facts are runner-owned and fail closed."""
+
+    def _remote_spec(self) -> TaskSpec:
+        return _spec(acceptance_criteria=(
+            "The task-scoped recovery commit is pushed to the existing PR head branch.",
+            "All required PR checks conclude successfully in GitHub Actions.",
+        ))
+
+    def test_runner_recorded_successful_remote_observations_satisfy_remote_acceptance(self) -> None:
+        observations = (
+            {
+                "kind": "pull-request-publication",
+                "outcome": "succeeded",
+                "subject": "refs/heads/recovery/rec29",
+                "observed_by": "runner",
+                "recorded_at": "2026-09-16T00:00:00Z",
+            },
+            {
+                "kind": "required-checks",
+                "outcome": "succeeded",
+                "subject": "pull-request/3@deadbeef",
+                "observed_by": "runner",
+                "recorded_at": "2026-09-16T00:00:01Z",
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report = root / "executor.md"
+            report.write_text("implemented", encoding="utf-8")
+            run = _implemented_run(root)
+            run.record_executor_evidence(
+                "VR-02", attempt=1, generation=1, report_path=report,
+            )
+            self.assertEqual(
+                run.record_remote_evidence("VR-02", attempt=1, observations=observations),
+                list(observations),
+            )
+            persisted = run.task("VR-02").execution_evidence["remote_evidence"]
+
+        evidence = _evidence(remote_evidence=tuple(persisted))
+
+        self.assertTrue(remote_evidence_required(self._remote_spec()))
+        self.assertIsNone(remote_evidence_failure(self._remote_spec(), evidence))
+        payload = json.loads(evidence.serialized())
+        self.assertEqual(payload["remote_evidence"][0]["observed_by"], "runner")
+        self.assertEqual(payload["current_run_boundary"]["remote_evidence"][1]["kind"], "required-checks")
+
+    def test_missing_runner_remote_observation_fails_closed(self) -> None:
+        self.assertEqual(
+            remote_evidence_failure(self._remote_spec(), _evidence()),
+            "required remote acceptance evidence is missing",
+        )
+
+    def test_executor_remote_claim_without_runner_record_fails_closed(self) -> None:
+        evidence = _evidence(
+            executor_report="Status: implemented\nPushed the branch and all GitHub Actions checks are green.\n",
+        )
+
+        self.assertEqual(
+            remote_evidence_failure(self._remote_spec(), evidence),
+            "executor reported remote action without runner-recorded remote evidence",
+        )
+
+    def test_verification_lifecycle_records_injected_runner_observations_before_settlement(self) -> None:
+        observations = ({
+            "kind": "pull-request-publication", "outcome": "succeeded",
+            "subject": "refs/heads/recovery/rec29", "observed_by": "runner",
+            "recorded_at": "2026-09-16T00:00:00Z",
+        }, {
+            "kind": "required-checks", "outcome": "succeeded",
+            "subject": "pull-request/3@deadbeef", "observed_by": "runner",
+            "recorded_at": "2026-09-16T00:00:01Z",
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = _implemented_run(root)
+            report = root / "executor.md"
+            report.write_text("implemented", encoding="utf-8")
+            run.record_executor_evidence("VR-02", attempt=1, generation=1, report_path=report)
+            spec = _spec(
+                acceptance_criteria=self._remote_spec().acceptance_criteria,
+                verification_commands=(),
+            )
+            register_work_items(run, (spec,))
+            with activate_work_item(run, spec.id):
+                outcome = VerificationService().verify(run, VerificationRequest(
+                    spec=spec, launchers=VerifierLaunchers(task=FakeVerifier(), test=FakeVerifier()),
+                    anchors=ANCHORS, attempt=1,
+                    remote_observer=lambda _spec, _attempt: observations,
+                ))
+
+        self.assertEqual(outcome.status, "done")
+        self.assertEqual(
+            run.task("VR-02").execution_evidence["remote_evidence"], list(observations),
+        )
+
+    def test_verification_lifecycle_rejects_inconsistent_observation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = _implemented_run(root)
+            report = root / "executor.md"
+            report.write_text("implemented", encoding="utf-8")
+            run.record_executor_evidence("VR-02", attempt=1, generation=1, report_path=report)
+            spec = _spec(
+                acceptance_criteria=self._remote_spec().acceptance_criteria,
+                verification_commands=(),
+            )
+            register_work_items(run, (spec,))
+            with activate_work_item(run, spec.id):
+                outcome = VerificationService().verify(run, VerificationRequest(
+                    spec=spec, launchers=VerifierLaunchers(task=FakeVerifier(), test=FakeVerifier()),
+                    anchors=ANCHORS, attempt=1,
+                    remote_observer=lambda _spec, _attempt: ({
+                        "kind": "pull-request-publication", "outcome": "succeeded",
+                        "subject": "refs/heads/recovery/rec29", "observed_by": "runner",
+                        "recorded_at": "2026-09-16T00:00:00Z",
+                    },),
+                ))
+
+        self.assertEqual((outcome.task_verdict, outcome.test_verdict), ("FAIL", "FAIL"))
+        self.assertEqual(outcome.forced_fail_reason, "remote acceptance evidence is missing or inconsistent")
+
+    def test_verification_lifecycle_rejects_executor_reported_remote_action(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = _implemented_run(root)
+            report = root / "executor.md"
+            report.write_text(
+                "Status: implemented\nPushed the branch; required GitHub Actions checks are green.\n",
+                encoding="utf-8",
+            )
+            run.record_executor_evidence("VR-02", attempt=1, generation=1, report_path=report)
+            spec = _spec(
+                acceptance_criteria=self._remote_spec().acceptance_criteria,
+                verification_commands=(),
+            )
+            register_work_items(run, (spec,))
+            with activate_work_item(run, spec.id):
+                outcome = VerificationService().verify(run, VerificationRequest(
+                    spec=spec, launchers=VerifierLaunchers(task=FakeVerifier(), test=FakeVerifier()),
+                    anchors=ANCHORS, attempt=1,
+                ))
+
+        self.assertEqual((outcome.task_verdict, outcome.test_verdict), ("FAIL", "FAIL"))
+        self.assertEqual(
+            outcome.forced_fail_reason,
+            "executor reported remote action without runner-recorded remote evidence",
         )
 
 

@@ -21,6 +21,7 @@ Standard library only.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Callable, Mapping, Sequence
 
 from feature_pipeline.contracts import TaskSpec
 
@@ -37,6 +38,7 @@ from pipeline_core.verification import (
     VerifierLaunchers,
     build_verification_evidence,
     orchestrate_verification,
+    remote_evidence_required,
 )
 
 __all__ = ["VerificationRequest", "VerificationService"]
@@ -57,6 +59,10 @@ class VerificationRequest:
     #: Executor-claimed checks, so a claim with no runner-recorded command surfaces as a
     #: fact-only ``FAIL`` rather than a prompt to re-run the check.
     claimed_checks: tuple[object, ...] = field(default_factory=tuple)
+    #: A runner-wired, read-only port. It is invoked only for a task contract that requires
+    #: remote acceptance facts, after local command capture and before verdict settlement.
+    #: ``None`` deliberately means no observation is available; settlement then fails closed.
+    remote_observer: Callable[[TaskSpec, int], Sequence[Mapping[str, object]]] | None = None
 
 
 class VerificationService:
@@ -87,6 +93,14 @@ class VerificationService:
                 attempt=request.attempt,
                 timeout=request.timeout,
             )
+        execution = run.task(task_id).execution_evidence or {}
+        if (remote_evidence_required(spec) and request.remote_observer is not None
+                and not execution.get("remote_evidence")):
+            observations = request.remote_observer(spec, request.attempt)
+            if observations:
+                run.record_remote_evidence(
+                    task_id, attempt=request.attempt, observations=observations,
+                )
         evidence = build_verification_evidence(
             run,
             task_id,
