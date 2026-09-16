@@ -54,6 +54,7 @@ class RegistryMapping:
     replacement: str
     superseded: str
     source_run: str | None = None
+    project_completion: bool = False
 
 
 class ReconciliationRegistryError(Exception):
@@ -149,8 +150,16 @@ def load_reconciliation_registry(path: str | Path) -> tuple[RegistryMapping, ...
                 "that is not a non-empty string",
                 "reconciliation-registry-malformed",
             )
+        raw_project_completion = entry.get("project_completion", False)
+        if not isinstance(raw_project_completion, bool):
+            raise ReconciliationRegistryError(
+                f"legacy reconciliation registry mapping {index} declares a 'project_completion' "
+                "that is not a boolean",
+                "reconciliation-registry-malformed",
+            )
         edges.append(RegistryMapping(
             replacement=replacement, superseded=historical, source_run=source_run,
+            project_completion=raw_project_completion,
         ))
     return tuple(edges)
 

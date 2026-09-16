@@ -24,7 +24,12 @@ from dataclasses import dataclass, field
 
 from feature_pipeline.contracts import TaskSpec
 
-from pipeline_core.commands import VerificationRun, run_verification_commands, verification_stage
+from pipeline_core.commands import (
+    VerificationRun,
+    active_revision,
+    run_verification_commands,
+    verification_stage,
+)
 from pipeline_core.state import Run
 from pipeline_core.verification import (
     VerificationOutcome,
@@ -60,7 +65,8 @@ class VerificationService:
     def verify(self, run: Run, request: VerificationRequest) -> VerificationOutcome:
         spec = request.spec
         task_id = spec.id
-        stage = verification_stage(task_id, attempt=request.attempt)
+        revision = active_revision(run, task_id)
+        stage = verification_stage(task_id, attempt=request.attempt, revision=revision)
         command_ids = run.stage_command_ids(stage)
         declared_count = len(spec.verification_commands)
         if len(command_ids) == declared_count:

@@ -39,7 +39,7 @@ from feature_pipeline.infrastructure.board_projection import (
 
 from pipeline_core.adapters import Adapter
 from pipeline_core.artifacts import write_json_atomic
-from pipeline_core.commands import verification_stage
+from pipeline_core.commands import active_revision, verification_stage
 from pipeline_core.dispatch import DispatchRequest, dispatch_executor
 from pipeline_core.lifecycle import RunLifecycle
 from pipeline_core.prompt_envelope import EnvelopeAnchors
@@ -161,13 +161,14 @@ def build_completion_evidence(run: Run, spec: TaskSpec) -> CompletionEvidence:
     """
     record = run.task(spec.id)
     gate = record.attempts + 1
-    stage = verification_stage(spec.id, attempt=gate)
+    revision = active_revision(run, spec.id)
+    stage = verification_stage(spec.id, attempt=gate, revision=revision)
     commands = tuple(
         CommandEvidence(
             cwd=entry["cwd"], command=" ".join(entry["argv"]), exit_code=entry["exit_code"])
         for entry in (run.command(cid) for cid in run.stage_command_ids(stage))
     )
-    arts = verifier_artifacts(run.run_dir, spec.id, gate)
+    arts = verifier_artifacts(run.run_dir, spec.id, gate, revision=revision)
     evidence_paths = tuple(
         repo_relative(path, run.repo_root)
         for path in (arts.task_report, arts.test_report)
@@ -323,7 +324,8 @@ class TaskEngine:
                             note="executor operation started")
             self._project(run, request, "in_progress")
         if record.status == "in_progress":
-            report = newest_repair_report(run.run_dir, task_id)
+            report = newest_repair_report(
+                run.run_dir, task_id, revision=active_revision(run, task_id))
             # An executor which already reported ``implemented`` is settled work.  If the
             # next unfinished boundary is verification (for example a verifier was
             # unavailable after runner-owned commands had completed), continue that gate
@@ -376,22 +378,24 @@ class TaskEngine:
         self, run: Run, spec: TaskSpec, gate: int, outcome: VerificationOutcome
     ) -> RepairReport:
         task_id = spec.id
+        revision = active_revision(run, task_id)
         attempt = run.task(task_id).attempts + 2
-        persisted = repair_report_path(run.run_dir, task_id, attempt)
+        persisted = repair_report_path(run.run_dir, task_id, attempt, revision=revision)
         if persisted.is_file():
-            if not _valid_repair_report(persisted, task_id):
+            if not _valid_repair_report(persisted, task_id, attempt, revision):
                 raise ExecutionError(
                     f"{task_id} has a malformed persisted repair report for attempt {attempt}",
                     "malformed-repair-report",
                 )
             return RepairReport(persisted, attempt, gate, (), (), (), ())
-        arts = verifier_artifacts(run.run_dir, task_id, gate)
+        arts = verifier_artifacts(run.run_dir, task_id, gate, revision=revision)
         product, environment, regression = _classify(spec, outcome)
         return write_repair_report(
             run, spec, attempt,
             task_verifier_text=_read(arts.task_report),
             test_verifier_text=_read(arts.test_report),
             source_attempt=gate,
+            revision=revision,
             product_defects=product,
             environment_problems=environment,
             regression_tests=regression,
@@ -515,17 +519,24 @@ class TaskEngine:
             tuple(passes))
 
 
-def _valid_repair_report(path: Path, task_id: str) -> bool:
-    """Return whether persisted repair evidence has the required identity and provenance."""
+def _valid_repair_report(
+    path: Path, task_id: str, attempt: int, revision: int | None = None,
+) -> bool:
+    """Return whether persisted repair evidence has the required identity and provenance.
+
+    ``attempt`` and ``revision`` are the caller's own expected identity — never re-derived from
+    the filename — so a persisted report whose declared revision disagrees with the task's
+    active revision is rejected rather than silently accepted as this revision's evidence.
+    """
     try:
-        attempt = int(path.stem.rsplit("-", 1)[1])
         text = path.read_text(encoding="utf-8")
-    except (IndexError, OSError, UnicodeError, ValueError):
+    except (OSError, UnicodeError):
         return False
     required = (
         f"# Repair Report — {task_id} — attempt {attempt} of ",
         f"- Task: {task_id} — ",
         f"- Attempt: {attempt} of ",
+        f"- Revision: {revision or 0}",
         f"- Source verification gate: {attempt - 1}",
         "- Original scope (unchanged): ",
         "- Out of scope (unchanged): ",

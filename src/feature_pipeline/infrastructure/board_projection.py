@@ -101,6 +101,8 @@ class CompletionEvidence:
     test_verdict: str | None = None
     commands: tuple[CommandEvidence, ...] = ()
     evidence_paths: tuple[str, ...] = field(default_factory=tuple)
+    reconciliation_source_task: str | None = None
+    reconciliation_replacement_task: str | None = None
 
     def __post_init__(self) -> None:
         if self.resolution not in {"completed", "cancelled"}:
@@ -114,6 +116,10 @@ class CompletionEvidence:
                 )
         for path in self.evidence_paths:
             _require_repo_relative(path)
+        if (self.reconciliation_source_task is None) != (
+            self.reconciliation_replacement_task is None
+        ):
+            raise InvalidEvidenceError("reconciliation provenance must name both tasks")
 
 
 def _require_repo_relative(path: str) -> None:
@@ -458,6 +464,11 @@ def _render_result_section(evidence: CompletionEvidence, newline: str) -> list[s
     lines.append(f"- Gate failures: {evidence.gate_count}{newline}")
     if evidence.resolution_reason:
         lines.append(f"- Reason: {evidence.resolution_reason}{newline}")
+    if evidence.reconciliation_source_task:
+        lines.append(
+            f"- Reconciliation: {evidence.reconciliation_source_task} completed from "
+            f"{evidence.reconciliation_replacement_task} run `{evidence.run_id}`{newline}"
+        )
     if evidence.resolution == "completed":
         lines.append(f"- Task verifier verdict: {evidence.task_verdict or 'none'}{newline}")
         lines.append(f"- Test verifier verdict: {evidence.test_verdict or 'none'}{newline}")
@@ -475,6 +486,11 @@ def _render_result_section(evidence: CompletionEvidence, newline: str) -> list[s
             lines.append(f"- {path}{newline}")
     lines.append(newline)
     return lines
+
+
+def _with_single_terminal_newline(text: str, newline: str) -> str:
+    """Keep a Markdown file terminated, but never with a trailing blank line."""
+    return text.rstrip() + newline
 
 
 def _apply_task_transition(
@@ -512,7 +528,7 @@ def _apply_task_transition(
         else:
             gap = [newline]
             remainder = lines[status_end:]
-        return "".join(head + gap + result_block + remainder)
+        return _with_single_terminal_newline("".join(head + gap + result_block + remainder), newline)
 
     if result_indices[0] < status_end:
         raise MalformedTaskError("## Result heading precedes the ## Status block")
@@ -526,4 +542,4 @@ def _apply_task_transition(
             rendered.extend(result_block)
         cursor = end
     rendered.extend(lines[cursor:])
-    return "".join(rendered)
+    return _with_single_terminal_newline("".join(rendered), newline)

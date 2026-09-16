@@ -62,7 +62,7 @@ _DIAGNOSTICS = DiagnosticService()
 _COMMAND_REFERENCE_KEYS = (
     "id", "stage", "cwd", "argv", "exit_code", "disposition", "duration",
     "stdout_log", "stderr_log", "reason", "command_index", "task_id", "attempt",
-    "snapshot",
+    "snapshot", "revision",
 )
 
 

@@ -78,6 +78,7 @@ from feature_pipeline.domain.vocabulary import StageId
 from feature_pipeline.contracts import TaskSpec
 from feature_pipeline.infrastructure.board_projection import (
     BoardProjectionError,
+    CompletionEvidence,
     project_task_state,
     remove_historical_cards,
 )
@@ -1507,6 +1508,31 @@ def _find_bound_source_evidence(
     return replacement_id, evidence
 
 
+def _reconciliation_completion_evidence(
+    *, source_dir: Path, repo_root: Path, historical_id: str,
+    replacement: TaskSpec,
+) -> CompletionEvidence | None:
+    """Render runner-owned completion evidence from one already-validated source run.
+
+    The source directory was selected by a registry's bare ``source_run`` identity and
+    independently accepted by :class:`VerifiedEvidenceStore`; loading it here only reads its
+    durable facts to make the historical Markdown projection useful.  It never transitions,
+    saves, or otherwise mutates that run.
+    """
+    try:
+        source = Run.load(source_dir, repo_root)
+        evidence = build_completion_evidence(source, replacement)
+        source_evidence = repo_relative(source_dir / "run.json", repo_root)
+    except (StateError, OSError, BoardProjectionError):
+        return None
+    return replace(
+        evidence,
+        evidence_paths=tuple(dict.fromkeys((*evidence.evidence_paths, source_evidence))),
+        reconciliation_source_task=historical_id,
+        reconciliation_replacement_task=replacement.id,
+    )
+
+
 def reconcile_historical_cards(
     life: RunLifecycle, board_path: Path, by_id: Mapping[str, TaskSpec],
 ) -> tuple[str, ...]:
@@ -1530,6 +1556,7 @@ def reconcile_historical_cards(
         return ()
     store = VerifiedEvidenceStore(life.run.run_dir.parent, life.run.repo_root)
     replacements: dict[str, tuple[str, Mapping[str, str]]] = {}
+    reconciled: dict[str, tuple[TaskSpec, CompletionEvidence]] = {}
     if graph is not None:
         for edge in graph.edges:
             evidence = find_superseding_evidence(
@@ -1547,22 +1574,51 @@ def reconcile_historical_cards(
                 evidence = _find_bound_source_evidence(
                     store, registry_definitions, edge.replacement, source_run,
                 )
+                if evidence is not None and getattr(edge, "project_completion", False):
+                    replacement_spec = registry_definitions.get(edge.replacement)
+                    historical_spec = registry_definitions.get(edge.superseded)
+                    projection_evidence = (
+                        _reconciliation_completion_evidence(
+                            source_dir=store.runs_root / source_run,
+                            repo_root=life.run.repo_root,
+                            historical_id=edge.superseded,
+                            replacement=replacement_spec,
+                        ) if replacement_spec is not None else None
+                    )
+                    if historical_spec is not None and projection_evidence is not None:
+                        reconciled[edge.superseded] = (historical_spec, projection_evidence)
             else:
                 evidence = find_superseding_evidence(
                     store, registry_graph, edge.superseded, registry_definitions
                 )
             if evidence is not None:
                 replacements[edge.superseded] = evidence
+    projected: list[str] = []
     try:
-        removed = remove_historical_cards(board_path, tuple(replacements))
+        for historical_id, (historical_spec, evidence) in reconciled.items():
+            if not historical_spec.path:
+                continue
+            project_task_state(
+                board_path=board_path,
+                task_path=life.run.repo_root / historical_spec.path,
+                task_id=historical_spec.id,
+                task_title=historical_spec.title,
+                state="done",
+                evidence=evidence,
+            )
+            projected.append(historical_id)
+        removed = remove_historical_cards(
+            board_path, tuple(task_id for task_id in replacements if task_id not in reconciled)
+        )
     except BoardProjectionError as exc:
         raise ExecutionError(
             f"historical board reconciliation failed: {exc}", "board-reconciliation-failed"
         ) from exc
-    if not removed:
+    retired = tuple(dict.fromkeys((*projected, *removed)))
+    if not retired:
         return ()
-    facts = ", ".join(f"{task_id}={replacements[task_id][0]}" for task_id in removed)
-    source_runs = ", ".join(replacements[task_id][1]["source_run_id"] for task_id in removed)
+    facts = ", ".join(f"{task_id}={replacements[task_id][0]}" for task_id in retired)
+    source_runs = ", ".join(replacements[task_id][1]["source_run_id"] for task_id in retired)
     life.run.record_event(
         "board-reconciliation:historical",
         to=facts,
@@ -1571,7 +1627,7 @@ def reconcile_historical_cards(
               f"evidence from runs: {source_runs}"),
     )
     life.run.save()
-    return removed
+    return retired
 
 
 def _with_rec01_recovery_definitions(

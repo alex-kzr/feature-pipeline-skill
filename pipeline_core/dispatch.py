@@ -47,6 +47,7 @@ from .adapters import (
     grant_tool_names,
 )
 from .artifacts import write_json_atomic, write_text_atomic
+from .commands import active_revision
 from .lifecycle import RunLifecycle
 from .prompt_envelope import EnvelopeAnchors, build_executor_envelope
 from .reports import (
@@ -58,7 +59,7 @@ from .reports import (
     parse_executor_status,
     settle_executor_status,
 )
-from .state import ACTOR_EXECUTOR, repo_relative
+from .state import ACTOR_EXECUTOR, StateError, repo_relative
 from .worktree import AttributionResult, attribute_executor_window, capture_snapshot
 from .git_port import GitPort, GitSafetyError
 
@@ -343,6 +344,44 @@ def _copy_repair_report_to_workspace(
     shutil.copyfile(source, destination)
 
 
+def _validated_repair_report_path(run, task_id: str, raw_path: str) -> str:
+    """Return the one repair input that belongs to this task's active revision.
+
+    The prompt path is caller-provided, while the report is runner-owned evidence.  Bind its
+    durable headers to the active task before a disposable workspace receives any bytes; a
+    revision-0 report must therefore never be supplied to a revision-1 repair launch merely
+    because both reports share an attempt number.
+    """
+    root = Path(run.repo_root)
+    try:
+        relative = repo_relative(raw_path, root)
+    except (StateError, ValueError) as exc:
+        raise DispatchError(
+            f"repair report is outside the repository: {raw_path}",
+            "repair-report-identity-conflict",
+        ) from exc
+    source = root / relative
+    if source.is_symlink() or not source.is_file():
+        raise DispatchError(
+            f"repair report is unavailable: {relative}", "repair-report-identity-conflict"
+        )
+    try:
+        text = source.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise DispatchError(
+            f"repair report cannot be read: {relative}", "repair-report-identity-conflict"
+        ) from exc
+    revision = active_revision(run, task_id) or 0
+    required = (f"- Task: {task_id} — ", f"- Revision: {revision}")
+    if not all(marker in text for marker in required):
+        raise DispatchError(
+            f"repair report identity conflicts with active {task_id} revision {revision}: "
+            f"{relative}",
+            "repair-report-identity-conflict",
+        )
+    return relative
+
+
 def _workspace_artifacts(artifacts: LaunchArtifacts, root: Path) -> LaunchArtifacts:
     """Mirror attribution artifacts inside an isolated workspace before promotion."""
     directory = root / ".pipeline-artifacts" / artifacts.task_id / f"launch-{artifacts.generation}"
@@ -454,6 +493,10 @@ def dispatch_executor(
             "task-not-running",
         )
 
+    repair_report_path = request.repair_report_path
+    if repair_report_path is not None:
+        repair_report_path = _validated_repair_report_path(run, task_id, repair_report_path)
+
     # Consume the generation *before* the launch: a failed attempt still owns its number.
     generation = life.consume_launch_generation(task_id, EXECUTOR_ROLE)
     life.record_operation(task_id, "executor", "started", "executor window opened",
@@ -470,15 +513,6 @@ def dispatch_executor(
             raise DispatchError(str(exc), exc.code) from None
         runner_evidence_satisfied = True
 
-    primary_root = Path(run.repo_root)
-    repair_report_path = request.repair_report_path
-    if repair_report_path is not None:
-        try:
-            available = (primary_root / repo_relative(repair_report_path, primary_root)).is_file()
-        except ValueError:
-            available = False
-        if not available:
-            repair_report_path = None
     envelope = build_executor_envelope(
         spec,
         anchors=request.anchors,

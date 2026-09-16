@@ -1079,7 +1079,11 @@ class DispatchAttributionTests(unittest.TestCase):
             repair_path = ".pipeline/runs/dispatch/reports/RDS-04/repair-1.md"
             source = root / repair_path
             source.parent.mkdir(parents=True)
-            source.write_text("# Repair findings\n\n- Fix this.\n", encoding="utf-8")
+            source.write_text(
+                "# Repair findings\n\n- Task: RDS-04 — isolated workspace coverage\n"
+                "- Revision: 0\n\n- Fix this.\n",
+                encoding="utf-8",
+            )
 
             def repair_report_is_readable(request) -> None:  # noqa: ANN001
                 visible = Path(request.working_root) / repair_path

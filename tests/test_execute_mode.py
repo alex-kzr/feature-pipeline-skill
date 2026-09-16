@@ -35,6 +35,7 @@ from pipeline_core.adapters import LaunchResult
 from pipeline_core.lifecycle import RunLifecycle
 from pipeline_core.prompt_envelope import EnvelopeAnchors
 from pipeline_core.state import ACTOR_RUNNER, Run, pid_alive
+from pipeline_core.task_files import load_task_spec
 from pipeline_core.verification import VerifierAnchors, VerifierLaunchers
 from feature_pipeline.contracts import CommandSpec, TaskSpec
 
@@ -1568,6 +1569,105 @@ class BoardProjectionWiringTests(unittest.TestCase):
             self.assertEqual(resumed_report_bytes, source_report_bytes)
             self.assertEqual(Run.load(first.run_dir, root).task("EX-01").verification,
                               run.task("EX-01").verification)
+
+    def test_execute_run_projects_a_registry_named_historical_task_done_from_its_replacement(
+        self,
+    ) -> None:
+        """REC-23. A normal ``execute_run`` invocation, dispatching an unrelated task, also
+        consults the project-declared legacy reconciliation registry. A registry mapping that
+        names one closed, exactly ``PASS``/``PASS`` replacement run and declares
+        ``project_completion`` projects the historical task's own Markdown to ``Done`` with one
+        ``## Result`` — it never dispatches an executor or verifier for the historical task, and
+        it never mutates the historical task's own (here, entirely absent) run."""
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            board = root / "docs" / "kanban.md"
+            board.parent.mkdir(parents=True, exist_ok=True)
+            board.write_text(
+                "# Kanban Board\n\n## To Do\n\n"
+                "- [HIST-01: Historical task](plans/tasks/HIST-01_historical.md)\n"
+                "- [EX-01: Direct success task](../fixtures/execution/tasks/EX-01_direct-success.md)\n\n"
+                "## In Progress\n",
+                encoding="utf-8",
+            )
+            for name in ("EX-01_direct-success.md",):
+                source = FIXTURES / "tasks" / name
+                dest = root / "fixtures" / "execution" / "tasks" / name
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+
+            def _write_named_task(task_id: str) -> Path:
+                path = root / "docs" / "plans" / "tasks" / f"{task_id}_slug.md"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    f"# {task_id} - {task_id} title\n\n"
+                    "## Status\n- [ ] To Do\n- [ ] In Progress\n- [ ] Done\n\n"
+                    "## Execution Metadata\n"
+                    "- Type: python\n- Executor: python-executor\n- Depends on: none\n"
+                    "- Allowed scope: `src/**`\n- Out of scope: none\n- Required skills: none\n"
+                    "- Maximum repair attempts: 1\n- Documentation impact: none\n"
+                    "- Verification commands:\n  - `.` -> `git diff --check`\n"
+                    "- Blocking conditions: none\n",
+                    encoding="utf-8",
+                )
+                return path
+
+            historical_path = root / "docs" / "plans" / "tasks" / "HIST-01_historical.md"
+            historical_path.parent.mkdir(parents=True, exist_ok=True)
+            historical_path.write_text(
+                "# HIST-01 - Historical task\n\n"
+                "## Status\n- [x] To Do\n- [ ] In Progress\n- [ ] Done\n\n"
+                "## Execution Metadata\n"
+                "- Type: python\n- Executor: python-executor\n- Depends on: none\n"
+                "- Allowed scope: `src/**`\n- Out of scope: none\n- Required skills: none\n"
+                "- Maximum repair attempts: 1\n- Documentation impact: none\n"
+                "- Verification commands:\n  - `.` -> `git diff --check`\n"
+                "- Blocking conditions: none\n",
+                encoding="utf-8",
+            )
+            replacement_path = _write_named_task("REPL-01")
+            replacement = load_task_spec(replacement_path)
+
+            registry = root / "tools" / "feature-pipeline" / "config" / "legacy_reconciliation_registry.json"
+            registry.parent.mkdir(parents=True)
+            registry.write_text(json.dumps({"mappings": [{
+                "historical_task": "HIST-01", "replacement_task": "REPL-01",
+                "source_run": "repl-01-verified", "project_completion": True,
+            }]}), encoding="utf-8")
+
+            source = Run.create(
+                "repl-01-verified", root / "prompt.md", None,
+                root / "runs" / "repl-01-verified", root,
+            )
+            RunLifecycle.initialize(source, tasks=[("REPL-01", ())])
+            persist_task_contracts(source, (replacement,))
+            source.transition_task("REPL-01", "in_progress", actor=ACTOR_RUNNER)
+            source.record_verdicts("REPL-01", "PASS", "PASS")
+            source.status = "verified"
+            source.save()
+
+            executor = sa.ScriptedExecutor(("implemented",))
+            result = execute_run(
+                _request(
+                    root, _specs(("EX-01",)), executor=executor,
+                    launchers=VerifierLaunchers(
+                        task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))),
+                    controls=ExecuteControls(plan_approved=True), environment={"claude": True},
+                    board_path=board))
+
+            self.assertTrue(result.ok, result.message)
+            board_text = board.read_text(encoding="utf-8")
+            self.assertNotIn("HIST-01", board_text)
+            # EX-01 completed through its own normal dispatch path and is likewise done.
+            self.assertNotIn("EX-01", board_text)
+
+            historical_text = historical_path.read_text(encoding="utf-8")
+            self.assertIn("- [x] Done", historical_text)
+            self.assertEqual(historical_text.count("## Result"), 1)
+            self.assertIn(
+                f"HIST-01 completed from REPL-01 run `{source.run_id}`", historical_text
+            )
+            self.assertIn("runs/repl-01-verified/run.json", historical_text)
 
     def test_fresh_reuse_projects_the_reused_dependency_after_pruning_its_ancestor(self) -> None:
         """A pruned ancestor is not a lifecycle record, but its reused dependent is."""

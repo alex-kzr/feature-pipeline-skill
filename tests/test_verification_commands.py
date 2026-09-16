@@ -341,5 +341,32 @@ class SubprocessEncodingTests(unittest.TestCase):
         self.assertEqual(record["stderr"], "naïve — café")
 
 
+class RevisionScopedStageTests(unittest.TestCase):
+    """REC-21: a positive amendment revision gets its own command-stage identity, distinct
+    from the unamended (revision-less) stage at the identical attempt number."""
+
+    def test_a_positive_revision_gets_a_distinct_stage_from_the_unamended_attempt(self) -> None:
+        unamended = verification_stage("VR-01", attempt=1)
+        amended = verification_stage("VR-01", attempt=1, revision=2)
+
+        self.assertEqual(unamended, "task:VR-01:verify:1")
+        self.assertEqual(amended, "task:VR-01:verify:1:revision:2")
+        self.assertNotEqual(unamended, amended)
+
+    def test_revision_zero_or_none_resolves_the_historical_unqualified_stage(self) -> None:
+        self.assertEqual(
+            verification_stage("VR-01", attempt=1, revision=None),
+            verification_stage("VR-01", attempt=1, revision=0),
+        )
+        self.assertEqual(
+            verification_stage("VR-01", attempt=1, revision=0),
+            "task:VR-01:verify:1",
+        )
+
+    def test_a_non_positive_revision_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            verification_stage("VR-01", attempt=1, revision=-1)
+
+
 if __name__ == "__main__":
     unittest.main()

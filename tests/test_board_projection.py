@@ -503,5 +503,26 @@ class CrlfPreservationTests(unittest.TestCase):
             self.assertIn(b"\r\n", task_bytes)
 
 
+class ReconciliationProvenanceTests(unittest.TestCase):
+    def test_done_result_records_named_replacement_run_provenance(self) -> None:
+        with temp_root() as root:
+            board = _write_bytes_exact(root / "docs/kanban.md", BOARD)
+            task = _write_bytes_exact(root / "docs/plans/tasks/ABC-01_do-the-thing.md", TASK)
+
+            project_task_state(
+                board_path=board, task_path=task, task_id="ABC-01", task_title="Do the thing",
+                state="done", evidence=_evidence(
+                    run_id="rec-22-run",
+                    evidence_paths=(".pipeline/runs/rec-22-run/run.json",),
+                    reconciliation_source_task="REC-21",
+                    reconciliation_replacement_task="REC-22",
+                ),
+            )
+
+            rendered = task.read_text(encoding="utf-8")
+            self.assertIn("- Reconciliation: REC-21 completed from REC-22 run `rec-22-run`", rendered)
+            self.assertIn("- .pipeline/runs/rec-22-run/run.json", rendered)
+
+
 if __name__ == "__main__":
     unittest.main()
