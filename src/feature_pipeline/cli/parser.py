@@ -34,6 +34,10 @@ DELIVERY_GATES = ("plan", "final-diff", "commit", "verification-verdict")
 #: nothing and always stops at the release dry-run boundary.
 POST_TASK_MODE = "release-dry-run"
 
+#: The ``--mode`` value that persists one explicit, human-approved amendment revision (see
+#: ``pipeline_core.plan``) instead of dispatching an executor or a preview.
+AMEND_MODE = "amend"
+
 # One-line meaning of each exit code, for the C5 line of the dry-run plan.
 EXIT_MEANINGS = {
     EXIT_OK: "ok",
@@ -50,11 +54,19 @@ FEATURE_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 SOURCE_FEATURE_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
+class _StableHelpFormatter(argparse.HelpFormatter):
+    """Keep the frozen CLI help surface independent of the terminal environment."""
+
+    def __init__(self, prog: str) -> None:
+        super().__init__(prog, width=78)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="run_pipeline.py",
         description="Portable feature-pipeline core runner. Every path is an explicit anchor "
                     "or a logical path resolved below one; nothing is inferred.",
+        formatter_class=_StableHelpFormatter,
     )
     anchors = parser.add_argument_group("explicit anchors (filesystem roots)")
     anchors.add_argument("--project-root", metavar="DIR",
@@ -84,27 +96,58 @@ def build_parser() -> argparse.ArgumentParser:
                           "without dispatching it in this run. Repeatable; real control for "
                           "--mode execute and for --dry-run (both resolve and validate the "
                           "source run read-only), accepted as a no-op otherwise")
-    run.add_argument("--verify-dependency-chain", action="store_true",
+    # Keep omission distinct from an explicit chain-verification request.  A resumed run
+    # inherits the durable policy when this is ``None``; ``False`` is the fresh-run default.
+    run.add_argument("--verify-dependency-chain", action="store_true", default=None,
                      help="verify the selected task's full dependency closure in this run; "
                           "by default eligible verified dependencies are reused")
     run.add_argument("--resume", action="store_true",
                      help="resume a previously recorded run instead of starting one")
+    run.add_argument("--recover-source", metavar="FEATURE",
+                     dest="recovery_source_feature",
+                     help="execute-only: create a fresh linked replacement from this failed source run")
+    run.add_argument("--recover-task", metavar="ID", dest="recovery_task",
+                     help="execute-only: selected pre-implementation task in --recover-source")
+    run.add_argument("--operational-unblock", metavar="ID", dest="operational_unblock_task",
+                     help="execute-only: reopen one terminal external uv-cache blocked task")
+    run.add_argument("--human-authorize-operational-unblock", action="store_true",
+                     dest="human_authorized_operational_unblock",
+                     help="execute-only: explicitly authorize the requested operational unblock")
+    run.add_argument("--uv-cache-dir", metavar="REL",
+                     help="execute-only: worktree-local UV cache directory for the authorized reopen")
     run.add_argument("--grant", action="append", default=[], help="assert an operator capability")
     run.add_argument("--approve", action="append", default=[], help="assert a named human approval")
     run.add_argument("--published-ref", action="append", default=[], metavar="SOURCE=REF",
                      help="bind a ref-published precondition to refs/heads/* or refs/tags/*")
     run.add_argument("--mode", default="plan-only",
-                     choices=["plan-only", "unattended", "execute", POST_TASK_MODE],
+                     choices=["plan-only", "unattended", "execute", POST_TASK_MODE, AMEND_MODE],
                      help="run mode (default: plan-only). 'execute' runs stages 5-9 — executor "
                           "dispatch, independent verification, and bounded repair — and stops "
                           "before documentation/delivery. 'release-dry-run' extends the "
                           "plan-only dry run with the post-task lifecycle (stages 10–16) and "
                           "its gates in the C4/C6 plan, then stops at the final-diff / release "
-                          "dry-run boundary; it still writes nothing")
+                          "dry-run boundary; it still writes nothing. 'amend' persists one "
+                          "explicit, human-approved amendment revision on an existing "
+                          "non-done task (TAM-01) and dispatches no executor")
     run.add_argument("--feature", metavar="NAME", help="override the plan's feature name")
     run.add_argument("--prompt", metavar="REL",
                      help="prompt file, relative to the resolved project directory "
                           "(defaults to the plan file)")
+
+    amend = parser.add_argument_group("amendment (--mode amend only; TAM-01)")
+    amend.add_argument("--amend-task", metavar="ID",
+                       help="the existing, non-done task id this amendment revises")
+    amend.add_argument("--amend-rationale", metavar="TEXT",
+                       help="why the additional scope is required (non-empty)")
+    amend.add_argument("--amend-approved-by", metavar="NAME",
+                       help="the human who approved this amendment (explicit approval)")
+    amend.add_argument("--amend-evidence", metavar="REF",
+                       help="a reference to the runner-owned or verifier evidence that "
+                            "justifies the amendment (a report path, run id, or command id)")
+    amend.add_argument("--amend-contract", metavar="PATH",
+                       help="a JSON file with 'new_contract' (required), 'prior_contract' "
+                            "(optional, defaults to an empty comparison baseline), and "
+                            "'added_paths' (optional list) keys")
 
     gates = parser.add_argument_group("delivery gates (all closed by default)")
     gates.add_argument("--approve-plan", action="store_true", help="satisfy the plan gate")
@@ -136,6 +179,10 @@ def build_parser() -> argparse.ArgumentParser:
     compat.add_argument("--adapter", metavar="NAME", choices=["claude", "codex", "auto"],
                         help="execution adapter for --mode execute (real control there); "
                              "accepted as a no-op in plan-only/unattended")
+    compat.add_argument("--model", metavar="MODEL",
+                        help="adapter-native model for --mode execute only")
+    compat.add_argument("--effort", metavar="LEVEL",
+                        help="adapter-native reasoning effort for --mode execute only")
     compat.add_argument("--max-repair-attempts", metavar="N", type=int,
                         help="repair-loop bound for --mode execute (overrides each task's "
                              "declared bound); accepted as a no-op in plan-only/unattended")
@@ -162,6 +209,7 @@ __all__ = [
     "PUSH_DENIED_MESSAGE",
     "DELIVERY_GATES",
     "POST_TASK_MODE",
+    "AMEND_MODE",
     "EXIT_MEANINGS",
     "FEATURE_RE",
     "SOURCE_FEATURE_RE",

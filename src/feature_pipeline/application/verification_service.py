@@ -24,7 +24,12 @@ from dataclasses import dataclass, field
 
 from feature_pipeline.contracts import TaskSpec
 
-from pipeline_core.commands import run_verification_commands, verification_stage
+from pipeline_core.commands import (
+    VerificationRun,
+    active_revision,
+    run_verification_commands,
+    verification_stage,
+)
 from pipeline_core.state import Run
 from pipeline_core.verification import (
     VerificationOutcome,
@@ -47,6 +52,8 @@ class VerificationRequest:
     attempt: int
     plan_path: str | None = None
     timeout: float | None = None
+    model: str | None = None
+    effort: str | None = None
     #: Executor-claimed checks, so a claim with no runner-recorded command surfaces as a
     #: fact-only ``FAIL`` rather than a prompt to re-run the check.
     claimed_checks: tuple[object, ...] = field(default_factory=tuple)
@@ -58,14 +65,28 @@ class VerificationService:
     def verify(self, run: Run, request: VerificationRequest) -> VerificationOutcome:
         spec = request.spec
         task_id = spec.id
-        commands_run = run_verification_commands(
-            run,
-            spec.verification_commands,
-            stage=verification_stage(task_id, attempt=request.attempt),
-            task_id=task_id,
-            attempt=request.attempt,
-            timeout=request.timeout,
-        )
+        revision = active_revision(run, task_id)
+        stage = verification_stage(task_id, attempt=request.attempt, revision=revision)
+        command_ids = run.stage_command_ids(stage)
+        declared_count = len(spec.verification_commands)
+        if len(command_ids) == declared_count:
+            # A verifier interruption occurs after these runner-owned command records have
+            # settled.  Reuse those immutable facts on resume; in particular, a non-zero
+            # command remains recorded as a failure instead of being hidden by a rerun.
+            commands_run = VerificationRun(tuple(run.command(command_id) for command_id in command_ids))
+            run.record_operation(
+                task_id, "verification", "resumed",
+                "reusing settled runner-owned command evidence", attempt=request.attempt,
+            )
+        else:
+            commands_run = run_verification_commands(
+                run,
+                spec.verification_commands,
+                stage=stage,
+                task_id=task_id,
+                attempt=request.attempt,
+                timeout=request.timeout,
+            )
         evidence = build_verification_evidence(
             run,
             task_id,
@@ -81,6 +102,8 @@ class VerificationService:
             anchors=request.anchors,
             attempt=request.attempt,
             plan_path=request.plan_path,
+            model=request.model,
+            effort=request.effort,
         )
         run.save()
         return outcome

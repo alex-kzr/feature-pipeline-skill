@@ -19,6 +19,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from feature_pipeline.contracts import AcceptanceCriterionSpec, CommandSpec, SchemaError, TaskSpec
+from feature_pipeline.application.verified_reuse import task_contract_digest
 
 from pipeline_core.legacy_adapter import adapt_task_spec
 from pipeline_core.task_files import (
@@ -26,6 +27,8 @@ from pipeline_core.task_files import (
     TaskFileError,
     load_task_spec,
     synthesize_acceptance_criteria,
+    task_presentation_digest,
+    parse_supersession_declarations,
 )
 
 
@@ -255,6 +258,30 @@ class TaskSpecBuildTests(unittest.TestCase):
 
 
 class LoadTaskSpecMarkdownTests(unittest.TestCase):
+    def test_supersession_declarations_use_the_plan_parser_relation(self) -> None:
+        with TemporaryDirectory() as raw:
+            path = _write(
+                Path(raw), "AB-01_normalize.md",
+                DECLARED_TASK_MD + "\n## Supersession\n- Supersedes: AB-00, AB-02\n",
+            )
+            self.assertEqual(parse_supersession_declarations(path), ("AB-00", "AB-02"))
+            path.write_text(DECLARED_TASK_MD + "\n## Supersession\n- AB-03\n", encoding="utf-8")
+            self.assertEqual(parse_supersession_declarations(path), ("AB-03",))
+
+    def test_runner_owned_projection_changes_only_the_presentation_digest(self) -> None:
+        with TemporaryDirectory() as raw:
+            path = _write(Path(raw), "AB-01_normalize.md", DECLARED_TASK_MD)
+            before_contract = task_contract_digest(load_task_spec(path))
+            before_presentation = task_presentation_digest(path)
+            path.write_text(
+                DECLARED_TASK_MD.replace("- [ ] To Do", "- [x] To Do").replace(
+                    "## Purpose\nx", "## Result\ncompleted\n\n## Blockers\n- [runner] none\n\n## Purpose\nx"
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(before_contract, task_contract_digest(load_task_spec(path)))
+            self.assertNotEqual(before_presentation, task_presentation_digest(path))
+
     def test_declared_markdown_task_file_normalizes_completely(self) -> None:
         with TemporaryDirectory() as raw:
             path = _write(Path(raw), "AB-01_normalize.md", DECLARED_TASK_MD)
@@ -348,6 +375,18 @@ class LoadTaskSpecHistoricalTests(unittest.TestCase):
         )
         self.assertIn("task_type", spec.defaults_applied)
         self.assertIn("acceptance_criteria", spec.defaults_applied)
+
+    def test_historical_affected_paths_share_the_declared_path_safety_boundary(self) -> None:
+        """AC-1: a legacy '## Affected Files / Components' path is normalized by the same
+        :func:`feature_pipeline.contracts.validate_relative_path` boundary a declared
+        'Allowed scope' entry uses — an unsafe legacy path still fails closed."""
+        unsafe = HISTORICAL_TASK_MD.replace(
+            "- `tools/export/writer.py`", "- `../outside/writer.py`"
+        )
+        with TemporaryDirectory() as raw:
+            path = _write(Path(raw), "LT-09_legacy.md", unsafe)
+            with self.assertRaises(TaskFileError):
+                load_task_spec(path, defaults=HISTORICAL_DEFAULTS)
 
     def test_a_historical_file_without_a_resolvable_scope_is_rejected(self) -> None:
         no_scope = HISTORICAL_TASK_MD.replace(

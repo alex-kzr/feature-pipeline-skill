@@ -12,17 +12,25 @@ import json
 import os
 import shutil
 import unittest
+from types import SimpleNamespace
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from feature_pipeline.cli import use_cases
+from feature_pipeline import bootstrap
+from feature_pipeline.cli.commands import RunCommand
+from feature_pipeline.cli.parser import build_parser
+from feature_pipeline.ports.adapters import AdapterCapabilities, AdapterRegistry
 from pipeline_core import runner_cli
 from pipeline_core.adapters import LaunchRequest
+from pipeline_core.execution import persist_task_contracts
 from pipeline_core.lifecycle import RunLifecycle
 from pipeline_core.state import ACTOR_RUNNER, Run
+from pipeline_core.task_files import load_task_spec, upsert_blockers_section
 from pipeline_core.verification import VerifierLaunchers
+from feature_pipeline.infrastructure.board_projection import CompletionEvidence, project_task_state
 
 from tests.test_repair import ScriptedExecutor, StubVerifier
 
@@ -90,6 +98,15 @@ def _seed(fixture: str, dest: Path, *, tasks: list[dict], with_registry: bool = 
 
 
 class HelpAndFlagSurfaceTests(unittest.TestCase):
+    def test_operational_unblock_flags_are_typed_runner_controls(self) -> None:
+        command = RunCommand.from_args(build_parser().parse_args([
+            "--mode", "execute", "--resume", "--operational-unblock", "T-01",
+            "--human-authorize-operational-unblock", "--uv-cache-dir", ".pipeline/uv-cache",
+        ]))
+        self.assertEqual(command.operational_unblock_task, "T-01")
+        self.assertTrue(command.human_authorized_operational_unblock)
+        self.assertEqual(command.uv_cache_dir, ".pipeline/uv-cache")
+
     def test_help_lists_every_anchor_and_core_operational_flag(self) -> None:
         with self.assertRaises(SystemExit) as raised:
             _run(["--help"])
@@ -181,6 +198,25 @@ C1_TO_C8 = ("C1.", "C2.", "C3.", "C4.", "C5.", "C6.", "C7.", "C8.")
 
 
 class DryRunPlanShapeTests(unittest.TestCase):
+    def test_execute_dry_run_compiles_explicit_codex_controls_against_codex(self) -> None:
+        with TemporaryDirectory() as directory:
+            dest = Path(directory) / "project"
+            seed = _seed("library-guide", dest, tasks=[{"id": "T-01", "type": "docs"}])
+            composition = SimpleNamespace(
+                adapter_registry=AdapterRegistry((
+                    AdapterCapabilities("claude", True, True, True, True, 3600.0),
+                    AdapterCapabilities("codex", True, False, True, True, 3600.0),
+                )),
+            )
+            with patch.object(use_cases, "build_bootstrap", return_value=composition):
+                code, out, err = _run(seed["anchors"] + [
+                    "--profile", seed["profile_rel"], "--plan", "plan.json",
+                    "--mode", "execute", "--dry-run", "--adapter", "codex",
+                    "--model", "gpt-5.6-terra", "--effort", "medium",
+                ])
+        self.assertEqual(code, 10, err)
+        self.assertIn("C5. Exit code: 10", out)
+
     def test_dry_run_against_library_guide_prints_full_shape_and_is_byte_identical(self) -> None:
         tasks = [
             {"id": "T-01", "type": "docs"},
@@ -453,7 +489,7 @@ class ForwardedLegacyFlagTests(unittest.TestCase):
             self.assertIn(flag, help_text)
         for literal in PROJECT_IDENTITY_LITERALS:
             self.assertNotIn(literal, help_text)
-        for banned in ("archive", "purge", "retry", "maintenance", "recovery", "unblock"):
+        for banned in ("archive", "purge", "maintenance", "recovery"):
             self.assertNotIn(banned, help_text)
 
 
@@ -531,7 +567,7 @@ class DryRunAttestationTests(unittest.TestCase):
             run.status = "verified"
             run.save()
 
-    def test_valid_attestation_stops_reporting_dependency_not_satisfied(self) -> None:
+    def test_thin_plan_attestation_rejects_source_without_canonical_identity(self) -> None:
         with TemporaryDirectory() as directory:
             seed = self._seeded(directory)
             self._make_source_run(seed["project_dir"], "source-feature", verified=True)
@@ -539,11 +575,11 @@ class DryRunAttestationTests(unittest.TestCase):
                 "--profile", seed["profile_rel"], "--plan", "plan.json",
                 "--task", "T-02", "--attest-dependency", "T-01=source-feature", "--dry-run",
             ])
-        self.assertEqual(code, 10, err)
-        self.assertNotIn("T-02: pending -> blocked", out)
-        self.assertIn("T-02: pending -> ready -> running -> implemented -> verified", out)
+        self.assertEqual(code, 30)
+        self.assertEqual(out, "")
+        self.assertIn("evidence-canonical-identity-missing", err)
 
-    def test_valid_attestation_dispatches_no_adapter_and_writes_nothing(self) -> None:
+    def test_rejected_thin_plan_attestation_writes_nothing(self) -> None:
         with TemporaryDirectory() as directory:
             seed = self._seeded(directory)
             self._make_source_run(seed["project_dir"], "source-feature", verified=True)
@@ -554,13 +590,14 @@ class DryRunAttestationTests(unittest.TestCase):
                 "--profile", seed["profile_rel"], "--plan", "plan.json",
                 "--task", "T-02", "--attest-dependency", "T-01=source-feature", "--dry-run",
             ])
-            self.assertEqual(code, 10, err)
+            self.assertEqual(code, 30)
+            self.assertIn("evidence-canonical-identity-missing", err)
             self.assertFalse(
                 (seed["project_dir"] / ".pipeline" / "runs" / "sample-feature"
                  / "run.json").exists())
             self.assertEqual(source_run_json.read_text(encoding="utf-8"), before)
 
-    def test_default_reuse_preview_reports_the_eligible_dependency_source(self) -> None:
+    def test_thin_plan_default_reuse_does_not_accept_unidentifiable_evidence(self) -> None:
         """A focused preview applies the same default reuse lookup as execute."""
         with TemporaryDirectory() as directory:
             seed = self._seeded(directory)
@@ -575,12 +612,82 @@ class DryRunAttestationTests(unittest.TestCase):
                 "--profile", seed["profile_rel"], "--plan", "plan.json",
                 "--task", "T-02", "--dry-run",
             ])
-        self.assertEqual(code, 10, err)
+        self.assertEqual(code, 20, err)
         self.assertIn("dependency verification chain: false", out)
         self.assertIn("execution scope: T-01, T-02", out)
-        self.assertIn(f"reused sources: T-01={source['run_id']}", out)
-        self.assertIn("planned dispatch set: T-02", out)
-        self.assertNotIn("T-02: pending -> blocked", out)
+        self.assertIn("reused sources: (none)", out)
+        self.assertIn("planned dispatch set: T-01, T-02", out)
+        self.assertIn("T-02: pending -> blocked", out)
+
+    def test_fresh_selected_task_preview_reuses_projected_markdown_dependency(self) -> None:
+        """A fresh dry run reuses projected evidence and plans only the selected task."""
+        with TemporaryDirectory() as directory:
+            seed = self._seeded(directory)
+            project = seed["project_dir"]
+            plan = project / "plan.md"
+            tasks = project / "tasks"
+            tasks.mkdir()
+            plan.write_text(
+                "# Projected reuse\n\n## Phase 1\n\n### RE-01 Dependency\n\n### RE-02 Selected\n",
+                encoding="utf-8",
+            )
+            dependency = tasks / "RE-01_dependency.md"
+            selected = tasks / "RE-02_selected.md"
+            for path, task_id, title, depends_on in (
+                (dependency, "RE-01", "Dependency", "none"),
+                (selected, "RE-02", "Selected", "RE-01"),
+            ):
+                path.write_text(
+                    f"# {task_id} - {title}\n\n## Status\n- [ ] To Do\n- [ ] In Progress\n- [ ] Done\n\n"
+                    "## Execution Metadata\n- Type: docs\n- Executor: docs-maintainer\n"
+                    f"- Depends on: {depends_on}\n- Allowed scope: `docs/**`\n"
+                    "- Out of scope: none\n- Required skills: none\n"
+                    "- Documentation impact: none\n"
+                    "- Verification commands:\n  - `.` -> `python -m unittest`\n\n"
+                    "## Purpose\nProjected-reuse regression.\n\n## Acceptance Criteria\n"
+                    "- [ ] AC-1 — The task is complete.\n",
+                    encoding="utf-8",
+                )
+            board = project / "board.md"
+            board.write_text("## To Do\n- [RE-01: Dependency](tasks/RE-01_dependency.md)\n\n## In Progress\n",
+                             encoding="utf-8")
+
+            source = Run.create(
+                "source-feature", plan, plan,
+                project / ".pipeline" / "runs" / "source-feature", project,
+            )
+            source_life = RunLifecycle.initialize(source, tasks=[("RE-01", [])])
+            self._force_verified(source_life, "RE-01")
+            persist_task_contracts(source, (load_task_spec(dependency),))
+            reports_dir = source.run_dir / "reports" / "RE-01" / "verify-1"
+            reports_dir.mkdir(parents=True)
+            (reports_dir / "task-verifier-1.md").write_text("PASS\n", encoding="utf-8")
+            (reports_dir / "test-verifier-1.md").write_text("PASS\n", encoding="utf-8")
+            source.status = "verified"
+            source.save()
+            source_bytes = (source.run_dir / "run.json").read_bytes()
+
+            project_task_state(
+                board_path=board, task_path=dependency, task_id="RE-01", task_title="Dependency",
+                state="done",
+                evidence=CompletionEvidence(
+                    completed_at="2026-09-09T00:00:00Z", run_id=source.run_id,
+                    resolution="completed", repair_count=0, gate_count=1,
+                    task_verdict="PASS", test_verdict="PASS",
+                ),
+            )
+            upsert_blockers_section(dependency, "runner-projection", "historical runner note")
+
+            code, out, err = _run(seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.md",
+                "--task", "RE-02", "--dry-run",
+            ])
+            self.assertEqual(code, 10, err)
+            self.assertIn(f"reused sources: RE-01={source.run_id}", out)
+            self.assertIn("planned dispatch set: RE-02", out)
+            self.assertNotIn("planned dispatch set: RE-01, RE-02", out)
+            self.assertNotIn("RE-02: pending -> blocked", out)
+            self.assertEqual((source.run_dir / "run.json").read_bytes(), source_bytes)
 
     def test_full_chain_preview_ignores_explicit_reuse_sources(self) -> None:
         """Full-chain dry-run must agree with execute's no-external-reuse policy."""
@@ -661,6 +768,100 @@ class DryRunAttestationTests(unittest.TestCase):
         self.assertIn("evidence-source-run-not-closed", err)
 
 
+class DryRunSupersessionReuseTests(unittest.TestCase):
+    """A focused dry run resolves a blocked predecessor through its verified replacement.
+
+    TC-05 depends on the historically blocked TC-04; REC-01 declares it supersedes TC-04 and
+    has its own eligible verified evidence in an ordinary repository run. A focused preview
+    for TC-05 must plan without dispatching TC-04 on the normal route, and must not put TC-04
+    in the planned dispatch set on the ``--verify-dependency-chain`` route either.
+    """
+
+    def _force_verified(self, life: RunLifecycle, task_id: str) -> None:
+        life.transition(task_id, "running", actor=ACTOR_RUNNER)
+        life.transition(task_id, "implemented", actor=ACTOR_RUNNER)
+        life.run.record_verdicts(task_id, "PASS", "PASS")
+        life.run.save()
+
+    def _scenario(self, directory: str) -> dict:
+        seed = _seed("library-guide", Path(directory) / "project", tasks=[{"id": "x", "type": "docs"}])
+        project = seed["project_dir"]
+        (project / "plan.json").unlink()
+        plan = project / "plan.md"
+        plan.write_text(
+            "# Supersession reuse\n\n## Phase 1\n\n"
+            "### TC-04 Blocked predecessor\n\n### REC-01 Replacement\n\n### TC-05 Selected\n",
+            encoding="utf-8",
+        )
+        tasks = project / "tasks"
+        tasks.mkdir()
+
+        def _task(path: Path, task_id: str, title: str, depends_on: str, extra: str = "") -> None:
+            path.write_text(
+                f"# {task_id} - {title}\n\n## Status\n- [ ] To Do\n- [ ] In Progress\n- [ ] Done\n\n"
+                "## Execution Metadata\n- Type: docs\n- Executor: docs-maintainer\n"
+                f"- Depends on: {depends_on}\n- Allowed scope: `docs/**`\n"
+                "- Out of scope: none\n- Required skills: none\n- Documentation impact: none\n"
+                "- Verification commands:\n  - `.` -> `python -m unittest`\n\n"
+                "## Purpose\nSupersession-reuse regression.\n\n## Acceptance Criteria\n"
+                "- [ ] AC-1 — The task is complete.\n" + extra,
+                encoding="utf-8",
+            )
+
+        blocked = tasks / "TC-04_blocked.md"
+        replacement = tasks / "REC-01_replacement.md"
+        selected = tasks / "TC-05_selected.md"
+        _task(blocked, "TC-04", "Blocked predecessor", "none")
+        _task(replacement, "REC-01", "Replacement", "none",
+              extra="\n## Supersession\n- Supersedes: TC-04\n")
+        _task(selected, "TC-05", "Selected", "TC-04")
+
+        source = Run.create(
+            "source-feature", plan, plan,
+            project / ".pipeline" / "runs" / "source-feature", project,
+        )
+        source_life = RunLifecycle.initialize(source, tasks=[("REC-01", [])])
+        self._force_verified(source_life, "REC-01")
+        persist_task_contracts(source, (load_task_spec(replacement),))
+        source.status = "verified"
+        source.save()
+        seed["source_run_id"] = source.run_id
+        seed["source_bytes"] = (source.run_dir / "run.json").read_bytes()
+        seed["source_run_dir"] = source.run_dir
+        return seed
+
+    def test_focused_dry_run_resolves_the_supersession_replacement(self) -> None:
+        with TemporaryDirectory() as directory:
+            seed = self._scenario(directory)
+            code, out, err = _run(seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.md",
+                "--task", "TC-05", "--dry-run",
+            ])
+            self.assertEqual(code, 10, err)
+            self.assertNotIn("TC-05: pending -> blocked", out)
+            self.assertNotIn("dependency-not-satisfied: TC-04", out)
+            self.assertIn(f"reused sources: TC-04={seed['source_run_id']}", out)
+            self.assertIn("planned dispatch set: TC-05", out)
+            self.assertNotIn("planned dispatch set: TC-04", out)
+            # The historical blocked source run is never touched.
+            self.assertEqual((seed["source_run_dir"] / "run.json").read_bytes(), seed["source_bytes"])
+
+    def test_verify_dependency_chain_dry_run_never_dispatches_the_blocked_predecessor(self) -> None:
+        with TemporaryDirectory() as directory:
+            seed = self._scenario(directory)
+            code, out, err = _run(seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.md",
+                "--task", "TC-05", "--verify-dependency-chain", "--dry-run",
+            ])
+            self.assertEqual(code, 10, err)
+            dispatch = next(
+                line for line in out.splitlines() if line.strip().startswith("planned dispatch set:")
+            )
+            self.assertNotIn("TC-04", dispatch)
+            self.assertIn("TC-05", dispatch)
+            self.assertEqual((seed["source_run_dir"] / "run.json").read_bytes(), seed["source_bytes"])
+
+
 RICH_EXECUTE_TASK = {
     "id": "TSK-01",
     "title": "Rich execute task",
@@ -711,7 +912,7 @@ class ExecuteModeTests(unittest.TestCase):
                 (seed["project_dir"] / ".pipeline" / "runs" / "sample-feature"
                  / "run.json").exists())
 
-    def test_execute_with_plan_approval_runs_a_task_to_verified(self) -> None:
+    def test_execute_with_plan_approval_runs_a_task_to_done(self) -> None:
         with TemporaryDirectory() as directory:
             seed = self._seed_rich(directory, [RICH_EXECUTE_TASK])
             with patch.object(use_cases, "make_execute_adapters", _fake_execute_adapters):
@@ -724,7 +925,91 @@ class ExecuteModeTests(unittest.TestCase):
             run = json.loads(
                 (seed["project_dir"] / ".pipeline" / "runs" / "sample-feature" / "run.json")
                 .read_text(encoding="utf-8"))
-            self.assertEqual(run["tasks"][0]["status"], "verified")
+            self.assertEqual(run["tasks"][0]["status"], "done")
+
+    def test_tsl02_cli_resume_inherits_persisted_false_dependency_chain_control(self) -> None:
+        """TSL-02's historical false policy survives an omitted CLI switch on resume."""
+        feature = "three-state-task-lifecycle-tsl02-retry2"
+        with TemporaryDirectory() as directory:
+            task = dict(RICH_EXECUTE_TASK, id="TSL-02")
+            seed = self._seed_rich(directory, [task])
+            plan_path = seed["project_dir"] / "plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["feature"] = feature
+            plan_path.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+            args = seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.json",
+                "--mode", "execute", "--approve-plan",
+            ]
+            with patch.object(use_cases, "make_execute_adapters", _fake_execute_adapters):
+                first_code, _out, first_err = _run(args + [
+                    "--adapter", "claude", "--model", "sonnet", "--effort", "medium",
+                ])
+                self.assertEqual(first_code, 0, first_err)
+
+                run_dir = seed["project_dir"] / ".pipeline" / "runs" / feature
+                recorded = Run.load(run_dir, seed["project_dir"])
+                self.assertIs(
+                    recorded.controls["verify_dependency_chain"]["value"], False
+                )
+                recorded.task("TSL-02").status = "in_progress"
+                recorded.status = "running"
+                recorded.save()
+
+                resume_args = args + ["--resume", "--adapter", "claude"]
+                parsed = RunCommand.from_args(build_parser().parse_args(resume_args))
+                self.assertIsNone(parsed.verify_dependency_chain)
+                captured = []
+                original_execute_run = bootstrap.execute_run
+
+                def capture_execute_run(request):  # noqa: ANN001 - boundary probe
+                    captured.append(request.controls.verify_dependency_chain)
+                    return original_execute_run(request)
+
+                with patch.object(bootstrap, "execute_run", capture_execute_run):
+                    resumed_code, resumed_out, resumed_err = _run(resume_args)
+
+            self.assertEqual(resumed_code, 0, resumed_err)
+            self.assertIn("verified", resumed_out)
+            self.assertEqual(captured, [None])
+
+    def test_tsl02_cli_resume_inherits_recorded_codex_runtime_before_compile(self) -> None:
+        """A bare resume must not compile a recorded Codex run against Claude defaults."""
+        feature = "three-state-task-lifecycle-tsl02-retry2"
+        with TemporaryDirectory() as directory:
+            task = dict(RICH_EXECUTE_TASK, id="TSL-02")
+            seed = self._seed_rich(directory, [task])
+            plan_path = seed["project_dir"] / "plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["feature"] = feature
+            plan_path.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+            args = seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.json",
+                "--mode", "execute", "--approve-plan",
+            ]
+
+            def codex_adapters(_project_dir, _agents_root, _core_root=None):
+                executor = ScriptedExecutor(("implemented",))
+                launchers = VerifierLaunchers(
+                    task=StubVerifier(("PASS",)), test=StubVerifier(("PASS",)))
+                return executor, launchers, {"claude": True, "codex": True}
+
+            with patch.object(use_cases, "make_execute_adapters", codex_adapters):
+                first_code, _out, first_err = _run(args + [
+                    "--adapter", "codex", "--model", "gpt-5.6-terra", "--effort", "medium",
+                ])
+                self.assertEqual(first_code, 0, first_err)
+
+                run_dir = seed["project_dir"] / ".pipeline" / "runs" / feature
+                recorded = Run.load(run_dir, seed["project_dir"])
+                recorded.task("TSL-02").status = "in_progress"
+                recorded.status = "running"
+                recorded.save()
+
+                resumed_code, resumed_out, resumed_err = _run(args + ["--resume"])
+
+            self.assertEqual(resumed_code, 0, resumed_err)
+            self.assertIn("verified", resumed_out)
 
     def test_execute_rejects_an_id_and_type_only_plan(self) -> None:
         with TemporaryDirectory() as directory:
@@ -791,6 +1076,102 @@ class ExecuteModeTests(unittest.TestCase):
             self.assertFalse(
                 (seed["project_dir"] / ".pipeline" / "runs" / "sample-feature"
                  / "run.json").exists())
+
+    def test_status_with_execute_and_approve_plan_stays_read_only_for_an_existing_run(
+        self,
+    ) -> None:
+        """SIR-01: ``--status`` must never cross into ``run_execute`` — not even with
+        ``--mode execute --approve-plan`` and adapter/model/effort controls — and must
+        report the recorded run's bytes unchanged, with no adapter invocation."""
+        calls: list[object] = []
+
+        def _spy_execute_adapters(project_dir, agents_root, core_root=None):
+            calls.append((project_dir, agents_root, core_root))
+            return _fake_execute_adapters(project_dir, agents_root, core_root)
+
+        with TemporaryDirectory() as directory:
+            seed = self._seed_rich(directory, [RICH_EXECUTE_TASK])
+            run_dir = seed["project_dir"] / ".pipeline" / "runs" / "sample-feature"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            run_state = {
+                "schema_version": 1, "feature": "sample-feature",
+                "prompt_path": "plan.json", "plan_path": "plan.json",
+                "run_id": "fixed-run-id", "status": "verified",
+                "tasks": [{"id": "TSK-01", "status": "done", "depends_on": [],
+                           "attempts": 1, "blocker": None}],
+                "history": [], "commands": [],
+            }
+            run_json_path = run_dir / "run.json"
+            run_json_path.write_text(json.dumps(run_state, indent=2) + "\n", encoding="utf-8")
+            before_bytes = run_json_path.read_bytes()
+            before_tree = sorted(
+                str(p.relative_to(seed["dest"])) for p in seed["dest"].rglob("*")
+            )
+
+            with patch.object(use_cases, "make_execute_adapters", _spy_execute_adapters):
+                code, out, err = _run(seed["anchors"] + [
+                    "--profile", seed["profile_rel"], "--plan", "plan.json",
+                    "--mode", "execute", "--approve-plan", "--adapter", "claude",
+                    "--model", "sonnet", "--effort", "medium", "--status",
+                ])
+
+            self.assertEqual(code, 0, err)
+            self.assertIn("status: verified", out)
+            self.assertIn("TSK-01", out)
+            self.assertEqual(run_json_path.read_bytes(), before_bytes)
+            after_tree = sorted(
+                str(p.relative_to(seed["dest"])) for p in seed["dest"].rglob("*")
+            )
+            self.assertEqual(before_tree, after_tree)
+            self.assertEqual(calls, [])
+
+    def test_status_with_no_recorded_run_creates_no_artifact_even_with_execute_controls(
+        self,
+    ) -> None:
+        calls: list[object] = []
+
+        def _spy_execute_adapters(project_dir, agents_root, core_root=None):
+            calls.append((project_dir, agents_root, core_root))
+            return _fake_execute_adapters(project_dir, agents_root, core_root)
+
+        with TemporaryDirectory() as directory:
+            seed = self._seed_rich(directory, [RICH_EXECUTE_TASK])
+            run_dir = seed["project_dir"] / ".pipeline" / "runs" / "sample-feature"
+            before_tree = sorted(
+                str(p.relative_to(seed["dest"])) for p in seed["dest"].rglob("*")
+            )
+
+            with patch.object(use_cases, "make_execute_adapters", _spy_execute_adapters):
+                code, out, err = _run(seed["anchors"] + [
+                    "--profile", seed["profile_rel"], "--plan", "plan.json",
+                    "--mode", "execute", "--approve-plan", "--status",
+                ])
+
+            self.assertEqual(code, 0, err)
+            self.assertIn("no recorded run", out)
+            self.assertFalse(run_dir.exists())
+            after_tree = sorted(
+                str(p.relative_to(seed["dest"])) for p in seed["dest"].rglob("*")
+            )
+            self.assertEqual(before_tree, after_tree)
+            self.assertEqual(calls, [])
+
+    def test_execute_without_status_still_evaluates_the_plan_gate(self) -> None:
+        """Control for SIR-01: without ``--status``, ``--mode execute`` retains its normal
+        gate/dispatch behavior (unchanged by the read-only status route)."""
+        with TemporaryDirectory() as directory:
+            seed = self._seed_rich(directory, [RICH_EXECUTE_TASK])
+            with patch.object(use_cases, "make_execute_adapters", _fake_execute_adapters):
+                code, out, err = _run(seed["anchors"] + [
+                    "--profile", seed["profile_rel"], "--plan", "plan.json",
+                    "--mode", "execute", "--approve-plan",
+                ])
+            self.assertEqual(code, 0, err)
+            self.assertIn("verified", out)
+            run = json.loads(
+                (seed["project_dir"] / ".pipeline" / "runs" / "sample-feature" / "run.json")
+                .read_text(encoding="utf-8"))
+            self.assertEqual(run["tasks"][0]["status"], "done")
 
 
 def _plan_request() -> LaunchRequest:
@@ -1144,3 +1525,79 @@ class ReleaseDryRunModeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AmendModeTests(unittest.TestCase):
+    """TAM-01: ``--mode amend`` persists one explicit, human-approved revision and nothing
+    else — it never resolves a profile/plan or reaches the executor dispatch path."""
+
+    def _run_for(self, project_root: Path, feature: str, task_id: str = "T-1"):
+        prompt = project_root / "prompt.md"
+        prompt.write_text("feature", encoding="utf-8")
+        run = Run.create(feature, prompt, None, project_root / ".pipeline" / "runs" / feature,
+                         project_root)
+        run.add_task(task_id)
+        run.save()
+        return run
+
+    def _contract(self, project_root: Path, **payload) -> str:
+        payload.setdefault("new_contract", {"allowed_scope": ["tests/**"], "max_repair_attempts": 2})
+        path = project_root / "amendment.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return "amendment.json"
+
+    def test_an_approved_amendment_persists_a_new_revision(self) -> None:
+        with TemporaryDirectory() as directory:
+            project_root = Path(directory)
+            run = self._run_for(project_root, "amend-feature")
+            contract_rel = self._contract(project_root)
+            code, out, err = _run([
+                "--project-root", str(project_root), "--mode", "amend",
+                "--feature", "amend-feature", "--amend-task", "T-1",
+                "--amend-rationale", "baseline exposed an out-of-scope failure",
+                "--amend-approved-by", "a-human", "--amend-evidence", "report:launch-1",
+                "--amend-contract", contract_rel,
+            ])
+            self.assertEqual(code, 0, err)
+            self.assertIn("amendment applied", out)
+            reloaded = Run.load(run.run_dir, project_root)
+            record = reloaded.task("T-1")
+            self.assertEqual(record.current_revision, 1)
+            self.assertEqual(len(record.amendment_revisions), 1)
+            self.assertEqual(record.amendment_revisions[0]["approved_by"], "a-human")
+
+    def test_missing_approval_is_rejected_before_any_mutation(self) -> None:
+        with TemporaryDirectory() as directory:
+            project_root = Path(directory)
+            run = self._run_for(project_root, "amend-feature")
+            before = (run.run_dir / "run.json").read_bytes()
+            contract_rel = self._contract(project_root)
+            code, _out, err = _run([
+                "--project-root", str(project_root), "--mode", "amend",
+                "--feature", "amend-feature", "--amend-task", "T-1",
+                "--amend-rationale", "baseline exposed an out-of-scope failure",
+                "--amend-evidence", "report:launch-1", "--amend-contract", contract_rel,
+            ])
+            self.assertNotEqual(code, 0)
+            self.assertIn("--amend-approved-by", err)
+            self.assertEqual((run.run_dir / "run.json").read_bytes(), before)
+
+    def test_a_done_task_cannot_be_amended(self) -> None:
+        with TemporaryDirectory() as directory:
+            project_root = Path(directory)
+            run = self._run_for(project_root, "amend-feature")
+            run.transition_task("T-1", "in_progress")
+            run.record_verdicts("T-1", "PASS", "PASS")
+            run.save()
+            before = (run.run_dir / "run.json").read_bytes()
+            contract_rel = self._contract(project_root)
+            code, _out, err = _run([
+                "--project-root", str(project_root), "--mode", "amend",
+                "--feature", "amend-feature", "--amend-task", "T-1",
+                "--amend-rationale", "baseline exposed an out-of-scope failure",
+                "--amend-approved-by", "a-human", "--amend-evidence", "report:launch-1",
+                "--amend-contract", contract_rel,
+            ])
+            self.assertNotEqual(code, 0)
+            self.assertIn("task-already-done", err)
+            self.assertEqual((run.run_dir / "run.json").read_bytes(), before)

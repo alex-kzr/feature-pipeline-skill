@@ -33,7 +33,18 @@ from pipeline_core.commands import (
     run_verification_commands,
     verification_stage,
 )
-from pipeline_core.reports import build_verdict_envelope_prompt, verifier_artifacts
+from pipeline_core.plan import (
+    AmendmentError,
+    AmendmentRequiredResult,
+    CLASSIFICATION_AMENDMENT_REQUIRED,
+    CLASSIFICATION_ENVIRONMENTAL,
+    CLASSIFICATION_TASK_ATTRIBUTABLE,
+    classify_baseline_failure,
+)
+from pipeline_core.reports import (
+    build_verdict_envelope_prompt,
+    verifier_artifacts,
+)
 from pipeline_core.snapshot import SnapshotError
 from pipeline_core.state import Run, StateError
 from pipeline_core.verification import (
@@ -51,17 +62,85 @@ from pipeline_core.verification import (
     orchestrate_verification,
 )
 from feature_pipeline.contracts import CommandSpec, TaskSpec
+from feature_pipeline.application.work_items import activate_work_item, register_work_items
 
 ANCHORS = VerifierAnchors(project_root="/repo", agents_root="/repo/.agents")
 
 
 class FreshEnvelopePromptTests(unittest.TestCase):
+    def test_amended_revision_uses_a_distinct_verifier_artifact_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            original = verifier_artifacts(directory, "ROC-01", 2)
+            amended = verifier_artifacts(directory, "ROC-01", 2, revision=3)
+
+        self.assertEqual(original.directory.name, "verify-2")
+        self.assertEqual(amended.directory.name, "verify-2-revision-3")
+        self.assertNotEqual(original.task_report, amended.task_report)
+
     def test_fresh_continuation_receives_runner_observed_verdict(self) -> None:
         prompt = build_verdict_envelope_prompt(
             role="task_verifier", task_id="VR-02", attempt=1, observed_verdict="PASS"
         )
 
         self.assertIn("Runner-observed verdict from the verifier report: PASS.", prompt)
+
+
+class ScopeAmendmentVerifierEvidenceTests(unittest.TestCase):
+    def test_both_prompts_embed_the_same_amendment_and_require_a_justification_finding(self) -> None:
+        evidence = VerificationEvidence(
+            "VR-02",
+            1,
+            changed_files=(
+                {
+                    "path": "feature-pipeline-skill/src/feature_pipeline/domain/scope.py",
+                    "status": "modified",
+                    "digest": "sha256:amended",
+                    "classification": "out_of_scope",
+                },
+            ),
+        )
+        payload = evidence.serialized()
+
+        task_prompt = build_verifier_prompt(
+            "task_verifier", _spec(), anchors=ANCHORS, feature_prompt="prompt.md",
+            evidence_payload=payload, attempt=1,
+        )
+        test_prompt = build_verifier_prompt(
+            "test_verifier", _spec(), anchors=ANCHORS, feature_prompt="prompt.md",
+            evidence_payload=payload, attempt=1,
+        )
+
+        amendment = json.loads(payload)["scope_amendment"]
+        self.assertEqual(
+            amendment["observed_paths"],
+            ["feature-pipeline-skill/src/feature_pipeline/domain/scope.py"],
+        )
+        self.assertEqual(task_prompt.split("```json\n", 1)[1], test_prompt.split("```json\n", 1)[1])
+        for prompt in (task_prompt, test_prompt):
+            self.assertIn("Amendment-justification finding:", prompt)
+            self.assertIn("observed paths", prompt)
+
+    def test_observation_retains_original_contract_without_claiming_approval(self) -> None:
+        evidence = VerificationEvidence(
+            "VR-02", 1,
+            scope_observation={
+                "observed_paths": ["new/module.py"],
+                "observed_changes": [{"path": "new/module.py", "status": "added"}],
+                "original_allowed_scope": ["src/**"],
+                "original_out_of_scope": [".pipeline/**"],
+                "original_acceptance_criteria": [{"id": "AC-1", "text": "works"}],
+                "approval": "pending-independent-verification",
+                "rationale": None,
+            },
+        )
+
+        amendment = json.loads(evidence.serialized())["scope_amendment"]
+
+        self.assertTrue(amendment["present"])
+        self.assertEqual(amendment["observed_paths"], ["new/module.py"])
+        self.assertEqual(amendment["original_allowed_scope"], ["src/**"])
+        self.assertEqual(amendment["approval"], "pending-independent-verification")
+        self.assertIsNone(amendment["rationale"])
 
 
 def _spec(**overrides: object) -> TaskSpec:
@@ -173,25 +252,27 @@ class FakeVerifier:
 
 
 def _orchestrate(run: Run, spec: TaskSpec, task: FakeVerifier, test: FakeVerifier, **kw):
-    return orchestrate_verification(
-        run, spec, _evidence(**kw.pop("evidence_kw", {})),
-        launchers=VerifierLaunchers(task=task, test=test),
-        anchors=ANCHORS, attempt=1,
-    )
+    register_work_items(run, (spec,))
+    with activate_work_item(run, spec.id):
+        return orchestrate_verification(
+            run, spec, _evidence(**kw.pop("evidence_kw", {})),
+            launchers=VerifierLaunchers(task=task, test=test),
+            anchors=ANCHORS, attempt=1,
+        )
 
 
 # --- transition table (written before the orchestration) ------------------------------------
 
 _MATRIX = {
-    ("PASS", "PASS"): "verified",
-    ("PASS", "FAIL"): "verification_failed",
-    ("FAIL", "PASS"): "verification_failed",
-    ("FAIL", "FAIL"): "verification_failed",
-    ("PASS", "BLOCKED"): "blocked",
-    ("BLOCKED", "PASS"): "blocked",
-    ("FAIL", "BLOCKED"): "blocked",
-    ("BLOCKED", "FAIL"): "blocked",
-    ("BLOCKED", "BLOCKED"): "blocked",
+    ("PASS", "PASS"): "done",
+    ("PASS", "FAIL"): "in_progress",
+    ("FAIL", "PASS"): "in_progress",
+    ("FAIL", "FAIL"): "in_progress",
+    ("PASS", "BLOCKED"): "in_progress",
+    ("BLOCKED", "PASS"): "in_progress",
+    ("FAIL", "BLOCKED"): "in_progress",
+    ("BLOCKED", "FAIL"): "in_progress",
+    ("BLOCKED", "BLOCKED"): "in_progress",
 }
 
 
@@ -208,15 +289,13 @@ class RecordVerdictsTransitionTableTests(unittest.TestCase):
                     self.assertEqual(recorded["task_verdict"], task_verdict)
                     self.assertEqual(recorded["test_verdict"], test_verdict)
                     self.assertIsNotNone(recorded["verified_at"])
-                    if expected == "blocked":
-                        self.assertIn("BLOCKED", run.task("VR-02").blocker or "")
 
     def test_only_pass_pass_verifies(self) -> None:
-        self.assertEqual(combine_verdict_status("PASS", "PASS"), "verified")
+        self.assertEqual(combine_verdict_status("PASS", "PASS"), "done")
         for combo in (("PASS", "FAIL"), ("FAIL", "PASS"), ("FAIL", "FAIL")):
-            self.assertEqual(combine_verdict_status(*combo), "verification_failed")
+            self.assertEqual(combine_verdict_status(*combo), "in_progress")
         for combo in (("PASS", "BLOCKED"), ("BLOCKED", "FAIL")):
-            self.assertEqual(combine_verdict_status(*combo), "blocked")
+            self.assertEqual(combine_verdict_status(*combo), "in_progress")
 
     def test_an_unknown_token_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -247,7 +326,7 @@ class VerdictMatrixOrchestrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             run = _implemented_run(Path(directory))
             outcome = _orchestrate(run, _spec(), FakeVerifier(), FakeVerifier())
-            self.assertEqual(outcome.status, "verified")
+            self.assertEqual(outcome.status, "done")
             self.assertIsNotNone(outcome.verdict_record)
 
 
@@ -281,7 +360,7 @@ class VerifierAgentNameRegressionTests(unittest.TestCase):
         task = _AgentNameRecordingVerifier()
         test = _AgentNameRecordingVerifier()
         outcome = _orchestrate(run, _spec(), task, test)
-        self.assertEqual(outcome.status, "verified", outcome.failure)
+        self.assertEqual(outcome.status, "done", outcome.failure)
         return task.initial_request(), test.initial_request()
 
     def _agent_arg(self, request) -> str:  # noqa: ANN001 - test helper
@@ -344,7 +423,7 @@ class VerifierResultTextExtractionTests(unittest.TestCase):
                 ClaudeAdapter(executable=executable),
             )
 
-            self.assertEqual(outcome.status, "verified")
+            self.assertEqual(outcome.status, "done")
             self.assertEqual(outcome.task_verdict, "PASS")
             self.assertEqual(outcome.test_verdict, "PASS")
             self.assertIsNone(outcome.failure)
@@ -398,6 +477,9 @@ class FreshReadOnlyToollessTests(unittest.TestCase):
             evidence_payload="{}", attempt=1)
         self.assertIn("no tools", prompt.lower())
         self.assertIn("no matching runner-recorded command is a FAIL", prompt)
+        self.assertIn("Do not require a PASS from either verifier", prompt)
+        self.assertIn("limited to runner-recorded verification-command evidence", prompt)
+        self.assertIn("functional failure/resume scenarios", prompt)
 
 
 class CurrentRunMutationEvidenceTests(unittest.TestCase):
@@ -470,7 +552,7 @@ class CurrentRunMutationEvidenceTests(unittest.TestCase):
                 evidence_kw={"external_actions": ({"action": "commit", "after": "deadbeef"},)},
             )
 
-        self.assertEqual(outcome.status, "verification_failed")
+        self.assertEqual(outcome.status, "in_progress")
         self.assertEqual(outcome.task_verdict, "FAIL")
         self.assertEqual(outcome.test_verdict, "FAIL")
         self.assertEqual(
@@ -479,12 +561,112 @@ class CurrentRunMutationEvidenceTests(unittest.TestCase):
         )
 
 
+class VerifierAttributionRulesTests(unittest.TestCase):
+    def test_payload_carries_durable_operation_history_for_toolless_verifiers(self) -> None:
+        evidence = VerificationEvidence(
+            "VR-02", 2,
+            operation_history=({
+                "kind": "verification", "outcome": "failed",
+                "detail": "task_verdict=PASS test=FAIL",
+            },),
+        )
+
+        payload = json.loads(evidence.serialized())
+
+        self.assertEqual(
+            payload["durable_operation_history"],
+            [{
+                "kind": "verification", "outcome": "failed",
+                "detail": "task_verdict=PASS test=FAIL",
+            }],
+        )
+        self.assertEqual(
+            payload["current_run_boundary"]["durable_operation_history"],
+            payload["durable_operation_history"],
+        )
+
+    def test_evidence_carries_prior_runner_projection_owners(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = _implemented_run(root)
+            run.add_task("TC-01")
+            run.add_task("TC-02")
+            board = root / "docs" / "kanban.md"
+            tc01 = root / "docs" / "plans" / "tasks" / "TC-01.md"
+            tc02 = root / "docs" / "plans" / "tasks" / "TC-02.md"
+            for path in (board, tc01, tc02):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("runner projection\n", encoding="utf-8")
+            run.record_runner_projection("TC-01", (board, tc01))
+            run.record_runner_projection("TC-02", (tc02,))
+
+            evidence = build_verification_evidence(
+                run, "VR-02", attempt=1, commands_run=VerificationRun(())
+            )
+
+        self.assertEqual(
+            [(row["task_id"], row["path"]) for row in evidence.runner_owned_writes],
+            [
+                ("TC-01", "docs/kanban.md"),
+                ("TC-01", "docs/plans/tasks/TC-01.md"),
+                ("TC-02", "docs/plans/tasks/TC-02.md"),
+            ],
+        )
+
+    def test_task_verifier_uses_task_snapshot_and_manifest_not_ambient_git_diff(self) -> None:
+        prompt = build_verifier_prompt(
+            "task_verifier", _spec(), anchors=ANCHORS, feature_prompt="prompt.md",
+            evidence_payload=_evidence().serialized(), attempt=1,
+        )
+
+        self.assertIn("task-relevant snapshot", prompt)
+        self.assertIn("not whole-worktree git diff", prompt)
+        self.assertIn("supplementary allowed-scope", prompt)
+
+
 class ProseEnvelopeSettlementTests(unittest.TestCase):
+    def test_amended_revision_requires_both_verifiers_to_assess_its_identity_and_rationale(self) -> None:
+        amendment = {"revision": 1, "epoch": 1, "rationale": "suite fixture is outside scope"}
+        prose = (
+            "# verifier\n\n- Verdict: PASS\n\n- Findings: none\n"
+            "- Amendment-justification finding: revision 1, epoch 1: suite fixture is outside scope\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            run = _implemented_run(Path(directory))
+            outcome = _orchestrate(
+                run, _spec(), FakeVerifier(prose=prose), FakeVerifier(prose=prose),
+                evidence_kw={"amendment": amendment},
+            )
+        self.assertEqual(outcome.status, "done")
+
+    def test_amended_revision_cannot_settle_pass_without_the_required_assessment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run = _implemented_run(Path(directory))
+            outcome = _orchestrate(
+                run, _spec(), FakeVerifier(), FakeVerifier(),
+                evidence_kw={"amendment": {"revision": 1, "rationale": "outside scope"}},
+            )
+        self.assertIn("missing-amendment-justification-finding", outcome.failure or "")
+        self.assertNotEqual(outcome.status, "done")
+
+    def test_amended_revision_cannot_settle_pass_with_another_revision_identity(self) -> None:
+        prose = (
+            "# verifier\n\n- Verdict: PASS\n\n- Findings: none\n"
+            "- Amendment-justification finding: revision 2, epoch 1: outside scope\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            run = _implemented_run(Path(directory))
+            outcome = _orchestrate(
+                run, _spec(), FakeVerifier(prose=prose), FakeVerifier(prose=prose),
+                evidence_kw={"amendment": {"revision": 1, "epoch": 1, "rationale": "outside scope"}},
+            )
+        self.assertIn("amendment-justification-missing-revision-identity", outcome.failure or "")
+
     def test_agreeing_prose_and_envelope_leave_no_drift(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             run = _implemented_run(Path(directory))
             outcome = _orchestrate(run, _spec(), FakeVerifier(), FakeVerifier())
-            self.assertEqual(outcome.status, "verified")
+            self.assertEqual(outcome.status, "done")
             self.assertIsNone(outcome.task_drift)
             self.assertIsNone(outcome.test_drift)
 
@@ -493,7 +675,7 @@ class ProseEnvelopeSettlementTests(unittest.TestCase):
             run = _implemented_run(Path(directory))
             task = FakeVerifier(prose="# task_verifier\n\nno verdict line at all\n")
             outcome = _orchestrate(run, _spec(), task, FakeVerifier())
-            self.assertEqual(outcome.status, "verified")
+            self.assertEqual(outcome.status, "done")
             self.assertIsNotNone(outcome.task_drift)
 
     def test_prose_envelope_disagreement_fails_closed_and_blocks(self) -> None:
@@ -506,17 +688,53 @@ class ProseEnvelopeSettlementTests(unittest.TestCase):
                      "task_id": "VR-02", "attempt": 1}),
             )
             outcome = _orchestrate(run, _spec(), task, FakeVerifier())
-            self.assertEqual(outcome.status, "blocked")
+            self.assertEqual(outcome.status, "in_progress")
             self.assertIn("verdict-envelope-mismatch", outcome.failure)
             self.assertTrue(outcome.diagnostic.exists())
             self.assertNotEqual(run.task("VR-02").status, "verified")
+
+    def test_explicit_localized_verdict_conflicting_with_envelope_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run = _implemented_run(Path(directory))
+            task = FakeVerifier(
+                prose="# task_verifier\n\nВердикт: **FAIL**\n",
+                envelope=json.dumps(
+                    {"role": "task_verifier", "verdict": "PASS",
+                     "task_id": "VR-02", "attempt": 1}),
+            )
+            outcome = _orchestrate(run, _spec(), task, FakeVerifier())
+            self.assertEqual(outcome.status, "in_progress")
+            self.assertIn("verdict-envelope-mismatch", outcome.failure)
+            self.assertNotEqual(run.task("VR-02").status, "verified")
+
+    def test_conflicting_explicit_verdicts_block_regardless_of_order(self) -> None:
+        cases = (
+            "- Verdict: PASS\n- Verdict: FAIL\n",
+            "- Verdict: FAIL\n- Вердикт: PASS\n",
+            "- Вердикт: **BLOCKED**\n- Verdict: PASS\n",
+        )
+        for prose in cases:
+            with self.subTest(prose=prose), tempfile.TemporaryDirectory() as directory:
+                run = _implemented_run(Path(directory))
+                task = FakeVerifier(
+                    prose=prose,
+                    envelope=json.dumps(
+                        {"role": "task_verifier", "verdict": "PASS",
+                         "task_id": "VR-02", "attempt": 1}),
+                )
+
+                outcome = _orchestrate(run, _spec(), task, FakeVerifier())
+
+                self.assertEqual(outcome.status, "in_progress")
+                self.assertIn("verdict-envelope-mismatch", outcome.failure)
+                self.assertNotEqual(run.task("VR-02").status, "verified")
 
     def test_malformed_envelope_blocks_with_a_diagnostic(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             run = _implemented_run(Path(directory))
             task = FakeVerifier(envelope="not json at all")
             outcome = _orchestrate(run, _spec(), task, FakeVerifier())
-            self.assertEqual(outcome.status, "blocked")
+            self.assertEqual(outcome.status, "in_progress")
             self.assertIn("unparseable-verdict-envelope", outcome.failure)
             self.assertTrue(outcome.diagnostic.exists())
 
@@ -528,7 +746,7 @@ class LaunchFailureTests(unittest.TestCase):
             task = FakeVerifier(launch_exit=3)
             test = FakeVerifier()
             outcome = _orchestrate(run, _spec(), task, test)
-            self.assertEqual(outcome.status, "blocked")
+            self.assertEqual(outcome.status, "in_progress")
             self.assertIn("exited with 3", outcome.failure)
             self.assertTrue(outcome.diagnostic.exists())
             self.assertEqual(test.calls, [])
@@ -539,7 +757,7 @@ class LaunchFailureTests(unittest.TestCase):
             run = _implemented_run(Path(directory))
             outcome = _orchestrate(
                 run, _spec(), FakeVerifier(raise_code="adapter-unavailable"), FakeVerifier())
-            self.assertEqual(outcome.status, "blocked")
+            self.assertEqual(outcome.status, "in_progress")
             self.assertIn("adapter-unavailable", outcome.failure)
 
     def test_a_missing_session_id_blocks_before_the_envelope_request(self) -> None:
@@ -547,7 +765,7 @@ class LaunchFailureTests(unittest.TestCase):
             run = _implemented_run(Path(directory))
             task = FakeVerifier(session_id=None)
             outcome = _orchestrate(run, _spec(), task, FakeVerifier())
-            self.assertEqual(outcome.status, "blocked")
+            self.assertEqual(outcome.status, "in_progress")
             self.assertIn("no session id", outcome.failure)
             self.assertNotIn("envelope", [c["kind"] for c in task.calls])
 
@@ -556,7 +774,7 @@ class LaunchFailureTests(unittest.TestCase):
             run = _implemented_run(Path(directory))
             task = FakeVerifier(envelope_exit=1)
             outcome = _orchestrate(run, _spec(), task, FakeVerifier())
-            self.assertEqual(outcome.status, "blocked")
+            self.assertEqual(outcome.status, "in_progress")
             self.assertIn("envelope request exited with 1", outcome.failure)
 
 
@@ -572,21 +790,24 @@ class NoFalseVerifiedTests(unittest.TestCase):
                 missing_evidence=missing)
             self.assertIsNotNone(evidence_forces_fail(evidence))
 
-            outcome = orchestrate_verification(
-                run, _spec(), evidence,
-                launchers=VerifierLaunchers(task=FakeVerifier(), test=FakeVerifier()),
-                anchors=ANCHORS, attempt=1)
+            spec = _spec()
+            register_work_items(run, (spec,))
+            with activate_work_item(run, spec.id):
+                outcome = orchestrate_verification(
+                    run, spec, evidence,
+                    launchers=VerifierLaunchers(task=FakeVerifier(), test=FakeVerifier()),
+                    anchors=ANCHORS, attempt=1)
 
             self.assertEqual(outcome.task_verdict, "PASS")
             self.assertEqual(outcome.test_verdict, "FAIL")
-            self.assertEqual(outcome.status, "verification_failed")
+            self.assertEqual(outcome.status, "in_progress")
             self.assertIsNotNone(outcome.forced_fail_reason)
             self.assertNotEqual(run.task("VR-02").status, "verified")
 
     def test_guard_rejects_a_task_that_is_not_implemented(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             run = _implemented_run(Path(directory))
-            run.transition_task("VR-02", "verified")
+            run.record_verdicts("VR-02", "PASS", "PASS")
             with self.assertRaises(VerificationError):
                 _orchestrate(run, _spec(), FakeVerifier(), FakeVerifier())
 
@@ -616,7 +837,7 @@ class PersistenceTests(unittest.TestCase):
             ):
                 self.assertTrue(path.exists(), path)
             persisted = json.loads(artifacts.verdict_record.read_text(encoding="utf-8"))
-            self.assertEqual(persisted["status"], "verified")
+            self.assertEqual(persisted["status"], "done")
             self.assertEqual(persisted["task_verdict"], "PASS")
 
             reloaded = Run.load(run.run_dir, run.repo_root)
@@ -624,7 +845,7 @@ class PersistenceTests(unittest.TestCase):
             self.assertEqual(recorded["task_verdict"], "PASS")
             self.assertEqual(recorded["test_verdict"], "PASS")
             self.assertIsNotNone(recorded["verified_at"])
-            self.assertEqual(reloaded.task("VR-02").status, "verified")
+            self.assertEqual(reloaded.task("VR-02").status, "done")
             self.assertEqual(outcome.verdict_record, artifacts.verdict_record)
 
 
@@ -721,6 +942,49 @@ class IsolatedVerificationSnapshotTests(unittest.TestCase):
                 run, (self._command(),), stage=stage, task_id="VR-02", attempt=1)
             self.assertIsNone(result.snapshot)
             self.assertNotIn("snapshot", result.records[0])
+
+
+class BaselineFailureClassificationTests(unittest.TestCase):
+    """TAM-01 AC-4: a pre-dispatch baseline failure is task-attributable, amendment-required,
+    or environmental — never silently folded into an implementation defect."""
+
+    def test_environmental_when_the_commands_own_working_directory_is_unavailable(self) -> None:
+        self.assertEqual(
+            classify_baseline_failure(exit_code=1, cwd_paths_exist=False,
+                                      path_covered_by_scope=True),
+            CLASSIFICATION_ENVIRONMENTAL,
+        )
+
+    def test_amendment_required_when_the_causal_evidence_is_outside_declared_scope(self) -> None:
+        self.assertEqual(
+            classify_baseline_failure(exit_code=1, cwd_paths_exist=True,
+                                      path_covered_by_scope=False),
+            CLASSIFICATION_AMENDMENT_REQUIRED,
+        )
+
+    def test_task_attributable_when_the_failure_is_inside_declared_scope(self) -> None:
+        self.assertEqual(
+            classify_baseline_failure(exit_code=1, cwd_paths_exist=True,
+                                      path_covered_by_scope=True),
+            CLASSIFICATION_TASK_ATTRIBUTABLE,
+        )
+
+    def test_a_passing_command_has_nothing_to_classify(self) -> None:
+        with self.assertRaises(AmendmentError):
+            classify_baseline_failure(exit_code=0, cwd_paths_exist=True,
+                                      path_covered_by_scope=True)
+
+    def test_amendment_required_result_retains_the_active_task_card(self) -> None:
+        result = AmendmentRequiredResult(
+            task_id="SIR-01", observed_paths=("tests/lifecycle/fixture_a.py",),
+            causal_commands=("cd . > uv run python -m unittest discover -s tests -t .",),
+            reason="declared suite fails outside the task's current scope",
+        )
+        payload = result.as_dict()
+        self.assertEqual(payload["outcome"], "AMENDMENT_REQUIRED")
+        self.assertEqual(payload["task_id"], "SIR-01")
+        self.assertTrue(payload["requires_human_decision"])
+        self.assertIn("tests/lifecycle/fixture_a.py", payload["observed_paths"])
 
 
 if __name__ == "__main__":

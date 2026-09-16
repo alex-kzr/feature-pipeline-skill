@@ -202,6 +202,23 @@ def _within(path: Path, parent: Path) -> bool:
         return False
 
 
+def _executor_exclude_roots(
+    repo_root: str | Path, exclude_roots: Sequence[str | Path]
+) -> tuple[Path, ...]:
+    """Return caller exclusions plus runner-owned executor artifacts.
+
+    Attribution must never depend on an individual dispatch caller remembering to
+    exclude its own report directory.  ``.pipeline-artifacts`` is runner output,
+    not an executor change eligible for scope review or promotion.
+    """
+    root = Path(repo_root).resolve()
+    return tuple(
+        dict.fromkeys(
+            [*(Path(entry).resolve() for entry in exclude_roots), root / ".pipeline-artifacts"]
+        )
+    )
+
+
 def capture_snapshot(
     repo_root: str | Path, *, exclude_roots: Sequence[str | Path] = ()
 ) -> WorktreeSnapshot:
@@ -218,9 +235,10 @@ def capture_snapshot(
     :func:`attribute_executor_window` consumes to close the window; ``files`` exposes the
     bounded set of bodies that were read at open.
     """
+    excluded = _executor_exclude_roots(repo_root, exclude_roots)
     marker = _INSPECTOR.capture_marker(
         str(Path(repo_root).resolve()),
-        exclude_roots=[str(Path(entry).resolve()) for entry in exclude_roots],
+        exclude_roots=[str(entry) for entry in excluded],
     )
     files = {
         key: SnapshotFile(body.data, unreadable=body.unreadable)
@@ -242,7 +260,7 @@ def _legacy_capture_snapshot(
     ``tests/worktree_parity.py`` only — every VCS-relevant path's bytes are read, so its
     cost is ``O(total repository bytes)`` (BL-02 finding F-16)."""
     root = Path(repo_root).resolve()
-    excludes = [Path(entry).resolve() for entry in exclude_roots]
+    excludes = list(_executor_exclude_roots(repo_root, exclude_roots))
     boundaries = _repository_boundaries(root)
     if boundaries is None:
         return WorktreeSnapshot(
@@ -521,11 +539,12 @@ def attribute_executor_window(
     """
     if before.marker is not None:
         try:
+            excluded = _executor_exclude_roots(repo_root, exclude_roots)
             inspection = _INSPECTOR.attribute(
                 before.marker,
                 str(Path(repo_root).resolve()),
                 allowed_scope=list(allowed_scope),
-                exclude_roots=[str(Path(entry).resolve()) for entry in exclude_roots],
+                exclude_roots=[str(entry) for entry in excluded],
             )
         except WorktreeInspectionError as exc:
             raise WorktreeError(str(exc), exc.code) from exc

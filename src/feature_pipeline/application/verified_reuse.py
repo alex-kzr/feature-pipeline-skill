@@ -4,13 +4,42 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
 
+from pipeline_core.plan import canonical_amendment_fields, contract_digest
+from pipeline_core.reports import verifier_artifacts
 from feature_pipeline.contracts import TaskSpec
 from feature_pipeline.domain.models import TaskDefinition
+
+
+# ``rec09-v1`` digests were persisted before the normalized work-item metadata was part of
+# the reusable-evidence boundary.  Keep their wire format readable, but never mistake them
+# for the versioned evidence newly emitted by this release.
+LEGACY_CANONICAL_CONTRACT_VERSION = "rec09-v1"
+CANONICAL_CONTRACT_VERSION = "rec09-v2"
+AMENDMENT_CONTRACT_VERSION = "tam01-amendment-v1"
+# REC-01 completed before canonical-contract versions were persisted.  Its retained digest
+# is therefore useful only together with the one current canonical contract below; this is a
+# recovery identity, not a general fallback for unversioned evidence.
+REC01_RECOVERY_CONTRACT_VERSION = "rec01-recovery-v1"
+_REC01_RECOVERY_TASK_ID = "REC-01"
+_REC01_RECOVERY_TASK_PATH = "docs/plans/tasks/REC-01_executor-context-and-catalog-recovery.md"
+_REC01_RECOVERY_SOURCE_DIGEST = (
+    "sha256:e2bf7ced1852e5288638b2e76f28dcb190aa7447f2724514a7714581cf386e03"
+)
+_REC01_RECOVERY_CURRENT_DIGEST = (
+    "sha256:fa22da413eeb11d686c1b0e1787f83007593b2bf5f612ea93c36d1f554617a9e"
+)
+_SUPPORTED_CONTRACT_VERSIONS = frozenset({
+    LEGACY_CANONICAL_CONTRACT_VERSION,
+    CANONICAL_CONTRACT_VERSION,
+    AMENDMENT_CONTRACT_VERSION,
+})
 
 
 class EvidenceEligibilityError(Exception):
@@ -21,35 +50,103 @@ class EvidenceEligibilityError(Exception):
         self.code = code
 
 
+@dataclass(frozen=True)
+class CanonicalTaskContract:
+    """The complete executable identity eligible for verified-evidence reuse.
+
+    This is deliberately built from the validated ``TaskSpec`` rather than Markdown bytes:
+    runner-owned ``Status``, ``Result``, and ``Blockers`` projections are presentation only.
+    """
+
+    id: str
+    task_type: str
+    executor: str
+    depends_on: tuple[str, ...]
+    allowed_scope: tuple[str, ...]
+    out_of_scope: tuple[str, ...]
+    required_skills: tuple[str, ...]
+    max_repair_attempts: int
+    documentation_impact: tuple[str, ...]
+    verification_commands: tuple[tuple[str, tuple[str, ...]], ...]
+    verification_tier: str
+    accepts_scoped: tuple[str, ...]
+    deferred_verification_commands: tuple[tuple[str, tuple[str, ...]], ...]
+    runner_evidence: str | None
+    blocking_conditions: str | None
+    preconditions: tuple[tuple[str, str], ...]
+    acceptance_criteria: tuple[tuple[str, str], ...]
+    supersedes: tuple[str, ...]
+
+    @classmethod
+    def from_definition(cls, definition: TaskDefinition | TaskSpec) -> "CanonicalTaskContract":
+        """Create the deterministic execution identity from one validated definition."""
+        spec = definition.spec if isinstance(definition, TaskDefinition) else definition
+        source_path = Path(definition.source_path if isinstance(definition, TaskDefinition) else definition.path)
+        # JSON tasks have no task-file declaration.  A native Markdown task must remain
+        # available while its contract is identified; a missing file cannot be guessed.
+        if source_path.is_file():
+            from pipeline_core.task_files import parse_supersession_declarations
+            supersedes = parse_supersession_declarations(source_path)
+        else:
+            supersedes = ()
+        return cls(
+            id=definition.id,
+            task_type=definition.task_type,
+            executor=definition.executor,
+            depends_on=tuple(sorted(definition.depends_on)),
+            allowed_scope=tuple(sorted(definition.allowed_scope)),
+            out_of_scope=tuple(sorted(definition.out_of_scope)),
+            required_skills=tuple(sorted(definition.required_skills)),
+            max_repair_attempts=definition.max_repair_attempts,
+            documentation_impact=tuple(sorted(definition.documentation_impact)),
+            verification_commands=tuple(
+                (command.cwd, tuple(command.argv)) for command in definition.verification_commands
+            ),
+            verification_tier=definition.verification_tier,
+            accepts_scoped=tuple(sorted(definition.accepts_scoped)),
+            deferred_verification_commands=tuple(
+                (command.cwd, tuple(command.argv))
+                for command in definition.deferred_verification_commands
+            ),
+            runner_evidence=spec.runner_evidence,
+            blocking_conditions=definition.blocking_conditions,
+            preconditions=tuple(sorted(
+                (item.kind, item.value) for item in definition.preconditions
+            )),
+            acceptance_criteria=tuple(
+                (criterion.id, criterion.text) for criterion in definition.acceptance_criteria
+            ),
+            supersedes=supersedes,
+        )
+
+    def as_mapping(self) -> dict[str, object]:
+        """Return a JSON-safe diagnostic view of this typed contract."""
+        return asdict(self)
+
+
 def canonical_task_contract(definition: TaskDefinition | TaskSpec) -> dict[str, object]:
-    """Return the input-neutral fields that define reusable task evidence."""
-    contract: dict[str, object] = {
-        "id": definition.id,
-        "depends_on": sorted(definition.depends_on),
-        "allowed_scope": sorted(definition.allowed_scope),
-        "out_of_scope": sorted(definition.out_of_scope),
-        "acceptance_criteria": [
-            {"id": criterion.id, "text": criterion.text}
-            for criterion in definition.acceptance_criteria
-        ],
-        "verification_commands": [
-            {"cwd": command.cwd, "argv": list(command.argv)}
-            for command in definition.verification_commands
-        ],
-        "verification_tier": definition.verification_tier,
-    }
-    preconditions = getattr(definition, "preconditions", ())
-    if preconditions:
-        contract["preconditions"] = [
-            {"kind": item.kind, "value": item.value} for item in preconditions
-        ]
-    return contract
+    """Return the diagnostic mapping of the typed reusable task contract."""
+    return CanonicalTaskContract.from_definition(definition).as_mapping()
 
 
-def task_contract_digest(definition: TaskDefinition | TaskSpec) -> str:
-    """Return the stable SHA-256 identity of ``definition``'s reusable contract."""
+def task_contract_digest(
+    definition: TaskDefinition | TaskSpec, *, version: str = CANONICAL_CONTRACT_VERSION,
+) -> str:
+    """Return the versioned stable SHA-256 identity of a reusable task contract.
+
+    V1 is deliberately byte-compatible with historical persisted digests.  V2 adds an
+    unambiguous version domain to the digest, so new evidence cannot be replayed as legacy
+    evidence (or vice versa) when task metadata evolves again.
+    """
+    if version not in _SUPPORTED_CONTRACT_VERSIONS:
+        raise ValueError(f"unsupported canonical contract version: {version}")
+    contract = CanonicalTaskContract.from_definition(definition).as_mapping()
+    payload: object = contract
+    if version != LEGACY_CANONICAL_CONTRACT_VERSION:
+        payload = {"canonical_contract_version": version, "contract": contract}
     encoded = json.dumps(
-        canonical_task_contract(definition), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        payload,
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False
     ).encode("utf-8")
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
@@ -72,6 +169,60 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+_DONE_CHECKBOX_RE = re.compile(r"^- \[([ xX])\] Done\s*$", re.MULTILINE)
+
+
+def _definition_source_path(definition: "TaskDefinition | TaskSpec") -> Path:
+    return Path(definition.source_path if isinstance(definition, TaskDefinition) else definition.path)
+
+
+def _markdown_already_marks_done(definition: "TaskDefinition | TaskSpec") -> bool:
+    """Whether ``definition``'s own task file already presents a Markdown ``Done`` record.
+
+    A task whose own file has never been projected ``Done`` (still ``To Do`` /
+    ``In Progress``, or a JSON-only entry with no backing file) carries no attempt-bearing
+    Markdown ``## Result`` to distrust or trust — only a *recorded historical* completion is
+    ever held to the stricter artifact-presence bar below.
+    """
+    source = _definition_source_path(definition)
+    if not source.is_file():
+        return False
+    try:
+        text = source.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    match = _DONE_CHECKBOX_RE.search(text)
+    return match is not None and match.group(1) in ("x", "X")
+
+
+def _require_final_artifacts_when_attempt_bearing(
+    run_dir: Path, task: Mapping[str, Any],
+) -> None:
+    """Fail closed when a Markdown ``Done`` task's named run has no final verifier evidence.
+
+    Only a task carrying a durable attempt identity (an ``attempts`` count, persisted by
+    every run this project itself creates) can even name a deterministic final-report path;
+    a pre-attempt legacy record has no such identity and is intentionally left to the
+    existing (run.json-only) eligibility policy — it cannot be held to a bar it has no way
+    to name.
+    """
+    attempts = task.get("attempts")
+    if not isinstance(attempts, int) or isinstance(attempts, bool):
+        return
+    revision = task.get("current_revision")
+    revision_value = (
+        revision if isinstance(revision, int) and not isinstance(revision, bool) and revision > 0
+        else None
+    )
+    artifacts = verifier_artifacts(run_dir, str(task["id"]), attempts + 1, revision=revision_value)
+    missing = [path for path in (artifacts.task_report, artifacts.test_report) if not path.is_file()]
+    if missing:
+        raise EvidenceEligibilityError(
+            "source task's named final verifier report is absent from disk",
+            "evidence-final-artifacts-missing",
+        )
+
+
 class VerifiedEvidenceStore:
     """Find reusable evidence without changing any source run artifact."""
 
@@ -86,33 +237,19 @@ class VerifiedEvidenceStore:
             raise EvidenceEligibilityError("no source run exists", "evidence-source-missing")
 
         exact: list[Mapping[str, str]] = []
-        legacy: list[Mapping[str, str]] = []
         denials: list[EvidenceEligibilityError] = []
         expected_path = canonical_task_path(definition, self.repo_root)
-        expected_digest = task_contract_digest(definition)
+        markdown_marks_done = _markdown_already_marks_done(definition)
         for path, raw, data in sources:
             try:
                 task = self._eligible_task(data, definition.id)
-                digest = task.get("task_contract_digest")
-                task_path = task.get("task_path")
-                if digest is None:
-                    if getattr(definition, "preconditions", ()):
-                        raise EvidenceEligibilityError(
-                            "legacy evidence has no precondition contract", "evidence-contract-digest-mismatch"
-                        )
-                    legacy.append(self._evidence(path, raw, data, task, definition.id, "legacy-task-id"))
-                elif task_path != expected_path:
-                    raise EvidenceEligibilityError(
-                        "source task path does not match", "evidence-task-path-mismatch"
-                    )
-                elif digest != expected_digest:
-                    raise EvidenceEligibilityError(
-                        "source task contract digest does not match", "evidence-contract-digest-mismatch"
-                    )
-                else:
-                    exact.append(self._evidence(
-                        path, raw, data, task, definition.id, "task-path-and-contract-digest"
-                    ))
+                if markdown_marks_done:
+                    _require_final_artifacts_when_attempt_bearing(path.parent, task)
+                version = self._canonical_identity(task, definition, expected_path)
+                exact.append(self._evidence(
+                    path, raw, data, task, definition.id,
+                    self._identity_name(version), version,
+                ))
             except EvidenceEligibilityError as exc:
                 denials.append(exc)
 
@@ -121,12 +258,6 @@ class VerifiedEvidenceStore:
         if len(exact) > 1:
             raise EvidenceEligibilityError(
                 "multiple source runs match the task path and contract digest", "evidence-exact-ambiguous"
-            )
-        if len(legacy) == 1:
-            return legacy[0]
-        if len(legacy) > 1:
-            raise EvidenceEligibilityError(
-                "multiple legacy source runs match the task ID", "evidence-legacy-ambiguous"
             )
         if denials:
             raise denials[0]
@@ -138,34 +269,71 @@ class VerifiedEvidenceStore:
         """Evaluate one explicitly selected source run with the default lookup policy."""
         path, raw, data = self._read_source(Path(run_dir) / "run.json")
         task = self._eligible_task(data, definition.id)
-        digest = task.get("task_contract_digest")
-        if digest is None:
-            if getattr(definition, "preconditions", ()):
-                raise EvidenceEligibilityError(
-                    "legacy evidence has no precondition contract", "evidence-contract-digest-mismatch"
-                )
-            legacy_matches = 0
-            for _, _, candidate in self._sources():
-                try:
-                    candidate_task = self._eligible_task(candidate, definition.id)
-                except EvidenceEligibilityError:
-                    continue
-                if candidate_task.get("task_contract_digest") is None:
-                    legacy_matches += 1
-            if legacy_matches > 1:
-                raise EvidenceEligibilityError(
-                    "multiple legacy source runs match the task ID", "evidence-legacy-ambiguous"
-                )
-            return self._evidence(path, raw, data, task, definition.id, "legacy-task-id")
-        if task.get("task_path") != canonical_task_path(definition, self.repo_root):
+        if _markdown_already_marks_done(definition):
+            _require_final_artifacts_when_attempt_bearing(path.parent, task)
+        version = self._canonical_identity(
+            task, definition, canonical_task_path(definition, self.repo_root)
+        )
+        return self._evidence(
+            path, raw, data, task, definition.id, self._identity_name(version), version
+        )
+
+    @staticmethod
+    def _identity_name(version: str) -> str:
+        if version == LEGACY_CANONICAL_CONTRACT_VERSION:
+            return "legacy-task-path-and-contract-digest"
+        return "task-path-and-contract-digest"
+
+    @staticmethod
+    def _canonical_identity(
+        task: Mapping[str, Any], definition: TaskDefinition, expected_path: str,
+    ) -> str:
+        """Validate the source identity using its declared digest format, never a guess."""
+        version = task.get("task_contract_version")
+        if version is None and (
+            definition.id == _REC01_RECOVERY_TASK_ID
+            and expected_path == _REC01_RECOVERY_TASK_PATH
+            and task.get("task_path") == _REC01_RECOVERY_TASK_PATH
+            and task.get("task_contract_digest") == _REC01_RECOVERY_SOURCE_DIGEST
+            and task_contract_digest(definition) == _REC01_RECOVERY_CURRENT_DIGEST
+        ):
+            return REC01_RECOVERY_CONTRACT_VERSION
+        if not isinstance(version, str) or version not in _SUPPORTED_CONTRACT_VERSIONS:
+            raise EvidenceEligibilityError(
+                "source task has no recognized canonical contract version",
+                "evidence-canonical-identity-missing",
+            )
+        if task.get("task_path") != expected_path:
             raise EvidenceEligibilityError(
                 "source task path does not match", "evidence-task-path-mismatch"
             )
-        if digest != task_contract_digest(definition):
+        if version == AMENDMENT_CONTRACT_VERSION:
+            revision = task.get("current_revision")
+            revisions = task.get("amendment_revisions")
+            expected_digest = contract_digest(canonical_amendment_fields(
+                definition.spec if isinstance(definition, TaskDefinition) else definition
+            ))
+            matching_revision = (
+                isinstance(revision, int)
+                and revision > 0
+                and isinstance(revisions, list)
+                and any(
+                    isinstance(item, Mapping)
+                    and item.get("revision") == revision
+                    and item.get("new_digest") == task.get("task_contract_digest")
+                    for item in revisions
+                )
+            )
+            if not matching_revision or task.get("task_contract_digest") != expected_digest:
+                raise EvidenceEligibilityError(
+                    "source amendment contract does not match", "evidence-contract-digest-mismatch"
+                )
+            return version
+        if task.get("task_contract_digest") != task_contract_digest(definition, version=version):
             raise EvidenceEligibilityError(
                 "source task contract digest does not match", "evidence-contract-digest-mismatch"
             )
-        return self._evidence(path, raw, data, task, definition.id, "task-path-and-contract-digest")
+        return version
 
     def _sources(self) -> list[tuple[Path, bytes, Mapping[str, Any]]]:
         if not self.runs_root.exists():
@@ -192,9 +360,16 @@ class VerifiedEvidenceStore:
             )
         return path, raw, data
 
-    @staticmethod
-    def _eligible_task(data: Mapping[str, Any], task_id: str) -> Mapping[str, Any]:
-        if data.get("status") != "verified":
+    #: Terminal run states whose per-task evidence may still be reused. ``verified`` is a
+    #: globally closed run; ``blocked`` is a terminal run that could not be globally closed
+    #: (e.g. a sibling task needs human recovery). Reuse from a ``blocked`` source is only
+    #: ever granted when the *named task itself* clears every check below — the run is never
+    #: treated as successful and its bytes are never touched.
+    _TERMINAL_RUN_STATES = ("verified", "blocked", "completed")
+
+    @classmethod
+    def _eligible_task(cls, data: Mapping[str, Any], task_id: str) -> Mapping[str, Any]:
+        if data.get("status") not in cls._TERMINAL_RUN_STATES:
             raise EvidenceEligibilityError("source run is not closed", "evidence-source-run-not-closed")
         tasks = data.get("tasks")
         if not isinstance(tasks, list):
@@ -202,7 +377,9 @@ class VerifiedEvidenceStore:
         task = next((item for item in tasks if isinstance(item, dict) and item.get("id") == task_id), None)
         if task is None:
             raise EvidenceEligibilityError("source task is absent", "evidence-source-task-missing")
-        if task.get("status") != "verified":
+        legacy_verified = task.get("status") == "verified"
+        completed = task.get("status") == "done" and task.get("resolution") == "completed"
+        if not (legacy_verified or completed):
             raise EvidenceEligibilityError("source task is not verified", "evidence-source-task-not-verified")
         verification = task.get("verification")
         if not isinstance(verification, dict):
@@ -218,7 +395,7 @@ class VerifiedEvidenceStore:
     @staticmethod
     def _evidence(
         path: Path, raw: bytes, data: Mapping[str, Any], task: Mapping[str, Any], dependency_id: str,
-        identity: str,
+        identity: str, evidence_contract_version: str,
     ) -> Mapping[str, str]:
         verification = task["verification"]
         assert isinstance(verification, Mapping)
@@ -230,6 +407,8 @@ class VerifiedEvidenceStore:
             "source_run_id": run_id,
             "source_run_digest": f"sha256:{hashlib.sha256(raw).hexdigest()}",
             "evidence_identity": identity,
+            "evidence_contract_version": evidence_contract_version,
+            "evidence_digest_version": evidence_contract_version,
             "task_verdict": "PASS",
             "test_verdict": "PASS",
             "verified_at": str(verification["verified_at"]),
@@ -237,7 +416,131 @@ class VerifiedEvidenceStore:
         })
 
 
+def supersession_graph(definitions: Mapping[str, Any], repo_root: str | Path) -> Any | None:
+    """Rebuild the plan's supersession relation from the task files' canonical
+    ``## Supersession`` grammar, or ``None`` when nothing declares one.
+
+    Read-only: it only re-parses task files already on disk (the same grammar
+    :class:`CanonicalTaskContract` folds into the reuse digest). Fails closed to ``None`` on
+    an invalid / cyclic / ambiguous declaration set — the plan loader already rejected those
+    before a run reaches here, so a malformed declaration can never *grant* a reuse.
+    """
+    from pipeline_core.supersession import Supersession, SupersessionError, SupersessionGraph
+    from pipeline_core.task_files import parse_supersession_declarations
+
+    root = Path(repo_root)
+    edges: list[Any] = []
+    for task_id, definition in definitions.items():
+        raw_source = getattr(definition, "source_path", None) or getattr(definition, "path", "")
+        source = Path(str(raw_source))
+        if not source.is_absolute():
+            source = root / source
+        if not source.is_file():
+            continue
+        for superseded in parse_supersession_declarations(source):
+            edges.append(Supersession(replacement=task_id, superseded=superseded))
+    if not edges:
+        return None
+    try:
+        return SupersessionGraph(
+            edges,
+            known_ids=list(definitions),
+            dependencies={
+                tid: list(getattr(d, "depends_on", ())) for tid, d in definitions.items()
+            },
+        )
+    except SupersessionError:
+        return None
+
+
+def find_superseding_evidence(
+    store: "VerifiedEvidenceStore",
+    graph: Any | None,
+    superseded_id: str,
+    definitions: Mapping[str, Any],
+) -> tuple[str, Mapping[str, str]] | None:
+    """``(replacement_id, evidence)`` for the task that directly supersedes
+    ``superseded_id`` and carries its *own* exact eligible verified evidence.
+
+    Returns ``None`` when no direct replacement is declared or it lacks eligible evidence.
+    A later successor cannot validate an unfinished intermediate replacement: every retired
+    card must have a formal edge backed by that edge's replacement evidence. The blocked
+    predecessor itself is never read, forged, or modified.
+    """
+    if graph is None:
+        return None
+    node = graph.replacement_for(superseded_id)
+    if node is None:
+        return None
+    definition = definitions.get(node)
+    if definition is None:
+        return None
+    try:
+        return node, store.find(definition)
+    except EvidenceEligibilityError:
+        return None
+
+
+def resolve_default_reuse(
+    store: "VerifiedEvidenceStore",
+    definitions: Mapping[str, Any],
+    scope: tuple[str, ...] | list[str],
+    selected: tuple[str, ...] | list[str],
+    repo_root: str | Path,
+    pre_resolved: tuple[str, ...] | list[str] = (),
+) -> dict[str, Mapping[str, str]]:
+    """Resolve default dependency reuse once for preview and execution.
+
+    A replacement is evidence for the *declared* dependency, never evidence that rewrites the
+    predecessor.  Once a replacement edge exists, failure to validate its evidence is a denial
+    rather than permission to redispatch a retired task.
+    """
+    graph = supersession_graph(definitions, repo_root)
+    if graph is None:
+        # ``supersession_graph`` deliberately has a permissive public shape for legacy callers.
+        # Default reuse cannot be permissive: an invalid declared replacement relation must not
+        # fall through to dispatching the terminal predecessor.
+        from pipeline_core.task_files import parse_supersession_declarations
+        root = Path(repo_root)
+        has_declaration = any(
+            parse_supersession_declarations(
+                path if path.is_absolute() else root / path
+            )
+            for definition in definitions.values()
+            for path in (Path(getattr(definition, "source_path", getattr(definition, "path", "")),),)
+            if (path if path.is_absolute() else root / path).is_file()
+        )
+        if has_declaration:
+            raise EvidenceEligibilityError(
+                "supersession declarations are invalid or cyclic", "evidence-supersession-invalid"
+            )
+    reused: dict[str, Mapping[str, str]] = {}
+    selected_ids = set(selected)
+    pre_resolved_ids = set(pre_resolved)
+    for task_id in scope:
+        if task_id in selected_ids or task_id in pre_resolved_ids:
+            continue
+        try:
+            reused[task_id] = store.find(definitions[task_id])
+            continue
+        except EvidenceEligibilityError as direct_denial:
+            if graph is None:
+                continue
+            replacement_id = graph.replacement_for(task_id)
+            if replacement_id is None:
+                continue
+            replacement = definitions.get(replacement_id)
+            if replacement is None:
+                raise direct_denial
+            evidence = dict(store.find(replacement))
+            evidence["dependency_id"] = task_id
+            evidence["replacement_id"] = replacement_id
+            reused[task_id] = MappingProxyType(evidence)
+    return reused
+
+
 __all__ = [
-    "EvidenceEligibilityError", "VerifiedEvidenceStore", "canonical_task_contract",
-    "canonical_task_path", "task_contract_digest",
+    "CANONICAL_CONTRACT_VERSION", "LEGACY_CANONICAL_CONTRACT_VERSION", "REC01_RECOVERY_CONTRACT_VERSION", "CanonicalTaskContract", "EvidenceEligibilityError", "VerifiedEvidenceStore",
+    "canonical_task_contract",
+    "canonical_task_path", "find_superseding_evidence", "resolve_default_reuse", "supersession_graph", "task_contract_digest",
 ]

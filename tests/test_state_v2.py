@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
 
+from pipeline_core.plan import AmendmentError, AmendmentRevision
 from pipeline_core.state import (
     ACTOR_EXECUTOR,
     ACTOR_RUNNER,
@@ -70,9 +72,12 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual(run.feature, "legacy-feature")
             self.assertEqual(run.status, "running")
             self.assertEqual(list(run.tasks), ["LT-1", "LT-2"])
-            self.assertEqual(run.task("LT-1").status, "verified")
+            self.assertEqual(run.task("LT-1").status, "done")
+            # RLC-01 AC-4: a legacy 'verified' status must load as 'done' *with* the
+            # completion resolution set — not just the status remapped.
+            self.assertEqual(run.task("LT-1").resolution, "completed")
             self.assertEqual(run.task("LT-1").attempts, 2)
-            self.assertEqual(run.task("LT-2").status, "blocked")
+            self.assertEqual(run.task("LT-2").status, "in_progress")
             self.assertEqual(run.task("LT-2").blocker, "dependency-not-satisfied: LT-1")
             self.assertEqual(run.task("LT-2").depends_on, ["LT-1"])
             self.assertEqual(run.history, _V1_RUN["history"])
@@ -99,6 +104,37 @@ class MigrationTests(unittest.TestCase):
                 Run.load(run_dir, root)
             self.assertEqual(caught.exception.code, "unknown-schema-version")
             self.assertEqual((run_dir / "run.json").read_text(encoding="utf-8"), original)
+
+    def test_legacy_verified_load_preserves_source_bytes_through_load_and_continuation(
+        self,
+    ) -> None:
+        """RLC-01 AC-4: loading a legacy v1 'verified' fixture never rewrites the source file,
+        and the corrected done/completed resolution survives an unrelated, separately
+        committed continuation (not just the first in-memory load)."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_dir = root / "runs" / "legacy-feature"
+            run_dir.mkdir(parents=True)
+            run_json = run_dir / "run.json"
+            run_json.write_text(json.dumps(_V1_RUN, indent=2) + "\n", encoding="utf-8")
+            before_digest = hashlib.sha256(run_json.read_bytes()).hexdigest()
+
+            run = Run.load(run_dir, root)
+            after_load_digest = hashlib.sha256(run_json.read_bytes()).hexdigest()
+            self.assertEqual(before_digest, after_load_digest)
+            self.assertEqual(run.task("LT-1").status, "done")
+            self.assertEqual(run.task("LT-1").resolution, "completed")
+
+            # A separately committed continuation unrelated to LT-1 must not lose the fact.
+            run.record_event("continuation", to="noted", note="unrelated continuation")
+            run.save()
+            after_continuation_digest = hashlib.sha256(run_json.read_bytes()).hexdigest()
+            self.assertEqual(before_digest, after_continuation_digest)
+
+            reloaded = Run.load(run_dir, root)
+            self.assertEqual(reloaded.task("LT-1").status, "done")
+            self.assertEqual(reloaded.task("LT-1").resolution, "completed")
+            self.assertEqual(reloaded.history[-1]["scope"], "continuation")
 
 
 class RoundTripTests(unittest.TestCase):
@@ -133,6 +169,7 @@ class RoundTripTests(unittest.TestCase):
                  "verified_at": "2026-09-01T09:00:00Z", "attested_at": "2026-09-01T10:00:00Z"}]
             record.task_path = "docs/plans/tasks/EX-1.md"
             record.task_contract_digest = "sha256:contract"
+            record.task_contract_version = "rec09-v1"
             record.reused_verification = [{
                 "dependency_id": "EX-0", "source_run_id": "prior-run-id",
                 "source_run_digest": "sha256:source", "evidence_identity": "legacy-task-id",
@@ -224,29 +261,27 @@ class CommandAndGenerationTests(unittest.TestCase):
 
 
 class ActorAuthorizationTests(unittest.TestCase):
-    def _implemented(self, root: Path) -> Run:
+    def _in_progress(self, root: Path) -> Run:
         run = _run(root)
         run.add_task("EX-1")
-        run.transition_task("EX-1", "ready")
-        run.transition_task("EX-1", "running")
-        run.transition_task("EX-1", "implemented", ACTOR_EXECUTOR)
+        run.transition_task("EX-1", "in_progress")
         return run
 
-    def test_executor_can_only_produce_implemented_never_verified(self) -> None:
+    def test_executor_cannot_complete_a_task(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            run = self._implemented(Path(directory))
+            run = self._in_progress(Path(directory))
             with self.assertRaises(StateError) as caught:
-                run.transition_task("EX-1", "verified", ACTOR_EXECUTOR)
+                run.transition_task("EX-1", "done", ACTOR_EXECUTOR, resolution="completed")
             self.assertEqual(caught.exception.code, "unauthorized-transition")
 
-    def test_only_the_runner_may_record_verified(self) -> None:
+    def test_only_the_runner_may_record_done(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            run = self._implemented(Path(directory))
-            self.assertEqual(run.transition_task("EX-1", "verified", ACTOR_RUNNER), "verified")
-            # verified is terminal: no further transition is defined.
+            run = self._in_progress(Path(directory))
+            self.assertEqual(run.record_verdicts("EX-1", "PASS", "PASS"), "done")
+            # done is terminal: no further transition is defined.
             with self.assertRaises(StateError) as caught:
-                run.transition_task("EX-1", "implemented", ACTOR_RUNNER)
-            self.assertEqual(caught.exception.code, "illegal-transition")
+                run.transition_task("EX-1", "in_progress", ACTOR_RUNNER)
+            self.assertEqual(caught.exception.code, "unauthorized-transition")
 
     def test_authorization_survives_migration_from_v1(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -256,10 +291,10 @@ class ActorAuthorizationTests(unittest.TestCase):
             (run_dir / "run.json").write_text(json.dumps(_V1_RUN, indent=2) + "\n",
                                               encoding="utf-8")
             run = Run.load(run_dir, root)
-            # LT-1 migrated as 'verified' (terminal) — even the runner cannot move it.
+            # LT-1 migrated as 'done' (terminal) — even the runner cannot move it.
             with self.assertRaises(StateError) as caught:
-                run.transition_task("LT-1", "implemented", ACTOR_RUNNER)
-            self.assertEqual(caught.exception.code, "illegal-transition")
+                run.transition_task("LT-1", "in_progress", ACTOR_RUNNER)
+            self.assertEqual(caught.exception.code, "unauthorized-transition")
 
 
 class AttestationTests(unittest.TestCase):
@@ -303,6 +338,84 @@ class AttestationTests(unittest.TestCase):
             self.assertEqual(record.task_path, "docs/plans/tasks/EX-1.md")
             self.assertEqual(record.task_contract_digest, "sha256:contract")
             self.assertEqual(record.reused_verification, [{"dependency_id": "EX-0", "source_run_id": "source"}])
+
+
+class AmendmentRevisionPersistenceTests(unittest.TestCase):
+    """TAM-01 AC-2/AC-3: an approved amendment is an immutable, revision-scoped record."""
+
+    def _revision(self, task_id: str = "AM-1", revision: int = 1) -> AmendmentRevision:
+        return AmendmentRevision(
+            task_id=task_id, revision=revision, prior_digest="sha256:before",
+            new_digest="sha256:after", changed_fields=("allowed_scope",),
+            added_paths=("tests/test_new_fixture.py",), rationale="baseline exposed scope gap",
+            approved_by="a-human", source_evidence="report:launch-2",
+            created_at="2026-09-12T00:00:00Z", epoch=1,
+        )
+
+    def test_apply_amendment_appends_revision_and_resets_the_repair_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = _run(root)
+            run.add_task("AM-1")
+            run.transition_task("AM-1", "in_progress")
+            run.begin_repair("AM-1", maximum=2)
+            run.record_verdicts("AM-1", "FAIL", "FAIL")
+            self.assertEqual(run.task("AM-1").attempts, 1)
+
+            revision = self._revision()
+            run.apply_amendment(revision, new_digest="sha256:canonical-after",
+                                new_digest_version="tam01-amendment-v1")
+
+            record = run.task("AM-1")
+            self.assertEqual(record.current_revision, 1)
+            self.assertEqual(record.attempts, 0)
+            self.assertEqual(record.verification["task_verdict"], None)
+            self.assertEqual(record.task_contract_digest, "sha256:canonical-after")
+            self.assertEqual(len(record.amendment_revisions), 1)
+            self.assertEqual(record.amendment_revisions[0]["approved_by"], "a-human")
+            self.assertEqual(record.revision_history, [
+                {"revision": 0, "attempts": 1,
+                 "verification": {"task_verdict": "FAIL", "test_verdict": "FAIL",
+                                  "verified_at": record.revision_history[0]["verification"]["verified_at"]},
+                 "contract_digest": None},
+            ])
+
+    def test_apply_amendment_rejects_a_task_that_is_already_done(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = _run(root)
+            run.add_task("AM-1")
+            run.transition_task("AM-1", "in_progress")
+            run.record_verdicts("AM-1", "PASS", "PASS")
+            self.assertEqual(run.task("AM-1").status, "done")
+            with self.assertRaises(AmendmentError) as ctx:
+                run.apply_amendment(self._revision(), new_digest="sha256:x",
+                                    new_digest_version="tam01-amendment-v1")
+            self.assertEqual(ctx.exception.code, "task-already-done")
+
+    def test_apply_amendment_rejects_an_out_of_order_revision_number(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = _run(root)
+            run.add_task("AM-1")
+            with self.assertRaises(AmendmentError) as ctx:
+                run.apply_amendment(self._revision(revision=2), new_digest="sha256:x",
+                                    new_digest_version="tam01-amendment-v1")
+            self.assertEqual(ctx.exception.code, "revision-out-of-order")
+
+    def test_amendment_revisions_and_new_fields_round_trip_through_save_and_load(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = _run(root)
+            run.add_task("AM-1")
+            run.apply_amendment(self._revision(), new_digest="sha256:canonical-after",
+                                new_digest_version="tam01-amendment-v1")
+            run.save()
+            reloaded = Run.load(run.run_dir, root)
+            record = reloaded.task("AM-1")
+            self.assertEqual(record.current_revision, 1)
+            self.assertEqual(len(record.amendment_revisions), 1)
+            self.assertEqual(record.amendment_revisions[0]["revision"], 1)
 
 
 if __name__ == "__main__":

@@ -32,7 +32,7 @@ Standard library only.
 
 from __future__ import annotations
 
-from typing import Callable
+from typing import Callable, Mapping
 
 from feature_pipeline.infrastructure.artifacts.store import FileArtifactStore
 from feature_pipeline.infrastructure.state.repository import StateRepository
@@ -112,6 +112,51 @@ class RunPersistence:
             state, self.layout.state_path, expected_revision=loaded.revision
         )
         return LoadedState(state=committed, revision=committed.revision)
+
+    def record_task_operation(
+        self,
+        loaded: LoadedState,
+        task_id: str,
+        operation: Mapping[str, object],
+        *,
+        on_step: StepHook = None,
+    ) -> LoadedState:
+        """Append immutable operation evidence through the compare-and-set boundary.
+
+        The product status is intentionally not inferred from an operation outcome.
+        An interrupted caller may submit the same ``operation_id`` again; the schema
+        snapshot treats that exact replay as settled, so no duplicate operation is
+        committed.  A reused id with different evidence is rejected before writing.
+        """
+        snapshot = loaded.state.with_appended_task_operation(task_id, operation)
+        if snapshot is loaded.state:
+            return loaded
+        _step(on_step, "reference")
+        committed = self.commit(loaded, snapshot)
+        _step(on_step, "commit")
+        return committed
+
+    def set_task_status(
+        self,
+        loaded: LoadedState,
+        task_id: str,
+        status: str,
+        *,
+        resolution: str | None = None,
+        resolution_reason: str | None = None,
+        on_step: StepHook = None,
+    ) -> LoadedState:
+        """Commit product status separately from the immutable operation timeline."""
+        snapshot = loaded.state.with_task_status(
+            task_id,
+            status,
+            resolution=resolution,
+            resolution_reason=resolution_reason,
+        )
+        _step(on_step, "reference")
+        committed = self.commit(loaded, snapshot)
+        _step(on_step, "commit")
+        return committed
 
     def record_command(
         self,

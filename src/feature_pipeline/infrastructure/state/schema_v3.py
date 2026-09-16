@@ -42,7 +42,7 @@ from dataclasses import dataclass, field, replace
 from typing import Literal, Mapping, Sequence
 
 from feature_pipeline.contracts import SCHEMA_VERSION as CONTRACT_SCHEMA_VERSION
-from feature_pipeline.domain.vocabulary import RunStatus, TaskStatus, Verdict
+from feature_pipeline.domain.vocabulary import DoneResolution, RunStatus, TaskStatus, Verdict
 
 from .errors import (
     FieldTypeError,
@@ -62,6 +62,7 @@ SUPPORTED_READ_SCHEMA_VERSIONS: frozenset[int] = frozenset({2, 3})
 UnknownFieldPolicy = Literal["reject", "ignore", "preserve"]
 
 _TASK_STATUSES: frozenset[str] = frozenset(TaskStatus.values())
+_DONE_RESOLUTIONS: frozenset[str] = frozenset(DoneResolution.values())
 _VERDICTS: frozenset[str] = frozenset(Verdict.values())
 #: ``pipeline_core.state.Run`` defaults ``status`` to ``"pending"`` before the first
 #: transition, so it is accepted alongside the declared :class:`RunStatus` members.
@@ -419,6 +420,9 @@ class TaskEntryV3:
 
     id: str
     status: str
+    resolution: str | None = None
+    resolution_reason: str | None = None
+    operation_history: tuple[dict[str, object], ...] = ()
     depends_on: tuple[str, ...] = ()
     attempts: int = 0
     blocker: str | None = None
@@ -437,6 +441,7 @@ class TaskEntryV3:
     external_launch_failures: tuple[dict[str, object], ...] = ()
     task_path: str | None = None
     task_contract_digest: str | None = None
+    task_contract_version: str | None = None
     reused_verification: tuple[dict[str, object], ...] = ()
     attested_dependencies: tuple[dict[str, object], ...] = ()
     next_executor_launch_generation: int = 1
@@ -446,11 +451,12 @@ class TaskEntryV3:
 
     _KNOWN = frozenset(
         {
-            "id", "status", "depends_on", "attempts", "blocker", "type", "executor",
+            "id", "status", "resolution", "resolution_reason", "operation_history",
+            "depends_on", "attempts", "blocker", "type", "executor",
             "adapter", "session_id", "verification", "execution_evidence", "changed_files",
             "verification_tier", "accepts_scoped", "promotion", "unblocks",
             "maintenance_audit", "external_launch_failures", "attested_dependencies",
-            "task_path", "task_contract_digest", "reused_verification",
+            "task_path", "task_contract_digest", "task_contract_version", "reused_verification",
             "next_executor_launch_generation", "next_task_verifier_launch_generation",
             "next_test_verifier_launch_generation",
         }
@@ -472,9 +478,30 @@ class TaskEntryV3:
             if promotion_raw is None
             else dict(_mapping(promotion_raw, _join(path, "promotion")))
         )
+        status = _enum(_require(data, "status", path), _join(path, "status"), _TASK_STATUSES)
+        resolution = (
+            None if data.get("resolution") is None else _enum(
+                data["resolution"], _join(path, "resolution"), _DONE_RESOLUTIONS
+            )
+        )
+        resolution_reason = _opt_str(data.get("resolution_reason"), _join(path, "resolution_reason"))
+        if status == "done" and resolution is None:
+            raise FieldValueError("a done task requires a resolution", field=_join(path, "resolution"))
+        if status != "done" and resolution is not None:
+            raise FieldValueError("only a done task may have a resolution", field=_join(path, "resolution"))
+        if resolution == "cancelled" and not (resolution_reason and resolution_reason.strip()):
+            raise FieldValueError(
+                "a cancelled task requires a non-empty reason",
+                field=_join(path, "resolution_reason"),
+            )
         return cls(
             id=_str(_require(data, "id", path), _join(path, "id")),
-            status=_enum(_require(data, "status", path), _join(path, "status"), _TASK_STATUSES),
+            status=status,
+            resolution=resolution,
+            resolution_reason=resolution_reason,
+            operation_history=_mapping_list(
+                data.get("operation_history", []), _join(path, "operation_history")
+            ),
             depends_on=_str_list(data.get("depends_on", []), _join(path, "depends_on")),
             attempts=_int(data.get("attempts", 0), _join(path, "attempts")),
             blocker=_opt_str(data.get("blocker"), _join(path, "blocker")),
@@ -516,6 +543,9 @@ class TaskEntryV3:
             task_contract_digest=_opt_str(
                 data.get("task_contract_digest"), _join(path, "task_contract_digest")
             ),
+            task_contract_version=_opt_str(
+                data.get("task_contract_version"), _join(path, "task_contract_version")
+            ),
             reused_verification=_mapping_list(
                 data.get("reused_verification", []), _join(path, "reused_verification")
             ),
@@ -539,6 +569,9 @@ class TaskEntryV3:
         out: dict[str, object] = {
             "id": self.id,
             "status": self.status,
+            "resolution": self.resolution,
+            "resolution_reason": self.resolution_reason,
+            "operation_history": [dict(entry) for entry in self.operation_history],
             "depends_on": list(self.depends_on),
             "attempts": self.attempts,
             "blocker": self.blocker,
@@ -559,6 +592,7 @@ class TaskEntryV3:
             ],
             "task_path": self.task_path,
             "task_contract_digest": self.task_contract_digest,
+            "task_contract_version": self.task_contract_version,
             "reused_verification": [dict(entry) for entry in self.reused_verification],
             "attested_dependencies": [
                 dict(entry) for entry in self.attested_dependencies
@@ -573,6 +607,55 @@ class TaskEntryV3:
         }
         out.update(self.extra)
         return out
+
+    def with_appended_operation(
+        self, operation: Mapping[str, object]
+    ) -> "TaskEntryV3":
+        """Append one immutable operation record without changing product status.
+
+        New writers identify an operation by ``operation_id``.  Replaying the exact
+        operation after an interruption is therefore a no-op, while attempting to
+        reuse an id for different evidence fails rather than silently rewriting
+        history.  Older records deliberately remain opaque and readable: they did
+        not carry an operation id and are historical source evidence, not a reason
+        to rewrite a source run in place.
+        """
+        entry = dict(operation)
+        operation_id = entry.get("operation_id")
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError("a new operation requires a non-empty operation_id")
+        for existing in self.operation_history:
+            if existing.get("operation_id") != operation_id:
+                continue
+            if existing == entry:
+                return self
+            raise ValueError(f"operation_id {operation_id!r} is already settled")
+        return replace(self, operation_history=self.operation_history + (entry,))
+
+    def with_status(
+        self,
+        status: str,
+        *,
+        resolution: str | None = None,
+        resolution_reason: str | None = None,
+    ) -> "TaskEntryV3":
+        """Return a status snapshot while leaving operation history untouched."""
+        if status not in _TASK_STATUSES:
+            raise ValueError(f"unsupported task status {status!r}")
+        if status == "done" and resolution not in _DONE_RESOLUTIONS:
+            raise ValueError("a done task requires a resolution")
+        if status != "done" and resolution is not None:
+            raise ValueError("only a done task may have a resolution")
+        if resolution == "cancelled" and not (
+            resolution_reason and resolution_reason.strip()
+        ):
+            raise ValueError("a cancelled task requires a non-empty reason")
+        return replace(
+            self,
+            status=status,
+            resolution=resolution if status == "done" else None,
+            resolution_reason=resolution_reason if status == "done" else None,
+        )
 
 
 @dataclass(frozen=True)
@@ -715,6 +798,31 @@ class RunStateV3:
             tasks=tuple(entry if task.id == entry.id else task for task in self.tasks),
         )
 
+    def with_appended_task_operation(
+        self, task_id: str, operation: Mapping[str, object]
+    ) -> "RunStateV3":
+        """Append an idempotent operation record to one task, preserving task order."""
+        task = self.task(task_id)
+        updated = task.with_appended_operation(operation)
+        return self if updated is task else self.with_task(updated)
+
+    def with_task_status(
+        self,
+        task_id: str,
+        status: str,
+        *,
+        resolution: str | None = None,
+        resolution_reason: str | None = None,
+    ) -> "RunStateV3":
+        """Replace only the durable product status and its Done resolution."""
+        return self.with_task(
+            self.task(task_id).with_status(
+                status,
+                resolution=resolution,
+                resolution_reason=resolution_reason,
+            )
+        )
+
     def with_appended_command(self, command: CommandRecordV3) -> "RunStateV3":
         """Return a copy with ``command`` appended to :attr:`commands`."""
         return replace(self, commands=self.commands + (command,))
@@ -728,9 +836,10 @@ class RunStateV3:
     def referenced_artifacts(self) -> frozenset[str]:
         """Every run-relative evidence path this state names.
 
-        The union of the :attr:`artifacts` registry values and each task's
-        ``execution_evidence.executor_report`` — the paths orphan reconciliation
-        (``docs/adr/004``) must keep.
+        The union of the :attr:`artifacts` registry values, each task's
+        ``execution_evidence.executor_report``, and operation-history
+        ``evidence_refs`` — the paths orphan reconciliation (``docs/adr/004``)
+        must keep.
         """
         refs: set[str] = {
             value for value in self.artifacts.values() if isinstance(value, str)
@@ -739,6 +848,14 @@ class RunStateV3:
             report = task.execution_evidence.executor_report
             if isinstance(report, str) and report:
                 refs.add(report)
+            for operation in task.operation_history:
+                evidence_refs = operation.get("evidence_refs")
+                if isinstance(evidence_refs, (list, tuple)):
+                    refs.update(
+                        reference
+                        for reference in evidence_refs
+                        if isinstance(reference, str) and reference
+                    )
         return frozenset(refs)
 
 

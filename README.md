@@ -81,12 +81,14 @@ Callers supply all anchors. The core does not infer host-specific locations or p
   with exit `10`; the release stage has no commit or push code path.
 - `execute` — run stages 5–9 for every dependency-ready selected task: executor dispatch,
   runner-owned verification commands, two independent verifier verdicts, and the bounded
-  repair loop, ending each task at `verified` or at a truthful non-zero terminal state. It
+  repair loop. Public task status remains `to_do`, `in_progress`, or `done`; failed checks,
+  waiting information, and repair exhaustion are recorded as operation outcomes, not terminal
+  task states. It
   **stops before stage 10** — no documentation, Graphify, final verification, release, or
   archive/purge code runs. It refuses to dispatch the first executor until the plan gate is
   satisfied (`--approve-plan`, or an explicit `--unattended` opt-in). For a Markdown-backed
   board plan it also projects each durable task transition onto `docs/kanban.md` and the task
-  file (`## Status`, and a `## Result` section on `verified`) as a convergent, durable-first
+  file (`## Status`, and a `## Result` section on `done`) as a convergent, durable-first
   side effect, and reconciles that view on `--resume`; a boardless JSON plan runs
   projection-free. The state-to-view mapping and result fields are the parent
   [board and task-local result projection](../docs/contracts/feature-pipeline.md#board-and-task-local-result-projection)
@@ -127,7 +129,7 @@ Verified dependencies are reused across runs by default only when their task pat
   `feature_pipeline.domain.scope.AllowedScope` (it does not trust the label attribution
   attached), and returns a deterministic decision: `clean` (verification proceeds),
   `scope-violation` (an executor-owned change landed outside the scope — the task is
-  blocked), or `attribution-unavailable` (the window could not be attributed with
+  an operational finding), or `attribution-unavailable` (the window could not be attributed with
   confidence — fail closed). The gate **never reverts or cleans a file** — out-of-scope
   paths may hold user work — and a file the user left dirty before the run that the
   executor never touched is not a candidate and cannot trip it. Its only side effect is a
@@ -140,8 +142,8 @@ Verified dependencies are reused across runs by default only when their task pat
   capability, a duplicate, or one out of the documented order. A deferred stage is recorded
   as a compile-time capability, not callable dead code; `PipelineEngine` never calls it. The
   engine holds no policy of its own: `TaskExecutionStage` wraps the existing `TaskEngine`
-  repair loop unchanged, and a run's terminal outcome maps onto the same `gate-pending` /
-  `blocked` / `error` exit codes the CLI already produces.
+  repair loop unchanged, and a run's outcome maps onto the same `gate-pending` /
+  `operational-finding` / `error` exit codes the CLI already produces.
 - **Stages 5-9 have exactly one production path.** Whenever a real `execute` invocation has a
   compiled plan (every CLI run, since CP-02), `pipeline_core.execution.execute_run` drives
   each dependency-ready task through the one `PipelineEngine`-compiled sequence — task

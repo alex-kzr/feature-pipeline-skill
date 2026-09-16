@@ -32,6 +32,46 @@ from .schema_v3 import (
 )
 
 
+_LEGACY_TASK_STATUS_COMPATIBILITY: dict[str, tuple[str, str | None]] = {
+    "pending": ("to_do", None),
+    "ready": ("to_do", None),
+    "running": ("in_progress", None),
+    "implemented": ("in_progress", None),
+    "verification_failed": ("in_progress", None),
+    "repairing": ("in_progress", None),
+    "verified": ("done", "completed"),
+    "blocked": ("in_progress", None),
+}
+
+
+def _migrate_task_statuses(payload: dict[str, object]) -> None:
+    """Translate legacy control-state labels into product progress plus immutable history."""
+    tasks = payload.get("tasks", [])
+    if not isinstance(tasks, list):
+        return
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        status = task.get("status")
+        if status not in _LEGACY_TASK_STATUS_COMPATIBILITY:
+            continue
+        product_status, resolution = _LEGACY_TASK_STATUS_COMPATIBILITY[status]
+        task["status"] = product_status
+        # Schema-v2 writers serialized ``resolution: null`` for every task.  A
+        # legacy ``verified`` value is the one compatibility value that carries
+        # a Done resolution, so ``setdefault`` is insufficient: the key is
+        # present but null.  Keep diagnostics/history intact while making the
+        # product-status snapshot valid for the strict v3 reader.
+        if resolution is not None:
+            task["resolution"] = resolution
+        else:
+            task.setdefault("resolution", None)
+        task.setdefault("resolution_reason", None)
+        history = task.setdefault("operation_history", [])
+        if isinstance(history, list):
+            history.append({"legacy_status": status})
+
+
 def _plain_copy(payload: Mapping[str, object]) -> dict[str, object]:
     """A deep copy with only JSON scalar/container types and the argument left untouched."""
     return json.loads(json.dumps(payload))
@@ -61,10 +101,12 @@ def migrate_v2_to_v3(
     migrated["schema_version"] = STATE_SCHEMA_VERSION
     migrated.setdefault("contract_version", CONTRACT_SCHEMA_VERSION)
     migrated.setdefault("revision", 0)
+    _migrate_task_statuses(migrated)
     for task in migrated.get("tasks", []):
         if isinstance(task, dict):
             task.setdefault("task_path", None)
             task.setdefault("task_contract_digest", None)
+            task.setdefault("task_contract_version", None)
             task.setdefault("reused_verification", [])
     # Fail closed: the migration output must satisfy the strict v3 reader.
     RunStateV3.from_mapping(migrated, unknown_fields=unknown_fields)
@@ -92,7 +134,9 @@ def load_state(
             field="schema_version",
         )
     if version == STATE_SCHEMA_VERSION:
-        return RunStateV3.from_mapping(payload, unknown_fields=unknown_fields)
+        compatible = _plain_copy(payload)
+        _migrate_task_statuses(compatible)
+        return RunStateV3.from_mapping(compatible, unknown_fields=unknown_fields)
     if version == 2:
         return RunStateV3.from_mapping(
             migrate_v2_to_v3(payload, unknown_fields=unknown_fields),

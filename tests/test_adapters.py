@@ -15,10 +15,12 @@ from pipeline_core.adapters import (
     EXIT_TIMEOUT,
     AdapterError,
     ClaudeAdapter,
+    CompletedProcess,
     CodexAdapter,
     LaunchRequest,
     build_codex_argv,
     build_claude_argv,
+    check_command_allowances,
     effective_grant,
     on_disk_agent_name,
     parse_result_text,
@@ -251,6 +253,130 @@ class ClaudeArgvTests(unittest.TestCase):
         self.assertIn("executor", definition["frontend-executor"]["prompt"].lower())
 
 
+class CheckCommandAllowanceTests(unittest.TestCase):
+    """RLC-01 AC-1: a Claude executor with ``run_checks`` is granted only exact, task-declared,
+    shell-free ``Bash(<argv>)`` allowances whose CWD is its working root."""
+
+    def test_qualifying_command_yields_one_exact_bash_allowance(self) -> None:
+        allowed = check_command_allowances(
+            [(".", ("uv", "run", "python", "-m", "unittest"))],
+            role_grant=("read", "run_checks"), working_root=".",
+        )
+        self.assertEqual(allowed, ("Bash(uv run python -m unittest)",))
+
+    def test_command_from_a_different_cwd_than_the_working_root_is_excluded(self) -> None:
+        allowed = check_command_allowances(
+            [("other-package", ("uv", "run", "pytest"))],
+            role_grant=("read", "run_checks"), working_root="feature-pipeline-skill",
+        )
+        self.assertEqual(allowed, ())
+
+    def test_without_run_checks_the_role_gets_no_allowance_at_all(self) -> None:
+        allowed = check_command_allowances(
+            [(".", ("uv", "run", "python", "-m", "unittest"))],
+            role_grant=("read", "write"), working_root=".",
+        )
+        self.assertEqual(allowed, ())
+
+    def test_a_push_command_is_never_approved_even_if_declared(self) -> None:
+        allowed = check_command_allowances(
+            [(".", ("git", "push", "origin", "main"))],
+            role_grant=("read", "run_checks"), working_root=".",
+        )
+        self.assertEqual(allowed, ())
+
+    def test_a_command_carrying_a_shell_metacharacter_is_never_approved(self) -> None:
+        allowed = check_command_allowances(
+            [(".", ("bash", "-c", "rm -rf / && echo pwned"))],
+            role_grant=("read", "run_checks"), working_root=".",
+        )
+        self.assertEqual(allowed, ())
+
+    def test_multiple_qualifying_commands_each_get_their_own_exact_allowance(self) -> None:
+        allowed = check_command_allowances(
+            [
+                (".", ("uv", "run", "python", "-m", "unittest")),
+                (".", ("uv", "run", "ruff", "check")),
+                ("other", ("uv", "run", "pytest")),
+            ],
+            role_grant=("read", "run_checks"), working_root=".",
+        )
+        self.assertEqual(
+            allowed,
+            ("Bash(uv run python -m unittest)", "Bash(uv run ruff check)"),
+        )
+
+    def test_windows_backslash_cwd_normalizes_the_same_as_the_working_root(self) -> None:
+        allowed = check_command_allowances(
+            [("feature-pipeline-skill", ("uv", "run", "python", "-m", "unittest"))],
+            role_grant=("read", "run_checks"), working_root="feature-pipeline-skill\\",
+        )
+        self.assertEqual(allowed, ("Bash(uv run python -m unittest)",))
+
+    def test_derived_allowances_flow_through_build_claude_argv_and_still_deny_push(self) -> None:
+        request = _request(
+            "executor", role_grant=("read", "run_checks"), tools=("Read", "Bash"),
+            allowed_tools=("Bash(uv run python -m unittest)",),
+        )
+        argv = build_claude_argv(request)
+        self.assertIn("Bash(uv run python -m unittest)", argv[argv.index("--allowed-tools") + 1])
+        self.assertIn("Bash(git push:*)", argv[argv.index("--disallowed-tools") + 1])
+
+
+class ClaudeExecutorResolutionTests(unittest.TestCase):
+    """REC-07: availability resolution must honor the inline ``--agents`` launch contract, so a
+    concrete ``*-executor`` role the adapter already defines inline resolves without an ambient
+    ``.claude/agents/<role>.md`` file — while a custom non-executor role still fails closed."""
+
+    def test_custom_concrete_executor_resolves_without_a_project_local_agent_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with unittest.mock.patch("pathlib.Path.home", return_value=root):
+                adapter = ClaudeAdapter(executable="claude", working_root=root, env={})
+                self.assertTrue(adapter.can_resolve_executor("tooling-executor"))
+                self.assertTrue(adapter.can_resolve_executor("python-executor"))
+
+    def test_resolved_inline_executor_argv_keeps_the_exact_role_and_stays_shell_free(self) -> None:
+        argv = build_claude_argv(
+            _request("tooling-executor", role_grant=("read", "run_checks", "write"),
+                     tools=("Read", "Bash", "Edit")),
+            executable="claude",
+        )
+        self.assertEqual(argv[argv.index("--agent") + 1], "tooling-executor")
+        self.assertLess(argv.index("--agents"), argv.index("--agent"))
+        definition = json.loads(argv[argv.index("--agents") + 1])
+        self.assertEqual(list(definition), ["tooling-executor"])
+        self.assertIn("executor", definition["tooling-executor"]["prompt"].lower())
+        for token in argv:
+            for bad in ("|", "&", ";", "<", ">", "`", "$(", "\n", "\r"):
+                self.assertNotIn(bad, token)
+
+    def test_custom_non_executor_role_without_an_agent_file_stays_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with unittest.mock.patch("pathlib.Path.home", return_value=root):
+                adapter = ClaudeAdapter(executable="claude", working_root=root, env={})
+                self.assertFalse(adapter.can_resolve_executor("tooling-maintainer"))
+                self.assertFalse(adapter.can_resolve_executor("release-manager"))
+
+    def test_inline_executor_resolution_ignores_builtin_disable_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with unittest.mock.patch("pathlib.Path.home", return_value=root):
+                adapter = ClaudeAdapter(
+                    executable="claude", working_root=root,
+                    env={"CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS": "1"})
+                self.assertTrue(adapter.can_resolve_executor("tooling-executor"))
+
+    def test_a_verifier_role_is_not_treated_as_a_concrete_executor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with unittest.mock.patch("pathlib.Path.home", return_value=root):
+                adapter = ClaudeAdapter(executable="claude", working_root=root, env={})
+                self.assertFalse(adapter.can_resolve_executor("task-verifier"))
+                self.assertFalse(adapter.can_resolve_executor("test_verifier"))
+
+
 class CodexArgvTests(unittest.TestCase):
     def test_write_launch_grants_only_the_external_root_named_by_allowed_scope(self) -> None:
         adapter = CodexAdapter(
@@ -269,7 +395,22 @@ class CodexArgvTests(unittest.TestCase):
 
         self.assertEqual(
             [argv[index + 1] for index, value in enumerate(argv) if value == "--add-dir"],
-            [str(Path("C:/agents/skills/example"))],
+            [str(Path("C:/repo")), str(Path("C:/agents/skills/example"))],
+        )
+
+    def test_writing_launch_grants_its_working_root_for_the_workspace_sandbox(self) -> None:
+        """A Codex executor explicitly grants its disposable --cd workspace.
+
+        On Windows, workspace-write alone does not consistently make the --cd path
+        writable. The actual production adapter must carry that path through --add-dir.
+        """
+        adapter = CodexAdapter(executable="codex", working_root="C:/executor/workspace")
+
+        argv = adapter.plan(_request("executor", role_grant=("read", "write")))
+
+        self.assertEqual(
+            [argv[index + 1] for index, value in enumerate(argv) if value == "--add-dir"],
+            [str(Path("C:/executor/workspace"))],
         )
 
     def test_read_only_launch_does_not_grant_external_roots(self) -> None:
@@ -331,6 +472,32 @@ class CodexArgvTests(unittest.TestCase):
 
 
 class ClaudeLaunchTests(unittest.TestCase):
+    def test_executor_launch_passes_exact_granted_check_argv_to_the_worker(self) -> None:
+        """The actual production launcher argv, not only ``plan()``, carries the narrow
+        command grant needed for a runner-declared executor check."""
+        observed: list[list[str]] = []
+
+        def runner(argv, **_kwargs):
+            observed.append(list(argv))
+            return CompletedProcess(
+                0,
+                json.dumps({"result": "implemented", "session_id": "session-1"}),
+                "",
+            )
+
+        adapter = ClaudeAdapter(executable="claude", runner=runner)
+        adapter.launch(_request(
+            "executor",
+            role_grant=("read", "write", "run_checks"),
+            tools=("Read", "Edit", "Bash"),
+            allowed_tools=("Bash(uv run python -m unittest)",),
+        ))
+
+        self.assertEqual(len(observed), 1)
+        argv = observed[0]
+        self.assertEqual(argv[argv.index("--allowed-tools") + 1], "Bash(uv run python -m unittest)")
+        self.assertEqual(argv[argv.index("--disallowed-tools") + 1], "Bash(git push:*)")
+
     def test_characterized_launch_returns_exit_output_and_session(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             executable = _fake_executable(Path(directory), _FAKE_CLAUDE, "fake_claude.py")

@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "name": "routing-baseline",
+  "logical_paths": {"project": ".", "agents": "shared", "core": "core"},
+  "role_grants": {"executor": ["read", "write", "run_checks"], "task_verifier": ["read"], "test_verifier": ["read"]},
+  "stages": [{"name": "implement", "subagents": ["executor"], "argv": ["plan-only"]}],
+  "registry": {
+    "task_types": {
+      "python": {"stack": "python", "subagents": ["python-worker"], "root": "python", "checks": ["python-tests", "repo-check"], "storage": "runs"},
+      "rust": {"stack": "rust", "subagents": ["rust-worker"], "root": "rust", "checks": ["rust-tests", "repo-check"], "storage": "runs"},
+      "docs": {"stack": "docs", "subagents": ["docs-worker"], "root": "docs", "checks": ["repo-check"], "storage": "runs"}
+    },
+    "stacks": {"python": {"runtime": "python"}, "rust": {"runtime": "rust"}, "docs": {"runtime": "text"}},
+    "subagents": {"python-worker": {"role": "executor"}, "rust-worker": {"role": "executor"}, "docs-worker": {"role": "executor"}},
+    "roots": {"python": "packages/python", "rust": "packages/rust", "docs": "docs"},
+    "checks": {"python-tests": ["uv", "run", "python", "-m", "unittest"], "rust-tests": ["cargo", "test"], "repo-check": ["git", "diff", "--check"]},
+    "storage": {"runs": "runs"}
+  }
+}

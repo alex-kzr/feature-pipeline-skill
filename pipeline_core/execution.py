@@ -29,9 +29,11 @@ Standard library only.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import subprocess
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -51,11 +53,18 @@ from feature_pipeline.application.task_engine import (
     build_completion_evidence,
 )
 from feature_pipeline.application.verified_reuse import (
+    CANONICAL_CONTRACT_VERSION,
     EvidenceEligibilityError,
+    _REC01_RECOVERY_TASK_ID,
+    _REC01_RECOVERY_TASK_PATH,
     VerifiedEvidenceStore,
     canonical_task_path,
+    find_superseding_evidence,
+    resolve_default_reuse,
+    supersession_graph,
     task_contract_digest,
 )
+from feature_pipeline.application.work_items import activate_work_item, register_work_items
 from feature_pipeline.application.selection import prune_reused_ancestors
 from feature_pipeline.domain.plan import CompiledRunPlan
 from feature_pipeline.domain.stages import (
@@ -69,7 +78,9 @@ from feature_pipeline.domain.vocabulary import StageId
 from feature_pipeline.contracts import TaskSpec
 from feature_pipeline.infrastructure.board_projection import (
     BoardProjectionError,
+    CompletionEvidence,
     project_task_state,
+    remove_historical_cards,
 )
 
 from .adapter_resolution import (
@@ -84,18 +95,27 @@ from .commands import (
     DIAGNOSTIC_OUTPUT_BUDGET,
     ROUTINE_OUTPUT_BUDGET,
 )
-from .concurrency import pipeline_lease, task_lease
+from .concurrency import pipeline_lease, pipeline_lock_path, task_lease, task_lock_path
 from .dispatch import DispatchError
 from .lease import LeaseHeldError
 from .lifecycle import RunLifecycle
+from .plan import (
+    AmendmentRequiredResult,
+    CLASSIFICATION_AMENDMENT_REQUIRED,
+    classify_baseline_failure,
+    canonical_amendment_fields,
+    contract_digest as amendment_contract_digest,
+)
 from .prompt_envelope import EnvelopeAnchors
-from .state import ACTOR_RUNNER, ResumeError, Run, StateError, repo_relative
+from .reconciliation_registry import reconciliation_supersession_graph
+from .state import ACTOR_RUNNER, ResumeError, Run, StateError, pid_alive, read_lease, repo_relative
 from .preconditions import GitRunner, bind_refs, evaluate_preconditions
-from .task_files import upsert_blockers_section
+from .task_files import TaskFileError, load_task_spec, upsert_blockers_section
 from .verification import (
     VerifierAnchors,
     VerifierLaunchers,
 )
+from .worktree import _in_allowed_scope
 
 #: Process exit codes, byte-identical to :mod:`pipeline_core.runner_cli` — ``execute`` mode
 #: shares the baseline compatibility table so one exit code means one thing across modes.
@@ -127,6 +147,9 @@ __all__ = [
     "TaskRunResult",
     "execute_run",
     "persist_task_contracts",
+    "reconcile_historical_cards",
+    "recovery_provenance",
+    "replacement_feature",
     "run_task",
 ]
 
@@ -138,10 +161,18 @@ def _utcnow() -> str:
 def persist_task_contracts(run: Run, specs: Sequence[TaskSpec]) -> None:
     """Record the reusable identity for every task in the current run."""
     for spec in specs:
+        record = run.task(spec.id)
+        # An approved TAM-01 revision has its own, deliberately narrower contract
+        # identity.  Do not overwrite it while reopening the run: the compatibility
+        # check below has already established that the current task definition matches
+        # this exact approved amendment.
+        if _matches_approved_amendment(record, spec):
+            continue
         run.set_task_contract(
             spec.id,
             canonical_task_path(spec, run.repo_root),
             task_contract_digest(spec),
+            version=CANONICAL_CONTRACT_VERSION,
         )
 
 
@@ -157,7 +188,9 @@ def run_task(life: RunLifecycle, request: TaskExecution) -> TaskRunResult:
     keeps the ``run_task`` / :class:`TaskExecution` / :class:`TaskRunResult` names the
     execute-mode integration and the existing tests import.
     """
-    return TaskEngine().run(life, request)
+    register_work_items(life.run, (request.spec,))
+    with activate_work_item(life.run, request.spec.id):
+        return TaskEngine().run(life, request)
 
 
 # ============================================================================================
@@ -227,15 +260,16 @@ def _run_selected_task(
     if plan is None:
         return run_task(life, request)
     sink: list[TaskRunResult] = []
-    PipelineEngine(_STAGE_SEQUENCE).run(
-        plan,
-        resources={
-            "lifecycle": life,
-            "task_execution": request,
-            "selected_task_id": task_id,
-            "task_result_sink": sink,
-        },
-    )
+    with activate_work_item(life.run, task_id):
+        PipelineEngine(_STAGE_SEQUENCE).run(
+            plan,
+            resources={
+                "lifecycle": life,
+                "task_execution": request,
+                "selected_task_id": task_id,
+                "task_result_sink": sink,
+            },
+        )
     return sink[0]
 
 
@@ -255,9 +289,7 @@ def _run_selected_task(
 #: The non-terminal task states :func:`execute_run` will still drive forward. A fresh run only
 #: ever presents ``ready``; the other three appear when a resume lands mid-flight (an executor
 #: that reported ``implemented`` before a crash, an open repair round, a rolled-back window).
-_ACTIONABLE_STATES = frozenset({"ready", "implemented", "verification_failed", "repairing"})
-
-_SUPPRESSED_PREFIX = "blocked_by: "
+_ACTIONABLE_STATES = frozenset({"to_do", "in_progress"})
 
 
 @dataclass(frozen=True)
@@ -275,6 +307,8 @@ class ExecuteControls:
     resume: bool = False
     adapter: str | None = None
     adapter_explicit: bool = False
+    model: str | None = None
+    effort: str | None = None
     max_repair_attempts: int | None = None
     routine_output_byte_budget: int | None = None
     diagnostic_output_byte_budget: int | None = None
@@ -284,10 +318,19 @@ class ExecuteControls:
     #: only alongside ``task`` — ``--through`` resolves its own dependency closure and must
     #: never trust an external attestation instead.
     attested_dependencies: tuple[tuple[str, str], ...] = ()
-    verify_dependency_chain: bool = False
+    #: ``None`` means the CLI supplied no chain-policy control.  On resume it inherits the
+    #: durable value; on a fresh run it resolves to the documented ``False`` default.
+    verify_dependency_chain: bool | None = False
     grants: tuple[str, ...] = ()
     approvals: tuple[str, ...] = ()
     published_refs: tuple[tuple[str, str], ...] = ()
+    recovery_source_feature: str | None = None
+    recovery_task: str | None = None
+    #: REC-11's explicit runner-owned recovery control.  It may reopen exactly one terminal
+    #: external uv-cache block when accompanied by a safe worktree-local cache directory.
+    operational_unblock_task: str | None = None
+    human_authorized_operational_unblock: bool = False
+    uv_cache_dir: str | None = None
 
     @property
     def gate_opened(self) -> bool:
@@ -342,7 +385,7 @@ class ExecuteRequest:
 class ExecuteResult:
     """The terminal outcome of one ``execute`` invocation."""
 
-    status: str  # 'ok' | 'gate-pending' | 'retryable' | 'blocked' | 'error'
+    status: str  # 'ok' | 'gate-pending' | 'retryable' | 'blocked' | 'error' | 'amendment_required'
     exit_code: int
     message: str
     run_dir: Path | None
@@ -464,10 +507,14 @@ def _resolve_attestation(
             f"attestation source run '{source_feature}' does not track {dep_id}",
             "attestation-source-dependency-absent") from None
 
-    if source_task.status != "verified":
+    completed = (
+        source_task.status == "done"
+        and source_task.resolution == "completed"
+    )
+    if source_task.status != "verified" and not completed:
         raise ExecutionError(
             f"attestation source run '{source_feature}' has {dep_id} at status "
-            f"'{source_task.status}', not 'verified'",
+            f"'{source_task.status}', not completed",
             "attestation-source-not-verified")
 
     digest = hashlib.sha256(run_json.read_bytes()).hexdigest()
@@ -503,6 +550,7 @@ def _ensure_attestations_match(run: Run, requested: tuple[tuple[str, str], ...])
 
 def _ensure_execution_controls_match(
     run: Run, scope: Sequence[str], verify_dependency_chain: bool,
+    model: str | None = None, effort: str | None = None,
 ) -> None:
     """Reject a resume whose immutable scope or chain policy changed."""
     recorded_scope = run.controls.get("execution_scope", {}).get("value")
@@ -511,24 +559,558 @@ def _ensure_execution_controls_match(
             "resume execution scope does not match the recorded scope",
             "execution-scope-mismatch",
         )
-    recorded_chain = run.controls.get("verify_dependency_chain", {}).get("value")
-    if recorded_chain is not verify_dependency_chain:
+    recorded_chain = bool(
+        (run.controls.get("verify_dependency_chain", {}) or {}).get("value", False)
+    )
+    if recorded_chain != verify_dependency_chain:
         raise ExecutionError(
-            "resume dependency-chain verification control does not match the recorded value",
+            "resume verify-dependency-chain control does not match the recorded run",
             "verify-dependency-chain-mismatch",
         )
+    for name, value in (("model", model), ("effort", effort)):
+        if run.controls.get(name, {}).get("value") != value:
+            raise ExecutionError(
+                f"resume {name} does not match the recorded run", "runtime-control-mismatch"
+            )
+
+
+def _approved_uv_cache_dir(repo_root: Path, value: str | None) -> Path:
+    """Resolve the one retry-only cache control, refusing paths outside this worktree."""
+    if not value or "\\" in value or "\x00" in value:
+        raise ExecutionError("operational unblock requires a token-safe relative UV cache path",
+                             "operational-unblock-cache-invalid")
+    candidate = Path(value)
+    if candidate.is_absolute() or any(part in {"", ".", ".."} for part in candidate.parts):
+        raise ExecutionError("operational unblock cache path must be worktree-local",
+                             "operational-unblock-cache-invalid")
+    resolved_root = repo_root.resolve()
+    resolved = (resolved_root / candidate).resolve()
+    try:
+        resolved.relative_to(resolved_root)
+    except ValueError:
+        raise ExecutionError("operational unblock cache path escapes the worktree",
+                             "operational-unblock-cache-invalid") from None
+    return resolved
+
+
+def _is_uv_cache_operational_blocker(reason: str | None) -> bool:
+    """Classify narrowly: ambiguous, product, verifier, and budget blocks stay terminal."""
+    normalized = (reason or "").lower()
+    return (
+        normalized.startswith("external operational:")
+        and "uv" in normalized and "cache" in normalized
+        and ("access denied" in normalized or "permission denied" in normalized)
+    )
+
+
+def _has_runner_owned_predispatch_uv_cache_evidence(
+    request: ExecuteRequest, source: Run, task_id: str,
+) -> bool:
+    """Recognize only the report-less, first-launch cache-start failure boundary.
+
+    A failed child launch has no executor report.  Its runner-written launch-failure
+    diagnostic is admissible only when every other execution surface proves the executor
+    never started.  Keep this deliberately narrower than ordinary executor evidence.
+    """
+    task = source.task(task_id)
+    implementation = task.execution_evidence.get("implementation", {})
+    if (
+        task.attempts != 0
+        or task.execution_evidence.get("executor_report") is not None
+        or task.session_id
+        or task.changed_files
+        or source.commands
+        or source.artifacts
+        or implementation.get("state") != "not-attempted"
+        or implementation.get("changed_files")
+        or implementation.get("manifest")
+        or implementation.get("diff")
+        or any(task.verification.get(name) is not None for name in (
+            "task_verdict", "test_verdict", "verified_at",
+        ))
+    ):
+        return False
+    failures = task.external_launch_failures
+    if len(failures) != 1:
+        return False
+    failure = failures[0]
+    generation = failure.get("generation")
+    if (
+        failure.get("stage") != "executor"
+        or not isinstance(generation, int)
+        or isinstance(generation, bool)
+        or generation < 1
+        or generation != task.next_executor_launch_generation - 1
+        or failure.get("detail") != task.blocker
+    ):
+        return False
+    diagnostic = request.run_dir / "reports" / task_id / f"launch-{generation}" / (
+        f"launch-failure-{generation}.json"
+    )
+    try:
+        diagnostic.resolve().relative_to(request.run_dir.resolve())
+        payload = json.loads(diagnostic.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    if diagnostic.is_symlink() or not isinstance(payload, dict):
+        return False
+    return all(
+        payload.get(name) == value
+        for name, value in (
+            ("task_id", task_id),
+            ("generation", generation),
+            ("attempt", 0),
+            ("stage", "executor"),
+            ("reason", task.blocker),
+            ("exit_code", failure.get("exit_code")),
+            ("source_run_id", failure.get("source_run_id")),
+        )
+    )
+
+
+def _has_runner_owned_predispatch_blocker_packet(
+    request: ExecuteRequest, source: Run, task_id: str,
+) -> bool:
+    """Recognize REC-11's one legacy TC-01 pre-dispatch blocker packet.
+
+    This is not generic artifact acceptance: the task must show precisely the recorded
+    no-dispatch state and its two artifacts must be the standard runner blocker packet and
+    its canonical diagnostic at the first-block location.
+    """
+    task = source.task(task_id)
+    packet = request.run_dir / "reports" / task_id / "blocked-1.json"
+    try:
+        packet.resolve().relative_to(request.run_dir.resolve())
+        payload = json.loads(packet.read_text(encoding="utf-8"))
+    except ValueError:
+        return False
+    except (OSError, json.JSONDecodeError):
+        return False
+    if packet.is_symlink() or not isinstance(payload, dict):
+        return False
+    diagnostic_ref = payload.get("diagnostic")
+    if not isinstance(diagnostic_ref, str) or not diagnostic_ref:
+        return False
+    try:
+        diagnostic = (request.repo_root.resolve() / diagnostic_ref).resolve()
+        diagnostic.relative_to(request.run_dir.resolve())
+        expected_ref = packet.resolve().relative_to(request.repo_root.resolve()).as_posix()
+        expected_diagnostic_ref = diagnostic.relative_to(request.run_dir.resolve()).as_posix()
+        expected_packet_diagnostic = diagnostic.relative_to(request.repo_root.resolve()).as_posix()
+    except ValueError:
+        return False
+    if (
+        task_id != "TC-01"
+        or task.attempts != 0
+        or task.next_executor_launch_generation != 2
+        or task.execution_evidence.get("executor_report") is not None
+        or source.commands
+        or task.external_launch_failures
+        or source.artifacts != {
+            f"blocker:{task_id}": expected_ref,
+            f"diagnostic:{task_id}:1": expected_diagnostic_ref,
+        }
+    ):
+        return False
+    try:
+        diagnostic.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    if (
+        diagnostic.is_symlink()
+        or not diagnostic.is_file()
+    ):
+        return False
+    return (
+        set(payload) == {
+            "task_id", "gate", "attempts", "max_repair_attempts", "blocker",
+            "diagnostic", "repair_report", "verdicts", "recorded_at",
+        }
+        and payload["task_id"] == task_id
+        and payload["gate"] == 1
+        and payload["attempts"] == 0
+        and payload["blocker"] == task.blocker
+        and payload["diagnostic"] == expected_packet_diagnostic
+        and isinstance(payload["max_repair_attempts"], int)
+        and not isinstance(payload["max_repair_attempts"], bool)
+        and payload["repair_report"] is None
+        and payload["verdicts"] == {"task": None, "test": None}
+        and isinstance(payload["recorded_at"], str)
+        and bool(payload["recorded_at"])
+    )
+
+
+def _validate_operational_unblock(
+    request: ExecuteRequest, source: Run, resolution: AdapterResolution,
+    scope: Sequence[str], specs: Sequence[TaskSpec], plan: CompiledRunPlan | None,
+) -> Path | None:
+    """Fail closed before a terminal task is reopened or a child process can launch."""
+    controls = request.controls
+    target = controls.operational_unblock_task
+    if target is None:
+        if controls.human_authorized_operational_unblock or controls.uv_cache_dir:
+            raise ExecutionError("operational unblock controls require a target task",
+                                 "operational-unblock-invalid-controls")
+        return None
+    if not (controls.resume and controls.human_authorized_operational_unblock):
+        raise ExecutionError("operational unblock requires resume and explicit human authorization",
+                             "operational-unblock-unauthorized")
+    if target not in source.tasks or target not in scope:
+        raise ExecutionError("operational unblock target is outside the recorded execution scope",
+                             "operational-unblock-target-invalid")
+    task = source.task(target)
+    runner_owned_predispatch_packet = _has_runner_owned_predispatch_blocker_packet(
+        request, source, target
+    )
+    if (
+        source.status != "blocked"
+        or task.status != "blocked"
+        or not (
+            _is_uv_cache_operational_blocker(task.blocker)
+            or runner_owned_predispatch_packet
+        )
+    ):
+        raise ExecutionError("operational unblock requires a classified terminal external uv-cache blocker",
+                             "operational-unblock-blocker-invalid")
+    report = task.execution_evidence.get("executor_report")
+    if isinstance(report, str) and report:
+        try:
+            report_path = (request.repo_root / report).resolve()
+            report_path.relative_to(request.run_dir.resolve())
+        except ValueError:
+            raise ExecutionError("operational unblock executor evidence escapes the source run",
+                                 "operational-unblock-evidence-invalid") from None
+        if not report_path.is_file() or report_path.is_symlink():
+            raise ExecutionError("operational unblock requires immutable executor evidence",
+                                 "operational-unblock-evidence-missing")
+    elif not (
+        _has_runner_owned_predispatch_uv_cache_evidence(request, source, target)
+        or _has_runner_owned_predispatch_blocker_packet(request, source, target)
+    ):
+        raise ExecutionError("operational unblock requires immutable runner evidence",
+                             "operational-unblock-evidence-missing")
+    for lease_path in (pipeline_lock_path(request.repo_root), task_lock_path(request.repo_root, target)):
+        lease = read_lease(lease_path)
+        if lease and (lease.get("unreadable") or pid_alive(lease.get("pid"))):
+            raise ExecutionError("operational unblock requires no live pipeline or task lease",
+                                 "operational-unblock-lease-held")
+    if source.environment.get("adapter", {}).get("resolved") != resolution.resolved:
+        raise ExecutionError("operational unblock adapter does not match the recorded adapter",
+                             "operational-unblock-adapter-mismatch")
+    _ensure_execution_controls_match(
+        source, scope, controls.verify_dependency_chain, controls.model, controls.effort)
+    _ensure_precondition_contracts_match(source, specs)
+    if plan is not None:
+        _ensure_plan_compatible(source, plan)
+    return _approved_uv_cache_dir(request.repo_root, controls.uv_cache_dir)
+
+
+@contextmanager
+def _child_uv_cache(cache_dir: Path | None):
+    """Pass the approved cache only to child-launch scope; never write global uv config."""
+    if cache_dir is None:
+        yield
+        return
+    previous = os.environ.get("UV_CACHE_DIR")
+    os.environ["UV_CACHE_DIR"] = str(cache_dir)
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("UV_CACHE_DIR", None)
+        else:
+            os.environ["UV_CACHE_DIR"] = previous
+
+
+def replacement_feature(source_feature: str, target_adapter: str) -> str:
+    """Return the deterministic identity of one linked replacement run."""
+    _validate_source_feature(source_feature)
+    if target_adapter != "codex":
+        raise ExecutionError("recovery requires the Codex target adapter", "recovery-invalid-controls")
+    return f"{source_feature}-recovery-{target_adapter}"
+
+
+def _validate_launch_failure_artifacts(
+    source_dir: Path, task_id: str, failure: Mapping[str, Any],
+) -> None:
+    """Require precisely the diagnostic owned by one recorded executor launch failure."""
+    generation = failure.get("generation")
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
+        raise ExecutionError("recovery source has an invalid executor launch failure", "recovery-launch-failure-invalid")
+    source_root = source_dir.resolve()
+    launch_dir = source_dir / "reports" / task_id / f"launch-{generation}"
+    diagnostic = launch_dir / f"launch-failure-{generation}.json"
+    prompt_envelope = launch_dir / f"executor-prompt-{generation}.md"
+    executor_diagnostic = launch_dir / f"executor-{generation}.md"
+    try:
+        diagnostic_relative = diagnostic.resolve().relative_to(source_root).as_posix()
+        prompt_relative = prompt_envelope.resolve().relative_to(source_root).as_posix()
+        executor_diagnostic_relative = executor_diagnostic.resolve().relative_to(source_root).as_posix()
+    except ValueError:
+        raise ExecutionError("recovery source launch-failure path escapes its run", "recovery-artifact-evidence") from None
+    expected = {"run.json", prompt_relative, diagnostic_relative}
+    expected_with_executor_diagnostic = expected | {executor_diagnostic_relative}
+    entries = tuple(source_dir.rglob("*"))
+    if any(path.is_symlink() for path in entries):
+        raise ExecutionError("recovery source contains escaped execution artifacts", "recovery-artifact-evidence")
+    actual = {
+        path.relative_to(source_dir).as_posix()
+        for path in entries
+        if path.is_file()
+    }
+    if actual not in (expected, expected_with_executor_diagnostic):
+        raise ExecutionError("recovery source contains retained execution artifacts", "recovery-artifact-evidence")
+    try:
+        diagnostic_payload = json.loads(diagnostic.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raise ExecutionError("recovery source launch-failure diagnostic is unreadable", "recovery-artifact-evidence") from None
+    if not isinstance(diagnostic_payload, dict) or any(
+        diagnostic_payload.get(name) != expected_value
+        for name, expected_value in (
+            ("task_id", task_id),
+            ("generation", generation),
+            ("stage", "executor"),
+            ("exit_code", failure.get("exit_code")),
+            ("reason", failure.get("detail")),
+            ("source_run_id", failure.get("source_run_id")),
+        )
+    ):
+        raise ExecutionError("recovery source launch-failure diagnostic does not match its record", "recovery-artifact-evidence")
+
+
+def recovery_provenance(
+    *, controls: ExecuteControls, run_dir: Path, repo_root: Path,
+    specs: Sequence[TaskSpec], replacement_identity: str | None = None,
+) -> dict[str, str] | None:
+    """Validate one dead pre-implementation source run without modifying it.
+
+    This deliberately accepts no inference: the operator supplies both source feature and
+    task, chooses a concrete target adapter, and the source contributes only evidence.
+    """
+    source_feature = controls.recovery_source_feature
+    source_task_id = controls.recovery_task
+    if source_feature is None and source_task_id is None:
+        return None
+    if not source_feature or not source_task_id:
+        raise ExecutionError(
+            "recovery requires both a source feature and a source task",
+            "recovery-selector-incomplete",
+        )
+    if controls.resume:
+        return None
+    if controls.adapter != "codex" or not controls.adapter_explicit:
+        raise ExecutionError(
+            "recovery requires a fresh run and the explicit Codex target adapter",
+            "recovery-invalid-controls",
+        )
+    if controls.task != source_task_id or controls.through is not None:
+        raise ExecutionError(
+            "recovery requires --task to select exactly the recovered task",
+            "recovery-selector-mismatch",
+        )
+    derived_replacement = replacement_feature(source_feature, controls.adapter or "")
+    expected_run_dir = (run_dir.parent / derived_replacement).resolve()
+    if run_dir.resolve() != expected_run_dir:
+        raise ExecutionError(
+            "recovery replacement identity must use the deterministic replacement run path",
+            "recovery-identity-mismatch",
+        )
+    if replacement_identity is not None and replacement_identity != derived_replacement:
+        raise ExecutionError(
+            "recovery replacement identity must use the deterministic derived feature",
+            "recovery-identity-mismatch",
+        )
+    if run_dir.exists():
+        raise ExecutionError(
+            "recovery replacement identity is already occupied",
+            "recovery-identity-collision",
+        )
+    if source_task_id not in {spec.id for spec in specs}:
+        raise ExecutionError("recovery task is absent from the replacement plan", "recovery-task-mismatch")
+    source_dir = _resolve_source_run_dir(run_dir, source_feature)
+    source_json = source_dir / "run.json"
+    if not source_json.is_file():
+        raise ExecutionError("recovery source run is missing or unreadable", "recovery-source-missing")
+    try:
+        source = Run.load(source_dir, repo_root)
+        source_task = source.task(source_task_id)
+    except StateError as exc:
+        raise ExecutionError("recovery source task is missing or unreadable", "recovery-source-missing") from exc
+    if source.status != "running":
+        raise ExecutionError(
+            "recovery source has a terminal run state",
+            "recovery-terminal-run-state",
+        )
+    if source_task.status != "in_progress":
+        raise ExecutionError(
+            "recovery source is not at the pre-implementation launch-failure boundary",
+            "recovery-terminal-task-state",
+        )
+    if (
+        source.current_task is not None
+        or pipeline_lock_path(repo_root).exists()
+        or task_lock_path(repo_root, source_task_id).exists()
+    ):
+        raise ExecutionError("recovery source has a live or unreconciled writer lease", "recovery-lease-held")
+    if source.commands:
+        raise ExecutionError("recovery source contains runner command evidence", "recovery-command-evidence")
+    if source.stages:
+        raise ExecutionError(
+            "recovery source contains pre-implementation stage evidence",
+            "recovery-stage-evidence",
+        )
+    if source.artifacts:
+        raise ExecutionError(
+            "recovery source contains retained execution artifacts",
+            "recovery-artifact-evidence",
+        )
+    if source.recovery is not None:
+        raise ExecutionError(
+            "recovery source already has recovery provenance",
+            "recovery-prior-provenance",
+        )
+    implementation = source_task.execution_evidence.get("implementation", {})
+    if (
+        source_task.execution_evidence.get("executor_report")
+        or source_task.session_id
+        or source_task.changed_files
+        or implementation.get("state") != "not-attempted"
+        or implementation.get("changed_files")
+        or implementation.get("manifest")
+        or implementation.get("diff")
+    ):
+        raise ExecutionError("recovery source contains implementation evidence", "recovery-implementation-evidence")
+    if any(source_task.verification.get(name) is not None for name in ("task_verdict", "test_verdict", "verified_at")):
+        raise ExecutionError("recovery source contains verifier evidence", "recovery-verifier-evidence")
+    failures = source_task.external_launch_failures
+    if len(failures) != 1 or failures[0].get("stage") != "executor":
+        raise ExecutionError("recovery source has no unique executor launch failure", "recovery-launch-failure-missing")
+    failure = failures[0]
+    _validate_launch_failure_artifacts(source_dir, source_task_id, failure)
+    for candidate in run_dir.parent.glob("*/run.json"):
+        if candidate.resolve() == source_json.resolve():
+            continue
+        try:
+            existing = Run.load(candidate.parent, repo_root)
+        except StateError:
+            continue
+        if existing.recovery and existing.recovery.get("source_feature") == source_feature and existing.recovery.get("source_task") == source_task_id:
+            raise ExecutionError("recovery source already has a replacement run", "recovery-duplicate")
+    digest = hashlib.sha256(json.dumps(failure, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return {
+        "policy_version": "preimplementation-recovery-v1",
+        "source_feature": source_feature,
+        "source_run_id": source.run_id,
+        "source_task": source_task_id,
+        "launch_failure_digest": f"sha256:{digest}",
+        "target_adapter": controls.adapter,
+    }
+
+
+def _validate_same_run_launch_recovery(
+    request: ExecuteRequest,
+    resolution: AdapterResolution,
+    specs: Sequence[TaskSpec],
+    execution_scope: Sequence[str],
+    plan: CompiledRunPlan | None,
+) -> None:
+    """Prove a stranded executor launch is compatible before resume changes its state."""
+    controls = request.controls
+    task_id = controls.recovery_task
+    if not (
+        controls.resume
+        and controls.recovery_source_feature == request.feature
+        and task_id is not None
+    ):
+        return
+    if controls.task != task_id or controls.through is not None or list(execution_scope) != [task_id]:
+        raise ExecutionError("launch-failure recovery must select exactly its recorded task", "recovery-selector-mismatch")
+    source = Run.load(request.run_dir, request.repo_root)
+    source_task = source.task(task_id)
+    if source.status != "running" or source_task.status != "in_progress" or source.current_task is not None:
+        raise ExecutionError("launch-failure recovery requires a nonterminal task with no live worker", "recovery-not-stranded")
+    for lease_path in (pipeline_lock_path(request.repo_root), task_lock_path(request.repo_root, task_id)):
+        lease = read_lease(lease_path)
+        if lease and (lease.get("unreadable") or pid_alive(lease.get("pid"))):
+            raise ExecutionError("launch-failure recovery requires no live worker", "recovery-lease-held")
+    if source.environment.get("adapter", {}).get("resolved") != resolution.resolved:
+        raise ExecutionError("launch-failure recovery adapter does not match the recorded adapter", "recovery-adapter-mismatch")
+    spec = next((item for item in specs if item.id == task_id), None)
+    if spec is None or (
+        source_task.task_contract_version != CANONICAL_CONTRACT_VERSION
+        or source_task.task_contract_digest != task_contract_digest(spec)
+    ):
+        raise ExecutionError("launch-failure recovery task contract does not match the recorded contract", "recovery-contract-mismatch")
+    _ensure_execution_controls_match(
+        source, execution_scope, controls.verify_dependency_chain, controls.model, controls.effort,
+    )
+    if plan is not None:
+        _ensure_plan_compatible(source, plan)
+    if source_task.execution_evidence.get("executor_report") or source_task.session_id:
+        raise ExecutionError("launch-failure recovery rejects an executor outcome", "recovery-executor-outcome")
+    if any(source_task.verification.get(name) is not None for name in ("task_verdict", "test_verdict", "verified_at")):
+        raise ExecutionError("launch-failure recovery rejects verifier evidence", "recovery-verifier-outcome")
+    if source_task.attempts >= spec.max_repair_attempts:
+        raise ExecutionError("launch-failure recovery repair accounting exceeds its recorded bound", "recovery-repair-exhausted")
+    failures = source_task.external_launch_failures
+    if not failures:
+        raise ExecutionError("launch-failure recovery requires a runner-recorded executor launch failure", "recovery-launch-failure-missing")
+    failure = failures[-1]
+    generation = failure.get("generation")
+    if (
+        failure.get("stage") != "executor"
+        or not isinstance(generation, int)
+        or generation != source_task.next_executor_launch_generation - 1
+    ):
+        raise ExecutionError("launch-failure recovery requires the latest executor generation to have failed", "recovery-launch-failure-stale")
+    diagnostic = request.run_dir / "reports" / task_id / f"launch-{generation}" / f"launch-failure-{generation}.json"
+    try:
+        payload = json.loads(diagnostic.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raise ExecutionError("launch-failure recovery diagnostic is unreadable", "recovery-launch-failure-invalid") from None
+    expected = (
+        ("task_id", task_id), ("generation", generation), ("stage", "executor"),
+        ("exit_code", failure.get("exit_code")), ("reason", failure.get("detail")),
+        ("source_run_id", source.run_id),
+    )
+    if not isinstance(payload, dict) or any(payload.get(key) != value for key, value in expected):
+        raise ExecutionError("launch-failure recovery diagnostic does not match its runner record", "recovery-launch-failure-invalid")
 
 
 def _ensure_precondition_contracts_match(run: Run, specs: Sequence[TaskSpec]) -> None:
     for spec in specs:
         if spec.id not in run.tasks:
             continue
-        digest = run.task(spec.id).task_contract_digest
-        if (digest is not None or spec.preconditions) and digest != task_contract_digest(spec):
+        record = run.task(spec.id)
+        digest = record.task_contract_digest
+        canonical_match = (
+            record.task_contract_version == CANONICAL_CONTRACT_VERSION
+            and digest == task_contract_digest(spec)
+        )
+        if not canonical_match and not _matches_approved_amendment(record, spec):
             raise ExecutionError(
                 f"resume task contract changed for {spec.id}; start a fresh reviewed run",
                 "task-contract-mismatch",
             )
+
+
+def _matches_approved_amendment(record, spec: TaskSpec) -> bool:
+    """Return whether ``spec`` is the exact current approved amendment revision.
+
+    Normal resume remains strict: only a current revision created through the explicit
+    amendment control can use the amendment digest, and its entire amendable surface must
+    match the reloaded task definition.
+    """
+    return (
+        record.current_revision > 0
+        and record.amendment_revisions
+        and record.task_contract_version == "tam01-amendment-v1"
+        and record.task_contract_digest == amendment_contract_digest(
+            canonical_amendment_fields(spec)
+        )
+        and record.amendment_revisions[-1].get("revision") == record.current_revision
+        and record.amendment_revisions[-1].get("new_digest") == record.task_contract_digest
+    )
 
 
 def _check_preconditions(life: RunLifecycle, request: ExecuteRequest, spec: TaskSpec,
@@ -550,9 +1132,12 @@ def _check_preconditions(life: RunLifecycle, request: ExecuteRequest, spec: Task
         observations.append({"task_id": spec.id, "predicate": predicate.identifier,
                              "observed": observed, "passed": failed is None})
         life.run.set_control("precondition_observations", observations)
+        life.record_operation(
+            spec.id, "precondition", "succeeded" if failed is None else "blocked",
+            f"{predicate.identifier}; observed: {observed}", predicate=predicate.identifier,
+        )
         if failed:
             reason = f"precondition-unmet: {predicate.identifier}; observed: {observed}"
-            life.run.status = "blocked"
             life.block(spec.id, reason)
             if spec.path and (request.repo_root / spec.path).is_file():
                 upsert_blockers_section(request.repo_root / spec.path, "precondition-unmet", reason,
@@ -582,6 +1167,73 @@ def _resolve_executor(request: ExecuteRequest, spec: TaskSpec) -> None:
         )
 
 
+#: Bound on one baseline diagnosis command; a pre-dispatch check must never hang the run.
+BASELINE_DIAGNOSIS_TIMEOUT = 600.0
+
+_TRACEBACK_FILE_RE = re.compile(r'File "([^"]+)"')
+
+
+def _baseline_observed_paths(output: str, repo_root: Path) -> tuple[str, ...]:
+    """Best-effort repository-relative paths named in a failing command's own output."""
+    found: set[str] = set()
+    for raw in _TRACEBACK_FILE_RE.findall(output):
+        try:
+            candidate = Path(raw)
+            relative = (candidate if candidate.is_absolute() else (repo_root / candidate)).resolve().relative_to(repo_root.resolve())
+        except (ValueError, OSError):
+            continue
+        found.add(relative.as_posix())
+    return tuple(sorted(found))
+
+
+def diagnose_baseline(spec: TaskSpec, repo_root: Path) -> AmendmentRequiredResult | None:
+    """Run this task's declared verification commands against the current worktree *before*
+    the executor window opens, and classify any failure (TAM-01 AC-4).
+
+    A command whose own working directory does not exist is an environmental gap, not this
+    task's fault, and is silently skipped here (the ordinary verification gate still reports
+    it). A command that fails with none of its observed evidence paths inside the task's
+    current ``allowed_scope`` is ``amendment_required`` — this never spends a repair attempt
+    and never dispatches the executor. Anything else is left for the ordinary repair loop.
+    """
+    root = Path(repo_root).resolve()
+    observed: set[str] = set()
+    causal: list[str] = []
+    for command in spec.verification_commands:
+        cwd = (root / command.cwd).resolve()
+        if not cwd.is_dir():
+            continue
+        try:
+            result = subprocess.run(
+                list(command.argv), cwd=cwd, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=BASELINE_DIAGNOSIS_TIMEOUT,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode == 0:
+            continue
+        paths = _baseline_observed_paths((result.stdout or "") + (result.stderr or ""), root)
+        covered = any(_in_allowed_scope(path, spec.allowed_scope) for path in paths) if paths else True
+        classification = classify_baseline_failure(
+            exit_code=result.returncode, cwd_paths_exist=True, path_covered_by_scope=covered,
+        )
+        if classification == CLASSIFICATION_AMENDMENT_REQUIRED:
+            observed.update(paths)
+            causal.append(" ".join(["cd", repo_relative(cwd, root) or "."] + [">"] + list(command.argv)))
+    if not causal:
+        return None
+    return AmendmentRequiredResult(
+        task_id=spec.id,
+        observed_paths=tuple(sorted(observed)),
+        causal_commands=tuple(causal),
+        reason=(
+            "a declared verification command fails on evidence outside this task's current "
+            "allowed scope; an approved amendment is required before dispatch"
+        ),
+    )
+
+
 def _prepare_executor(life: RunLifecycle, request: ExecuteRequest, spec: TaskSpec,
                       bindings: dict[str, str]) -> str | None:
     """Recheck gates and role availability before an initial or repair dispatch."""
@@ -591,7 +1243,6 @@ def _prepare_executor(life: RunLifecycle, request: ExecuteRequest, spec: TaskSpe
     try:
         _resolve_executor(request, spec)
     except ExecutionError as exc:
-        life.run.status = "blocked"
         life.block(spec.id, f"{exc.code}: {exc}")
         raise
     return None
@@ -609,6 +1260,8 @@ def _controls_map(
         "adapter_requested": (resolution.requested, "explicit" if controls.adapter_explicit
                               else "default"),
         "adapter_resolved": (resolution.resolved, resolution.sourced),
+        "model": ((controls.model, "explicit") if controls.model is not None else (None, "default")),
+        "effort": ((controls.effort, "explicit") if controls.effort is not None else (None, "default")),
         "max_repair_attempts": (
             (controls.max_repair_attempts, "explicit")
             if controls.max_repair_attempts is not None else (None, "default")),
@@ -638,13 +1291,24 @@ def _controls_map(
     }
 
 
+def _dependency_satisfied(life: RunLifecycle, dep_id: str) -> bool:
+    """Whether ``dep_id`` is compatible completed-resolution evidence for a dependent.
+
+    A task only satisfies a dependent's dependency once it is durably ``done`` with the
+    ``completed`` resolution. A human cancellation still reaches ``done``, but it is an
+    explicit decision that the functionality is no longer needed, never verified
+    implementation — it must not silently satisfy a functional dependency (ROC-02 AC-3).
+    """
+    dependency = life.run.task(dep_id)
+    return dependency.status == "done" and dependency.resolution == "completed"
+
+
 def _next_actionable(
     life: RunLifecycle, selected: Sequence[str], order: Sequence[str]
 ) -> str | None:
     """The first selected task, in plan order, the loop can still move forward.
 
-    A task carrying a ``blocked_by:`` suppression marker is skipped — its blocked root has
-    already ended the run.
+    Dependencies delay automatic dispatch but never mutate a dependent task.
     """
     chosen = set(selected)
     for task_id in order:
@@ -653,7 +1317,7 @@ def _next_actionable(
         record = life.run.task(task_id)
         if record.status not in _ACTIONABLE_STATES:
             continue
-        if (record.blocker or "").startswith(_SUPPRESSED_PREFIX):
+        if any(not _dependency_satisfied(life, dep) for dep in record.depends_on):
             continue
         return task_id
     return None
@@ -664,19 +1328,11 @@ def _pending_reason(life: RunLifecycle, pending: Sequence[str]) -> str:
     parts: list[str] = []
     for task_id in pending:
         record = life.run.task(task_id)
-        if record.status == "blocked":
-            parts.append(f"{task_id} blocked: {record.blocker or 'see diagnostics'}")
-        elif (record.blocker or "").startswith(_SUPPRESSED_PREFIX):
-            parts.append(f"{task_id} suppressed ({record.blocker})")
+        unmet = [dep for dep in record.depends_on if not _dependency_satisfied(life, dep)]
+        if unmet:
+            parts.append(f"{task_id} dependency-not-satisfied: {', '.join(unmet)}")
         else:
-            unmet = [dep for dep in record.depends_on
-                     if life.run.task(dep).status != "verified"]
-            if unmet:
-                parts.append(
-                    f"{task_id} dependency-not-satisfied: {', '.join(unmet)}")
-            else:
-                parts.append(
-                    f"{task_id} did not reach verified (status '{record.status}')")
+            parts.append(f"{task_id} remains {record.status}; see operation history")
     return "; ".join(parts)
 
 
@@ -690,7 +1346,7 @@ def _apply_repair_bound(
 
 
 def _plan_fingerprint(plan: CompiledRunPlan) -> dict[str, str]:
-    """A flat ``{field-path: value}`` map over every resolved decision in ``plan``.
+    """A flat ``{field-path: value}`` map over the run's resolved decisions.
 
     Persisted verbatim on ``run.json`` (control ``plan_fingerprint``); a resume recomputes it
     from the freshly compiled plan and reports the **first** key whose value moved (AC-3).
@@ -701,7 +1357,9 @@ def _plan_fingerprint(plan: CompiledRunPlan) -> dict[str, str]:
         "selection_mode": plan.selection_mode,
         "selection": ",".join(plan.selection),
         "execution_scope": ",".join(plan.execution_scope),
-        "order": ",".join(plan.order),
+        # ``plan.order`` is the whole current board order.  Resume owns only the recorded
+        # execution scope, so preserve its relative order while ignoring new independent work.
+        "order": ",".join(task_id for task_id in plan.order if task_id in plan.execution_scope),
         "adapter": plan.adapter,
     }
     for control in plan.controls:
@@ -749,9 +1407,14 @@ def _ensure_plan_compatible(run: Run, plan: CompiledRunPlan) -> None:
                 "plan-incompatible",
             )
         return
+    scoped_ids = set(plan.execution_scope)
     for key in list(recorded) + [k for k in now if k not in recorded]:
         before = recorded.get(key, "<absent>")
         after = now.get(key, "<absent>")
+        if key == "order" and isinstance(before, str):
+            # Older runs persisted full-board order. Compare their recorded
+            # scope's relative order only; new independent board work is irrelevant.
+            before = ",".join(task_id for task_id in before.split(",") if task_id in scoped_ids)
         if before != after:
             raise ExecutionError(
                 f"resume: compiled plan is incompatible with the recorded run at "
@@ -770,7 +1433,7 @@ def _reconcile_projection(
     A crash between a durable transition and its Markdown projection leaves the human view
     stale; replaying :func:`~feature_pipeline.infrastructure.board_projection.project_task_state`
     for each selected task's *current* persisted status repairs that view without redispatching
-    an already-``verified`` task's executor (the loop below never selects a terminal task
+    an already-``done`` task's executor (the loop below never selects a terminal task
     anyway — this only ever touches the human-facing files). Idempotent when nothing was
     actually stale.
     """
@@ -779,8 +1442,12 @@ def _reconcile_projection(
         if spec is None or not spec.path:
             continue
         record = life.run.task(task_id)
+        if record.resolution_reason == "independently completed reusable evidence":
+            # A reused dependency is fast-forwarded from *another* run's evidence; it was
+            # never dispatched here and never carried a board card of its own to repair.
+            continue
         evidence = (
-            build_completion_evidence(life.run, spec) if record.status == "verified" else None
+            build_completion_evidence(life.run, spec) if record.status == "done" else None
         )
         try:
             project_task_state(
@@ -791,12 +1458,197 @@ def _reconcile_projection(
                 state=record.status,
                 evidence=evidence,
             )
+            # Resume reconciliation is also a runner lifecycle projection.  Attribute its
+            # exact writes before any resumed executor can open a worktree window.
+            life.run.record_runner_projection(
+                spec.id, (board_path, life.run.repo_root / spec.path)
+            )
+            life.run.save()
         except BoardProjectionError as exc:
             raise ExecutionError(
                 f"board projection reconciliation failed for {task_id} -> "
                 f"{record.status!r}: {exc}",
                 "board-projection-failed",
             ) from exc
+
+
+def _find_bound_source_evidence(
+    store: VerifiedEvidenceStore,
+    definitions: Mapping[str, TaskSpec],
+    replacement_id: str,
+    source_run: str,
+) -> tuple[str, Mapping[str, str]] | None:
+    """``(replacement_id, evidence)`` from exactly the registry-named ``source_run``.
+
+    A registry mapping may bind an otherwise-ambiguous replacement (more than one closed
+    run independently carries matching exact evidence) to one explicitly named source run.
+    A missing/unreadable run directory, an unknown replacement definition, or evidence that
+    is not eligible from that exact run (wrong contract, run not closed, no PASS/PASS
+    verdicts) fails closed to ``None`` — never falling back to the ambiguous default lookup
+    and never touching any run's recorded bytes.
+    """
+    definition = definitions.get(replacement_id)
+    if definition is None:
+        return None
+    run_dir = (store.runs_root / source_run).resolve()
+    try:
+        run_dir.relative_to(store.runs_root.resolve())
+    except ValueError:
+        return None
+    try:
+        evidence = store.find_at(run_dir, definition)
+    except EvidenceEligibilityError:
+        return None
+    return replacement_id, evidence
+
+
+def _reconciliation_completion_evidence(
+    *, source_dir: Path, repo_root: Path, historical_id: str,
+    replacement: TaskSpec,
+) -> CompletionEvidence | None:
+    """Render runner-owned completion evidence from one already-validated source run.
+
+    The source directory was selected by a registry's bare ``source_run`` identity and
+    independently accepted by :class:`VerifiedEvidenceStore`; loading it here only reads its
+    durable facts to make the historical Markdown projection useful.  It never transitions,
+    saves, or otherwise mutates that run.
+    """
+    try:
+        source = Run.load(source_dir, repo_root)
+        evidence = build_completion_evidence(source, replacement)
+        source_evidence = repo_relative(source_dir / "run.json", repo_root)
+    except (StateError, OSError, BoardProjectionError):
+        return None
+    return replace(
+        evidence,
+        evidence_paths=tuple(dict.fromkeys((*evidence.evidence_paths, source_evidence))),
+        reconciliation_source_task=historical_id,
+        reconciliation_replacement_task=replacement.id,
+    )
+
+
+def reconcile_historical_cards(
+    life: RunLifecycle, board_path: Path, by_id: Mapping[str, TaskSpec],
+) -> tuple[str, ...]:
+    """Retire stale cards only when declared replacements have verified evidence.
+
+    Two independent sources of a declared replacement are consulted: each task file's own
+    ``## Supersession`` grammar, and the project-declared legacy reconciliation registry
+    (:mod:`pipeline_core.reconciliation_registry`) — used for a direct mapping whose completed
+    replacement contract cannot be edited to add its own declaration without invalidating its
+    recorded PASS/PASS evidence. Either source failing to validate (malformed, cyclic, self,
+    duplicate, or an unknown task) contributes no edges rather than raising; a card is only
+    ever retired by an edge whose replacement carries its own exact eligible evidence.
+    """
+
+    reconciliation_definitions = _with_rec01_recovery_definitions(
+        by_id, life.run.repo_root,
+    )
+    graph = supersession_graph(reconciliation_definitions, life.run.repo_root)
+    registry = reconciliation_supersession_graph(life.run.repo_root)
+    if graph is None and registry is None:
+        return ()
+    store = VerifiedEvidenceStore(life.run.run_dir.parent, life.run.repo_root)
+    replacements: dict[str, tuple[str, Mapping[str, str]]] = {}
+    reconciled: dict[str, tuple[TaskSpec, CompletionEvidence]] = {}
+    if graph is not None:
+        for edge in graph.edges:
+            evidence = find_superseding_evidence(
+                store, graph, edge.superseded, reconciliation_definitions,
+            )
+            if evidence is not None:
+                replacements[edge.superseded] = evidence
+    if registry is not None:
+        registry_graph, registry_definitions = registry
+        for edge in registry_graph.edges:
+            if edge.superseded in replacements:
+                continue
+            source_run = getattr(edge, "source_run", None)
+            if source_run is not None:
+                evidence = _find_bound_source_evidence(
+                    store, registry_definitions, edge.replacement, source_run,
+                )
+                if evidence is not None and getattr(edge, "project_completion", False):
+                    replacement_spec = registry_definitions.get(edge.replacement)
+                    historical_spec = registry_definitions.get(edge.superseded)
+                    projection_evidence = (
+                        _reconciliation_completion_evidence(
+                            source_dir=store.runs_root / source_run,
+                            repo_root=life.run.repo_root,
+                            historical_id=edge.superseded,
+                            replacement=replacement_spec,
+                        ) if replacement_spec is not None else None
+                    )
+                    if historical_spec is not None and projection_evidence is not None:
+                        reconciled[edge.superseded] = (historical_spec, projection_evidence)
+            else:
+                evidence = find_superseding_evidence(
+                    store, registry_graph, edge.superseded, registry_definitions
+                )
+            if evidence is not None:
+                replacements[edge.superseded] = evidence
+    projected: list[str] = []
+    try:
+        for historical_id, (historical_spec, evidence) in reconciled.items():
+            if not historical_spec.path:
+                continue
+            project_task_state(
+                board_path=board_path,
+                task_path=life.run.repo_root / historical_spec.path,
+                task_id=historical_spec.id,
+                task_title=historical_spec.title,
+                state="done",
+                evidence=evidence,
+            )
+            projected.append(historical_id)
+        removed = remove_historical_cards(
+            board_path, tuple(task_id for task_id in replacements if task_id not in reconciled)
+        )
+    except BoardProjectionError as exc:
+        raise ExecutionError(
+            f"historical board reconciliation failed: {exc}", "board-reconciliation-failed"
+        ) from exc
+    retired = tuple(dict.fromkeys((*projected, *removed)))
+    if not retired:
+        return ()
+    facts = ", ".join(f"{task_id}={replacements[task_id][0]}" for task_id in retired)
+    source_runs = ", ".join(replacements[task_id][1]["source_run_id"] for task_id in retired)
+    life.run.record_event(
+        "board-reconciliation:historical",
+        to=facts,
+        actor=ACTOR_RUNNER,
+        note=("removed stale active cards using independently verified replacement "
+              f"evidence from runs: {source_runs}"),
+    )
+    life.run.save()
+    return retired
+
+
+def _with_rec01_recovery_definitions(
+    by_id: Mapping[str, TaskSpec], repo_root: Path,
+) -> Mapping[str, TaskSpec]:
+    """Expose the fixed REC-01 -> TC-04 declaration to runner-only projection.
+
+    A focused recovery plan does not include either historical task in its executable
+    selection.  Read their immutable task contracts solely to evaluate the already-declared
+    replacement; neither definition is added to the run scope or dispatch set.
+    """
+    recovery_paths = {
+        "TC-04": "docs/plans/tasks/TC-04_task-kind-catalog.md",
+        _REC01_RECOVERY_TASK_ID: _REC01_RECOVERY_TASK_PATH,
+    }
+    definitions = dict(by_id)
+    for task_id, relative_path in recovery_paths.items():
+        if task_id in definitions:
+            continue
+        try:
+            spec = load_task_spec(repo_root / relative_path)
+        except (OSError, TaskFileError):
+            return by_id
+        if spec.id != task_id:
+            return by_id
+        definitions[task_id] = spec
+    return definitions
 
 
 def _resolve_selection_and_scope(
@@ -825,6 +1677,77 @@ def _resolve_selection_and_scope(
     return selected, [task_id for task_id in order if task_id in closure]
 
 
+def _resolve_unset_dependency_chain_control(request: ExecuteRequest) -> ExecuteRequest:
+    """Materialize an omitted chain-policy control before selection or resume validation."""
+    if request.controls.verify_dependency_chain is not None:
+        return request
+    if not request.controls.resume:
+        value = False
+    else:
+        recorded = Run.load(request.run_dir, request.repo_root)
+        value = (recorded.controls.get("verify_dependency_chain", {}) or {}).get("value", False)
+        if not isinstance(value, bool):
+            raise ExecutionError(
+                "recorded verify-dependency-chain control is invalid",
+                "verify-dependency-chain-invalid",
+            )
+    return replace(request, controls=replace(request.controls, verify_dependency_chain=value))
+
+
+def _hydrate_resume_runtime_controls(request: ExecuteRequest) -> ExecuteRequest:
+    """Restore an omitted model/effort pair from the immutable run record.
+
+    A resume may deliberately omit both runtime flags.  Supplying only one remains an
+    invalid override and is left for normal validation; it must never combine a caller value
+    with a persisted value.
+    """
+    controls = request.controls
+    if not controls.resume or controls.model is not None or controls.effort is not None:
+        return request
+    recorded = Run.load(request.run_dir, request.repo_root)
+    model = (recorded.controls.get("model", {}) or {}).get("value")
+    effort = (recorded.controls.get("effort", {}) or {}).get("value")
+    if model is None and effort is None:
+        return request
+    if not isinstance(model, str) or not isinstance(effort, str):
+        raise ExecutionError(
+            "recorded model and effort controls must be a complete string pair",
+            "runtime-control-invalid",
+        )
+    return replace(request, controls=replace(controls, model=model, effort=effort))
+
+
+def _substitute_superseded_scope(
+    scope: Sequence[str], selected: Sequence[str], order: Sequence[str],
+    definitions: Mapping[str, TaskSpec], repo_root: Path,
+) -> list[str]:
+    """Replace retired, non-selected predecessors with their declared live replacements.
+
+    Full-chain verification re-executes dependencies but must never redispatch a task whose
+    successor supersedes it. The replacement remains a real task in the same compiled plan;
+    no historical run record is read or modified here.
+    """
+    graph = supersession_graph(definitions, repo_root)
+    if graph is None:
+        return list(scope)
+    selected_ids = set(selected)
+    resolved: set[str] = set()
+    for task_id in scope:
+        if task_id in selected_ids:
+            resolved.add(task_id)
+            continue
+        node = task_id
+        seen: set[str] = set()
+        while True:
+            replacement = graph.replacement_for(node)
+            if replacement is None or replacement in seen:
+                break
+            seen.add(replacement)
+            node = replacement
+        resolved.add(node)
+    return [task_id for task_id in order if task_id in resolved]
+
+
 def _resume_open_run(
     request: ExecuteRequest,
     resolution: AdapterResolution,
@@ -837,9 +1760,13 @@ def _resume_open_run(
 ) -> tuple[RunLifecycle, list[str]]:
     """Reconcile the persisted run for a ``--resume`` and return ``(lifecycle, active scope)``."""
     recorded = Run.load(request.run_dir, request.repo_root)
+    source_run_bytes = (request.run_dir / "run.json").read_bytes()
     active_scope = [task_id for task_id in execution_scope if task_id in recorded.tasks]
+    # A launch failure is an operation fact, not a task state.  An ordinary resume may
+    # deterministically continue the latest unfinished operation without a recovery selector.
     _ensure_execution_controls_match(
         recorded, execution_scope, request.controls.verify_dependency_chain,
+        request.controls.model, request.controls.effort,
     )
     _ensure_precondition_contracts_match(recorded, specs)
     recorded_bindings = recorded.controls.get("precondition_bindings", {}).get("value") or {}
@@ -851,6 +1778,8 @@ def _resume_open_run(
         )
     if plan is not None:
         _ensure_plan_compatible(recorded, plan)
+    cache_dir = _validate_operational_unblock(
+        request, recorded, resolution, execution_scope, specs, plan)
     life = RunLifecycle.resume(
         request.run_dir, request.repo_root,
         feature=request.feature, prompt_path=request.prompt_path,
@@ -861,6 +1790,13 @@ def _resume_open_run(
         },
     )
     ensure_pinned_adapter(life.run, resolution)
+    if request.controls.operational_unblock_task is not None:
+        life.reopen_operational_block(
+            request.controls.operational_unblock_task,
+            authorization="human-authorized-operational-unblock",
+            cache_path=cache_dir.relative_to(request.repo_root.resolve()).as_posix(),
+            source_run_bytes=source_run_bytes,
+        )
     _ensure_attestations_match(life.run, request.controls.attested_dependencies)
     for name, (value, sourced) in controls_map.items():
         if sourced == "explicit":
@@ -883,25 +1819,26 @@ def _collect_reusable_evidence(
         return reused, list(scope)
     store = VerifiedEvidenceStore(request.run_dir.parent, request.repo_root)
     explicit_sources = dict(request.controls.attested_dependencies)
-    for task_id in scope:
-        if task_id in selected:
-            continue
-        try:
-            evidence = (
-                store.find_at(
-                    _resolve_source_run_dir(request.run_dir, explicit_sources[task_id]),
-                    by_id[task_id],
-                ) if task_id in explicit_sources else store.find(by_id[task_id])
+    try:
+        for task_id, source_feature in explicit_sources.items():
+            reused[task_id] = store.find_at(
+                _resolve_source_run_dir(request.run_dir, source_feature), by_id[task_id]
             )
-        except EvidenceEligibilityError as exc:
-            if task_id in explicit_sources:
-                raise ExecutionError(str(exc), exc.code) from None
-            continue
-        reused[task_id] = evidence
+        reused.update(resolve_default_reuse(
+            store, by_id, list(scope), list(selected), request.repo_root, list(explicit_sources)
+        ))
+    except EvidenceEligibilityError as exc:
+        raise ExecutionError(str(exc), exc.code) from None
     pruned = list(prune_reused_ancestors(
         scope, selected, reused,
         {task_id: spec.depends_on for task_id, spec in by_id.items()},
     ))
+    # A replacement satisfies the declared dependency without admitting its terminal
+    # predecessor into this run at all. Ordinary direct reuse keeps its task record.
+    pruned = [
+        task_id for task_id in pruned
+        if task_id in selected or "replacement_id" not in reused.get(task_id, {})
+    ]
     return reused, pruned
 
 
@@ -914,6 +1851,7 @@ def _fresh_open_run(
     scope: list[str],
     by_id: Mapping[str, TaskSpec],
     bindings: dict[str, str],
+    recovery: Mapping[str, str] | None = None,
 ) -> tuple[RunLifecycle, list[str]] | ExecuteResult:
     """Create a fresh run, fast-forward every reuse-eligible task, and return
     ``(lifecycle, scope)`` — or a terminal :class:`ExecuteResult` when a reused task's
@@ -922,6 +1860,8 @@ def _fresh_open_run(
     run = Run.create(
         request.feature, request.prompt_path, request.plan_path,
         request.run_dir, request.repo_root)
+    if recovery is not None:
+        run.recovery = dict(recovery)
     life = RunLifecycle.initialize(
         run,
         tasks=[
@@ -942,12 +1882,14 @@ def _fresh_open_run(
                 persist_task_contracts(life.run, [by_id[tid] for tid in scope])
                 life.run.save()
                 return ExecuteResult("blocked", EXIT_BLOCKED, reason, request.run_dir, life.run.run_id)
-            life.transition(task_id, "running", actor=ACTOR_RUNNER,
-                            note="verified by reusable evidence")
-            life.transition(task_id, "implemented", actor=ACTOR_RUNNER,
-                            note="verified by reusable evidence")
-            life.run.record_verdicts(task_id, "PASS", "PASS")
-            life.run.record_reused_verification(task_id, evidence)
+            life.reuse_completed_task(task_id, evidence)
+        # A superseded predecessor is pruned from this run.  Its evidence belongs to the live
+        # consumer, keyed by the declared edge and the independently verified replacement.
+        for task_id in scope:
+            for dependency_id in by_id[task_id].depends_on:
+                evidence = reused.get(dependency_id)
+                if evidence is not None and dependency_id not in life.run.tasks:
+                    life.run.record_reused_verification(task_id, evidence)
         life.recompute_readiness()
     return life, scope
 
@@ -963,6 +1905,7 @@ def _open_run(
     by_id: Mapping[str, TaskSpec],
     bindings: dict[str, str],
     plan: CompiledRunPlan | None,
+    recovery: Mapping[str, str] | None = None,
 ) -> tuple[RunLifecycle, list[str]] | ExecuteResult:
     """Initialize a fresh durable run or reconcile a resumed one.
 
@@ -979,6 +1922,7 @@ def _open_run(
         else:
             opened = _fresh_open_run(
                 request, resolution, controls_map, specs, selected, scope, by_id, bindings,
+                recovery,
             )
             if isinstance(opened, ExecuteResult):
                 return opened
@@ -990,6 +1934,109 @@ def _open_run(
     pin_adapter(life.run, resolution)
     life.run.save()
     return life, scope
+
+
+def _run_scoped_tasks(
+    request: ExecuteRequest,
+    life: RunLifecycle,
+    scope: Sequence[str],
+    order: Sequence[str],
+    by_id: Mapping[str, TaskSpec],
+    plan: CompiledRunPlan | None,
+    bindings: Mapping[str, Any],
+    cache_dir: Path | None,
+    pid: int,
+) -> ExecuteResult:
+    """Run the actionable scope while the caller holds the pipeline lease."""
+    results: list[TaskRunResult] = []
+    while True:
+        task_id = _next_actionable(life, scope, order)
+        if task_id is None:
+            break
+        spec = by_id[task_id]
+        try:
+            reason = _prepare_executor(life, request, spec, bindings)
+        except ExecutionError as exc:
+            return _error(f"{exc.code}: {exc}", request, tuple(results), life.run.run_id)
+        if reason:
+            return ExecuteResult("blocked", EXIT_BLOCKED, reason, request.run_dir,
+                                 life.run.run_id, tuple(results))
+        t_lease = task_lease(request.repo_root, life.run.run_id, task_id, pid)
+        try:
+            t_lease.acquire(task_id)
+        except LeaseHeldError as exc:
+            life.record_operation(task_id, "lease", "blocked", f"{exc.code}: {exc}")
+            return ExecuteResult("blocked", EXIT_BLOCKED, f"{exc.code}: {exc}",
+                                 request.run_dir, life.run.run_id, tuple(results))
+        try:
+            with _child_uv_cache(
+                cache_dir if task_id == request.controls.operational_unblock_task else None
+            ):
+                outcome = _run_selected_task(
+                    life, plan, task_id,
+                    TaskExecution(
+                        spec=spec, adapter=request.adapter, launchers=request.launchers,
+                        verifier_anchors=request.verifier_anchors,
+                        envelope_anchors=request.envelope_anchors,
+                        role_grant=tuple(request.role_grant), execution_mode=request.execution_mode,
+                        plan_path=request.plan_prompt_path,
+                        working_root=_task_working_root(request, spec), timeout=request.timeout,
+                        model=request.controls.model, effort=request.controls.effort,
+                        board_path=request.board_path,
+                        pre_dispatch=lambda: _prepare_executor(life, request, spec, bindings),
+                        baseline_diagnosis=lambda: diagnose_baseline(spec, request.repo_root),
+                    ),
+                )
+        except (ExecutionError, DispatchError) as exc:
+            return _error(f"{getattr(exc, 'code', 'execution-error')}: {exc}", request,
+                          tuple(results), life.run.run_id)
+        finally:
+            t_lease.release()
+
+        results.append(outcome)
+        if outcome.status == "retryable":
+            life.run.status = "running"
+            life.record_operation(task_id, "executor", "retryable", outcome.blocker)
+            life.run.save()
+            return ExecuteResult(
+                "retryable", EXIT_ERROR,
+                f"{task_id} has a retryable orchestration failure: "
+                f"{outcome.blocker or 'see the persisted diagnostic'}",
+                request.run_dir, life.run.run_id, tuple(results))
+        if outcome.status == "amendment_required":
+            life.run.status = "running"
+            life.record_operation(task_id, "baseline", "amendment_required", outcome.blocker)
+            life.run.save()
+            return ExecuteResult(
+                "amendment_required", EXIT_BLOCKED,
+                f"{task_id} requires an approved amendment before it can be dispatched: "
+                f"{outcome.blocker or 'see the persisted diagnostic'}",
+                request.run_dir, life.run.run_id, tuple(results))
+        if outcome.status != "done":
+            life.run.status = "running"
+            life.record_operation(task_id, "execution", "failed", outcome.blocker)
+            life.run.save()
+            return ExecuteResult(
+                "blocked", EXIT_BLOCKED,
+                f"{task_id} ended '{outcome.status}': "
+                f"{outcome.blocker or 'see the persisted diagnostic'}",
+                request.run_dir, life.run.run_id, tuple(results))
+        life.recompute_readiness()
+
+    pending = [tid for tid in scope if life.run.task(tid).status != "done"]
+    if not pending:
+        life.run.status = "verified"
+        life.run.save()
+        return ExecuteResult(
+            "ok", EXIT_OK,
+            f"execute complete: {len(scope)} scoped task(s) verified. Stopped after "
+            f"stage 9 — documentation, knowledge-graph refresh, final verification, "
+            f"release, and archive/purge are not run in execute mode.",
+            request.run_dir, life.run.run_id, tuple(results))
+    life.run.status = "running"
+    life.run.save()
+    return ExecuteResult("blocked", EXIT_BLOCKED, _pending_reason(life, pending),
+                         request.run_dir, life.run.run_id, tuple(results))
 
 
 def execute_run(request: ExecuteRequest) -> ExecuteResult:
@@ -1014,6 +2061,12 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
     Stages 10–16 are never reached: no documentation, knowledge-graph refresh, final
     verification, release, archive, purge, or recovery code is called from here.
     """
+    try:
+        request = _hydrate_resume_runtime_controls(request)
+        request = _resolve_unset_dependency_chain_control(request)
+    except (StateError, ExecutionError) as exc:
+        return _error(f"{getattr(exc, 'code', 'state-error')}: {exc}", request)
+
     specs = list(request.specs)
     if not specs:
         return _error("execute mode needs at least one task in the plan", request)
@@ -1023,7 +2076,15 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
 
     try:
         selected, scope = _resolve_selection_and_scope(request, plan, order, spec_by_id)
+        if request.controls.verify_dependency_chain:
+            scope = _substitute_superseded_scope(
+                scope, selected, order, spec_by_id, request.repo_root
+            )
         _validate_attestation_scope(request.controls, spec_by_id)
+        recovery = recovery_provenance(
+            controls=request.controls, run_dir=request.run_dir, repo_root=request.repo_root,
+            specs=specs, replacement_identity=request.feature,
+        )
     except ExecutionError as exc:
         return _error(f"{exc.code}: {exc}", request)
 
@@ -1078,32 +2139,59 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
         controls_map["plan_digest"] = (plan.digest, "explicit")
         controls_map["plan_fingerprint"] = (_plan_fingerprint(plan), "explicit")
 
+    try:
+        _validate_same_run_launch_recovery(
+            request, resolution, specs, execution_scope, plan,
+        )
+    except (StateError, ExecutionError) as exc:
+        return _error(f"{getattr(exc, 'code', 'state-error')}: {exc}", request)
+
+    # A fresh invocation has no authority to reuse a run identity.  In particular, do this
+    # before ``_open_run`` creates and saves a new Run: otherwise a second plain execute can
+    # replace the durable record (and its independently verified dependency evidence) merely
+    # because it selected the same feature/run directory.  Resume is the sole explicit path
+    # that may continue an existing identity; recovery has an additional, stricter guard in
+    # ``recovery_provenance``.
+    if not request.controls.resume and request.run_dir.exists():
+        return _error(
+            "run-identity-collision: fresh execute refuses an existing run directory; "
+            "use --resume to continue its immutable run identity",
+            request,
+        )
+
     # 3. Durable lifecycle: initialize a fresh run, or resume the persisted one. A fresh run's
     #    attestations are resolved against their source runs before any run.json exists
     #    (AC-2's "no partial state" on a denial); a resume trusts whatever was recorded.
     opened = _open_run(
         request, resolution, controls_map, specs, selected, scope, execution_scope,
-        by_id, bindings, plan,
+        by_id, bindings, plan, recovery,
     )
     if isinstance(opened, ExecuteResult):
         return opened
     life, scope = opened
+    register_work_items(life.run, tuple(by_id[task_id] for task_id in scope))
+    cache_dir = (
+        _approved_uv_cache_dir(request.repo_root, request.controls.uv_cache_dir)
+        if request.controls.operational_unblock_task is not None else None
+    )
 
     for task_id in scope:
         record = life.run.task(task_id)
-        if record.status != "verified" or not request.controls.resume:
+        if record.status != "done" or not request.controls.resume:
             continue
         spec = by_id[task_id]
         reason = _check_preconditions(life, request, spec, bindings)
         if reason:
             return ExecuteResult("blocked", EXIT_BLOCKED, reason, request.run_dir, life.run.run_id)
 
-    if not request.controls.resume and request.board_path is not None:
+    if request.board_path is not None:
         try:
-            recorded_scope = [
-                task_id for task_id in execution_scope if task_id in life.run.tasks
-            ]
-            _reconcile_projection(life, request.board_path, by_id, recorded_scope)
+            reconcile_historical_cards(life, request.board_path, by_id)
+            if request.controls.resume:
+                recorded_scope = [
+                    task_id for task_id in execution_scope if task_id in life.run.tasks
+                ]
+                _reconcile_projection(life, request.board_path, by_id, recorded_scope)
         except ExecutionError as exc:
             return _error(f"{exc.code}: {exc}", request, run_id=life.run.run_id)
 
@@ -1113,91 +2201,19 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
     try:
         lease.acquire()
     except LeaseHeldError as exc:
+        # No task has been selected yet under pipeline-wide contention: record the wait as
+        # durable run-level evidence rather than a task operation. The run itself stays
+        # 'running' — external lease contention is operation-level, never a terminal state.
+        life.run.record_event(
+            "lease:pipeline", to="blocked", note=f"{exc.code}: {exc}")
+        life.run.save()
         return ExecuteResult(
             "blocked", EXIT_BLOCKED, f"{exc.code}: {exc}",
             request.run_dir, life.run.run_id)
 
-    results: list[TaskRunResult] = []
     try:
-        while True:
-            task_id = _next_actionable(life, scope, order)
-            if task_id is None:
-                break
-            spec = by_id[task_id]
-            try:
-                reason = _prepare_executor(life, request, spec, bindings)
-            except ExecutionError as exc:
-                return _error(f"{exc.code}: {exc}", request, tuple(results), life.run.run_id)
-            if reason:
-                return ExecuteResult("blocked", EXIT_BLOCKED, reason, request.run_dir,
-                                     life.run.run_id, tuple(results))
-            t_lease = task_lease(request.repo_root, life.run.run_id, task_id, pid)
-            try:
-                t_lease.acquire(task_id)
-            except LeaseHeldError as exc:
-                return ExecuteResult(
-                    "blocked", EXIT_BLOCKED, f"{exc.code}: {exc}",
-                    request.run_dir, life.run.run_id, tuple(results))
-            try:
-                outcome = _run_selected_task(
-                    life, plan, task_id,
-                    TaskExecution(
-                        spec=spec,
-                        adapter=request.adapter,
-                        launchers=request.launchers,
-                        verifier_anchors=request.verifier_anchors,
-                        envelope_anchors=request.envelope_anchors,
-                        role_grant=tuple(request.role_grant),
-                        execution_mode=request.execution_mode,
-                        plan_path=request.plan_prompt_path,
-                        working_root=_task_working_root(request, spec),
-                        timeout=request.timeout,
-                        board_path=request.board_path,
-                        pre_dispatch=lambda: _prepare_executor(life, request, spec, bindings),
-                    ),
-                )
-            except (ExecutionError, DispatchError) as exc:
-                return _error(
-                    f"{getattr(exc, 'code', 'execution-error')}: {exc}",
-                    request, tuple(results), life.run.run_id)
-            finally:
-                t_lease.release()
-
-            results.append(outcome)
-            if outcome.status == "retryable":
-                # A launch/protocol error has no executor outcome. Preserve the non-terminal
-                # lifecycle so a later --resume obtains a fresh launch generation.
-                life.run.status = "running"
-                life.run.save()
-                return ExecuteResult(
-                    "retryable", EXIT_ERROR,
-                    f"{task_id} has a retryable orchestration failure: "
-                    f"{outcome.blocker or 'see the persisted diagnostic'}",
-                    request.run_dir, life.run.run_id, tuple(results))
-            if outcome.status != "verified":
-                life.run.status = "blocked"
-                life.run.save()
-                return ExecuteResult(
-                    "blocked", EXIT_BLOCKED,
-                    f"{task_id} ended '{outcome.status}': "
-                    f"{outcome.blocker or 'see the persisted diagnostic'}",
-                    request.run_dir, life.run.run_id, tuple(results))
-            life.recompute_readiness()
-
-        pending = [tid for tid in scope if life.run.task(tid).status != "verified"]
-        if not pending:
-            life.run.status = "verified"
-            life.run.save()
-            return ExecuteResult(
-                "ok", EXIT_OK,
-                f"execute complete: {len(scope)} scoped task(s) verified. Stopped after "
-                f"stage 9 — documentation, knowledge-graph refresh, final verification, "
-                f"release, and archive/purge are not run in execute mode.",
-                request.run_dir, life.run.run_id, tuple(results))
-        life.run.status = "blocked"
-        life.run.save()
-        return ExecuteResult(
-            "blocked", EXIT_BLOCKED, _pending_reason(life, pending),
-            request.run_dir, life.run.run_id, tuple(results))
+        return _run_scoped_tasks(
+            request, life, scope, order, by_id, plan, bindings, cache_dir, pid,
+        )
     finally:
         lease.release()

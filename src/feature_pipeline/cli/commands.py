@@ -36,7 +36,9 @@ class RunCommand:
     task: str | None
     through: str | None
     attest_dependency: list[str] = field(default_factory=list)
-    verify_dependency_chain: bool = False
+    # ``None`` means the switch was omitted.  This is significant on ``--resume``, where
+    # execution inherits the immutable value from run.json.
+    verify_dependency_chain: bool | None = None
     resume: bool = False
     mode: str = "plan-only"
     feature: str | None = None
@@ -44,6 +46,16 @@ class RunCommand:
     grants: list[str] = field(default_factory=list)
     approvals: list[str] = field(default_factory=list)
     published_refs: list[str] = field(default_factory=list)
+    recovery_source_feature: str | None = None
+    recovery_task: str | None = None
+    operational_unblock_task: str | None = None
+    human_authorized_operational_unblock: bool = False
+    uv_cache_dir: str | None = None
+    amend_task: str | None = None
+    amend_rationale: str | None = None
+    amend_approved_by: str | None = None
+    amend_evidence: str | None = None
+    amend_contract: str | None = None
 
     # Delivery gates.
     approve_plan: bool = False
@@ -57,6 +69,8 @@ class RunCommand:
     status: bool = False
     unattended: bool = False
     adapter: str | None = None
+    model: str | None = None
+    effort: str | None = None
     max_repair_attempts: int | None = None
     routine_output_byte_budget: int | None = None
     diagnostic_output_byte_budget: int | None = None
@@ -84,6 +98,16 @@ class RunCommand:
             prompt=args.prompt,
             grants=list(args.grant or []), approvals=list(args.approve or []),
             published_refs=list(args.published_ref or []),
+            recovery_source_feature=args.recovery_source_feature,
+            recovery_task=args.recovery_task,
+            operational_unblock_task=args.operational_unblock_task,
+            human_authorized_operational_unblock=args.human_authorized_operational_unblock,
+            uv_cache_dir=args.uv_cache_dir,
+            amend_task=args.amend_task,
+            amend_rationale=args.amend_rationale,
+            amend_approved_by=args.amend_approved_by,
+            amend_evidence=args.amend_evidence,
+            amend_contract=args.amend_contract,
             approve_plan=args.approve_plan,
             approve_final_diff=args.approve_final_diff,
             commit=args.commit,
@@ -93,6 +117,8 @@ class RunCommand:
             status=args.status,
             unattended=args.unattended,
             adapter=args.adapter,
+            model=args.model,
+            effort=args.effort,
             max_repair_attempts=args.max_repair_attempts,
             routine_output_byte_budget=args.routine_output_byte_budget,
             diagnostic_output_byte_budget=args.diagnostic_output_byte_budget,

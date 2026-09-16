@@ -63,8 +63,17 @@ from feature_pipeline.ports.worktree import (
     RepositoryBoundary,
     WorktreeInspection,
 )
+from feature_pipeline.contracts import TaskSpec
+from feature_pipeline.application.work_items import activate_work_item, register_work_items
+from pipeline_core.adapters import LaunchResult
+from pipeline_core.dispatch import DispatchRequest, dispatch_executor
+from pipeline_core.lifecycle import RunLifecycle
+from pipeline_core.prompt_envelope import EnvelopeAnchors
+from pipeline_core.state import ACTOR_RUNNER, Run
 from pipeline_core.worktree import _in_allowed_scope as _legacy_in_allowed_scope
 from pipeline_core.worktree import _scope_regex as _legacy_scope_regex
+from pipeline_core.worktree import AttributionResult, SnapshotFile, WorktreeSnapshot
+from pipeline_core.dispatch import _enforce_scope_boundary
 
 _RUN_ID = "20260904T120000Z-abcdef01"
 
@@ -594,6 +603,75 @@ class NoRevertTests(unittest.TestCase):
             (repo / "user_notes.txt").read_text(encoding="utf-8"),
             "user edit before the run\n",
         )
+
+
+class PrimaryWorktreeBoundaryTests(unittest.TestCase):
+    """TAM-01 AC-5: dispatch runs isolated and promotes only approved paths."""
+
+    def test_dispatch_promotes_only_allowed_changes_and_preserves_dirty_primary_bytes(self) -> None:
+        class IsolatedExecutor:
+            isolated_workspace = True
+
+            def launch(self, request):  # noqa: ANN001
+                if request.no_tools:
+                    return LaunchResult(0, json.dumps({
+                        "role": "executor", "status": "implemented",
+                        "task_id": request.task_id, "attempt": 1,
+                    }), session_id="executor-session")
+                workspace = Path(request.working_root)
+                (workspace / "allowed.py").write_text("promoted\n", encoding="utf-8")
+                (workspace / "user-notes.txt").write_text("executor overwrite\n", encoding="utf-8")
+                return LaunchResult(0, "- Status: implemented\n", session_id="executor-session")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _init_repo(root)
+            original = b"user change before executor\n"
+            (root / "user-notes.txt").write_bytes(original)
+            prompt = root / "prompt.md"
+            prompt.write_text("feature", encoding="utf-8")
+            run = Run.create("tam", prompt, None, root / "storage" / "tam", root)
+            spec = TaskSpec.build(
+                id="TAM-01", title="isolated promotion", path="docs/task.md", task_type="tooling",
+                executor="executor", allowed_scope=("allowed.py",),
+                verification_commands=(), max_repair_attempts=1,
+            )
+            life = RunLifecycle.initialize(run, tasks=[(spec.id, [])])
+            register_work_items(run, (spec,))
+            life.transition(spec.id, "running", actor=ACTOR_RUNNER)
+            request = DispatchRequest(
+                spec=spec, role_grant=("read", "write"),
+                anchors=EnvelopeAnchors(project_root=".", agents_root=".agents"),
+            )
+            with activate_work_item(run, spec.id):
+                outcome = dispatch_executor(life, request, IsolatedExecutor())
+
+            self.assertEqual(outcome.status, "implemented")
+            self.assertEqual((root / "allowed.py").read_text(encoding="utf-8"), "promoted\n")
+            self.assertEqual((root / "user-notes.txt").read_bytes(), original)
+            self.assertEqual(
+                {row["classification"] for row in outcome.attribution.changed_files},
+                {"in_allowed_scope", "out_of_scope"},
+            )
+
+    def test_runner_artifacts_are_structurally_excluded_from_attribution(self) -> None:
+        """A caller cannot accidentally attribute runner evidence as executor output."""
+        from pipeline_core.worktree import attribute_window, capture_snapshot
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _init_repo(root)
+            before = capture_snapshot(root)
+            (root / ".pipeline-artifacts" / "TAM-01").mkdir(parents=True)
+            (root / ".pipeline-artifacts" / "TAM-01" / "executor.md").write_text(
+                "runner evidence\n", encoding="utf-8"
+            )
+            (root / "allowed.py").write_text("executor change\n", encoding="utf-8")
+            after = capture_snapshot(root)
+
+            attribution = attribute_window(before, after, allowed_scope=("allowed.py",))
+
+            self.assertEqual([entry.path for entry in attribution.changed_files], ["allowed.py"])
 
 
 if __name__ == "__main__":  # pragma: no cover

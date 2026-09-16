@@ -65,7 +65,29 @@ class MigrationPreservesEveryRecordedFact(unittest.TestCase):
                 self.assertEqual(len(migrated["tasks"]), len(source["tasks"]))
                 for before, after in zip(source["tasks"], migrated["tasks"]):
                     for key, value in before.items():
+                        if key == "status":
+                            continue
                         self.assertEqual(after[key], value, f"{path.name}:{before['id']}.{key}")
+
+    def test_legacy_statuses_are_mapped_to_product_progress_with_history(self) -> None:
+        source = _read(_FIXTURES / "v2" / "run-state-basic.json")
+        migrated = migrate_v2_to_v3(source)
+        for before, after in zip(source["tasks"], migrated["tasks"]):
+            self.assertIn(after["status"], {"to_do", "in_progress", "done"})
+            self.assertEqual(after["operation_history"][-1]["legacy_status"], before["status"])
+
+    def test_verified_legacy_status_replaces_v2_null_resolution(self) -> None:
+        source = _read(_FIXTURES / "v2" / "run-state-basic.json")
+        verified = source["tasks"][0]
+        verified["status"] = "verified"
+        verified["resolution"] = None
+
+        state = load_state(source)
+
+        task = state.task(verified["id"])
+        self.assertEqual(task.status, "done")
+        self.assertEqual(task.resolution, "completed")
+        self.assertEqual(task.operation_history[-1]["legacy_status"], "verified")
 
     def test_run_level_facts_survive_migration(self) -> None:
         for path in _V2_FIXTURES:
@@ -150,6 +172,14 @@ class CorruptOrFutureStateFailsWithFieldLevelDiagnostics(unittest.TestCase):
             "invalid-status.json", FieldValueError, "invalid-field-value", "tasks[0].status",
         )
 
+    def test_done_status_requires_a_resolution(self) -> None:
+        payload = migrate_v2_to_v3(_read(_FIXTURES / "v2" / "run-state-basic.json"))
+        payload["tasks"][0]["status"] = "done"
+        payload["tasks"][0]["resolution"] = None
+        with self.assertRaises(FieldValueError) as caught:
+            RunStateV3.from_mapping(payload)
+        self.assertEqual(caught.exception.field, "tasks[0].resolution")
+
     def test_invalid_nested_evidence_is_not_coerced(self) -> None:
         self._expect(
             "invalid-nested-evidence.json", FieldTypeError, "invalid-field-type",
@@ -230,11 +260,23 @@ class VerifiedReuseFieldsRoundTrip(unittest.TestCase):
         task = payload["tasks"][0]
         task["task_path"] = "docs/plans/tasks/T-01.md"
         task["task_contract_digest"] = "sha256:contract"
+        task["task_contract_version"] = "rec09-v1"
         task["reused_verification"] = [{"dependency_id": "T-00", "source_run_id": "source",
                                          "source_run_digest": "sha256:source",
                                          "evidence_identity": "legacy-task-id", "task_verdict": "PASS",
                                          "test_verdict": "PASS", "verified_at": "then", "reused_at": "now"}]
         self.assertEqual(RunStateV3.from_mapping(payload).to_mapping(), payload)
+
+    def test_v2_projection_preserves_a_canonical_contract_identity(self) -> None:
+        payload = migrate_v2_to_v3(_read(_FIXTURES / "v2" / "run-state-basic.json"))
+        task = payload["tasks"][0]
+        task.update({
+            "task_path": "docs/plans/tasks/T-01.md",
+            "task_contract_digest": "sha256:contract",
+            "task_contract_version": "rec09-v1",
+        })
+        self.assertEqual(RunStateV3.from_mapping(payload).task("T-01").task_contract_version,
+                         "rec09-v1")
 
 
 class LoadingNeverWritesAndCommitIsTheOnlyWriter(unittest.TestCase):

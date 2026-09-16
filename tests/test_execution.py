@@ -50,30 +50,29 @@ class HappyPathTests(unittest.TestCase):
 
             self.assertTrue(result.ok)
             self.assertEqual(result.exit_code, 0)
-            self.assertEqual(result.status, "verified")
+            self.assertEqual(result.status, "done")
             self.assertEqual(result.attempts, 0)
             self.assertEqual(result.gates, 1)
             self.assertEqual(result.blocker, None)
             self.assertEqual(len(result.passes), 1)
             self.assertEqual(result.passes[0].task_verdict, "PASS")
-            self.assertEqual(life.run.task("VR-03").status, "verified")
+            self.assertEqual(life.run.task("VR-03").status, "done")
             self.assertEqual(executor.launches, 1)
 
-    def test_resumed_implemented_task_skips_straight_to_verification(self) -> None:
+    def test_resumed_in_progress_task_starts_a_fresh_operation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             life = _run(root)
             spec = _spec()
-            # First pass implements then fails verification once, so the executor evidence is
-            # already on the record; roll the record back to 'implemented' to model a resume
-            # that lost only the verification window.
+            # A failed verification is retained as operation history.  Resume starts a fresh
+            # executor operation rather than restoring a legacy intermediate task state.
             run_task(
                 life,
                 _execution(spec, ScriptedExecutor(("implemented", "implemented")),
                            StubVerifier(("FAIL", "PASS")), StubVerifier(("PASS", "PASS"))),
             )
             reloaded = Run.load(life.run.run_dir, root)
-            reloaded.task("VR-03").status = "implemented"
+            reloaded.task("VR-03").status = "in_progress"
             reloaded.save()
 
             executor = ScriptedExecutor(("implemented",))
@@ -81,14 +80,44 @@ class HappyPathTests(unittest.TestCase):
                 RunLifecycle(reloaded),
                 _execution(spec, executor, StubVerifier(("PASS",)), StubVerifier(("PASS",))),
             )
-            self.assertEqual(result.status, "verified")
-            self.assertEqual(executor.launches, 0)  # no executor dispatch on the resume
+            self.assertEqual(result.status, "done")
+            self.assertEqual(executor.launches, 1)
+
+    def test_resume_continues_interrupted_verification_without_reimplementing(self) -> None:
+        """A verifier wait is an operation boundary, not a reason to repeat implementation."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            life = _run(root)
+            spec = _spec()
+            first_executor = ScriptedExecutor(("implemented",))
+            first = run_task(
+                life,
+                _execution(spec, first_executor, StubVerifier(("BLOCKED",)),
+                           StubVerifier(("PASS",))),
+            )
+            self.assertEqual(first.status, "waiting")
+            self.assertEqual(first_executor.launches, 1)
+
+            resumed_executor = ScriptedExecutor(("implemented",))
+            reloaded = Run.load(life.run.run_dir, root)
+            resumed = run_task(
+                RunLifecycle(reloaded),
+                _execution(spec, resumed_executor, StubVerifier(("PASS",)),
+                           StubVerifier(("PASS",))),
+            )
+
+            self.assertEqual(resumed.status, "done")
+            self.assertEqual(resumed_executor.launches, 0)
+            self.assertTrue(any(
+                entry["outcome"] == "resumed"
+                for entry in reloaded.task("VR-03").operation_history
+            ))
 
     def test_an_illegal_entry_state_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             life = _run(root)
-            life.run.task("VR-03").status = "pending"
+            life.run.task("VR-03").status = "unknown"
             with self.assertRaises(ExecutionError) as ctx:
                 run_task(
                     life,
@@ -105,7 +134,7 @@ class TaskFileBlockerSectionTests(unittest.TestCase):
         "## Acceptance Criteria\n- [ ] AC-1 - The loop is bounded.\n"
     )
 
-    def test_limit_block_appends_a_blockers_section_without_touching_checkboxes(self) -> None:
+    def test_limit_escalation_preserves_task_state_without_touching_checkboxes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             task_rel = "docs/plans/tasks/VR-03_bounded-repair-loop.md"
@@ -120,12 +149,12 @@ class TaskFileBlockerSectionTests(unittest.TestCase):
                 _execution(spec, ScriptedExecutor(("implemented",)),
                            StubVerifier(("FAIL",)), StubVerifier(("PASS",))),
             )
-            self.assertEqual(result.status, "blocked")
+            self.assertEqual(result.status, "escalated")
+            self.assertEqual(life.run.task("VR-03").status, "in_progress")
+            self.assertEqual(life.run.task("VR-03").operation_history[-1]["outcome"], "escalated")
 
             text = task_file.read_text(encoding="utf-8")
-            self.assertIn("## Blockers", text)
-            self.assertIn(f"- [{life.run.run_id}]", text)
-            self.assertIn("maximum repair attempts", text)
+            self.assertNotIn("## Blockers", text)
             # the pre-existing sections are byte-for-byte intact.
             self.assertIn("## Status\n- [ ] To Do\n- [ ] In Progress\n- [ ] Done\n", text)
             self.assertIn("- [ ] AC-1 - The loop is bounded.", text)

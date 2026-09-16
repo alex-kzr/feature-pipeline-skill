@@ -250,6 +250,34 @@ def collect_evidence() -> AcceptanceEvidence:
             done.stderr.strip(),
         ))
 
+        # REC-01 / AC-5 — the packaged task-kind catalog loads from the wheel install and is
+        # byte-for-byte the committed revision (the same importlib.resources path an sdist
+        # consumer uses, with no source checkout on sys.path).
+        from feature_pipeline.domain.task_kinds import load_catalog as _load_local_catalog
+
+        expected_digest = _load_local_catalog().digest
+        catalog_probe = (
+            "import json; "
+            "from feature_pipeline.domain.task_kinds import load_catalog, available_versions; "
+            "c = load_catalog(); "
+            "print(json.dumps({'digest': c.digest, 'versions': list(available_versions()), "
+            "'records': len(c.task_kinds)}))"
+        )
+        done = _run([str(python), "-I", "-c", catalog_probe], cwd=elsewhere)
+        loaded = json.loads(done.stdout or "{}") if done.returncode == 0 else {}
+        catalog_ok = (
+            done.returncode == 0
+            and loaded.get("digest") == expected_digest
+            and loaded.get("versions") == ["v1"]
+            and loaded.get("records", 0) >= 24
+        )
+        ev.checks.append(Check(
+            "packaged_task_kind_catalog_loads",
+            catalog_ok,
+            done.stderr.strip() if done.returncode != 0
+            else f"digest {loaded.get('digest')!r} != {expected_digest!r}",
+        ))
+
         # AC-3 — root discovery: the installed runner still refuses to infer a layout.
         done = _run(
             [str(python), "-I", "-m", "pipeline_core.runner_cli", "--mode", "execute"],

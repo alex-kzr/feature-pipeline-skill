@@ -184,6 +184,12 @@ def build_status_envelope_prompt(
         "Reply with only the following JSON object and nothing else — no other text, no "
         "code fence, no explanation, no markdown:",
         shape,
+        '- If status is "blocked", add a non-empty "reason" string field describing why '
+        '(e.g. {"role": "'
+        + role
+        + '", "status": "blocked", "task_id": "'
+        + task_id
+        + f'", "attempt": {attempt}, "reason": "<why>"}}).',
         "",
     ]
     if observed_status is not None:
@@ -226,10 +232,15 @@ class StatusResolution:
     prose_token: str | None
     envelope_token: str
     drift: str | None  # set when the prose line was absent or malformed
+    #: A non-empty reason the executor supplied on the envelope for a 'blocked' token
+    #: (RLC-01 AC-2); ``None`` for 'implemented' or when no reason was supplied — never a
+    #: fabricated substitute.
+    reason: str | None = None
 
 
 def settle_executor_status(
-    *, prose_text: str, envelope_text: str, role: str, task_id: str, attempt: int
+    *, prose_text: str, envelope_text: str, role: str, task_id: str, attempt: int,
+    require_reason: bool = False,
 ) -> StatusResolution:
     """Reconcile the strict prose parser and the authoritative JSON envelope.
 
@@ -249,11 +260,13 @@ def settle_executor_status(
             role=role,
             task_id=task_id,
             attempt=attempt,
+            require_reason=require_reason,
         )
     except _ReportProtocolError as exc:
         raise _reraise(exc) from None
     return StatusResolution(
-        settled.token, settled.prose_token, settled.envelope_token, settled.drift
+        settled.token, settled.prose_token, settled.envelope_token, settled.drift,
+        settled.reason,
     )
 
 
@@ -315,15 +328,28 @@ class VerifierArtifacts:
 
 
 def verifier_artifacts(
-    run_dir: str | Path, task_id: str, attempt: int
+    run_dir: str | Path, task_id: str, attempt: int, *, revision: int | None = None,
 ) -> VerifierArtifacts:
-    """Resolve every artifact path for ``task_id``'s ``attempt``-th independent verification."""
+    """Resolve immutable artifacts for one independent verification pass.
+
+    An amended task may reuse its repair attempt while its governing contract revision
+    changes.  That revision receives a distinct directory so stale verifier reports cannot
+    be read as evidence for the new contract.
+    """
     if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
         raise ReportError(
             f"verification attempt must be a positive integer, got {attempt!r}",
             "invalid-verification-attempt",
         )
-    directory = Path(run_dir) / REPORTS_DIRNAME / str(task_id) / f"verify-{attempt}"
+    suffix = f"verify-{attempt}"
+    if revision is not None:
+        if not isinstance(revision, int) or isinstance(revision, bool) or revision < 1:
+            raise ReportError(
+                f"verification revision must be a positive integer, got {revision!r}",
+                "invalid-verification-revision",
+            )
+        suffix += f"-revision-{revision}"
+    directory = Path(run_dir) / REPORTS_DIRNAME / str(task_id) / suffix
     return VerifierArtifacts(
         task_id=str(task_id),
         attempt=attempt,
@@ -432,6 +458,12 @@ def settle_verifier_verdict(
 REPAIR_REPORT_STEM = "repair"
 
 _REPAIR_NAME_RE = re.compile(rf"^{REPAIR_REPORT_STEM}-([1-9][0-9]*)\.md$")
+#: An approved amendment revision resets a task's repair attempts, so its repair reports get a
+#: distinct, revision-qualified name — never a bare ``repair-N.md`` a later resume could
+#: confuse with a different revision's evidence at the same attempt number.
+_REPAIR_REVISION_NAME_RE = re.compile(
+    rf"^{REPAIR_REPORT_STEM}-([1-9][0-9]*)-revision-([1-9][0-9]*)\.md$"
+)
 
 
 @dataclass(frozen=True)
@@ -447,30 +479,56 @@ class RepairReport:
     regression_tests: tuple[str, ...]
 
 
-def repair_report_path(run_dir: str | Path, task_id: str, attempt: int) -> Path:
-    """Resolve the immutable path for ``task_id``'s ``attempt``-numbered repair report."""
+def repair_report_path(
+    run_dir: str | Path, task_id: str, attempt: int, *, revision: int | None = None,
+) -> Path:
+    """Resolve the immutable path for ``task_id``'s ``attempt``-numbered repair report.
+
+    An approved amendment revision resets the repair budget, so revision N's repair report
+    gets its own revision-qualified name (``repair-<attempt>-revision-<revision>.md``) rather
+    than the bare ``repair-<attempt>.md`` an earlier, unrelated revision may already own at the
+    same attempt number. ``revision=None`` (or ``0``) is the unamended contract and resolves the
+    original, unqualified name unchanged (read compatibility).
+    """
     if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
         raise ReportError(
             f"repair attempt must be a positive integer, got {attempt!r}",
             "invalid-repair-attempt",
         )
-    return (
-        Path(run_dir) / REPORTS_DIRNAME / str(task_id) / f"{REPAIR_REPORT_STEM}-{attempt}.md"
-    )
+    name = f"{REPAIR_REPORT_STEM}-{attempt}.md"
+    if revision:
+        if not isinstance(revision, int) or isinstance(revision, bool) or revision < 1:
+            raise ReportError(
+                f"repair revision must be a positive integer, got {revision!r}",
+                "invalid-repair-revision",
+            )
+        name = f"{REPAIR_REPORT_STEM}-{attempt}-revision-{revision}.md"
+    return Path(run_dir) / REPORTS_DIRNAME / str(task_id) / name
 
 
-def newest_repair_report(run_dir: str | Path, task_id: str) -> Path | None:
-    """The highest-numbered persisted repair report for ``task_id``, or ``None``.
+def newest_repair_report(
+    run_dir: str | Path, task_id: str, *, revision: int | None = None,
+) -> Path | None:
+    """The highest-numbered persisted repair report for ``task_id``'s active ``revision``, or
+    ``None``.
 
     A resume that lands back on ``verification_failed`` uses this to continue the exact repair
-    round already opened rather than deriving a fresh one and double-counting the attempt.
+    round already opened rather than deriving a fresh one and double-counting the attempt. Only
+    the reports belonging to the caller's exact revision identity are ever considered, so a
+    resumed same-revision repair can never pick up a different revision's report by number
+    alone.
     """
     base = Path(run_dir) / REPORTS_DIRNAME / str(task_id)
     if not base.is_dir():
         return None
+    pattern = _REPAIR_NAME_RE if not revision else _REPAIR_REVISION_NAME_RE
+    glob_pattern = (
+        f"{REPAIR_REPORT_STEM}-*.md" if not revision
+        else f"{REPAIR_REPORT_STEM}-*-revision-{revision}.md"
+    )
     best: tuple[int, Path] | None = None
-    for candidate in base.glob(f"{REPAIR_REPORT_STEM}-*.md"):
-        match = _REPAIR_NAME_RE.match(candidate.name)
+    for candidate in base.glob(glob_pattern):
+        match = pattern.match(candidate.name)
         if match and candidate.is_file():
             number = int(match.group(1))
             if best is None or number > best[0]:
@@ -514,6 +572,7 @@ def write_repair_report(
     task_verifier_text: str,
     test_verifier_text: str,
     source_attempt: int | None = None,
+    revision: int | None = None,
     product_defects: Sequence[str] = (),
     environment_problems: Sequence[str] = (),
     regression_tests: Sequence[str] = (),
@@ -525,15 +584,22 @@ def write_repair_report(
     tests the repair must rerun. Deduplication of the *finding lines* is done here;
     interpretation (which finding is which kind) is the caller's, passed in explicitly. The
     two source reports are also embedded verbatim so nothing is lost.
+
+    ``revision`` is the task's active amendment revision (``None``/``0`` for the unamended
+    contract). It is threaded into the persisted path, the cited ``verify-*`` evidence
+    directory, and an explicit ``Revision:`` line so a repair report can never be read as, or
+    confused with, a different revision's evidence.
     """
     if source_attempt is None:
         source_attempt = max(attempt - 1, 1)
-    path = repair_report_path(run.run_dir, spec.id, attempt)
+    path = repair_report_path(run.run_dir, spec.id, attempt, revision=revision)
     findings = consolidate_findings(task_verifier_text, test_verifier_text)
     maximum = getattr(spec, "max_repair_attempts", "?")
     scope = ", ".join(getattr(spec, "allowed_scope", ()) or ()) or "none"
     out_of_scope = ", ".join(getattr(spec, "out_of_scope", ()) or ()) or "none"
     verify_dir = f"{REPORTS_DIRNAME}/{spec.id}/verify-{source_attempt}"
+    if revision:
+        verify_dir += f"-revision-{revision}"
 
     lines: list[str] = [
         f"# Repair Report — {spec.id} — attempt {attempt} of {maximum}",
@@ -542,6 +608,7 @@ def write_repair_report(
         f"- Consolidated from: {verify_dir}/task-verifier-{source_attempt}.md, "
         f"{verify_dir}/test-verifier-{source_attempt}.md",
         f"- Attempt: {attempt} of {maximum}",
+        f"- Revision: {revision or 0}",
         f"- Source verification gate: {source_attempt}",
         f"- Original scope (unchanged): {scope}",
         f"- Out of scope (unchanged): {out_of_scope}",
@@ -569,8 +636,9 @@ def write_repair_report(
         "",
         f"- Write only inside: {scope}",
         f"- Never touch: {out_of_scope}",
-        "- Do not widen scope to satisfy a finding; an out-of-scope need is a blocker or a "
-        "discovery, never a change in this task.",
+        "- Treat the declared scope as the original estimate. If functionality needs another "
+        "safe path, preserve its attribution and provide a rationale and amended acceptance "
+        "criteria for independent review; never use an amendment to authorize a safety boundary.",
         "",
         "## Task-verifier report (verbatim)",
         "",

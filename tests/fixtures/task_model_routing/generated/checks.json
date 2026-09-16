@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "checks": [
+    {"name": "rust-tests", "stack": "rust", "argv": ["cargo", "test"], "cwd": "packages/rust"},
+    {"name": "repo-check", "stack": "repo", "argv": ["git", "diff", "--check"], "cwd": "."},
+    {"name": "python-tests", "stack": "python", "argv": ["uv", "run", "python", "-m", "unittest"], "cwd": "packages/python"}
+  ]
+}

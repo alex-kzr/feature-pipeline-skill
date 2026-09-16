@@ -21,6 +21,7 @@ Standard library only.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -59,6 +60,8 @@ from feature_pipeline.application.render_plan import render_dry_run
 from feature_pipeline.application.verified_reuse import (
     EvidenceEligibilityError,
     VerifiedEvidenceStore,
+    resolve_default_reuse,
+    supersession_graph,
 )
 from feature_pipeline.application.results import Outcome, PipelineResult
 from feature_pipeline.application.selection import (
@@ -70,9 +73,18 @@ from feature_pipeline.domain.errors import DomainError
 from feature_pipeline.domain.graph import TaskGraph
 from feature_pipeline.contracts import SchemaError, validate_preconditions, validate_relative_path
 
+from feature_pipeline.bootstrap import (
+    AmendmentError,
+    AmendmentRequest,
+    build_amendment_revision,
+    canonical_amendment_fields,
+    contract_digest,
+)
+
 from .commands import RunCommand
 from .errors import CliError
 from .parser import (
+    AMEND_MODE,
     EXIT_BLOCKED,
     EXIT_ERROR,
     EXIT_GATE_PENDING,
@@ -261,8 +273,115 @@ def _preview_exit_code(
     return EXIT_GATE_PENDING
 
 
+def _substitute_superseded(
+    scope: Sequence[str], selected: Sequence[str], order: Sequence[str], graph,
+) -> tuple[str, ...]:
+    """Replace each non-selected scope task a later task supersedes with that replacement.
+
+    Used by the ``--verify-dependency-chain`` preview so a retired blocked predecessor is
+    never in the planned dispatch set; its live replacement (which *can* be verified) stands
+    in. Order follows the plan; the result is de-duplicated.
+    """
+    selected_set = set(selected)
+    resolved: set[str] = set()
+    for task_id in scope:
+        if task_id in selected_set:
+            resolved.add(task_id)
+            continue
+        node = task_id
+        seen: set[str] = set()
+        while True:
+            nxt = graph.replacement_for(node)
+            if nxt is None or nxt in seen:
+                break
+            seen.add(nxt)
+            node = nxt
+        resolved.add(node)
+    return tuple(task_id for task_id in order if task_id in resolved)
+
+
+def run_amend(command: RunCommand) -> PipelineResult:
+    """Persist one explicit, human-approved amendment revision (TAM-01).
+
+    Deliberately independent of profile/plan resolution and task selection: an amendment is
+    a control-plane act on the already-persisted run, not a dispatch. It requires only the
+    project root (the run's repository root) and the run's feature name to locate
+    ``run.json`` at the runner's standard storage layout, plus the explicit amendment inputs
+    below. Fails closed — via :class:`~pipeline_core.plan.AmendmentError` — for a missing
+    rationale or approval, a completed task, a task-id change, or an amendment that touches
+    a forbidden control-plane path; nothing is persisted on any rejection.
+    """
+    project_root = Path(_require(command.project_root, "--project-root"))
+    feature = _require(command.feature, "--feature")
+    task_id = _require(command.amend_task, "--amend-task")
+    rationale = _require(command.amend_rationale, "--amend-rationale")
+    approved_by = _require(command.amend_approved_by, "--amend-approved-by")
+    evidence = _require(command.amend_evidence, "--amend-evidence")
+    contract_rel = _require(command.amend_contract, "--amend-contract")
+    contract_path = project_root / contract_rel
+    try:
+        payload = json.loads(contract_path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise CliError(EXIT_ERROR, f"--amend-contract could not be read: {exc}") from None
+    except json.JSONDecodeError as exc:
+        raise CliError(EXIT_ERROR, f"--amend-contract is not valid JSON: {exc}") from None
+    if not isinstance(payload, dict) or not isinstance(payload.get("new_contract"), dict):
+        raise CliError(EXIT_ERROR, "--amend-contract must declare a 'new_contract' object")
+    new_contract = payload["new_contract"]
+    prior_contract = payload.get("prior_contract")
+    if not isinstance(prior_contract, dict):
+        prior_contract = {}
+    added_paths = payload.get("added_paths", [])
+    if not isinstance(added_paths, list):
+        raise CliError(EXIT_ERROR, "--amend-contract 'added_paths' must be a list")
+
+    lease_dir = project_root / ".pipeline" / "runs" / feature
+    try:
+        run = Run.load(lease_dir, project_root)
+    except StateError as exc:
+        raise CliError(EXIT_ERROR, f"amendment target run could not be loaded: {exc}") from None
+    try:
+        record = run.task(task_id)
+    except StateError as exc:
+        raise CliError(EXIT_ERROR, str(exc)) from None
+
+    request = AmendmentRequest(
+        task_id=task_id, task_status=record.status, prior_contract=prior_contract,
+        new_contract=new_contract, rationale=rationale, approved_by=approved_by,
+        source_evidence=evidence, added_paths=tuple(str(item) for item in added_paths),
+    )
+    try:
+        revision = build_amendment_revision(
+            request, next_revision=record.current_revision + 1,
+            next_epoch=record.current_revision + 1,
+        )
+        new_digest = contract_digest(canonical_amendment_fields(new_contract))
+        run.apply_amendment(
+            revision, new_digest=new_digest, new_digest_version="tam01-amendment-v1")
+        # An amendment creates a new execution epoch.  Keep the strict-resume
+        # fingerprint aligned with amendment-governed repair policy, otherwise
+        # a legitimate bound change is rejected before that epoch can dispatch.
+        if "max_repair_attempts" in new_contract:
+            repair_bound = int(new_contract["max_repair_attempts"])
+            fingerprint = dict(run.controls.get("plan_fingerprint", {}).get("value") or {})
+            prefix = f"task.{task_id}"
+            fingerprint[f"{prefix}.repair_bound"] = repr(repair_bound)
+            fingerprint[f"{prefix}.control.max_repair_attempts"] = f"{repair_bound} (default)"
+            run.set_control("plan_fingerprint", fingerprint, sourced="amendment")
+    except AmendmentError as exc:
+        raise CliError(EXIT_BLOCKED, f"amendment rejected ({exc.code}): {exc}") from None
+    run.save()
+    return _result(
+        f"amendment applied: {task_id} revision {revision.revision} approved by "
+        f"{approved_by}; changed fields: {', '.join(revision.changed_fields) or 'none'}\n",
+        EXIT_OK,
+    )
+
+
 def run_command(command: RunCommand) -> PipelineResult:
     """Resolve anchors and profile, then dispatch to status, dry-run, or execute."""
+    if command.mode == AMEND_MODE:
+        return run_amend(command)
     project_root = Path(_require(command.project_root, "--project-root"))
     agents_root = Path(_require(command.agents_root, "--agents-root"))
     core_root = Path(_require(command.core_root, "--core-root"))
@@ -273,6 +392,16 @@ def run_command(command: RunCommand) -> PipelineResult:
     post_task = command.mode == POST_TASK_MODE
     if post_task:
         command.dry_run = True
+
+    if (command.recovery_source_feature or command.recovery_task) and (
+        command.mode != "execute" or command.dry_run
+    ):
+        raise CliError(EXIT_ERROR, "recovery selectors are valid only for --mode execute")
+    if (command.operational_unblock_task or command.human_authorized_operational_unblock
+            or command.uv_cache_dir) and (command.mode != "execute" or command.dry_run):
+        raise CliError(EXIT_ERROR, "operational unblock controls are valid only for --mode execute")
+    if (command.model is not None or command.effort is not None) and command.mode != "execute":
+        raise CliError(EXIT_ERROR, "--model and --effort are valid only for --mode execute")
 
     profile_rel = _logical_relative(_require(command.profile, "--profile"), "--profile")
     profile_path = _resolve_under(project_root, profile_rel, "--profile")
@@ -292,7 +421,12 @@ def run_command(command: RunCommand) -> PipelineResult:
     prompt_rel = _logical_relative(command.prompt, "--prompt") if command.prompt else plan_rel
     _resolve_under(project_dir, prompt_rel, "--prompt")
 
-    if command.mode == "execute" and not command.dry_run:
+    # ``--status`` is a read-only inspector even when the caller also supplies
+    # ``--mode execute`` and delivery-gate flags: it must never reach ``run_execute`` (which
+    # evaluates the plan gate, initializes/reconciles a run, and can dispatch an executor).
+    # Execute-mode controls, adapter/model/effort, and approval flags stay inert compatibility
+    # inputs for a status query; only the shared, read-only preview resolution below runs.
+    if command.mode == "execute" and not command.dry_run and not command.status:
         return run_execute(command, anchors, agents_root, project_dir, profile, plan_path,
                             prompt_rel)
 
@@ -348,6 +482,9 @@ def run_command(command: RunCommand) -> PipelineResult:
                 profile=compiled_profile,
                 overrides=ControlOverrides(
                     max_repair_attempts=command.max_repair_attempts,
+                    adapter=command.adapter,
+                    model=command.model,
+                    effort=command.effort,
                     verify_dependency_chain=(
                         True if command.verify_dependency_chain else None
                     ),
@@ -393,19 +530,33 @@ def run_command(command: RunCommand) -> PipelineResult:
                 dict(item.split("=", 1) for item in (command.attest_dependency or ()))
             )
             store = VerifiedEvidenceStore(lease_dir.parent, project_dir)
-            for task_id in compiled_plan.execution_scope:
-                if task_id in compiled_plan.selection or task_id in attested_ids:
-                    continue
-                try:
-                    evidence = store.find(definitions[task_id])
-                except EvidenceEligibilityError:
-                    continue
+            try:
+                reused = resolve_default_reuse(
+                    store, definitions, compiled_plan.execution_scope, compiled_plan.selection,
+                    project_dir, tuple(attested_ids),
+                )
+            except EvidenceEligibilityError as exc:
+                raise CliError(EXIT_ERROR, f"{exc.code}: {exc}") from None
+            for task_id, evidence in reused.items():
                 attested_ids.add(task_id)
                 reused_sources[task_id] = evidence["source_run_id"]
             execution_scope = prune_reused_ancestors(
                 execution_scope, compiled_plan.selection, reused_sources,
                 {task_id: definition.depends_on for task_id, definition in definitions.items()},
             )
+            execution_scope = tuple(
+                task_id for task_id in execution_scope
+                if task_id in compiled_plan.selection or "replacement_id" not in reused.get(task_id, {})
+            )
+        elif compiled_plan is not None and command.verify_dependency_chain:
+            # `--verify-dependency-chain` re-verifies the chain rather than trusting reuse,
+            # but a retired blocked predecessor cannot be re-run: substitute the live task
+            # that supersedes it so the preview never plans to dispatch the blocked one.
+            superseders = supersession_graph(definitions, project_dir)
+            if superseders is not None:
+                execution_scope = _substitute_superseded(
+                    execution_scope, compiled_plan.selection, compiled_plan.order, superseders
+                )
 
     dep_blocked: dict[str, list[str]] = {}
     if command.task is not None:
@@ -482,7 +633,9 @@ def run_command(command: RunCommand) -> PipelineResult:
                 post_task=post_task,
                 post_task_lines=post_task_lines,
                 post_task_transition_line=post_task_transition_line,
-                verify_dependency_chain=command.verify_dependency_chain,
+                # Preview renders the documented resolved value; ``None`` only carries the
+                # omitted-switch provenance into execute/resume.
+                verify_dependency_chain=bool(command.verify_dependency_chain),
                 execution_scope=(
                     execution_scope
                 ),
@@ -555,5 +708,6 @@ __all__ = [
     "dispatch",
     "run_command",
     "run_execute",
+    "run_amend",
     "make_execute_adapters",
 ]

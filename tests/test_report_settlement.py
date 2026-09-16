@@ -183,6 +183,81 @@ class MalformedAndStaleParity(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------------------------
+# RLC-01 AC-2 — a non-empty executor blocked reason is preserved through settlement, and
+# malformed/contradictory reason data fails closed rather than being silently dropped.
+# --------------------------------------------------------------------------------------------
+class BlockedReasonSettlement(unittest.TestCase):
+    def test_blocked_envelope_reason_is_preserved_on_the_settlement(self) -> None:
+        resolution = reports.settle_executor_status(
+            prose_text="- Status: blocked",
+            envelope_text=_envelope(
+                "status", "blocked", reason="required service is unavailable"),
+            role="executor", task_id="VP-02", attempt=1,
+        )
+        self.assertEqual(resolution.token, "blocked")
+        self.assertEqual(resolution.reason, "required service is unavailable")
+
+    def test_implemented_envelope_carries_no_reason(self) -> None:
+        resolution = reports.settle_executor_status(
+            prose_text="- Status: implemented",
+            envelope_text=_envelope("status", "implemented"),
+            role="executor", task_id="VP-02", attempt=1,
+        )
+        self.assertIsNone(resolution.reason)
+
+    def test_blocked_envelope_with_empty_reason_fails_closed(self) -> None:
+        with self.assertRaises(reports.ReportError) as ctx:
+            reports.settle_executor_status(
+                prose_text="- Status: blocked",
+                envelope_text=_envelope("status", "blocked", reason="   "),
+                role="executor", task_id="VP-02", attempt=1,
+            )
+        self.assertEqual(ctx.exception.code, "unparseable-status-envelope")
+
+    def test_blocked_envelope_with_no_reason_fails_closed(self) -> None:
+        with self.assertRaises(reports.ReportError) as ctx:
+            reports.settle_executor_status(
+                prose_text="- Status: blocked",
+                envelope_text=_envelope("status", "blocked"),
+                role="executor", task_id="VP-02", attempt=1, require_reason=True,
+            )
+        self.assertEqual(ctx.exception.code, "unparseable-status-envelope")
+
+    def test_legacy_blocked_envelope_without_reason_remains_compatible(self) -> None:
+        resolution = reports.settle_executor_status(
+            prose_text="- Status: blocked",
+            envelope_text=_envelope("status", "blocked"),
+            role="executor", task_id="VP-02", attempt=1,
+        )
+        self.assertEqual(resolution.token, "blocked")
+        self.assertIsNone(resolution.reason)
+
+    def test_blocked_envelope_with_non_string_reason_fails_closed(self) -> None:
+        with self.assertRaises(reports.ReportError) as ctx:
+            reports.settle_executor_status(
+                prose_text="- Status: blocked",
+                envelope_text=_envelope("status", "blocked", reason=123),
+                role="executor", task_id="VP-02", attempt=1,
+            )
+        self.assertEqual(ctx.exception.code, "unparseable-status-envelope")
+
+    def test_implemented_envelope_with_a_reason_key_is_contradictory_and_fails_closed(
+        self,
+    ) -> None:
+        with self.assertRaises(reports.ReportError) as ctx:
+            reports.settle_executor_status(
+                prose_text="- Status: implemented",
+                envelope_text=_envelope(
+                    "status", "implemented", reason="not applicable"),
+                role="executor", task_id="VP-02", attempt=1,
+            )
+        self.assertEqual(ctx.exception.code, "unparseable-status-envelope")
+
+    def test_verdict_envelope_never_carries_a_reason(self) -> None:
+        self.assertIsNone(settlement.VERDICT_CONTRACT.reason_field)
+
+
+# --------------------------------------------------------------------------------------------
 # Typed findings, outcomes, and the standardized disposition vocabulary
 # --------------------------------------------------------------------------------------------
 class TypedFindingsAndDispositions(unittest.TestCase):

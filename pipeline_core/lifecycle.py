@@ -29,14 +29,17 @@ Standard library only.
 
 from __future__ import annotations
 
+import hashlib
 import sys
 from typing import Any, Iterable, Mapping, Sequence
 
 from .state import (
+    ACTOR_HUMAN,
     ACTOR_RUNNER,
     RESUME_ROLLBACKS,
     ResumeError,
     Run,
+    StateError,
 )
 
 #: Portable feature-pipeline core engine version. Recorded in the run's environment so a
@@ -44,7 +47,12 @@ from .state import (
 #: secret detail.
 CORE_VERSION = "0.1.0"
 
-_BLOCKED_BY_PREFIX = "blocked_by: "
+#: Persisted states a task may hold while being *absent* from a compatible resume's selection
+#: scope without that absence being a task-set mismatch. A ``blocked`` predecessor whose work a
+#: later task supersedes, and an already-``verified`` upstream task kept for history, are both
+#: legitimately out of a narrower resume scope (REC-01: ``TC-01 -> TC-02 -> TC-03 -> REC-01``
+#: leaves the blocked ``TC-04`` out of scope). Any other state means live work would be dropped.
+_RESUME_ABSENT_OK_STATES = frozenset({"done"})
 
 
 def _environment(*, adapter_requested: str | None, adapter_resolved: str | None) -> dict[str, Any]:
@@ -131,9 +139,10 @@ class RunLifecycle:
 
     # -- durable mutations (each flushes once) ------------------------------------------
 
-    def transition(self, task_id: str, status: str, *, actor: str, note: str | None = None) -> None:
+    def transition(self, task_id: str, status: str, *, actor: str, note: str | None = None,
+                   resolution: str | None = None) -> None:
         """Transition a task and flush. ``transition_task`` records the history event."""
-        self.run.transition_task(task_id, status, actor=actor, note=note)
+        self.run.transition_task(task_id, status, actor=actor, note=note, resolution=resolution)
         self.run.save()
 
     def record_command(
@@ -164,23 +173,76 @@ class RunLifecycle:
         return generation
 
     def block(self, task_id: str, reason: str, *, actor: str = ACTOR_RUNNER) -> None:
-        """Block a task, record the blocker, suppress its dependents, and flush once."""
+        """Record an operational wait without turning a task into a terminal state."""
         record = self.run.task(task_id)
-        if record.status != "blocked":
-            self.run.transition_task(task_id, "blocked", actor=actor, note=reason)
-        previous = record.blocker
-        record.blocker = reason
+        if record.status == "to_do":
+            self.run.transition_task(task_id, "in_progress", actor=actor, note="operation started")
+        self.run.record_operation(task_id, "wait", "blocked", reason)
+        self.run.save()
+
+    def record_operation(self, task_id: str, kind: str, outcome: str,
+                         detail: str | None = None, **facts: Any) -> dict[str, Any]:
+        entry = self.run.record_operation(task_id, kind, outcome, detail, **facts)
+        self.run.save()
+        return entry
+
+    def reuse_completed_task(self, task_id: str, evidence: Mapping[str, Any]) -> None:
+        """Fast-forward a fresh task from independently completed source evidence.
+
+        Reuse is not an executor or verifier operation in this run, so it must never open an
+        ``in_progress`` window merely to satisfy the ordinary implementation transition.
+        """
+        record = self.run.task(task_id)
+        if record.status != "to_do":
+            raise StateError(
+                f"cannot reuse completion for {task_id} from {record.status}",
+                "reuse-not-fresh-task",
+            )
+        record.status = "done"
+        record.resolution = "completed"
+        record.resolution_reason = "independently completed reusable evidence"
+        record.verification = {
+            "task_verdict": evidence["task_verdict"],
+            "test_verdict": evidence["test_verdict"],
+            "verified_at": evidence["verified_at"],
+        }
+        self.run.record_operation(
+            task_id, "verified-reuse", "succeeded",
+            "independently completed reusable evidence",
+            source_run_id=evidence["source_run_id"],
+        )
+        self.run.record_reused_verification(task_id, evidence)
         self.run.record_event(
-            f"blocker:{task_id}", frm=previous, to=reason, actor=actor, note="blocker set")
-        self._suppress_dependents()
+            f"task:{task_id}", frm="to_do", to="done", actor=ACTOR_RUNNER,
+            note="independently completed reusable evidence",
+        )
+        self.run.save()
+
+    def reopen_operational_block(
+        self, task_id: str, *, authorization: str, cache_path: str,
+        source_run_bytes: bytes | None = None,
+    ) -> None:
+        """Append a snapshot of a terminal operational block, then reopen just that task.
+
+        Validation of the authorization, blocker class, cache path, identity and leases belongs
+        to the execute runner.  This durable mutation boundary only accepts its exact approved
+        authorization token and refuses to overwrite the terminal record it is recovering.
+        """
+        record = self.run.task(task_id)
+        if record.status == "done":
+            raise ResumeError("a completed task cannot be reopened operationally",
+                              "operational-reopen-completed")
+        self.run.record_operation(
+            task_id, "resume", "retryable", "operator requested another operation",
+            authorization=authorization, cache_path=cache_path,
+        )
         self.run.save()
 
     # -- readiness ----------------------------------------------------------------------
 
     def eligible_tasks(self) -> list[str]:
         """Task ids ready to dispatch: status ``ready`` and carrying no blocker."""
-        return [task.id for task in self.run.tasks.values()
-                if task.status == "ready" and not task.blocker]
+        return [task.id for task in self.run.tasks.values() if task.status == "to_do"]
 
     def recompute_readiness(self) -> None:
         """Rederive readiness/suppression from the persisted graph and flush."""
@@ -190,12 +252,33 @@ class RunLifecycle:
     # -- internals --------------------------------------------------------------------
 
     def _check_task_set(self, expected: Mapping[str, Sequence[str]]) -> None:
+        """Reject an incompatible task-set change while tolerating a narrower resume scope.
+
+        ``expected`` is the resume's selection closure (``task_id -> depends_on``). A task in
+        ``expected`` that the run never recorded is always a mismatch. A *persisted* task that
+        ``expected`` omits is a mismatch only when it still holds live work — a ``blocked``
+        predecessor a later task supersedes, or an already-``verified`` upstream task, is
+        legitimately outside a narrower scope and must not synthesise a mismatch. Dependency
+        edges are compared within the resumed scope only, mirroring how
+        :meth:`initialize` persists ``[dep for dep in depends_on if dep in scope]``.
+        """
         persisted = {tid: list(rec.depends_on) for tid, rec in self.run.tasks.items()}
-        if set(expected) != set(persisted):
+        unknown = set(expected) - set(persisted)
+        if unknown:
             raise ResumeError(
-                "resume task set does not match the persisted run", "task-set-mismatch")
+                f"resume introduces task(s) the run never recorded: {', '.join(sorted(unknown))}",
+                "task-set-mismatch")
+        for tid in set(persisted) - set(expected):
+            if self.run.tasks[tid].status not in _RESUME_ABSENT_OK_STATES:
+                raise ResumeError(
+                    f"resume scope drops {tid}, which still holds live work "
+                    f"({self.run.tasks[tid].status})",
+                    "task-set-mismatch")
+        scope = set(expected)
         for tid, depends_on in expected.items():
-            if list(depends_on) != persisted[tid]:
+            recorded_edges = [dep for dep in persisted[tid] if dep in scope]
+            resumed_edges = [dep for dep in depends_on if dep in scope]
+            if resumed_edges != recorded_edges:
                 raise ResumeError(
                     f"dependency edges for {tid} changed since the run was recorded",
                     "task-set-mismatch")
@@ -213,87 +296,17 @@ class RunLifecycle:
     def _blocking_root(self, task: Any) -> str | None:
         """The id of the blocked task holding ``task`` up, following ``blocked_by`` markers
         back to their root so every dependent points at the actually-blocked task."""
-        for dep_id in task.depends_on:
-            dep = self.run.task(dep_id)
-            if dep.status == "blocked":
-                return dep.id
-            marker = dep.blocker or ""
-            if marker.startswith(_BLOCKED_BY_PREFIX):
-                return marker[len(_BLOCKED_BY_PREFIX):]
         return None
 
     def _rederive_readiness(self) -> None:
-        # A blocked_by marker set on one task can suppress a further dependent, so iterate to
-        # a fixed point (bounded by the task count).
-        for _ in range(len(self.run.tasks) + 1):
-            if not self._readiness_pass():
-                break
+        # Dependencies only influence automatic scheduling. They never write a blocker.
+        return None
 
     def _readiness_pass(self) -> bool:
-        changed = False
-        for task in self.run.tasks.values():
-            if task.status not in {"pending", "ready"}:
-                continue
-            deps = [self.run.task(dep) for dep in task.depends_on]
-            blocking = self._blocking_root(task)
-            if blocking is not None:
-                marker = f"{_BLOCKED_BY_PREFIX}{blocking}"
-                if task.blocker != marker:
-                    self.run.record_event(
-                        f"blocker:{task.id}", frm=task.blocker, to=marker, actor=ACTOR_RUNNER,
-                        note="dependent-suppressed")
-                    task.blocker = marker
-                    changed = True
-                if task.status == "ready":
-                    self.run.record_event(
-                        f"task:{task.id}", frm="ready", to="pending", actor=ACTOR_RUNNER,
-                        note="readiness-rederived")
-                    task.status = "pending"
-                    changed = True
-                continue
-            if (task.blocker or "").startswith(_BLOCKED_BY_PREFIX):
-                self.run.record_event(
-                    f"blocker:{task.id}", frm=task.blocker, to=None, actor=ACTOR_RUNNER,
-                    note="dependent-unsuppressed")
-                task.blocker = None
-                changed = True
-            # A dependency the task itself has attested (--attest-dependency) counts as
-            # satisfied without ever being dispatched here; an unattested sibling dependency
-            # still needs a real 'verified' status — attestation never widens beyond its own
-            # named dep_id.
-            attested = {entry.get("dep_id") for entry in task.attested_dependencies}
-            deps_verified = all(
-                dep.status == "verified" or dep.id in attested for dep in deps)
-            if task.status == "pending" and deps_verified:
-                self.run.transition_task(
-                    task.id, "ready", actor=ACTOR_RUNNER, note="readiness-rederived")
-                changed = True
-            elif task.status == "ready" and not deps_verified:
-                self.run.record_event(
-                    f"task:{task.id}", frm="ready", to="pending", actor=ACTOR_RUNNER,
-                    note="readiness-rederived")
-                task.status = "pending"
-                changed = True
-        return changed
+        return False
 
     def _suppress_dependents(self) -> None:
-        for _ in range(len(self.run.tasks) + 1):
-            if not self._suppress_pass():
-                break
+        return None
 
     def _suppress_pass(self) -> bool:
-        changed = False
-        for task in self.run.tasks.values():
-            if task.status not in {"pending", "ready"}:
-                continue
-            blocking = self._blocking_root(task)
-            if blocking is None:
-                continue
-            marker = f"{_BLOCKED_BY_PREFIX}{blocking}"
-            if task.blocker != marker:
-                self.run.record_event(
-                    f"blocker:{task.id}", frm=task.blocker, to=marker, actor=ACTOR_RUNNER,
-                    note="dependent-suppressed")
-                task.blocker = marker
-                changed = True
-        return changed
+        return False

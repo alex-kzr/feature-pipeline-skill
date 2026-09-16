@@ -100,6 +100,12 @@ class IsolatedInstall(unittest.TestCase):
         check = self._check("root_discovery_fail_closed")
         self.assertTrue(check.ok, check.detail)
 
+    def test_packaged_task_kind_catalog_loads_from_the_install(self) -> None:
+        # REC-01 / AC-5 — the versioned catalog resource ships in the wheel and the isolated
+        # interpreter loads the exact committed revision.
+        check = self._check("packaged_task_kind_catalog_loads")
+        self.assertTrue(check.ok, check.detail)
+
 
 class InstalledPackageDiscovery(unittest.TestCase):
     """AC-3 — test discovery passes against the wheel-only install."""

@@ -13,6 +13,7 @@ never updated automatically during a later refactor.
 
 from __future__ import annotations
 
+import os
 import re
 import socket
 import unittest
@@ -67,6 +68,13 @@ class GoldenComparisonTests(unittest.TestCase):
 class DeterminismTests(unittest.TestCase):
     def test_regeneration_is_byte_identical_across_two_runs(self) -> None:
         self.assertEqual(harness.regenerate(), harness.regenerate())
+
+    def test_cli_help_is_independent_of_terminal_width(self) -> None:
+        with patch.dict(os.environ, {"COLUMNS": "40"}):
+            narrow = harness.regenerate()["cli-help.txt"]
+        with patch.dict(os.environ, {"COLUMNS": "120"}):
+            wide = harness.regenerate()["cli-help.txt"]
+        self.assertEqual(narrow, wide)
 
 
 class RedactionTests(unittest.TestCase):
@@ -162,7 +170,7 @@ class EnvelopeContractTests(unittest.TestCase):
         state = json.loads(harness.load_golden("run-state-v2.json"))
         self.assertEqual(state["schema_version"], SCHEMA_VERSION)
         statuses = {task["status"] for task in state["tasks"]}
-        self.assertEqual(statuses, {"pending", "implemented", "verified", "blocked"})
+        self.assertEqual(statuses, {"to_do", "in_progress", "done"})
 
 
 class NormalizationDocTests(unittest.TestCase):

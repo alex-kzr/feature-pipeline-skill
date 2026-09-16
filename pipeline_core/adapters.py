@@ -54,12 +54,14 @@ Standard library only.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, Protocol, Sequence
+from typing import Callable, Mapping, Protocol, Sequence
 
 from feature_pipeline.infrastructure.adapters.claude_launcher import ClaudeLauncher
 from feature_pipeline.infrastructure.adapters.codex_launcher import CodexLauncher
@@ -124,6 +126,15 @@ class LaunchRequest:
     no_tools: bool = False
     timeout: float | None = None
     envelope_path: Path | None = None
+    #: Physical directories a worker must be able to read for its declared task / plan /
+    #: prompt / required-skill inputs (REC-05). Deliberately distinct from ``allowed_scope``:
+    #: lowering these to ``--add-dir`` never contributes a write capability, a scoped write
+    #: root, or an ``effective_grant`` entry.
+    required_input_dirs: tuple[str, ...] = ()
+    #: Explicit per-run runtime selection (REC-06). These values come from the typed
+    #: execution controls; adapters never infer them from prompt prose or configuration.
+    model: str | None = None
+    effort: str | None = None
 
 
 @dataclass(frozen=True)
@@ -144,6 +155,242 @@ class LaunchResult:
     raw_stdout: str = ""
 
 
+#: Stable, machine-readable reason for every executor-context-bundle rejection.
+CONTEXT_BUNDLE_INVALID = "context-bundle-invalid"
+
+#: The context kinds a runner may hand an executor: its canonical task contract plus the
+#: plan / prompt / required-skill content that task needs.
+CONTEXT_KINDS = frozenset({"task", "plan", "prompt", "skill"})
+
+#: A host-absolute path leaking into bundle content: a Windows drive root (``C:\path`` or
+#: ``C:/path``) or a POSIX home/root prefix. The bundle is runner-owned evidence and must stay
+#: portable — it carries logical sources and content, never host paths or secrets. A caller
+#: redacts known roots before building; this is the fail-closed backstop.
+_HOST_ABSOLUTE_PATH_RE = re.compile(r"(?:[A-Za-z]:[\\/]{1,2}[\w.$-])|(?:/(?:home|Users|root)/\w)")
+
+
+def _sha256_hex(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _is_safe_logical_source(source: str) -> bool:
+    """A safe logical source is a clean project/agents-root-relative POSIX path.
+
+    No absolute or drive-letter path, no ``..`` traversal, no backslash (a host separator),
+    no empty or ``.`` segment, and no leading/trailing whitespace.
+    """
+    if not source or source != source.strip() or "\\" in source:
+        return False
+    if source.startswith("/") or (len(source) >= 2 and source[1] == ":"):
+        return False
+    parts = source.split("/")
+    return all(part not in ("", ".", "..") for part in parts)
+
+
+@dataclass(frozen=True)
+class ContextEntry:
+    """One immutable, digest-bound piece of runner-supplied executor context.
+
+    ``logical_source`` is a safe project- or agents-root-relative POSIX path (never a host
+    path); ``digest`` is the lowercase SHA-256 hex of ``content``.
+    """
+
+    kind: str
+    logical_source: str
+    digest: str
+    content: str
+
+    def validate(self) -> None:
+        if self.kind not in CONTEXT_KINDS:
+            raise AdapterError(
+                f"context entry kind {self.kind!r} is not one of {sorted(CONTEXT_KINDS)}",
+                CONTEXT_BUNDLE_INVALID,
+            )
+        if not _is_safe_logical_source(self.logical_source):
+            raise AdapterError(
+                f"context entry source {self.logical_source!r} is not a safe "
+                f"project/agents-root logical path",
+                CONTEXT_BUNDLE_INVALID,
+            )
+        if self.digest != _sha256_hex(self.content):
+            raise AdapterError(
+                f"context entry {self.logical_source!r} digest does not match its content",
+                CONTEXT_BUNDLE_INVALID,
+            )
+        if _HOST_ABSOLUTE_PATH_RE.search(self.content):
+            raise AdapterError(
+                f"context entry {self.logical_source!r} content carries a host-absolute path",
+                CONTEXT_BUNDLE_INVALID,
+            )
+
+    @classmethod
+    def of(cls, kind: str, logical_source: str, content: str) -> "ContextEntry":
+        """Build an entry, digesting ``content`` and failing closed on an unsafe source."""
+        entry = cls(kind, logical_source, _sha256_hex(content), content)
+        entry.validate()
+        return entry
+
+
+@dataclass(frozen=True)
+class ExecutorContextBundle:
+    """Runner-owned, immutable context for exactly one assigned task.
+
+    It carries the canonical task contract plus the task-relevant plan / prompt / required-skill
+    content, each bound to a safe logical source and SHA-256 digest. A launch into a nested
+    working root (``feature-pipeline-skill``) consumes this bundle instead of reading the task,
+    plan, prompt, or skills from outside that root — and it never widens a write root.
+    """
+
+    task_id: str
+    entries: tuple[ContextEntry, ...]
+
+    def validate(self) -> None:
+        if not self.task_id:
+            raise AdapterError("executor context bundle has no task id", CONTEXT_BUNDLE_INVALID)
+        kinds = {entry.kind for entry in self.entries}
+        if "task" not in kinds:
+            raise AdapterError(
+                "executor context bundle carries no task contract", CONTEXT_BUNDLE_INVALID
+            )
+        seen: set[tuple[str, str]] = set()
+        for entry in self.entries:
+            entry.validate()
+            key = (entry.kind, entry.logical_source)
+            if key in seen:
+                raise AdapterError(
+                    f"executor context bundle repeats {entry.kind} source "
+                    f"{entry.logical_source!r}",
+                    CONTEXT_BUNDLE_INVALID,
+                )
+            seen.add(key)
+
+    def render(self) -> str:
+        """The verbatim context block prepended to the child's stdin prompt."""
+        self.validate()
+        lines = [
+            "=== Runner-supplied executor context (immutable, digest-bound) ===",
+            f"Assigned task: {self.task_id}",
+            "The runner provides the authoritative task/plan/prompt/skill content below. Treat "
+            "it as canonical and do not read these files from outside your working root.",
+        ]
+        for entry in self.entries:
+            lines += [
+                "",
+                f"--- {entry.kind}: {entry.logical_source} (sha256:{entry.digest}) ---",
+                entry.content.rstrip("\n"),
+            ]
+        lines += ["", "=== End runner-supplied executor context ==="]
+        return "\n".join(lines) + "\n"
+
+
+#: Stable, machine-readable reason for every required-input rejection.
+REQUIRED_INPUT_INVALID = "required-input-invalid"
+
+#: The anchors a required-input logical source may resolve under. ``project`` is the outer
+#: project root; ``agents`` is the external shared-agents anchor. Nothing else is addressable.
+REQUIRED_INPUT_ANCHORS = frozenset({"project", "agents"})
+
+
+@dataclass(frozen=True)
+class RequiredInput:
+    """One mandatory read input a nested worker must reach before it edits or verifies code.
+
+    ``kind`` is one of :data:`CONTEXT_KINDS`; ``anchor`` is ``"project"`` or ``"agents"``;
+    ``logical_source`` is a safe anchor-relative POSIX path to the *file* (never a directory,
+    never a host path). It is deliberately separate from a task's ``Allowed scope`` — deriving
+    a directory grant from it never adds a write capability (REC-05 AC-2).
+    """
+
+    kind: str
+    anchor: str
+    logical_source: str
+
+    def validate(self) -> None:
+        if self.kind not in CONTEXT_KINDS:
+            raise AdapterError(
+                f"required input kind {self.kind!r} is not one of {sorted(CONTEXT_KINDS)}",
+                REQUIRED_INPUT_INVALID,
+            )
+        if self.anchor not in REQUIRED_INPUT_ANCHORS:
+            raise AdapterError(
+                f"required input anchor {self.anchor!r} is not one of "
+                f"{sorted(REQUIRED_INPUT_ANCHORS)}",
+                REQUIRED_INPUT_INVALID,
+            )
+        if not _is_safe_logical_source(self.logical_source):
+            raise AdapterError(
+                f"required input source {self.logical_source!r} is not a safe "
+                f"anchor-relative logical path",
+                REQUIRED_INPUT_INVALID,
+            )
+        if "/" not in self.logical_source:
+            raise AdapterError(
+                f"required input {self.logical_source!r} names no directory to grant; a bare "
+                f"anchor-root file would widen the grant to the whole anchor",
+                REQUIRED_INPUT_INVALID,
+            )
+
+
+def derive_required_input_dirs(
+    inputs: Sequence[RequiredInput],
+    *,
+    project_root: str | os.PathLike[str],
+    agents_root: str | os.PathLike[str],
+    reachable_roots: Sequence[str | os.PathLike[str]] = (),
+) -> tuple[str, ...]:
+    """The smallest set of physical directories that lets a worker read every declared input.
+
+    Each input is validated, resolved under its declared anchor, and reduced to the parent
+    directory of the referenced file. The result is de-duplicated, collapsed so no directory
+    sits alongside one of its own ancestors, and stripped of anything already reachable from
+    ``reachable_roots`` (the worker's own working root). Fails closed — it never silently
+    widens — on an unsafe path, a traversal that escapes its anchor, a missing anchor, or the
+    same logical source claimed under two anchors (REC-05 AC-4).
+    """
+    anchors: dict[str, Path] = {
+        "project": Path(project_root).resolve(),
+        "agents": Path(agents_root).resolve(),
+    }
+    for name, path in anchors.items():
+        if not path.is_dir():
+            raise AdapterError(
+                f"required-input anchor {name!r} is not a directory: {path}",
+                REQUIRED_INPUT_INVALID,
+            )
+    reachable = [Path(root).resolve() for root in reachable_roots]
+    claimed: dict[tuple[str, str], str] = {}
+    grants: list[Path] = []
+    for item in inputs:
+        item.validate()
+        key = (item.kind, item.logical_source)
+        if claimed.setdefault(key, item.anchor) != item.anchor:
+            raise AdapterError(
+                f"required input {item.logical_source!r} is claimed under two anchors "
+                f"({claimed[key]!r} and {item.anchor!r})",
+                REQUIRED_INPUT_INVALID,
+            )
+        anchor = anchors[item.anchor]
+        target = (anchor / item.logical_source).resolve()
+        try:
+            target.relative_to(anchor)
+        except ValueError:
+            raise AdapterError(
+                f"required input {item.logical_source!r} escapes its {item.anchor!r} anchor",
+                REQUIRED_INPUT_INVALID,
+            ) from None
+        grant = target.parent
+        if grant not in grants:
+            grants.append(grant)
+    kept: list[Path] = []
+    for directory in sorted(set(grants), key=lambda p: len(p.parts)):
+        if any(directory == root or root in directory.parents for root in reachable):
+            continue
+        if any(directory == existing or existing in directory.parents for existing in kept):
+            continue
+        kept.append(directory)
+    return tuple(str(directory) for directory in kept)
+
+
 class Adapter(Protocol):
     """A CLI-specific implementation of a role launch."""
 
@@ -161,6 +408,20 @@ def normalize_role(role: str) -> str:
 
 def is_verifier_role(role: str) -> bool:
     return normalize_role(role) in VERIFIER_ROLES
+
+
+def is_executor_role(role: str) -> bool:
+    """Whether ``role`` is a concrete executor the adapter can define and select inline.
+
+    Any ``*-executor`` role (``python-executor``, ``tooling-executor``, …) — and the bare
+    ``executor`` charter name — shares the inline executor charter (:func:`_role_charter`), so
+    :func:`build_claude_argv` always renders a matching ``--agents`` definition and selects it
+    by its exact name with ``--agent``. Such a launch therefore never depends on an on-disk
+    ``.claude/agents/<role>.md`` in the target project (RDS-06); availability resolution must
+    agree with that contract rather than demand an ambient agent file. A verifier role is not
+    an executor even though ``test_verifier`` ends in a non-``executor`` word.
+    """
+    return normalize_role(role).endswith("executor")
 
 
 #: The exact on-disk Claude CLI agent name for each normalized verifier role. The CLI's
@@ -197,9 +458,9 @@ def on_disk_agent_name(role: str) -> str:
 #: ``rust-executor``, …) shares the executor charter; anything unrecognized gets the generic one.
 _ROLE_CHARTER: dict[str, str] = {
     "executor": (
-        "Feature-pipeline executor. Implement only the selected task's allowed scope, run the "
-        "declared verification commands, and report the required status envelope. Do not verify "
-        "your own work and do not tick acceptance checkboxes."
+        "Feature-pipeline executor. Implement only the selected task's allowed scope and report "
+        "the required status envelope. The runner owns declared verification commands and "
+        "independent verification, so do not run them or tick acceptance checkboxes."
     ),
     "task_verifier": (
         "Feature-pipeline task verifier. Read-only: never edit files. Judge the task's "
@@ -299,6 +560,59 @@ def grant_tool_names(grant: Sequence[str]) -> tuple[str, ...]:
             seen.add(name)
             ordered.append(name)
     return tuple(ordered)
+
+
+def _normalized_cwd(value: str) -> str:
+    """A comparable form of a task-declared or launch working root: forward slashes, no
+    leading/trailing separators, ``.`` for the root itself."""
+    text = (value or ".").replace("\\", "/").strip("/")
+    return text or "."
+
+
+def check_command_allowances(
+    commands: Sequence[tuple[str, Sequence[str]]],
+    *,
+    role_grant: Sequence[str],
+    working_root: str = ".",
+) -> tuple[str, ...]:
+    """Exact ``Bash(<argv>)`` allowances for this task's own declared checks (AC-1).
+
+    Each ``commands`` entry is ``(cwd, argv)`` — the task's own declared verification
+    commands, already shell-free by contract (:class:`~feature_pipeline.contracts.CommandSpec`
+    never accepts a shell metacharacter). A command is granted one exact allowance only when
+    every one of these holds:
+
+    * the role's grant carries ``run_checks`` — no grant means no allowance at all, regardless
+      of what the task declares;
+    * its declared ``cwd`` equals the executor's own ``working_root`` (normalized for slash
+      and case-of-empty-root differences only — never a prefix or an ancestor match);
+    * its ``argv`` is non-empty, carries no shell metacharacter, and is not a ``git push``
+      form.
+
+    A command failing any test is silently excluded — never approved on a partial match — so
+    the result is always a subset of what the task actually declared for its own root, one
+    allowance per qualifying command, in declaration order.
+    """
+    if "run_checks" not in set(role_grant):
+        return ()
+    root = _normalized_cwd(working_root)
+    allowed: list[str] = []
+    for cwd, argv in commands:
+        if _normalized_cwd(cwd) != root:
+            continue
+        argv = tuple(str(token) for token in argv)
+        if not argv:
+            continue
+        try:
+            _assert_shell_free(argv)
+        except AdapterError:
+            continue
+        if any(_is_push_token(token) for token in argv):
+            continue
+        entry = f"Bash({' '.join(argv)})"
+        if entry not in allowed:
+            allowed.append(entry)
+    return tuple(allowed)
 
 
 def scoped_add_dirs(
@@ -402,6 +716,10 @@ def build_claude_argv(
 
     argv = _executable_prefix(executable)
     argv += ["-p", "--output-format", "json"]
+    if request.model is not None:
+        argv += ["--model", request.model]
+    if request.effort is not None:
+        argv += ["--effort", request.effort]
     argv += ["--permission-mode", PERMISSION_MODE_READ_ONLY if read_only else PERMISSION_MODE_WRITE]
     argv += ["--setting-sources", "user,project"]
     if settings_path is not None:
@@ -430,8 +748,15 @@ def build_claude_argv(
     argv += ["--agents", inline_agents_json(request, read_only=read_only)]
     argv += ["--agent", on_disk_agent_name(request.role)]
 
-    for directory in add_dirs:
-        argv += ["--add-dir", str(directory)]
+    # Scoped write roots first, then the read-only required-input grants (REC-05). Both lower
+    # to ``--add-dir``; the required-input set is deliberately not folded into any write scope.
+    seen_dirs: set[str] = set()
+    for directory in (*add_dirs, *request.required_input_dirs):
+        text = str(directory)
+        if text in seen_dirs:
+            continue
+        seen_dirs.add(text)
+        argv += ["--add-dir", text]
     if request.resume_session_id:
         argv += ["--resume", str(request.resume_session_id)]
 
@@ -455,10 +780,21 @@ def build_codex_argv(
     # request so its read-only sandbox and resolved grants are present on the actual argv.
     sandbox = "read-only" if request_is_read_only(request) else "workspace-write"
     argv += ["--json", "--sandbox", sandbox]
+    if request.model is not None:
+        argv += ["--model", request.model]
+    if request.effort is not None:
+        # `codex exec --help` documents `--config key=value`; the installed
+        # client accepts this native reasoning control without ambient config.
+        argv += ["--config", f'model_reasoning_effort="{request.effort}"']
     if working_root is not None:
         argv += ["--cd", str(working_root)]
-    for directory in add_dirs:
-        argv += ["--add-dir", str(directory)]
+    seen_dirs: set[str] = set()
+    for directory in (*add_dirs, *request.required_input_dirs):
+        text = str(directory)
+        if text in seen_dirs:
+            continue
+        seen_dirs.add(text)
+        argv += ["--add-dir", text]
     _assert_shell_free(argv)
     _ = grant
     return argv
@@ -736,6 +1072,11 @@ class ClaudeAdapter:
     """
 
     name = "claude"
+    #: Executor windows are run in a disposable copy and promoted by the dispatcher.
+    isolated_workspace = True
+    #: Claude's RLC-01 status-envelope prompt requires a blocked diagnostic.  Other adapter
+    #: protocols retain compatibility with the historical four-key blocked envelope.
+    requires_blocked_envelope_reason = True
 
     def __init__(
         self,
@@ -748,6 +1089,9 @@ class ClaudeAdapter:
         env: dict[str, str] | None = None,
         timeout: float = DEFAULT_TIMEOUT_S,
         working_root: str | os.PathLike[str] | None = None,
+        executor_contexts: Mapping[str, ExecutorContextBundle] | None = None,
+        required_input_dirs: Mapping[str, Sequence[str]] | None = None,
+        task_scope_dirs: Mapping[str, Sequence[str]] | None = None,
     ) -> None:
         self._executable = executable
         self._resolver = resolver or (lambda: shutil.which("claude"))
@@ -757,6 +1101,23 @@ class ClaudeAdapter:
         self._env = env
         self._timeout = timeout
         self._working_root = Path(working_root) if working_root is not None else None
+        #: Runner-owned minimal mandatory-input directory grants, keyed by task id. Merged
+        #: into the launch's ``--add-dir`` set on the first (session-opening) launch so a
+        #: nested working root can read its task/plan/prompt/skill files (REC-05).
+        self._required_input_dirs: dict[str, tuple[str, ...]] = {
+            key: tuple(value) for key, value in dict(required_input_dirs or {}).items()
+        }
+        #: Runner-owned minimal declared-``allowed_scope`` directory grants outside this
+        #: task's own working root, keyed by task id (CSR-01). Distinct from
+        #: ``required_input_dirs``: these lower to ``--add-dir`` only for a write-capable,
+        #: non-read-only request, never for a read-only verifier launch.
+        self._task_scope_dirs: dict[str, tuple[str, ...]] = {
+            key: tuple(value) for key, value in dict(task_scope_dirs or {}).items()
+        }
+        #: Runner-owned immutable context, keyed by task id. Merged into the child's stdin
+        #: prompt on its first (session-opening) launch so a nested working root gets exact
+        #: task/plan/prompt/skill content without a filesystem read outside it.
+        self._executor_contexts: dict[str, ExecutorContextBundle] = dict(executor_contexts or {})
 
     def resolved_executable(self) -> str | Sequence[str] | None:
         if self._executable is not None:
@@ -767,13 +1128,21 @@ class ClaudeAdapter:
         return self.resolved_executable() is not None
 
     def can_resolve_executor(self, role: str, *, working_root: str = ".") -> bool:
-        """Resolve custom or enabled built-in agents before opening an executor window."""
+        """Resolve custom or enabled built-in agents before opening an executor window.
+
+        A concrete ``*-executor`` role (:func:`is_executor_role`) resolves through the adapter's
+        own inline ``--agents``/``--agent`` definition, so it needs no project-local agent file
+        and no built-in entry; an on-disk definition still wins when present. Every other custom
+        role stays fail-closed unless an on-disk or enabled built-in agent backs it.
+        """
         name = on_disk_agent_name(role)
         if not name or Path(name).name != name or "/" in name or "\\" in name:
             return False
         directory = ((self._working_root or Path.cwd()) / working_root).resolve()
         roots = (directory, *directory.parents, Path.home())
         if any((root / ".claude" / "agents" / f"{name}.md").is_file() for root in roots):
+            return True
+        if is_executor_role(role):
             return True
         env = os.environ if self._env is None else self._env
         if env.get("CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS") == "1":
@@ -783,9 +1152,23 @@ class ClaudeAdapter:
             return False
         return name in _CLAUDE_BUILTIN_AGENTS
 
+    def _with_required_inputs(self, request: LaunchRequest) -> LaunchRequest:
+        """Merge this task's minimal mandatory-input grants onto a fresh, session-opening
+        request. A resumed continuation already has the reach it needs and is left untouched."""
+        if request.resume_session_id:
+            return request
+        dirs = self._required_input_dirs.get(request.task_id, ())
+        if not dirs:
+            return request
+        merged = tuple(dict.fromkeys((*request.required_input_dirs, *dirs)))
+        if merged == tuple(request.required_input_dirs):
+            return request
+        return replace(request, required_input_dirs=merged)
+
     def plan(self, request: LaunchRequest) -> list[str]:
         """The argv this request would run — used by a dry run and by the tests, so what is
         reviewed is exactly what would execute."""
+        request = self._with_required_inputs(request)
         executable = self.resolved_executable() or "claude"
         return build_claude_argv(
             request, executable=executable,
@@ -798,13 +1181,14 @@ class ClaudeAdapter:
             raise AdapterError(
                 "the Claude CLI is not available on PATH", "adapter-unavailable"
             )
+        request = self._with_required_inputs(request)
         argv = build_claude_argv(
             request, executable=executable,
             settings_path=self._settings_path, add_dirs=self._add_dirs_for(request),
         )
         completed = self._runner(
             argv,
-            prompt=request.prompt,
+            prompt=self._prompt_for(request),
             cwd=self._cwd_for(request),
             timeout=request.timeout or self._timeout,
             env=self._env,
@@ -821,6 +1205,22 @@ class ClaudeAdapter:
             raw_stdout=completed.stdout,
         )
 
+    def _prompt_for(self, request: LaunchRequest) -> str:
+        """The stdin prompt: the request prompt, prefixed with this task's context bundle.
+
+        Only the first, session-opening launch is enriched — a same-session ``--resume``
+        continuation (the status envelope) already has the context in its transcript. A
+        malformed or tampered bundle fails the launch closed rather than degrading to a
+        context-free prompt.
+        """
+        if request.resume_session_id:
+            return request.prompt
+        bundle = self._executor_contexts.get(request.task_id)
+        if bundle is None:
+            return request.prompt
+        bundle.validate()
+        return bundle.render() + "\n" + request.prompt
+
     def _cwd_for(self, request: LaunchRequest) -> Path | None:
         working_root = request.working_root or "."
         if self._working_root is not None:
@@ -830,13 +1230,19 @@ class ClaudeAdapter:
         return None
 
     def _add_dirs_for(self, request: LaunchRequest) -> tuple[str, ...]:
-        return scoped_add_dirs(request, self._scope_roots)
+        external = scoped_add_dirs(request, self._scope_roots)
+        if request_is_read_only(request) or not set(effective_grant(request)) & WRITE_CAPABILITIES:
+            return external
+        task_dirs = self._task_scope_dirs.get(request.task_id, ())
+        return tuple(dict.fromkeys((*external, *task_dirs)))
 
 
 class CodexAdapter:
     """Adapter over the non-interactive ``codex exec`` CLI."""
 
     name = "codex"
+    #: Executor windows are run in a disposable copy and promoted by the dispatcher.
+    isolated_workspace = True
     # ``codex exec resume`` cannot carry the sandbox or resolved-directory flags required for
     # the runner's tool-free status continuation. The coordinator supplies only the parsed
     # report token to this fresh, read-only context.
@@ -852,6 +1258,8 @@ class CodexAdapter:
         env: dict[str, str] | None = None,
         timeout: float = DEFAULT_TIMEOUT_S,
         working_root: str | os.PathLike[str] | None = None,
+        required_input_dirs: Mapping[str, Sequence[str]] | None = None,
+        task_scope_dirs: Mapping[str, Sequence[str]] | None = None,
     ) -> None:
         self._executable = executable
         self._resolver = resolver or (lambda: shutil.which("codex"))
@@ -860,6 +1268,16 @@ class CodexAdapter:
         self._env = env
         self._timeout = timeout
         self._working_root = Path(working_root) if working_root is not None else None
+        #: Runner-owned minimal mandatory-input directory grants, keyed by task id (REC-05).
+        self._required_input_dirs: dict[str, tuple[str, ...]] = {
+            key: tuple(value) for key, value in dict(required_input_dirs or {}).items()
+        }
+        #: Runner-owned minimal declared-``allowed_scope`` directory grants outside this
+        #: task's own working root, keyed by task id (CSR-01). Write-only, like the working
+        #: root's own ``--add-dir`` grant; never applied to a read-only verifier launch.
+        self._task_scope_dirs: dict[str, tuple[str, ...]] = {
+            key: tuple(value) for key, value in dict(task_scope_dirs or {}).items()
+        }
 
     def resolved_executable(self) -> str | Sequence[str] | None:
         return self._executable if self._executable is not None else self._resolver()
@@ -867,7 +1285,20 @@ class CodexAdapter:
     def available(self) -> bool:
         return self.resolved_executable() is not None
 
+    def _with_required_inputs(self, request: LaunchRequest) -> LaunchRequest:
+        """Merge this task's minimal mandatory-input grants onto a fresh request (REC-05)."""
+        if request.resume_session_id:
+            return request
+        dirs = self._required_input_dirs.get(request.task_id, ())
+        if not dirs:
+            return request
+        merged = tuple(dict.fromkeys((*request.required_input_dirs, *dirs)))
+        if merged == tuple(request.required_input_dirs):
+            return request
+        return replace(request, required_input_dirs=merged)
+
     def plan(self, request: LaunchRequest) -> list[str]:
+        request = self._with_required_inputs(request)
         executable = self.resolved_executable() or "codex"
         return build_codex_argv(
             request,
@@ -880,6 +1311,7 @@ class CodexAdapter:
         executable = self.resolved_executable()
         if executable is None:
             raise AdapterError("the Codex CLI is not available on PATH", "adapter-unavailable")
+        request = self._with_required_inputs(request)
         completed = self._runner(
             build_codex_argv(
                 request,
@@ -910,4 +1342,14 @@ class CodexAdapter:
         return None
 
     def _add_dirs_for(self, request: LaunchRequest) -> tuple[str, ...]:
-        return scoped_add_dirs(request, self._scope_roots)
+        external_roots = scoped_add_dirs(request, self._scope_roots)
+        if request_is_read_only(request) or not set(effective_grant(request)) & WRITE_CAPABILITIES:
+            return external_roots
+        task_dirs = self._task_scope_dirs.get(request.task_id, ())
+        working_root = self._cwd_for(request)
+        if working_root is None:
+            return tuple(dict.fromkeys((*external_roots, *task_dirs)))
+        # Codex's workspace-write sandbox does not consistently treat --cd as a writable
+        # grant on Windows. Explicitly grant the runner-selected disposable worktree.
+        root = str(working_root)
+        return tuple(dict.fromkeys((root, *external_roots, *task_dirs)))

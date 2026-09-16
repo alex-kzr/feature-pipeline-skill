@@ -14,9 +14,11 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from pipeline_core.concurrency import (
     FileMutex,
+    MutexTimeout,
     PipelineLease,
     is_serialized_program,
     pipeline_lease,
@@ -27,6 +29,9 @@ from pipeline_core.concurrency import (
 )
 from pipeline_core.lease import LeaseHeldError
 from pipeline_core.state import read_lease, write_lease
+from feature_pipeline.infrastructure.locks import manager as lease_manager_module
+from feature_pipeline.infrastructure.locks.owner import current_owner
+from feature_pipeline.infrastructure.locks.record import HolderRecord, now_stamp, render_record
 
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 
@@ -269,6 +274,39 @@ class WriteMutexTests(unittest.TestCase):
         self.assertEqual(len(spans), 2, f"expected two serialized runs, got {intervals}")
         (a_enter, a_exit), (b_enter, b_exit) = spans
         self.assertLessEqual(a_exit, b_enter, f"serialized runs overlapped: {spans}")
+
+
+class LeaseTransientReadRaceTests(unittest.TestCase):
+    """Windows two-process race: a competing creator's read of the winner's freshly created
+    lock file can transiently raise ``OSError`` (a brief sharing violation) even though the
+    file is a genuinely live, well-formed lease. That reader must retry the read and treat
+    the lease as held by its live owner — never as a corrupt, undeniable ("unreadable")
+    lease it fails closed on at once."""
+
+    def test_a_transient_read_failure_is_retried_instead_of_denied_as_unreadable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "race.lock"
+            winner = current_owner("winner-run", pid=os.getpid())
+            stamp = now_stamp()
+            path.write_text(
+                render_record(winner, task_id="T-1", acquired_at=stamp, heartbeat_at=stamp),
+                encoding="utf-8",
+            )
+            real_read_holder = lease_manager_module.read_holder
+            calls = {"count": 0}
+
+            def flaky_read_holder(target):
+                calls["count"] += 1
+                if calls["count"] == 1:
+                    return HolderRecord(unreadable=True)
+                return real_read_holder(target)
+
+            mutex = FileMutex(path, run_id="loser-run", timeout=1)
+            with patch.object(lease_manager_module, "read_holder", side_effect=flaky_read_holder):
+                with self.assertRaises(MutexTimeout):
+                    mutex.acquire()
+
+            self.assertGreater(calls["count"], 1)
 
 
 if __name__ == "__main__":

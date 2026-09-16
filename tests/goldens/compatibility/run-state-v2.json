@@ -16,7 +16,17 @@
   "tasks": [
     {
       "id": "T-01",
-      "status": "verified",
+      "status": "done",
+      "resolution": "completed",
+      "resolution_reason": "independent completion policy passed",
+      "operation_history": [
+        {
+          "at": "<timestamp>",
+          "kind": "verification",
+          "outcome": "succeeded",
+          "detail": "task_verdict=PASS test=PASS"
+        }
+      ],
       "depends_on": [],
       "attempts": 0,
       "blocker": null,
@@ -40,6 +50,7 @@
         }
       },
       "changed_files": [],
+      "runner_owned_writes": [],
       "verification_tier": "full",
       "accepts_scoped": [],
       "promotion": null,
@@ -48,15 +59,22 @@
       "external_launch_failures": [],
       "task_path": null,
       "task_contract_digest": null,
+      "task_contract_version": null,
       "reused_verification": [],
       "attested_dependencies": [],
       "next_executor_launch_generation": 1,
       "next_task_verifier_launch_generation": 1,
-      "next_test_verifier_launch_generation": 1
+      "next_test_verifier_launch_generation": 1,
+      "amendment_revisions": [],
+      "current_revision": 0,
+      "revision_history": []
     },
     {
       "id": "T-02",
-      "status": "implemented",
+      "status": "in_progress",
+      "resolution": null,
+      "resolution_reason": null,
+      "operation_history": [],
       "depends_on": [
         "T-01"
       ],
@@ -82,6 +100,7 @@
         }
       },
       "changed_files": [],
+      "runner_owned_writes": [],
       "verification_tier": "full",
       "accepts_scoped": [],
       "promotion": null,
@@ -90,15 +109,22 @@
       "external_launch_failures": [],
       "task_path": null,
       "task_contract_digest": null,
+      "task_contract_version": null,
       "reused_verification": [],
       "attested_dependencies": [],
       "next_executor_launch_generation": 1,
       "next_task_verifier_launch_generation": 1,
-      "next_test_verifier_launch_generation": 1
+      "next_test_verifier_launch_generation": 1,
+      "amendment_revisions": [],
+      "current_revision": 0,
+      "revision_history": []
     },
     {
       "id": "T-03",
-      "status": "blocked",
+      "status": "in_progress",
+      "resolution": null,
+      "resolution_reason": null,
+      "operation_history": [],
       "depends_on": [
         "T-01"
       ],
@@ -124,6 +150,7 @@
         }
       },
       "changed_files": [],
+      "runner_owned_writes": [],
       "verification_tier": "full",
       "accepts_scoped": [],
       "promotion": null,
@@ -132,15 +159,22 @@
       "external_launch_failures": [],
       "task_path": null,
       "task_contract_digest": null,
+      "task_contract_version": null,
       "reused_verification": [],
       "attested_dependencies": [],
       "next_executor_launch_generation": 1,
       "next_task_verifier_launch_generation": 1,
-      "next_test_verifier_launch_generation": 1
+      "next_test_verifier_launch_generation": 1,
+      "amendment_revisions": [],
+      "current_revision": 0,
+      "revision_history": []
     },
     {
       "id": "T-04",
-      "status": "pending",
+      "status": "to_do",
+      "resolution": null,
+      "resolution_reason": null,
+      "operation_history": [],
       "depends_on": [
         "T-01"
       ],
@@ -166,6 +200,7 @@
         }
       },
       "changed_files": [],
+      "runner_owned_writes": [],
       "verification_tier": "full",
       "accepts_scoped": [],
       "promotion": null,
@@ -174,91 +209,95 @@
       "external_launch_failures": [],
       "task_path": null,
       "task_contract_digest": null,
+      "task_contract_version": null,
       "reused_verification": [],
       "attested_dependencies": [],
       "next_executor_launch_generation": 1,
       "next_task_verifier_launch_generation": 1,
-      "next_test_verifier_launch_generation": 1
+      "next_test_verifier_launch_generation": 1,
+      "amendment_revisions": [],
+      "current_revision": 0,
+      "revision_history": []
     }
   ],
   "history": [
     {
       "at": "<timestamp>",
-      "scope": "task:T-01",
-      "from": "pending",
-      "to": "ready",
-      "actor": "runner",
-      "note": null
-    },
-    {
-      "at": "<timestamp>",
-      "scope": "task:T-01",
-      "from": "ready",
-      "to": "running",
-      "actor": "runner",
-      "note": null
-    },
-    {
-      "at": "<timestamp>",
-      "scope": "task:T-01",
-      "from": "running",
-      "to": "implemented",
-      "actor": "executor",
-      "note": null
-    },
-    {
-      "at": "<timestamp>",
-      "scope": "task:T-01",
-      "from": "implemented",
-      "to": "verified",
-      "actor": "runner",
-      "note": "independent verdicts task=PASS test=PASS"
-    },
-    {
-      "at": "<timestamp>",
-      "scope": "verdicts:T-01",
+      "scope": "operation:T-01:legacy-transition",
       "from": null,
-      "to": "verified",
+      "to": "to_do",
       "actor": "runner",
-      "note": "task_verdict=PASS test_verdict=PASS"
+      "note": "legacy execution phase normalized"
     },
     {
       "at": "<timestamp>",
-      "scope": "task:T-02",
-      "from": "pending",
-      "to": "ready",
-      "actor": "runner",
-      "note": null
-    },
-    {
-      "at": "<timestamp>",
-      "scope": "task:T-02",
-      "from": "ready",
-      "to": "running",
+      "scope": "task:T-01",
+      "from": "to_do",
+      "to": "in_progress",
       "actor": "runner",
       "note": null
     },
     {
       "at": "<timestamp>",
-      "scope": "task:T-02",
-      "from": "running",
-      "to": "implemented",
+      "scope": "operation:T-01:legacy-transition",
+      "from": null,
+      "to": "in_progress",
       "actor": "executor",
-      "note": null
+      "note": "legacy execution phase normalized"
     },
     {
       "at": "<timestamp>",
-      "scope": "task:T-03",
-      "from": "pending",
-      "to": "ready",
+      "scope": "operation:T-01:verification",
+      "from": null,
+      "to": "succeeded",
+      "actor": "runner",
+      "note": "task_verdict=PASS test=PASS"
+    },
+    {
+      "at": "<timestamp>",
+      "scope": "task:T-01",
+      "from": "in_progress",
+      "to": "done",
+      "actor": "runner",
+      "note": "independent completion policy passed"
+    },
+    {
+      "at": "<timestamp>",
+      "scope": "operation:T-02:legacy-transition",
+      "from": null,
+      "to": "to_do",
+      "actor": "runner",
+      "note": "legacy execution phase normalized"
+    },
+    {
+      "at": "<timestamp>",
+      "scope": "task:T-02",
+      "from": "to_do",
+      "to": "in_progress",
       "actor": "runner",
       "note": null
     },
     {
       "at": "<timestamp>",
+      "scope": "operation:T-02:legacy-transition",
+      "from": null,
+      "to": "in_progress",
+      "actor": "executor",
+      "note": "legacy execution phase normalized"
+    },
+    {
+      "at": "<timestamp>",
+      "scope": "operation:T-03:legacy-transition",
+      "from": null,
+      "to": "to_do",
+      "actor": "runner",
+      "note": "legacy execution phase normalized"
+    },
+    {
+      "at": "<timestamp>",
       "scope": "task:T-03",
-      "from": "ready",
-      "to": "blocked",
+      "from": "to_do",
+      "to": "in_progress",
       "actor": "runner",
       "note": "external dependency unavailable"
     }
@@ -284,5 +323,6 @@
       ]
     }
   },
-  "artifacts": {}
+  "artifacts": {},
+  "recovery": null
 }

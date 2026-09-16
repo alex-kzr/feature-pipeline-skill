@@ -218,13 +218,38 @@ def _run_relative(path: Path, run_dir: str | Path) -> str:
         return path.as_posix()
 
 
-def verification_stage(task_id: str, *, attempt: int | None = None) -> str:
+def verification_stage(
+    task_id: str, *, attempt: int | None = None, revision: int | None = None,
+) -> str:
     """The stable stage key under which a task's verification commands are recorded.
 
     Every attempt owns its own stage so a repair re-run's evidence never overwrites the
-    first pass's records.
+    first pass's records. An approved amendment revision resets a task's repair attempts, so
+    ``attempt`` alone would collide with an earlier revision's settled commands at the same
+    gate number; a positive ``revision`` gets its own stage suffix so revision N's first gate
+    can never read or reuse revision N-1's command evidence. ``revision=None`` (or ``0``) is
+    the unamended contract and keeps every historical, revision-less stage name unchanged
+    (read compatibility).
     """
-    return f"task:{task_id}:verify" if attempt is None else f"task:{task_id}:verify:{attempt}"
+    if attempt is None:
+        return f"task:{task_id}:verify"
+    if not revision:
+        return f"task:{task_id}:verify:{attempt}"
+    if not isinstance(revision, int) or isinstance(revision, bool) or revision < 1:
+        raise ValueError(f"verification revision must be a positive integer, got {revision!r}")
+    return f"task:{task_id}:verify:{attempt}:revision:{revision}"
+
+
+def active_revision(run: object, task_id: str) -> int | None:
+    """The task's currently governing amendment revision, or ``None`` for an unamended (or
+    not-yet-amended) contract.
+
+    This is the one place a caller reads ``current_revision`` off the durable task record so
+    every command-stage, verifier-artifact, and repair-report lookup shares the identical
+    revision identity — never inferred from a directory name or a stale caller-supplied value.
+    """
+    revision = getattr(run.task(task_id), "current_revision", 0)
+    return revision or None
 
 
 def _declared_cwd_argv(command: object) -> tuple[str, tuple[str, ...]]:

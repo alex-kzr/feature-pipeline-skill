@@ -61,6 +61,15 @@ class EnvelopeContract:
     mismatch_code: str
     normalize: Callable[[str], str]
     prose_code: str = "unparseable-report"
+    #: The optional extra envelope key that carries a human-readable reason for a token in
+    #: :attr:`reason_eligible_tokens` (e.g. ``"blocked"``). ``None`` when this envelope kind
+    #: never carries a reason (the verifier verdict envelope). The key is additive. A caller
+    #: may require it for an eligible token when settling a protocol that owns that guarantee;
+    #: otherwise an eligible envelope may omit it. If present it must be a non-empty string,
+    #: and it must be *absent* for every other token — a reason next to ``"implemented"`` is
+    #: contradictory, not merely unused.
+    reason_field: str | None = None
+    reason_eligible_tokens: frozenset[str] = frozenset()
 
     @property
     def prose_pattern(self) -> re.Pattern[str]:
@@ -86,6 +95,8 @@ STATUS_CONTRACT: Final = EnvelopeContract(
     envelope_code="unparseable-status-envelope",
     mismatch_code="status-envelope-mismatch",
     normalize=str.lower,
+    reason_field="reason",
+    reason_eligible_tokens=frozenset({"blocked"}),
 )
 
 VERDICT_CONTRACT: Final = EnvelopeContract(
@@ -123,10 +134,16 @@ def parse_prose_token(text: str, contract: EnvelopeContract) -> str:
     return contract.normalize(match.group(1))
 
 
-def parse_envelope(
-    text: str, contract: EnvelopeContract, *, role: str, task_id: str, attempt: int
-) -> str:
-    """Strictly parse one JSON report envelope. Never infers, never falls back to the prose."""
+def _parse_envelope_data(
+    text: str, contract: EnvelopeContract, *, role: str, task_id: str, attempt: int,
+    require_reason: bool = False,
+) -> dict:
+    """Strictly parse and validate one JSON report envelope, returning the raw mapping.
+
+    :func:`parse_envelope` exposes only the settled token, unchanged for every historical
+    caller; :func:`settle` needs the raw mapping too, so it can also recover an optional
+    blocked reason (RLC-01 AC-2) without a second, looser parse of the same text.
+    """
     stripped = (text or "").strip()
     try:
         data = json.loads(stripped)
@@ -139,10 +156,27 @@ def parse_envelope(
         raise ReportProtocolError(
             f"{contract.envelope_noun} is not a JSON object", contract.envelope_code
         )
-    if set(data.keys()) != set(contract.keys):
+    present = set(data.keys())
+    base_keys = set(contract.keys)
+    # A caller may require the reason key for an eligible token. A reason key next to any
+    # other token is always contradictory and rejected.
+    token_peek = data.get(contract.token_field)
+    reason_field = contract.reason_field
+    reason_eligible = reason_field is not None and token_peek in contract.reason_eligible_tokens
+    expected_keys: set[str] = (
+        base_keys | {reason_field}
+        if reason_eligible and require_reason and reason_field is not None
+        else base_keys
+    )
+    allowed_keys: set[str] = (
+        base_keys | {reason_field}
+        if reason_eligible and reason_field is not None
+        else base_keys
+    )
+    if (not present <= allowed_keys) or (require_reason and present != expected_keys):
         raise ReportProtocolError(
-            f"{contract.envelope_noun} has keys {sorted(data.keys())}, expected exactly "
-            f"{sorted(contract.keys)} — none missing, none extra",
+            f"{contract.envelope_noun} has keys {sorted(present)}, expected exactly "
+            f"{sorted(expected_keys)} — none missing, none extra",
             contract.envelope_code,
         )
     token = data.get(contract.token_field)
@@ -169,7 +203,27 @@ def parse_envelope(
             f"{attempt!r}",
             contract.envelope_code,
         )
-    return str(token)
+    if contract.reason_field and contract.reason_field in present:
+        reason_value = data.get(contract.reason_field)
+        if not isinstance(reason_value, str) or not reason_value.strip():
+            raise ReportProtocolError(
+                f"{contract.envelope_noun} '{contract.reason_field}' is present but empty or "
+                f"not a string — a claim without a real reason is not evidence",
+                contract.envelope_code,
+            )
+    return data
+
+
+def parse_envelope(
+    text: str, contract: EnvelopeContract, *, role: str, task_id: str, attempt: int,
+    require_reason: bool = False,
+) -> str:
+    """Strictly parse one JSON report envelope. Never infers, never falls back to the prose."""
+    data = _parse_envelope_data(
+        text, contract, role=role, task_id=task_id, attempt=attempt,
+        require_reason=require_reason,
+    )
+    return str(data[contract.token_field])
 
 
 @dataclass(frozen=True)
@@ -184,6 +238,10 @@ class Settlement:
     prose_token: str | None
     envelope_token: str
     drift: str | None
+    #: The envelope's optional reason (RLC-01 AC-2) — set only when the envelope carried a
+    #: validated non-empty ``reason`` string next to an eligible token; ``None`` otherwise,
+    #: never a fabricated substitute.
+    reason: str | None = None
 
 
 def settle(
@@ -194,6 +252,7 @@ def settle(
     role: str,
     task_id: str,
     attempt: int,
+    require_reason: bool = False,
 ) -> Settlement:
     """Reconcile the strict prose parser and the authoritative JSON envelope.
 
@@ -202,9 +261,12 @@ def settle(
     * envelope valid, prose valid, they disagree -> ``contract.mismatch_code`` (fail closed);
     * envelope valid, prose absent/malformed -> the envelope token, with ``drift`` set.
     """
-    envelope_token = parse_envelope(
-        envelope_text, contract, role=role, task_id=task_id, attempt=attempt
+    envelope_data = _parse_envelope_data(
+        envelope_text, contract, role=role, task_id=task_id, attempt=attempt,
+        require_reason=require_reason,
     )
+    envelope_token = str(envelope_data[contract.token_field])
+    reason = envelope_data.get(contract.reason_field) if contract.reason_field else None
 
     prose_token: str | None = None
     prose_error: str | None = None
@@ -227,4 +289,4 @@ def settle(
             f"prose {contract.drift_noun} line unusable ({prose_error}); envelope "
             f"{contract.drift_noun} {envelope_token!r} stands"
         )
-    return Settlement(envelope_token, prose_token, envelope_token, drift)
+    return Settlement(envelope_token, prose_token, envelope_token, drift, reason)
