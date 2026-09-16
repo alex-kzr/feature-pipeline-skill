@@ -224,7 +224,7 @@ class ResumeReconciliationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             run = _run(root, plan="plan.md")
-            life = RunLifecycle.initialize(run, tasks=[("A-1", [])])
+            RunLifecycle.initialize(run, tasks=[("A-1", [])])
             source = run.run_dir / "run.json"
             payload = _stored(run.run_dir)
             payload["tasks"][0]["status"] = "running"

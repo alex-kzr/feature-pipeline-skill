@@ -19,7 +19,9 @@ from pipeline_core.state import Run
 
 def _spec() -> TaskSpec:
     return TaskSpec.build(
-        id="WI-01", task_type="python", executor="python-executor",
+        id="WI-01",
+        task_type="python",
+        executor="python-executor",
         allowed_scope=("src/**",),
     )
 
@@ -28,9 +30,10 @@ class WorkItemTests(unittest.TestCase):
     def test_registered_active_item_has_a_stable_producer_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            prompt = root / "prompt.md"; prompt.write_text("x", encoding="utf-8")
+            prompt = root / "prompt.md"
+            prompt.write_text("x", encoding="utf-8")
             run = Run.create("feature", prompt, None, root / "runs" / "feature", root)
-            life = RunLifecycle.initialize(run, tasks=[("WI-01", ())])
+            RunLifecycle.initialize(run, tasks=[("WI-01", ())])
             register_work_items(run, (_spec(),))
             with activate_work_item(run, "WI-01") as item:
                 self.assertEqual(item.producer_id, f"{run.run_id}:WI-01")
@@ -38,7 +41,8 @@ class WorkItemTests(unittest.TestCase):
     def test_unknown_or_inactive_item_is_denied(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            prompt = root / "prompt.md"; prompt.write_text("x", encoding="utf-8")
+            prompt = root / "prompt.md"
+            prompt.write_text("x", encoding="utf-8")
             run = Run.create("feature", prompt, None, root / "runs" / "feature", root)
             RunLifecycle.initialize(run, tasks=[("WI-01", ())])
             with self.assertRaisesRegex(WorkItemError, "unregistered"):
@@ -48,7 +52,8 @@ class WorkItemTests(unittest.TestCase):
     def test_registration_does_not_activate_a_work_item(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            prompt = root / "prompt.md"; prompt.write_text("x", encoding="utf-8")
+            prompt = root / "prompt.md"
+            prompt.write_text("x", encoding="utf-8")
             run = Run.create("feature", prompt, None, root / "runs" / "feature", root)
             RunLifecycle.initialize(run, tasks=[("WI-01", ())])
             register_work_items(run, (_spec(),))

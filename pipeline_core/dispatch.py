@@ -59,7 +59,7 @@ from .reports import (
     parse_executor_status,
     settle_executor_status,
 )
-from .state import ACTOR_EXECUTOR, StateError, repo_relative
+from .state import ACTOR_EXECUTOR, Run, StateError, repo_relative
 from .worktree import AttributionResult, attribute_executor_window, capture_snapshot
 from .git_port import GitPort, GitSafetyError
 

@@ -37,7 +37,7 @@ class NamedSourceReconciliationTests(unittest.TestCase):
             historical_path = _write_task(root, "REC-21")
             replacement_path = _write_task(root, "REC-22")
             audit_path = _write_task(root, "AUD-01")
-            historical = load_task_spec(historical_path)
+            load_task_spec(historical_path)
             replacement = load_task_spec(replacement_path)
             audit = load_task_spec(audit_path)
             registry = root / "tools" / "feature-pipeline" / "config" / "legacy_reconciliation_registry.json"

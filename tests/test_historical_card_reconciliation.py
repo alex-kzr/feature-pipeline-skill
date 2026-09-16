@@ -216,7 +216,7 @@ class HistoricalCardReconciliationTests(unittest.TestCase):
             )
             source = Run.create("historical", root / "prompt.md", None,
                                 root / ".pipeline/runs/historical", root)
-            source_life = RunLifecycle.initialize(source, tasks=[("NEW-01", ()), ("NEW-02", ())])
+            RunLifecycle.initialize(source, tasks=[("NEW-01", ()), ("NEW-02", ())])
             persist_task_contracts(source, (replacement, unfinished_replacement))
             source.transition_task("NEW-01", "in_progress", actor=ACTOR_RUNNER)
             source.transition_task("NEW-02", "in_progress", actor=ACTOR_RUNNER)

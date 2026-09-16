@@ -1005,12 +1005,6 @@ def recovery_provenance(
         "launch_failure_digest": f"sha256:{digest}",
         "target_adapter": controls.adapter,
     }
-    recorded_chain = run.controls.get("verify_dependency_chain", {}).get("value")
-    if recorded_chain is not verify_dependency_chain:
-        raise ExecutionError(
-            "resume dependency-chain verification control does not match the recorded value",
-            "verify-dependency-chain-mismatch",
-        )
 
 
 def _validate_same_run_launch_recovery(
@@ -1942,6 +1936,109 @@ def _open_run(
     return life, scope
 
 
+def _run_scoped_tasks(
+    request: ExecuteRequest,
+    life: RunLifecycle,
+    scope: Sequence[str],
+    order: Sequence[str],
+    by_id: Mapping[str, TaskSpec],
+    plan: CompiledRunPlan | None,
+    bindings: Mapping[str, Any],
+    cache_dir: Path | None,
+    pid: int,
+) -> ExecuteResult:
+    """Run the actionable scope while the caller holds the pipeline lease."""
+    results: list[TaskRunResult] = []
+    while True:
+        task_id = _next_actionable(life, scope, order)
+        if task_id is None:
+            break
+        spec = by_id[task_id]
+        try:
+            reason = _prepare_executor(life, request, spec, bindings)
+        except ExecutionError as exc:
+            return _error(f"{exc.code}: {exc}", request, tuple(results), life.run.run_id)
+        if reason:
+            return ExecuteResult("blocked", EXIT_BLOCKED, reason, request.run_dir,
+                                 life.run.run_id, tuple(results))
+        t_lease = task_lease(request.repo_root, life.run.run_id, task_id, pid)
+        try:
+            t_lease.acquire(task_id)
+        except LeaseHeldError as exc:
+            life.record_operation(task_id, "lease", "blocked", f"{exc.code}: {exc}")
+            return ExecuteResult("blocked", EXIT_BLOCKED, f"{exc.code}: {exc}",
+                                 request.run_dir, life.run.run_id, tuple(results))
+        try:
+            with _child_uv_cache(
+                cache_dir if task_id == request.controls.operational_unblock_task else None
+            ):
+                outcome = _run_selected_task(
+                    life, plan, task_id,
+                    TaskExecution(
+                        spec=spec, adapter=request.adapter, launchers=request.launchers,
+                        verifier_anchors=request.verifier_anchors,
+                        envelope_anchors=request.envelope_anchors,
+                        role_grant=tuple(request.role_grant), execution_mode=request.execution_mode,
+                        plan_path=request.plan_prompt_path,
+                        working_root=_task_working_root(request, spec), timeout=request.timeout,
+                        model=request.controls.model, effort=request.controls.effort,
+                        board_path=request.board_path,
+                        pre_dispatch=lambda: _prepare_executor(life, request, spec, bindings),
+                        baseline_diagnosis=lambda: diagnose_baseline(spec, request.repo_root),
+                    ),
+                )
+        except (ExecutionError, DispatchError) as exc:
+            return _error(f"{getattr(exc, 'code', 'execution-error')}: {exc}", request,
+                          tuple(results), life.run.run_id)
+        finally:
+            t_lease.release()
+
+        results.append(outcome)
+        if outcome.status == "retryable":
+            life.run.status = "running"
+            life.record_operation(task_id, "executor", "retryable", outcome.blocker)
+            life.run.save()
+            return ExecuteResult(
+                "retryable", EXIT_ERROR,
+                f"{task_id} has a retryable orchestration failure: "
+                f"{outcome.blocker or 'see the persisted diagnostic'}",
+                request.run_dir, life.run.run_id, tuple(results))
+        if outcome.status == "amendment_required":
+            life.run.status = "running"
+            life.record_operation(task_id, "baseline", "amendment_required", outcome.blocker)
+            life.run.save()
+            return ExecuteResult(
+                "amendment_required", EXIT_BLOCKED,
+                f"{task_id} requires an approved amendment before it can be dispatched: "
+                f"{outcome.blocker or 'see the persisted diagnostic'}",
+                request.run_dir, life.run.run_id, tuple(results))
+        if outcome.status != "done":
+            life.run.status = "running"
+            life.record_operation(task_id, "execution", "failed", outcome.blocker)
+            life.run.save()
+            return ExecuteResult(
+                "blocked", EXIT_BLOCKED,
+                f"{task_id} ended '{outcome.status}': "
+                f"{outcome.blocker or 'see the persisted diagnostic'}",
+                request.run_dir, life.run.run_id, tuple(results))
+        life.recompute_readiness()
+
+    pending = [tid for tid in scope if life.run.task(tid).status != "done"]
+    if not pending:
+        life.run.status = "verified"
+        life.run.save()
+        return ExecuteResult(
+            "ok", EXIT_OK,
+            f"execute complete: {len(scope)} scoped task(s) verified. Stopped after "
+            f"stage 9 — documentation, knowledge-graph refresh, final verification, "
+            f"release, and archive/purge are not run in execute mode.",
+            request.run_dir, life.run.run_id, tuple(results))
+    life.run.status = "running"
+    life.run.save()
+    return ExecuteResult("blocked", EXIT_BLOCKED, _pending_reason(life, pending),
+                         request.run_dir, life.run.run_id, tuple(results))
+
+
 def execute_run(request: ExecuteRequest) -> ExecuteResult:
     """Drive every selected task to ``verified`` or to a truthful non-zero terminal state.
 
@@ -2114,113 +2211,9 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
             "blocked", EXIT_BLOCKED, f"{exc.code}: {exc}",
             request.run_dir, life.run.run_id)
 
-    results: list[TaskRunResult] = []
     try:
-        while True:
-            task_id = _next_actionable(life, scope, order)
-            if task_id is None:
-                break
-            spec = by_id[task_id]
-            try:
-                reason = _prepare_executor(life, request, spec, bindings)
-            except ExecutionError as exc:
-                return _error(f"{exc.code}: {exc}", request, tuple(results), life.run.run_id)
-            if reason:
-                return ExecuteResult("blocked", EXIT_BLOCKED, reason, request.run_dir,
-                                     life.run.run_id, tuple(results))
-            t_lease = task_lease(request.repo_root, life.run.run_id, task_id, pid)
-            try:
-                t_lease.acquire(task_id)
-            except LeaseHeldError as exc:
-                # Lease contention is operation-level evidence on an otherwise-unfinished
-                # task, never a task state change: the task stays exactly where it was.
-                life.record_operation(task_id, "lease", "blocked", f"{exc.code}: {exc}")
-                return ExecuteResult(
-                    "blocked", EXIT_BLOCKED, f"{exc.code}: {exc}",
-                    request.run_dir, life.run.run_id, tuple(results))
-            try:
-                with _child_uv_cache(cache_dir if task_id == request.controls.operational_unblock_task else None):
-                    outcome = _run_selected_task(
-                        life, plan, task_id,
-                        TaskExecution(
-                            spec=spec,
-                            adapter=request.adapter,
-                            launchers=request.launchers,
-                            verifier_anchors=request.verifier_anchors,
-                            envelope_anchors=request.envelope_anchors,
-                            role_grant=tuple(request.role_grant),
-                            execution_mode=request.execution_mode,
-                            plan_path=request.plan_prompt_path,
-                            working_root=_task_working_root(request, spec),
-                            timeout=request.timeout,
-                            model=request.controls.model,
-                            effort=request.controls.effort,
-                            board_path=request.board_path,
-                            pre_dispatch=lambda: _prepare_executor(life, request, spec, bindings),
-                            # This is deliberately before the executor window and before the
-                            # repair loop consumes an attempt.  A failure attributable to a
-                            # path outside the current revision therefore becomes an explicit
-                            # human amendment decision, never a futile repair dispatch.
-                            baseline_diagnosis=lambda: diagnose_baseline(spec, request.repo_root),
-                        ),
-                    )
-            except (ExecutionError, DispatchError) as exc:
-                return _error(
-                    f"{getattr(exc, 'code', 'execution-error')}: {exc}",
-                    request, tuple(results), life.run.run_id)
-            finally:
-                t_lease.release()
-
-            results.append(outcome)
-            if outcome.status == "retryable":
-                # A launch/protocol error has no executor outcome. Preserve the non-terminal
-                # lifecycle so a later --resume obtains a fresh launch generation.
-                life.run.status = "running"
-                life.record_operation(task_id, "executor", "retryable", outcome.blocker)
-                life.run.save()
-                return ExecuteResult(
-                    "retryable", EXIT_ERROR,
-                    f"{task_id} has a retryable orchestration failure: "
-                    f"{outcome.blocker or 'see the persisted diagnostic'}",
-                    request.run_dir, life.run.run_id, tuple(results))
-            if outcome.status == "amendment_required":
-                # A pre-dispatch baseline diagnosis found declared-command evidence outside
-                # this task's current scope (TAM-01 AC-4). The active task card is retained
-                # unchanged and no repair attempt was spent reaching this outcome; only an
-                # explicit, approved amendment (never a futile repair) can proceed.
-                life.run.status = "running"
-                life.record_operation(task_id, "baseline", "amendment_required", outcome.blocker)
-                life.run.save()
-                return ExecuteResult(
-                    "amendment_required", EXIT_BLOCKED,
-                    f"{task_id} requires an approved amendment before it can be dispatched: "
-                    f"{outcome.blocker or 'see the persisted diagnostic'}",
-                    request.run_dir, life.run.run_id, tuple(results))
-            if outcome.status != "done":
-                life.run.status = "running"
-                life.record_operation(task_id, "execution", "failed", outcome.blocker)
-                life.run.save()
-                return ExecuteResult(
-                    "blocked", EXIT_BLOCKED,
-                    f"{task_id} ended '{outcome.status}': "
-                    f"{outcome.blocker or 'see the persisted diagnostic'}",
-                    request.run_dir, life.run.run_id, tuple(results))
-            life.recompute_readiness()
-
-        pending = [tid for tid in scope if life.run.task(tid).status != "done"]
-        if not pending:
-            life.run.status = "verified"
-            life.run.save()
-            return ExecuteResult(
-                "ok", EXIT_OK,
-                f"execute complete: {len(scope)} scoped task(s) verified. Stopped after "
-                f"stage 9 — documentation, knowledge-graph refresh, final verification, "
-                f"release, and archive/purge are not run in execute mode.",
-                request.run_dir, life.run.run_id, tuple(results))
-        life.run.status = "running"
-        life.run.save()
-        return ExecuteResult(
-            "blocked", EXIT_BLOCKED, _pending_reason(life, pending),
-            request.run_dir, life.run.run_id, tuple(results))
+        return _run_scoped_tasks(
+            request, life, scope, order, by_id, plan, bindings, cache_dir, pid,
+        )
     finally:
         lease.release()

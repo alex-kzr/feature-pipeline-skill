@@ -78,8 +78,7 @@ def _request(
         adapter=executor,
         launchers=launchers,
         envelope_anchors=EnvelopeAnchors(project_root=".", agents_root=".agents"),
-        verifier_anchors=VerifierAnchors(
-            project_root=str(root), agents_root=str(root / ".agents")),
+        verifier_anchors=VerifierAnchors(project_root=str(root), agents_root=str(root / ".agents")),
         environment=environment,
         controls=controls,
         plan_prompt_path="fixtures/execution/plan.json",
@@ -95,28 +94,49 @@ def _controls(scenario: sa.Scenario) -> ExecuteControls:
 
 def _seed_reportless_uv_cache_block(request: ExecuteRequest) -> None:
     """Build REC-11's real first-launch, runner-owned cache-start terminal shape."""
-    source = Run.create(FEATURE, request.prompt_path, request.plan_path, request.run_dir, request.repo_root)
+    source = Run.create(
+        FEATURE, request.prompt_path, request.plan_path, request.run_dir, request.repo_root
+    )
     life = RunLifecycle.initialize(
-        source, tasks=[("EX-01", [])],
+        source,
+        tasks=[("EX-01", [])],
         controls={
             "execution_scope": (["EX-01"], "explicit"),
             "verify_dependency_chain": (False, "default"),
-            "model": (None, "default"), "effort": (None, "default"),
+            "model": (None, "default"),
+            "effort": (None, "default"),
             "precondition_bindings": ({}, "explicit"),
-        }, adapter_requested="claude", adapter_resolved="claude")
+        },
+        adapter_requested="claude",
+        adapter_resolved="claude",
+    )
     life.transition("EX-01", "running", actor=ACTOR_RUNNER)
     generation = life.consume_launch_generation("EX-01")
     blocker = "external operational: uv cache access denied"
-    diagnostic = request.run_dir / "reports" / "EX-01" / f"launch-{generation}" / (
-        f"launch-failure-{generation}.json"
+    diagnostic = (
+        request.run_dir
+        / "reports"
+        / "EX-01"
+        / f"launch-{generation}"
+        / (f"launch-failure-{generation}.json")
     )
     diagnostic.parent.mkdir(parents=True)
-    diagnostic.write_text(json.dumps({
-        "task_id": "EX-01", "generation": generation, "attempt": 0,
-        "stage": "executor", "reason": blocker, "exit_code": 1,
-    }), encoding="utf-8")
+    diagnostic.write_text(
+        json.dumps(
+            {
+                "task_id": "EX-01",
+                "generation": generation,
+                "attempt": 0,
+                "stage": "executor",
+                "reason": blocker,
+                "exit_code": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
     life.run.record_launch_failure(
-        "EX-01", stage="executor", generation=generation, exit_code=1, detail=blocker)
+        "EX-01", stage="executor", generation=generation, exit_code=1, detail=blocker
+    )
     persist_task_contracts(life.run, request.specs)
     life.block("EX-01", blocker)
     life.run.status = "blocked"
@@ -126,15 +146,22 @@ def _seed_reportless_uv_cache_block(request: ExecuteRequest) -> None:
 def _seed_actual_tc01_predispatch_block(request: ExecuteRequest, *, tamper: bool = False) -> None:
     """Seed REC-11's persisted TC-01 runner-owned pre-dispatch blocker exactly."""
     task_id = "TC-01"
-    source = Run.create(FEATURE, request.prompt_path, request.plan_path, request.run_dir, request.repo_root)
+    source = Run.create(
+        FEATURE, request.prompt_path, request.plan_path, request.run_dir, request.repo_root
+    )
     life = RunLifecycle.initialize(
-        source, tasks=[(task_id, [])],
+        source,
+        tasks=[(task_id, [])],
         controls={
             "execution_scope": ([task_id], "explicit"),
             "verify_dependency_chain": (False, "default"),
-            "model": (None, "default"), "effort": (None, "default"),
+            "model": (None, "default"),
+            "effort": (None, "default"),
             "precondition_bindings": ({}, "explicit"),
-        }, adapter_requested="claude", adapter_resolved="claude")
+        },
+        adapter_requested="claude",
+        adapter_resolved="claude",
+    )
     blocker = "external operational: uv cache access denied"
     life.transition(task_id, "running", actor=ACTOR_RUNNER)
     life.block(task_id, blocker)
@@ -145,17 +172,22 @@ def _seed_actual_tc01_predispatch_block(request: ExecuteRequest, *, tamper: bool
     diagnostic.write_text("runner-owned diagnostic\n", encoding="utf-8")
     diagnostic_ref = diagnostic.relative_to(request.repo_root).as_posix()
     packet = request.run_dir / "reports" / task_id / "blocked-1.json"
-    packet.write_text(json.dumps({
-        "task_id": task_id,
-        "gate": 2 if tamper else 1,
-        "attempts": 0,
-        "max_repair_attempts": 2,
-        "blocker": blocker,
-        "diagnostic": diagnostic_ref,
-        "repair_report": None,
-        "verdicts": {"task": None, "test": None},
-        "recorded_at": "2026-09-10T00:00:00Z",
-    }), encoding="utf-8")
+    packet.write_text(
+        json.dumps(
+            {
+                "task_id": task_id,
+                "gate": 2 if tamper else 1,
+                "attempts": 0,
+                "max_repair_attempts": 2,
+                "blocker": blocker,
+                "diagnostic": diagnostic_ref,
+                "repair_report": None,
+                "verdicts": {"task": None, "test": None},
+                "recorded_at": "2026-09-10T00:00:00Z",
+            }
+        ),
+        encoding="utf-8",
+    )
     life.run.artifacts = {
         f"blocker:{task_id}": packet.relative_to(request.repo_root).as_posix(),
         f"diagnostic:{task_id}:1": diagnostic.relative_to(request.run_dir).as_posix(),
@@ -172,24 +204,38 @@ class ScenarioTableTests(unittest.TestCase):
             scenario = sa.SCENARIOS["direct-success"]
             executor = scenario.executor()
             request = _request(
-                root, _specs(("EX-01",)), executor=executor,
+                root,
+                _specs(("EX-01",)),
+                executor=executor,
                 launchers=VerifierLaunchers(
-                    task=scenario.task_verifier(), test=scenario.test_verifier()),
-                controls=ExecuteControls(plan_approved=True), environment={"claude": True})
-            source = Run.create(FEATURE, request.prompt_path, request.plan_path, request.run_dir, root)
+                    task=scenario.task_verifier(), test=scenario.test_verifier()
+                ),
+                controls=ExecuteControls(plan_approved=True),
+                environment={"claude": True},
+            )
+            source = Run.create(
+                FEATURE, request.prompt_path, request.plan_path, request.run_dir, root
+            )
             life = RunLifecycle.initialize(
-                source, tasks=[("EX-01", [])],
+                source,
+                tasks=[("EX-01", [])],
                 controls={
                     "execution_scope": (["EX-01"], "explicit"),
                     "verify_dependency_chain": (False, "default"),
-                    "model": (None, "default"), "effort": (None, "default"),
+                    "model": (None, "default"),
+                    "effort": (None, "default"),
                     "precondition_bindings": ({}, "explicit"),
-                }, adapter_requested="claude", adapter_resolved="claude")
+                },
+                adapter_requested="claude",
+                adapter_resolved="claude",
+            )
             life.transition("EX-01", "running", actor=ACTOR_RUNNER)
             report = request.run_dir / "reports" / "EX-01" / "report.md"
             report.parent.mkdir(parents=True)
             report.write_text("blocked by uv cache\n", encoding="utf-8")
-            life.run.task("EX-01").execution_evidence["executor_report"] = report.relative_to(root).as_posix()
+            life.run.task("EX-01").execution_evidence["executor_report"] = report.relative_to(
+                root
+            ).as_posix()
             persist_task_contracts(life.run, request.specs)
             life.block("EX-01", "external operational: uv cache access denied")
             life.run.status = "blocked"
@@ -203,18 +249,24 @@ class ScenarioTableTests(unittest.TestCase):
                 return original_launch(request)
 
             executor.launch = launch
-            cache = root / ".pipeline" / "uv-cache"
             result = execute_run(
                 _request(
-                    root, _specs(("EX-01",)), executor=executor,
+                    root,
+                    _specs(("EX-01",)),
+                    executor=executor,
                     launchers=VerifierLaunchers(
-                        task=scenario.task_verifier(), test=scenario.test_verifier()),
+                        task=scenario.task_verifier(), test=scenario.test_verifier()
+                    ),
                     controls=ExecuteControls(
-                        plan_approved=True, resume=True,
+                        plan_approved=True,
+                        resume=True,
                         operational_unblock_task="EX-01",
                         human_authorized_operational_unblock=True,
                         uv_cache_dir=".pipeline/uv-cache",
-                    ), environment={"claude": True}))
+                    ),
+                    environment={"claude": True},
+                )
+            )
 
             self.assertEqual(result.status, "error")
             self.assertIn("operational-unblock-blocker-invalid", result.message)
@@ -226,20 +278,35 @@ class ScenarioTableTests(unittest.TestCase):
             scenario = sa.SCENARIOS["direct-success"]
             executor = scenario.executor()
             request = _request(
-                root, _specs(("EX-01",)), executor=executor,
+                root,
+                _specs(("EX-01",)),
+                executor=executor,
                 launchers=VerifierLaunchers(
-                    task=scenario.task_verifier(), test=scenario.test_verifier()),
-                controls=ExecuteControls(plan_approved=True), environment={"claude": True})
+                    task=scenario.task_verifier(), test=scenario.test_verifier()
+                ),
+                controls=ExecuteControls(plan_approved=True),
+                environment={"claude": True},
+            )
             _seed_reportless_uv_cache_block(request)
 
-            result = execute_run(_request(
-                root, _specs(("EX-01",)), executor=executor,
-                launchers=VerifierLaunchers(
-                    task=scenario.task_verifier(), test=scenario.test_verifier()),
-                controls=ExecuteControls(
-                    plan_approved=True, resume=True, operational_unblock_task="EX-01",
-                    human_authorized_operational_unblock=True, uv_cache_dir=".pipeline/uv-cache",
-                ), environment={"claude": True}))
+            result = execute_run(
+                _request(
+                    root,
+                    _specs(("EX-01",)),
+                    executor=executor,
+                    launchers=VerifierLaunchers(
+                        task=scenario.task_verifier(), test=scenario.test_verifier()
+                    ),
+                    controls=ExecuteControls(
+                        plan_approved=True,
+                        resume=True,
+                        operational_unblock_task="EX-01",
+                        human_authorized_operational_unblock=True,
+                        uv_cache_dir=".pipeline/uv-cache",
+                    ),
+                    environment={"claude": True},
+                )
+            )
 
             self.assertEqual(result.status, "error")
             self.assertIn("operational-unblock-blocker-invalid", result.message)
@@ -251,12 +318,19 @@ class ScenarioTableTests(unittest.TestCase):
                 scenario = sa.SCENARIOS["direct-success"]
                 executor = scenario.executor()
                 request = _request(
-                    root, _specs(("EX-01",)), executor=executor,
+                    root,
+                    _specs(("EX-01",)),
+                    executor=executor,
                     launchers=VerifierLaunchers(
-                        task=scenario.task_verifier(), test=scenario.test_verifier()),
-                    controls=ExecuteControls(plan_approved=True), environment={"claude": True})
+                        task=scenario.task_verifier(), test=scenario.test_verifier()
+                    ),
+                    controls=ExecuteControls(plan_approved=True),
+                    environment={"claude": True},
+                )
                 _seed_reportless_uv_cache_block(request)
-                diagnostic = request.run_dir / "reports" / "EX-01" / "launch-1" / "launch-failure-1.json"
+                diagnostic = (
+                    request.run_dir / "reports" / "EX-01" / "launch-1" / "launch-failure-1.json"
+                )
                 if name == "absent":
                     diagnostic.unlink()
                 else:
@@ -264,21 +338,35 @@ class ScenarioTableTests(unittest.TestCase):
                     payload["reason"] = "tampered"
                     diagnostic.write_text(json.dumps(payload), encoding="utf-8")
 
-                result = execute_run(_request(
-                    root, _specs(("EX-01",)), executor=executor,
-                    launchers=VerifierLaunchers(
-                        task=scenario.task_verifier(), test=scenario.test_verifier()),
-                    controls=ExecuteControls(
-                        plan_approved=True, resume=True, operational_unblock_task="EX-01",
-                        human_authorized_operational_unblock=True, uv_cache_dir=".pipeline/uv-cache",
-                    ), environment={"claude": True}))
+                result = execute_run(
+                    _request(
+                        root,
+                        _specs(("EX-01",)),
+                        executor=executor,
+                        launchers=VerifierLaunchers(
+                            task=scenario.task_verifier(), test=scenario.test_verifier()
+                        ),
+                        controls=ExecuteControls(
+                            plan_approved=True,
+                            resume=True,
+                            operational_unblock_task="EX-01",
+                            human_authorized_operational_unblock=True,
+                            uv_cache_dir=".pipeline/uv-cache",
+                        ),
+                        environment={"claude": True},
+                    )
+                )
 
                 self.assertEqual(result.status, "error")
                 self.assertIn("operational-unblock-blocker-invalid", result.message)
                 self.assertEqual(executor.launches, 0)
-                self.assertEqual(Run.load(request.run_dir, root).task("EX-01").status, "in_progress")
+                self.assertEqual(
+                    Run.load(request.run_dir, root).task("EX-01").status, "in_progress"
+                )
 
-    def test_operational_unblock_accepts_only_the_actual_tc01_predispatch_blocker_packet(self) -> None:
+    def test_operational_unblock_accepts_only_the_actual_tc01_predispatch_blocker_packet(
+        self,
+    ) -> None:
         for name in ("matching", "absent", "tampered"):
             with self.subTest(name=name), TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -286,10 +374,15 @@ class ScenarioTableTests(unittest.TestCase):
                 executor = scenario.executor()
                 tc01 = replace(_specs(("EX-01",))[0], id="TC-01")
                 request = _request(
-                    root, (tc01,), executor=executor,
+                    root,
+                    (tc01,),
+                    executor=executor,
                     launchers=VerifierLaunchers(
-                        task=scenario.task_verifier(), test=scenario.test_verifier()),
-                    controls=ExecuteControls(plan_approved=True), environment={"claude": True})
+                        task=scenario.task_verifier(), test=scenario.test_verifier()
+                    ),
+                    controls=ExecuteControls(plan_approved=True),
+                    environment={"claude": True},
+                )
                 _seed_actual_tc01_predispatch_block(request, tamper=name == "tampered")
                 packet = request.run_dir / "reports" / "TC-01" / "blocked-1.json"
                 if name == "absent":
@@ -302,25 +395,45 @@ class ScenarioTableTests(unittest.TestCase):
                 self.assertEqual(seeded_task.external_launch_failures, [])
                 self.assertEqual(seeded_task.next_executor_launch_generation, 2)
 
-                result = execute_run(_request(
-                    root, (tc01,), executor=executor,
-                    launchers=VerifierLaunchers(
-                        task=scenario.task_verifier(), test=scenario.test_verifier()),
-                    controls=ExecuteControls(
-                        plan_approved=True, resume=True, operational_unblock_task="TC-01",
-                        human_authorized_operational_unblock=True, uv_cache_dir=".pipeline/uv-cache",
-                    ), environment={"claude": True}))
+                result = execute_run(
+                    _request(
+                        root,
+                        (tc01,),
+                        executor=executor,
+                        launchers=VerifierLaunchers(
+                            task=scenario.task_verifier(), test=scenario.test_verifier()
+                        ),
+                        controls=ExecuteControls(
+                            plan_approved=True,
+                            resume=True,
+                            operational_unblock_task="TC-01",
+                            human_authorized_operational_unblock=True,
+                            uv_cache_dir=".pipeline/uv-cache",
+                        ),
+                        environment={"claude": True},
+                    )
+                )
 
                 self.assertEqual(result.status, "error")
                 self.assertIn("operational-unblock-blocker-invalid", result.message)
                 self.assertEqual(executor.launches, 0)
-                self.assertEqual(Run.load(request.run_dir, root).task("TC-01").status, "in_progress")
+                self.assertEqual(
+                    Run.load(request.run_dir, root).task("TC-01").status, "in_progress"
+                )
 
     def test_operational_unblock_fails_closed_for_unapproved_or_unsafe_retry(self) -> None:
         cases = (
             ("missing-authorization", {}, "operational-unblock-unauthorized"),
-            ("unsafe-cache", {"uv_cache_dir": "../uv-cache"}, "operational-unblock-blocker-invalid"),
-            ("product-blocker", {"blocker": "repair budget exhausted"}, "operational-unblock-blocker-invalid"),
+            (
+                "unsafe-cache",
+                {"uv_cache_dir": "../uv-cache"},
+                "operational-unblock-blocker-invalid",
+            ),
+            (
+                "product-blocker",
+                {"blocker": "repair budget exhausted"},
+                "operational-unblock-blocker-invalid",
+            ),
             ("model-drift", {"model": "different"}, "runtime-control-mismatch"),
             ("live-lease", {"live_lease": True}, "operational-unblock-blocker-invalid"),
             ("missing-evidence", {"missing_evidence": True}, "operational-unblock-blocker-invalid"),
@@ -331,27 +444,43 @@ class ScenarioTableTests(unittest.TestCase):
                 scenario = sa.SCENARIOS["direct-success"]
                 executor = scenario.executor()
                 request = _request(
-                    root, _specs(("EX-01",)), executor=executor,
+                    root,
+                    _specs(("EX-01",)),
+                    executor=executor,
                     launchers=VerifierLaunchers(
-                        task=scenario.task_verifier(), test=scenario.test_verifier()),
-                    controls=ExecuteControls(plan_approved=True), environment={"claude": True})
-                source = Run.create(FEATURE, request.prompt_path, request.plan_path, request.run_dir, root)
+                        task=scenario.task_verifier(), test=scenario.test_verifier()
+                    ),
+                    controls=ExecuteControls(plan_approved=True),
+                    environment={"claude": True},
+                )
+                source = Run.create(
+                    FEATURE, request.prompt_path, request.plan_path, request.run_dir, root
+                )
                 life = RunLifecycle.initialize(
-                    source, tasks=[("EX-01", [])],
+                    source,
+                    tasks=[("EX-01", [])],
                     controls={
                         "execution_scope": (["EX-01"], "explicit"),
                         "verify_dependency_chain": (False, "default"),
-                        "model": (None, "default"), "effort": (None, "default"),
+                        "model": (None, "default"),
+                        "effort": (None, "default"),
                         "precondition_bindings": ({}, "explicit"),
-                    }, adapter_requested="claude", adapter_resolved="claude")
+                    },
+                    adapter_requested="claude",
+                    adapter_resolved="claude",
+                )
                 life.transition("EX-01", "running", actor=ACTOR_RUNNER)
                 if not override.get("missing_evidence"):
                     report = request.run_dir / "reports" / "EX-01" / "report.md"
                     report.parent.mkdir(parents=True)
                     report.write_text("blocked by uv cache\n", encoding="utf-8")
-                    life.run.task("EX-01").execution_evidence["executor_report"] = report.relative_to(root).as_posix()
+                    life.run.task("EX-01").execution_evidence["executor_report"] = (
+                        report.relative_to(root).as_posix()
+                    )
                 persist_task_contracts(life.run, request.specs)
-                life.block("EX-01", override.get("blocker", "external operational: uv cache access denied"))
+                life.block(
+                    "EX-01", override.get("blocker", "external operational: uv cache access denied")
+                )
                 life.run.status = "blocked"
                 life.run.save()
                 if override.get("live_lease"):
@@ -359,22 +488,33 @@ class ScenarioTableTests(unittest.TestCase):
                     lock.parent.mkdir(parents=True, exist_ok=True)
                     lock.write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
                 controls = ExecuteControls(
-                    plan_approved=True, resume=True, operational_unblock_task="EX-01",
+                    plan_approved=True,
+                    resume=True,
+                    operational_unblock_task="EX-01",
                     human_authorized_operational_unblock=not name == "missing-authorization",
                     uv_cache_dir=override.get("uv_cache_dir", ".pipeline/uv-cache"),
                     model=override.get("model"),
                 )
 
-                result = execute_run(_request(
-                    root, _specs(("EX-01",)), executor=executor,
-                    launchers=VerifierLaunchers(
-                        task=scenario.task_verifier(), test=scenario.test_verifier()),
-                    controls=controls, environment={"claude": True}))
+                result = execute_run(
+                    _request(
+                        root,
+                        _specs(("EX-01",)),
+                        executor=executor,
+                        launchers=VerifierLaunchers(
+                            task=scenario.task_verifier(), test=scenario.test_verifier()
+                        ),
+                        controls=controls,
+                        environment={"claude": True},
+                    )
+                )
 
                 self.assertEqual(result.status, "error")
                 self.assertIn(expected, result.message)
                 self.assertEqual(executor.launches, 0)
-                self.assertEqual(Run.load(request.run_dir, root).task("EX-01").status, "in_progress")
+                self.assertEqual(
+                    Run.load(request.run_dir, root).task("EX-01").status, "in_progress"
+                )
 
     def test_every_scenario_reaches_its_declared_terminal_shape(self) -> None:
         for name, scenario in sa.SCENARIOS.items():
@@ -382,12 +522,18 @@ class ScenarioTableTests(unittest.TestCase):
                 root = Path(directory)
                 executor = scenario.executor()
                 launchers = VerifierLaunchers(
-                    task=scenario.task_verifier(), test=scenario.test_verifier())
+                    task=scenario.task_verifier(), test=scenario.test_verifier()
+                )
                 result = execute_run(
                     _request(
-                        root, _specs(scenario.task_ids),
-                        executor=executor, launchers=launchers,
-                        controls=_controls(scenario), environment=dict(scenario.environment)))
+                        root,
+                        _specs(scenario.task_ids),
+                        executor=executor,
+                        launchers=launchers,
+                        controls=_controls(scenario),
+                        environment=dict(scenario.environment),
+                    )
+                )
                 self.assertEqual(result.status, scenario.expected_status, name)
                 self.assertEqual(result.exit_code, scenario.expected_exit, name)
 
@@ -398,10 +544,16 @@ class ScenarioTableTests(unittest.TestCase):
             executor = scenario.executor()
             result = execute_run(
                 _request(
-                    root, _specs(scenario.task_ids), executor=executor,
+                    root,
+                    _specs(scenario.task_ids),
+                    executor=executor,
                     launchers=VerifierLaunchers(
-                        task=scenario.task_verifier(), test=scenario.test_verifier()),
-                    controls=_controls(scenario), environment={"claude": True}))
+                        task=scenario.task_verifier(), test=scenario.test_verifier()
+                    ),
+                    controls=_controls(scenario),
+                    environment={"claude": True},
+                )
+            )
 
             self.assertTrue(result.ok)
             self.assertEqual(result.exit_code, EXIT_OK)
@@ -424,10 +576,16 @@ class ScenarioTableTests(unittest.TestCase):
             root = Path(directory)
             result = execute_run(
                 _request(
-                    root, _specs(scenario.task_ids), executor=scenario.executor(),
+                    root,
+                    _specs(scenario.task_ids),
+                    executor=scenario.executor(),
                     launchers=VerifierLaunchers(
-                        task=scenario.task_verifier(), test=scenario.test_verifier()),
-                    controls=_controls(scenario), environment={"claude": True}))
+                        task=scenario.task_verifier(), test=scenario.test_verifier()
+                    ),
+                    controls=_controls(scenario),
+                    environment={"claude": True},
+                )
+            )
 
             self.assertEqual(result.exit_code, EXIT_BLOCKED)
             self.assertIn("maximum repair attempts", result.message)
@@ -444,10 +602,16 @@ class ScenarioTableTests(unittest.TestCase):
             executor = scenario.executor()
             result = execute_run(
                 _request(
-                    root, _specs(scenario.task_ids), executor=executor,
+                    root,
+                    _specs(scenario.task_ids),
+                    executor=executor,
                     launchers=VerifierLaunchers(
-                        task=scenario.task_verifier(), test=scenario.test_verifier()),
-                    controls=_controls(scenario), environment={"claude": True}))
+                        task=scenario.task_verifier(), test=scenario.test_verifier()
+                    ),
+                    controls=_controls(scenario),
+                    environment={"claude": True},
+                )
+            )
 
             self.assertEqual(result.exit_code, EXIT_BLOCKED)
             self.assertEqual({call["task_id"] for call in executor.calls}, {"EX-01"})
@@ -462,10 +626,16 @@ class ScenarioTableTests(unittest.TestCase):
             root = Path(directory)
             result = execute_run(
                 _request(
-                    root, _specs(scenario.task_ids), executor=scenario.executor(),
+                    root,
+                    _specs(scenario.task_ids),
+                    executor=scenario.executor(),
                     launchers=VerifierLaunchers(
-                        task=scenario.task_verifier(), test=scenario.test_verifier()),
-                    controls=_controls(scenario), environment={"claude": True}))
+                        task=scenario.task_verifier(), test=scenario.test_verifier()
+                    ),
+                    controls=_controls(scenario),
+                    environment={"claude": True},
+                )
+            )
             self.assertEqual(result.status, "gate-pending")
             self.assertFalse((root / "runs" / FEATURE / "run.json").exists())
 
@@ -474,9 +644,14 @@ class ResumeAndSafetyTests(unittest.TestCase):
     def _run_once(self, root: Path, *, executor, task, test, controls):
         return execute_run(
             _request(
-                root, _specs(("EX-01",)), executor=executor,
+                root,
+                _specs(("EX-01",)),
+                executor=executor,
                 launchers=VerifierLaunchers(task=task, test=test),
-                controls=controls, environment={"claude": True}))
+                controls=controls,
+                environment={"claude": True},
+            )
+        )
 
     def test_resume_continues_an_open_repair_without_double_counting(self) -> None:
         with TemporaryDirectory() as directory:
@@ -486,7 +661,8 @@ class ResumeAndSafetyTests(unittest.TestCase):
                 executor=sa.ScriptedExecutor(("implemented", "implemented")),
                 task=sa.ScriptedVerifier(("FAIL", "PASS")),
                 test=sa.ScriptedVerifier(("PASS", "PASS")),
-                controls=ExecuteControls(plan_approved=True))
+                controls=ExecuteControls(plan_approved=True),
+            )
             self.assertTrue(first.ok)
 
             # Simulate a crash between the failed gate and the repair redispatch.
@@ -496,9 +672,12 @@ class ResumeAndSafetyTests(unittest.TestCase):
 
             executor = sa.ScriptedExecutor(("implemented",))
             resumed = self._run_once(
-                root, executor=executor,
-                task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",)),
-                controls=ExecuteControls(plan_approved=True, resume=True))
+                root,
+                executor=executor,
+                task=sa.ScriptedVerifier(("PASS",)),
+                test=sa.ScriptedVerifier(("PASS",)),
+                controls=ExecuteControls(plan_approved=True, resume=True),
+            )
 
             self.assertTrue(resumed.ok)
             self.assertEqual(resumed.exit_code, EXIT_OK)
@@ -510,6 +689,7 @@ class ResumeAndSafetyTests(unittest.TestCase):
 
     def test_resume_hydrates_the_persisted_codex_model_and_effort(self) -> None:
         """An omitted runtime pair resumes with the exact persisted Codex settings."""
+
         class CapturingExecutor(sa.ScriptedExecutor):
             def launch(self, request):  # noqa: ANN001 - deterministic protocol fixture
                 self.runtime = (request.model, request.effort)
@@ -517,14 +697,24 @@ class ResumeAndSafetyTests(unittest.TestCase):
 
         with TemporaryDirectory() as directory:
             root = Path(directory)
-            first = execute_run(_request(
-                root, _specs(("EX-01",)), executor=sa.ScriptedExecutor(("implemented",)),
-                launchers=VerifierLaunchers(
-                    task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))),
-                controls=ExecuteControls(
-                    plan_approved=True, adapter="codex", adapter_explicit=True,
-                    model="gpt-5.6-terra", effort="medium",
-                ), environment={"codex": True}))
+            first = execute_run(
+                _request(
+                    root,
+                    _specs(("EX-01",)),
+                    executor=sa.ScriptedExecutor(("implemented",)),
+                    launchers=VerifierLaunchers(
+                        task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))
+                    ),
+                    controls=ExecuteControls(
+                        plan_approved=True,
+                        adapter="codex",
+                        adapter_explicit=True,
+                        model="gpt-5.6-terra",
+                        effort="medium",
+                    ),
+                    environment={"codex": True},
+                )
+            )
             self.assertTrue(first.ok, first.message)
             persisted = Run.load(first.run_dir, root)
             persisted.task("EX-01").status = "in_progress"
@@ -532,13 +722,23 @@ class ResumeAndSafetyTests(unittest.TestCase):
             persisted.save()
 
             executor = CapturingExecutor(("implemented",))
-            resumed = execute_run(_request(
-                root, _specs(("EX-01",)), executor=executor,
-                launchers=VerifierLaunchers(
-                    task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))),
-                controls=ExecuteControls(
-                    plan_approved=True, resume=True, adapter="codex", adapter_explicit=True,
-                ), environment={"codex": True}))
+            resumed = execute_run(
+                _request(
+                    root,
+                    _specs(("EX-01",)),
+                    executor=executor,
+                    launchers=VerifierLaunchers(
+                        task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))
+                    ),
+                    controls=ExecuteControls(
+                        plan_approved=True,
+                        resume=True,
+                        adapter="codex",
+                        adapter_explicit=True,
+                    ),
+                    environment={"codex": True},
+                )
+            )
 
             self.assertTrue(resumed.ok, resumed.message)
             self.assertEqual(executor.runtime, ("gpt-5.6-terra", "medium"))
@@ -548,14 +748,20 @@ class ResumeAndSafetyTests(unittest.TestCase):
         state fixture: an executor permission wait is non-terminal, and a compatible resume
         must preserve all generation-one bytes/history while runner-owned checks and both
         independent verifiers complete generation two."""
+
         class PermissionBlockedExecutor(sa.ScriptedExecutor):
             def launch(self, request):  # noqa: ANN001 - deterministic protocol fixture
                 result = super().launch(request)
                 if request.no_tools or request.resume_session_id:
-                    reasoned = json.dumps({
-                        "role": "executor", "status": "blocked", "task_id": request.task_id,
-                        "attempt": 1, "reason": "declared check requires an unavailable grant",
-                    })
+                    reasoned = json.dumps(
+                        {
+                            "role": "executor",
+                            "status": "blocked",
+                            "task_id": request.task_id,
+                            "attempt": 1,
+                            "reason": "declared check requires an unavailable grant",
+                        }
+                    )
                     Path(request.report_path).write_text(reasoned, encoding="utf-8")
                     return LaunchResult(exit_code=0, stdout=reasoned, session_id="exec-sess")
                 return result
@@ -566,46 +772,75 @@ class ResumeAndSafetyTests(unittest.TestCase):
                 _specs(("EX-01",))[0],
                 verification_commands=(CommandSpec(".", (sys.executable, "-c", "pass")),),
             )
-            first = execute_run(_request(
-                root, (spec,), executor=PermissionBlockedExecutor(("blocked",)),
-                launchers=VerifierLaunchers(
-                    task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))),
-                controls=ExecuteControls(plan_approved=True), environment={"claude": True}))
+            first = execute_run(
+                _request(
+                    root,
+                    (spec,),
+                    executor=PermissionBlockedExecutor(("blocked",)),
+                    launchers=VerifierLaunchers(
+                        task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))
+                    ),
+                    controls=ExecuteControls(plan_approved=True),
+                    environment={"claude": True},
+                )
+            )
 
             self.assertEqual(first.status, "blocked")
             initial = Run.load(first.run_dir, root)
             record = initial.task("EX-01")
             self.assertEqual(record.status, "in_progress")
-            self.assertEqual(record.operation_history[-2]["detail"],
-                             "declared check requires an unavailable grant")
+            self.assertEqual(
+                record.operation_history[-2]["detail"],
+                "declared check requires an unavailable grant",
+            )
             first_history = json.loads(json.dumps(record.operation_history))
             launch_one = first.run_dir / "reports" / "EX-01" / "launch-1"
             first_bytes = {
-                path.relative_to(launch_one).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
-                for path in launch_one.rglob("*") if path.is_file()
+                path.relative_to(launch_one).as_posix(): hashlib.sha256(
+                    path.read_bytes()
+                ).hexdigest()
+                for path in launch_one.rglob("*")
+                if path.is_file()
             }
 
             resumed_executor = sa.ScriptedExecutor(("implemented",))
-            resumed = execute_run(_request(
-                root, (spec,), executor=resumed_executor,
-                launchers=VerifierLaunchers(
-                    task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))),
-                controls=ExecuteControls(plan_approved=True, resume=True), environment={"claude": True}))
+            resumed = execute_run(
+                _request(
+                    root,
+                    (spec,),
+                    executor=resumed_executor,
+                    launchers=VerifierLaunchers(
+                        task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))
+                    ),
+                    controls=ExecuteControls(plan_approved=True, resume=True),
+                    environment={"claude": True},
+                )
+            )
 
             self.assertTrue(resumed.ok, resumed.message)
             self.assertEqual(resumed_executor.launches, 1)
             final = Run.load(resumed.run_dir, root)
             self.assertEqual(final.task("EX-01").status, "done")
             self.assertEqual(final.task("EX-01").next_executor_launch_generation, 3)
-            self.assertEqual(first_history, final.task("EX-01").operation_history[:len(first_history)])
-            self.assertEqual(first_bytes, {
-                path.relative_to(launch_one).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
-                for path in launch_one.rglob("*") if path.is_file()
-            })
-            self.assertTrue(any(
-                entry["argv"][-2:] == ["-c", "pass"] and entry["exit_code"] == 0
-                for entry in final.commands
-            ))
+            self.assertEqual(
+                first_history, final.task("EX-01").operation_history[: len(first_history)]
+            )
+            self.assertEqual(
+                first_bytes,
+                {
+                    path.relative_to(launch_one).as_posix(): hashlib.sha256(
+                        path.read_bytes()
+                    ).hexdigest()
+                    for path in launch_one.rglob("*")
+                    if path.is_file()
+                },
+            )
+            self.assertTrue(
+                any(
+                    entry["argv"][-2:] == ["-c", "pass"] and entry["exit_code"] == 0
+                    for entry in final.commands
+                )
+            )
             self.assertEqual(final.task("EX-01").verification["task_verdict"], "PASS")
             self.assertEqual(final.task("EX-01").verification["test_verdict"], "PASS")
 
@@ -619,28 +854,51 @@ class ResumeAndSafetyTests(unittest.TestCase):
             def launch(self, request):  # noqa: ANN001 - deterministic adapter double
                 payloads = (
                     [{"not": "a final result"}],
-                    [{"role": "executor", "task_id": request.task_id, "attempt": 1,
-                      "status": "implemented"}],
+                    [
+                        {
+                            "role": "executor",
+                            "task_id": request.task_id,
+                            "attempt": 1,
+                            "status": "implemented",
+                        }
+                    ],
                 )
                 current = payloads[self.launches]
                 self.launches += 1
                 Path(request.report_path).parent.mkdir(parents=True, exist_ok=True)
                 Path(request.report_path).write_text("# Human report\n", encoding="utf-8")
-                events = [json.dumps({"type": "item.completed", "item": {
-                    "type": "agent_message", "text": json.dumps(payload),
-                }}) for payload in current]
+                events = [
+                    json.dumps(
+                        {
+                            "type": "item.completed",
+                            "item": {
+                                "type": "agent_message",
+                                "text": json.dumps(payload),
+                            },
+                        }
+                    )
+                    for payload in current
+                ]
                 events.append(json.dumps({"type": "turn.completed"}))
                 return LaunchResult(0, "# Human report\n", "", "thread-1", "\n".join(events))
 
         with TemporaryDirectory() as directory:
             root = Path(directory)
             executor = CodexSequenceExecutor()
-            first = execute_run(_request(
-                root, _specs(("EX-01",)), executor=executor,
-                launchers=VerifierLaunchers(
-                    task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))),
-                controls=ExecuteControls(plan_approved=True, adapter="codex", adapter_explicit=True),
-                environment={"codex": True}))
+            first = execute_run(
+                _request(
+                    root,
+                    _specs(("EX-01",)),
+                    executor=executor,
+                    launchers=VerifierLaunchers(
+                        task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))
+                    ),
+                    controls=ExecuteControls(
+                        plan_approved=True, adapter="codex", adapter_explicit=True
+                    ),
+                    environment={"codex": True},
+                )
+            )
 
             self.assertEqual(first.status, "retryable")
             run = Run.load(first.run_dir, root)
@@ -648,16 +906,29 @@ class ResumeAndSafetyTests(unittest.TestCase):
             self.assertEqual(run.task("EX-01").status, "in_progress")
             self.assertEqual(run.task("EX-01").attempts, 0)
             self.assertTrue(
-                (first.run_dir / "reports" / "EX-01" / "launch-1" /
-                 "result-protocol-invalid-1.json").is_file())
+                (
+                    first.run_dir
+                    / "reports"
+                    / "EX-01"
+                    / "launch-1"
+                    / "result-protocol-invalid-1.json"
+                ).is_file()
+            )
 
-            resumed = execute_run(_request(
-                root, _specs(("EX-01",)), executor=executor,
-                launchers=VerifierLaunchers(
-                    task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))),
-                controls=ExecuteControls(
-                    plan_approved=True, resume=True, adapter="codex", adapter_explicit=True),
-                environment={"codex": True}))
+            resumed = execute_run(
+                _request(
+                    root,
+                    _specs(("EX-01",)),
+                    executor=executor,
+                    launchers=VerifierLaunchers(
+                        task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))
+                    ),
+                    controls=ExecuteControls(
+                        plan_approved=True, resume=True, adapter="codex", adapter_explicit=True
+                    ),
+                    environment={"codex": True},
+                )
+            )
 
             self.assertEqual(resumed.status, "ok")
             self.assertEqual(executor.launches, 2)
@@ -668,9 +939,12 @@ class ResumeAndSafetyTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             first = self._run_once(
-                root, executor=sa.ScriptedExecutor(("implemented",)),
-                task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",)),
-                controls=ExecuteControls(plan_approved=True))
+                root,
+                executor=sa.ScriptedExecutor(("implemented",)),
+                task=sa.ScriptedVerifier(("PASS",)),
+                test=sa.ScriptedVerifier(("PASS",)),
+                controls=ExecuteControls(plan_approved=True),
+            )
             self.assertTrue(first.ok)
 
             run_json = first.run_dir / "run.json"
@@ -679,9 +953,12 @@ class ResumeAndSafetyTests(unittest.TestCase):
             run_json.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
             resumed = self._run_once(
-                root, executor=sa.ScriptedExecutor(("implemented",)),
-                task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",)),
-                controls=ExecuteControls(plan_approved=True, resume=True))
+                root,
+                executor=sa.ScriptedExecutor(("implemented",)),
+                task=sa.ScriptedVerifier(("PASS",)),
+                test=sa.ScriptedVerifier(("PASS",)),
+                controls=ExecuteControls(plan_approved=True, resume=True),
+            )
             self.assertEqual(resumed.status, "error")
             self.assertEqual(resumed.exit_code, EXIT_ERROR)
             self.assertIn("adapter-switch", resumed.message)
@@ -692,15 +969,25 @@ class ResumeAndSafetyTests(unittest.TestCase):
             lock = pipeline_lock_path(root)
             lock.parent.mkdir(parents=True, exist_ok=True)
             lock.write_text(
-                json.dumps({"run_id": "other-run", "pid": __import__("os").getpid(),
-                            "task_id": None, "started_at": "2026-09-01T00:00:00Z"}),
-                encoding="utf-8")
+                json.dumps(
+                    {
+                        "run_id": "other-run",
+                        "pid": __import__("os").getpid(),
+                        "task_id": None,
+                        "started_at": "2026-09-01T00:00:00Z",
+                    }
+                ),
+                encoding="utf-8",
+            )
             self.assertTrue(pid_alive(__import__("os").getpid()))
 
             result = self._run_once(
-                root, executor=sa.ScriptedExecutor(("implemented",)),
-                task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",)),
-                controls=ExecuteControls(plan_approved=True))
+                root,
+                executor=sa.ScriptedExecutor(("implemented",)),
+                task=sa.ScriptedVerifier(("PASS",)),
+                test=sa.ScriptedVerifier(("PASS",)),
+                controls=ExecuteControls(plan_approved=True),
+            )
             self.assertEqual(result.status, "blocked")
             self.assertEqual(result.exit_code, EXIT_BLOCKED)
             self.assertIn("lease-held", result.message)
@@ -709,7 +996,9 @@ class ResumeAndSafetyTests(unittest.TestCase):
             # history records the wait; no task operation history exists to check.
             self.assertTrue(
                 any("lease" in (entry.get("scope") or "") for entry in reloaded.history)
-                if reloaded is not None else True)
+                if reloaded is not None
+                else True
+            )
 
     def test_a_live_foreign_task_lease_is_a_durable_unfinished_operation(self) -> None:
         with TemporaryDirectory() as directory:
@@ -717,14 +1006,24 @@ class ResumeAndSafetyTests(unittest.TestCase):
             lock = task_lock_path(root, "EX-01")
             lock.parent.mkdir(parents=True, exist_ok=True)
             lock.write_text(
-                json.dumps({"run_id": "other-run", "pid": os.getpid(),
-                            "task_id": "EX-01", "started_at": "2026-09-01T00:00:00Z"}),
-                encoding="utf-8")
+                json.dumps(
+                    {
+                        "run_id": "other-run",
+                        "pid": os.getpid(),
+                        "task_id": "EX-01",
+                        "started_at": "2026-09-01T00:00:00Z",
+                    }
+                ),
+                encoding="utf-8",
+            )
 
             result = self._run_once(
-                root, executor=sa.ScriptedExecutor(("implemented",)),
-                task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",)),
-                controls=ExecuteControls(plan_approved=True))
+                root,
+                executor=sa.ScriptedExecutor(("implemented",)),
+                task=sa.ScriptedVerifier(("PASS",)),
+                test=sa.ScriptedVerifier(("PASS",)),
+                controls=ExecuteControls(plan_approved=True),
+            )
 
             self.assertEqual(result.status, "blocked")
             self.assertEqual(result.exit_code, EXIT_BLOCKED)
@@ -736,8 +1035,10 @@ class ResumeAndSafetyTests(unittest.TestCase):
             self.assertEqual(reloaded.task("EX-01").status, "to_do")
             operations = reloaded.task("EX-01").operation_history
             self.assertTrue(
-                any(entry.get("kind") == "lease" and entry.get("outcome") == "blocked"
-                    for entry in operations),
+                any(
+                    entry.get("kind") == "lease" and entry.get("outcome") == "blocked"
+                    for entry in operations
+                ),
                 operations,
             )
 
@@ -754,15 +1055,15 @@ class ResumeAndSafetyTests(unittest.TestCase):
                 if not (request.no_tools or request.resume_session_id):
                     unsafe = Path(request.working_root) / "fixtures/execution/work/secrets.txt"
                     unsafe.parent.mkdir(parents=True, exist_ok=True)
-                    unsafe.write_text(
-                        "token=do-not-leak-this-secret-value", encoding="utf-8")
+                    unsafe.write_text("token=do-not-leak-this-secret-value", encoding="utf-8")
                 return super().launch(request)
 
         class UnreachedVerifier(sa.ScriptedVerifier):
             def launch(self, request):  # noqa: ANN001 - test double
                 raise AssertionError(
                     "an amendment can never authorize a safety category; no verifier may "
-                    "launch over an unsafe executor-owned path")
+                    "launch over an unsafe executor-owned path"
+                )
 
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -771,8 +1072,16 @@ class ResumeAndSafetyTests(unittest.TestCase):
             (root / ".gitkeep").write_text("", encoding="utf-8")
             subprocess.run(("git", "add", "."), cwd=root, check=True)
             subprocess.run(
-                ("git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
-                 "commit", "-qm", "fixture baseline"),
+                (
+                    "git",
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "-qm",
+                    "fixture baseline",
+                ),
                 cwd=root,
                 check=True,
             )
@@ -781,7 +1090,8 @@ class ResumeAndSafetyTests(unittest.TestCase):
                 executor=UnsafeScopeExecutor(("implemented",)),
                 task=UnreachedVerifier(("PASS",)),
                 test=UnreachedVerifier(("PASS",)),
-                controls=ExecuteControls(plan_approved=True))
+                controls=ExecuteControls(plan_approved=True),
+            )
 
             self.assertEqual(result.status, "blocked")
             self.assertEqual(result.exit_code, EXIT_BLOCKED)
@@ -794,10 +1104,13 @@ class ResumeAndSafetyTests(unittest.TestCase):
             # public status, and no unblock transition is ever recorded.
             self.assertEqual(record.status, "in_progress")
             self.assertNotIn(
-                "unblock", " ".join(entry["outcome"] for entry in record.operation_history))
+                "unblock", " ".join(entry["outcome"] for entry in record.operation_history)
+            )
             self.assertTrue(
-                any(entry.get("kind") == "wait" and entry.get("outcome") == "blocked"
-                    for entry in record.operation_history),
+                any(
+                    entry.get("kind") == "wait" and entry.get("outcome") == "blocked"
+                    for entry in record.operation_history
+                ),
                 record.operation_history,
             )
 
@@ -805,9 +1118,12 @@ class ResumeAndSafetyTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             result = self._run_once(
-                root, executor=sa.ScriptedExecutor(("implemented",)),
-                task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",)),
-                controls=ExecuteControls(unattended=True))
+                root,
+                executor=sa.ScriptedExecutor(("implemented",)),
+                task=sa.ScriptedVerifier(("PASS",)),
+                test=sa.ScriptedVerifier(("PASS",)),
+                controls=ExecuteControls(unattended=True),
+            )
             self.assertTrue(result.ok)
 
 
@@ -824,8 +1140,14 @@ class AttestDependencyTests(unittest.TestCase):
         return root, prompt, plan
 
     def _request(
-        self, root: Path, prompt: Path, plan: Path, *, feature: str = FEATURE,
-        task_ids: tuple[str, ...], controls: ExecuteControls,
+        self,
+        root: Path,
+        prompt: Path,
+        plan: Path,
+        *,
+        feature: str = FEATURE,
+        task_ids: tuple[str, ...],
+        controls: ExecuteControls,
         executor=None,
     ) -> ExecuteRequest:
         return ExecuteRequest(
@@ -837,10 +1159,12 @@ class AttestDependencyTests(unittest.TestCase):
             specs=_specs(task_ids),
             adapter=executor or sa.ScriptedExecutor(("implemented",)),
             launchers=VerifierLaunchers(
-                task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))),
+                task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))
+            ),
             envelope_anchors=EnvelopeAnchors(project_root=".", agents_root=".agents"),
             verifier_anchors=VerifierAnchors(
-                project_root=str(root), agents_root=str(root / ".agents")),
+                project_root=str(root), agents_root=str(root / ".agents")
+            ),
             environment={"claude": True},
             controls=controls,
             plan_prompt_path="fixtures/execution/plan.json",
@@ -858,8 +1182,14 @@ class AttestDependencyTests(unittest.TestCase):
         life.run.save()
 
     def _make_source_run(
-        self, root: Path, feature: str, prompt: Path, plan: Path, *,
-        tasks: tuple[tuple[str, list[str]], ...], verified_ids: tuple[str, ...],
+        self,
+        root: Path,
+        feature: str,
+        prompt: Path,
+        plan: Path,
+        *,
+        tasks: tuple[tuple[str, list[str]], ...],
+        verified_ids: tuple[str, ...],
     ) -> Path:
         """A hand-built, closed source run: fine-grained control over exactly which tasks it
         tracks and which of those reach 'verified', without driving the full dispatch loop."""
@@ -877,15 +1207,29 @@ class AttestDependencyTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             root, prompt, plan = self._seed(directory)
             self._make_source_run(
-                root, "source-feature", prompt, plan,
-                tasks=(("EX-01", []),), verified_ids=("EX-01",))
+                root,
+                "source-feature",
+                prompt,
+                plan,
+                tasks=(("EX-01", []),),
+                verified_ids=("EX-01",),
+            )
 
             executor = sa.ScriptedExecutor(("implemented",))
-            result = execute_run(self._request(
-                root, prompt, plan, task_ids=("EX-01", "EX-02"), executor=executor,
-                controls=ExecuteControls(
-                    plan_approved=True, task="EX-02",
-                    attested_dependencies=(("EX-01", "source-feature"),))))
+            result = execute_run(
+                self._request(
+                    root,
+                    prompt,
+                    plan,
+                    task_ids=("EX-01", "EX-02"),
+                    executor=executor,
+                    controls=ExecuteControls(
+                        plan_approved=True,
+                        task="EX-02",
+                        attested_dependencies=(("EX-01", "source-feature"),),
+                    ),
+                )
+            )
 
             self.assertTrue(result.ok, result.message)
             self.assertEqual(result.exit_code, EXIT_OK)
@@ -903,7 +1247,9 @@ class AttestDependencyTests(unittest.TestCase):
     def test_completed_resolution_is_eligible_for_attestation(self) -> None:
         with TemporaryDirectory() as directory:
             root, prompt, plan = self._seed(directory)
-            source = Run.create("source-feature", prompt, plan, root / "runs" / "source-feature", root)
+            source = Run.create(
+                "source-feature", prompt, plan, root / "runs" / "source-feature", root
+            )
             life = RunLifecycle.initialize(source, tasks=(("EX-01", []),))
             self._force_completed(life, "EX-01")
             source.status = "verified"
@@ -911,8 +1257,12 @@ class AttestDependencyTests(unittest.TestCase):
             source.save()
 
             evidence = execution_module._resolve_attestation(
-                dep_id="EX-01", source_feature="source-feature", run_dir=root / "runs" / FEATURE,
-                repo_root=root, prompt_path=prompt, plan_path=plan,
+                dep_id="EX-01",
+                source_feature="source-feature",
+                run_dir=root / "runs" / FEATURE,
+                repo_root=root,
+                prompt_path=prompt,
+                plan_path=plan,
             )
 
             self.assertEqual(evidence["dep_id"], "EX-01")
@@ -922,14 +1272,25 @@ class AttestDependencyTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             root, prompt, plan = self._seed(directory)
             self._make_source_run(
-                root, "source-feature", prompt, plan,
-                tasks=(("EX-02", ()),), verified_ids=("EX-02",))
+                root,
+                "source-feature",
+                prompt,
+                plan,
+                tasks=(("EX-02", ()),),
+                verified_ids=("EX-02",),
+            )
 
             executor = sa.ScriptedExecutor(("implemented",))
-            result = execute_run(self._request(
-                root, prompt, plan, task_ids=("EX-01", "EX-02", "EX-03"),
-                executor=executor,
-                controls=ExecuteControls(plan_approved=True, task="EX-03")))
+            result = execute_run(
+                self._request(
+                    root,
+                    prompt,
+                    plan,
+                    task_ids=("EX-01", "EX-02", "EX-03"),
+                    executor=executor,
+                    controls=ExecuteControls(plan_approved=True, task="EX-03"),
+                )
+            )
 
             self.assertTrue(result.ok, result.message)
             self.assertEqual([call["task_id"] for call in executor.calls], ["EX-03"])
@@ -942,20 +1303,32 @@ class AttestDependencyTests(unittest.TestCase):
             self.assertEqual(run.task("EX-02").status, "done")
             self.assertEqual(run.task("EX-03").status, "done")
 
-
     def test_attesting_never_writes_to_the_source_run(self) -> None:
         with TemporaryDirectory() as directory:
             root, prompt, plan = self._seed(directory)
             source_dir = self._make_source_run(
-                root, "source-feature", prompt, plan,
-                tasks=(("EX-01", []),), verified_ids=("EX-01",))
+                root,
+                "source-feature",
+                prompt,
+                plan,
+                tasks=(("EX-01", []),),
+                verified_ids=("EX-01",),
+            )
             before = (source_dir / "run.json").read_text(encoding="utf-8")
 
-            result = execute_run(self._request(
-                root, prompt, plan, task_ids=("EX-01", "EX-02"),
-                controls=ExecuteControls(
-                    plan_approved=True, task="EX-02",
-                    attested_dependencies=(("EX-01", "source-feature"),))))
+            result = execute_run(
+                self._request(
+                    root,
+                    prompt,
+                    plan,
+                    task_ids=("EX-01", "EX-02"),
+                    controls=ExecuteControls(
+                        plan_approved=True,
+                        task="EX-02",
+                        attested_dependencies=(("EX-01", "source-feature"),),
+                    ),
+                )
+            )
 
             self.assertTrue(result.ok, result.message)
             after = (source_dir / "run.json").read_text(encoding="utf-8")
@@ -964,11 +1337,19 @@ class AttestDependencyTests(unittest.TestCase):
     def test_through_scope_is_refused_before_any_state_is_written(self) -> None:
         with TemporaryDirectory() as directory:
             root, prompt, plan = self._seed(directory)
-            result = execute_run(self._request(
-                root, prompt, plan, task_ids=("EX-01", "EX-02"),
-                controls=ExecuteControls(
-                    plan_approved=True, through="EX-02",
-                    attested_dependencies=(("EX-01", "source-feature"),))))
+            result = execute_run(
+                self._request(
+                    root,
+                    prompt,
+                    plan,
+                    task_ids=("EX-01", "EX-02"),
+                    controls=ExecuteControls(
+                        plan_approved=True,
+                        through="EX-02",
+                        attested_dependencies=(("EX-01", "source-feature"),),
+                    ),
+                )
+            )
             self.assertEqual(result.status, "error")
             self.assertIn("attestation-requires-task-scope", result.message)
             self.assertFalse((root / "runs" / FEATURE / "run.json").exists())
@@ -976,22 +1357,36 @@ class AttestDependencyTests(unittest.TestCase):
     def test_unfiltered_run_scope_is_refused(self) -> None:
         with TemporaryDirectory() as directory:
             root, prompt, plan = self._seed(directory)
-            result = execute_run(self._request(
-                root, prompt, plan, task_ids=("EX-01", "EX-02"),
-                controls=ExecuteControls(
-                    plan_approved=True,
-                    attested_dependencies=(("EX-01", "source-feature"),))))
+            result = execute_run(
+                self._request(
+                    root,
+                    prompt,
+                    plan,
+                    task_ids=("EX-01", "EX-02"),
+                    controls=ExecuteControls(
+                        plan_approved=True, attested_dependencies=(("EX-01", "source-feature"),)
+                    ),
+                )
+            )
             self.assertEqual(result.status, "error")
             self.assertIn("attestation-requires-task-scope", result.message)
 
     def test_dep_id_not_a_declared_dependency_is_refused(self) -> None:
         with TemporaryDirectory() as directory:
             root, prompt, plan = self._seed(directory)
-            result = execute_run(self._request(
-                root, prompt, plan, task_ids=("EX-01", "EX-02", "EX-03"),
-                controls=ExecuteControls(
-                    plan_approved=True, task="EX-02",
-                    attested_dependencies=(("EX-03", "source-feature"),))))
+            result = execute_run(
+                self._request(
+                    root,
+                    prompt,
+                    plan,
+                    task_ids=("EX-01", "EX-02", "EX-03"),
+                    controls=ExecuteControls(
+                        plan_approved=True,
+                        task="EX-02",
+                        attested_dependencies=(("EX-03", "source-feature"),),
+                    ),
+                )
+            )
             self.assertEqual(result.status, "error")
             self.assertIn("attestation-not-a-dependency", result.message)
             self.assertFalse((root / "runs" / FEATURE / "run.json").exists())
@@ -999,11 +1394,19 @@ class AttestDependencyTests(unittest.TestCase):
     def test_duplicate_dep_id_across_flags_is_refused(self) -> None:
         with TemporaryDirectory() as directory:
             root, prompt, plan = self._seed(directory)
-            result = execute_run(self._request(
-                root, prompt, plan, task_ids=("EX-01", "EX-02"),
-                controls=ExecuteControls(
-                    plan_approved=True, task="EX-02",
-                    attested_dependencies=(("EX-01", "one"), ("EX-01", "two")))))
+            result = execute_run(
+                self._request(
+                    root,
+                    prompt,
+                    plan,
+                    task_ids=("EX-01", "EX-02"),
+                    controls=ExecuteControls(
+                        plan_approved=True,
+                        task="EX-02",
+                        attested_dependencies=(("EX-01", "one"), ("EX-01", "two")),
+                    ),
+                )
+            )
             self.assertEqual(result.status, "error")
             self.assertIn("duplicate-attestation-dependency", result.message)
             self.assertFalse((root / "runs" / FEATURE / "run.json").exists())
@@ -1013,22 +1416,38 @@ class AttestDependencyTests(unittest.TestCase):
             root, prompt, plan = self._seed(directory)
             for unsafe in ("../evil", "/etc/passwd", "a/b", "a.b", ".."):
                 with self.subTest(source=unsafe):
-                    result = execute_run(self._request(
-                        root, prompt, plan, task_ids=("EX-01", "EX-02"),
-                        controls=ExecuteControls(
-                            plan_approved=True, task="EX-02",
-                            attested_dependencies=(("EX-01", unsafe),))))
+                    result = execute_run(
+                        self._request(
+                            root,
+                            prompt,
+                            plan,
+                            task_ids=("EX-01", "EX-02"),
+                            controls=ExecuteControls(
+                                plan_approved=True,
+                                task="EX-02",
+                                attested_dependencies=(("EX-01", unsafe),),
+                            ),
+                        )
+                    )
                     self.assertEqual(result.status, "error")
                     self.assertIn("attestation-unsafe-source", result.message)
 
     def test_missing_source_run_is_refused(self) -> None:
         with TemporaryDirectory() as directory:
             root, prompt, plan = self._seed(directory)
-            result = execute_run(self._request(
-                root, prompt, plan, task_ids=("EX-01", "EX-02"),
-                controls=ExecuteControls(
-                    plan_approved=True, task="EX-02",
-                    attested_dependencies=(("EX-01", "does-not-exist"),))))
+            result = execute_run(
+                self._request(
+                    root,
+                    prompt,
+                    plan,
+                    task_ids=("EX-01", "EX-02"),
+                    controls=ExecuteControls(
+                        plan_approved=True,
+                        task="EX-02",
+                        attested_dependencies=(("EX-01", "does-not-exist"),),
+                    ),
+                )
+            )
             self.assertEqual(result.status, "error")
             self.assertIn("evidence-source-missing", result.message)
             self.assertFalse((root / "runs" / FEATURE / "run.json").exists())
@@ -1039,28 +1458,54 @@ class AttestDependencyTests(unittest.TestCase):
             other_plan = root / "plan-2.json"
             other_plan.write_text(json.dumps(PLAN, indent=2) + "\n", encoding="utf-8")
             self._make_source_run(
-                root, "source-feature", prompt, other_plan,
-                tasks=(("EX-01", []),), verified_ids=("EX-01",))
+                root,
+                "source-feature",
+                prompt,
+                other_plan,
+                tasks=(("EX-01", []),),
+                verified_ids=("EX-01",),
+            )
 
-            result = execute_run(self._request(
-                root, prompt, plan, task_ids=("EX-01", "EX-02"),
-                controls=ExecuteControls(
-                    plan_approved=True, task="EX-02",
-                    attested_dependencies=(("EX-01", "source-feature"),))))
+            result = execute_run(
+                self._request(
+                    root,
+                    prompt,
+                    plan,
+                    task_ids=("EX-01", "EX-02"),
+                    controls=ExecuteControls(
+                        plan_approved=True,
+                        task="EX-02",
+                        attested_dependencies=(("EX-01", "source-feature"),),
+                    ),
+                )
+            )
             self.assertTrue(result.ok, result.message)
 
     def test_source_not_tracking_the_dependency_is_refused(self) -> None:
         with TemporaryDirectory() as directory:
             root, prompt, plan = self._seed(directory)
             self._make_source_run(
-                root, "source-feature", prompt, plan,
-                tasks=(("EX-02", []),), verified_ids=("EX-02",))  # no EX-01 tracked at all
+                root,
+                "source-feature",
+                prompt,
+                plan,
+                tasks=(("EX-02", []),),
+                verified_ids=("EX-02",),
+            )  # no EX-01 tracked at all
 
-            result = execute_run(self._request(
-                root, prompt, plan, task_ids=("EX-01", "EX-02"),
-                controls=ExecuteControls(
-                    plan_approved=True, task="EX-02",
-                    attested_dependencies=(("EX-01", "source-feature"),))))
+            result = execute_run(
+                self._request(
+                    root,
+                    prompt,
+                    plan,
+                    task_ids=("EX-01", "EX-02"),
+                    controls=ExecuteControls(
+                        plan_approved=True,
+                        task="EX-02",
+                        attested_dependencies=(("EX-01", "source-feature"),),
+                    ),
+                )
+            )
             self.assertEqual(result.status, "error")
             self.assertIn("evidence-source-task-missing", result.message)
             self.assertFalse((root / "runs" / FEATURE / "run.json").exists())
@@ -1069,14 +1514,22 @@ class AttestDependencyTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             root, prompt, plan = self._seed(directory)
             self._make_source_run(
-                root, "source-feature", prompt, plan,
-                tasks=(("EX-01", []),), verified_ids=())  # EX-01 stays 'ready', never verified
+                root, "source-feature", prompt, plan, tasks=(("EX-01", []),), verified_ids=()
+            )  # EX-01 stays 'ready', never verified
 
-            result = execute_run(self._request(
-                root, prompt, plan, task_ids=("EX-01", "EX-02"),
-                controls=ExecuteControls(
-                    plan_approved=True, task="EX-02",
-                    attested_dependencies=(("EX-01", "source-feature"),))))
+            result = execute_run(
+                self._request(
+                    root,
+                    prompt,
+                    plan,
+                    task_ids=("EX-01", "EX-02"),
+                    controls=ExecuteControls(
+                        plan_approved=True,
+                        task="EX-02",
+                        attested_dependencies=(("EX-01", "source-feature"),),
+                    ),
+                )
+            )
             self.assertEqual(result.status, "error")
             self.assertIn("evidence-source-run-not-closed", result.message)
             self.assertFalse((root / "runs" / FEATURE / "run.json").exists())
@@ -1085,79 +1538,147 @@ class AttestDependencyTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             root, prompt, plan = self._seed(directory)
             self._make_source_run(
-                root, "source-feature", prompt, plan,
-                tasks=(("EX-01", []),), verified_ids=("EX-01",))
+                root,
+                "source-feature",
+                prompt,
+                plan,
+                tasks=(("EX-01", []),),
+                verified_ids=("EX-01",),
+            )
 
-            first = execute_run(self._request(
-                root, prompt, plan, task_ids=("EX-01", "EX-02"),
-                executor=sa.ScriptedExecutor(("implemented",)),
-                controls=ExecuteControls(
-                    plan_approved=True, task="EX-02",
-                    attested_dependencies=(("EX-01", "source-feature"),))))
+            first = execute_run(
+                self._request(
+                    root,
+                    prompt,
+                    plan,
+                    task_ids=("EX-01", "EX-02"),
+                    executor=sa.ScriptedExecutor(("implemented",)),
+                    controls=ExecuteControls(
+                        plan_approved=True,
+                        task="EX-02",
+                        attested_dependencies=(("EX-01", "source-feature"),),
+                    ),
+                )
+            )
             self.assertTrue(first.ok, first.message)
 
-            resumed = execute_run(self._request(
-                root, prompt, plan, task_ids=("EX-01", "EX-02"),
-                executor=sa.ScriptedExecutor(("implemented",)),
-                controls=ExecuteControls(plan_approved=True, task="EX-02", resume=True)))
+            resumed = execute_run(
+                self._request(
+                    root,
+                    prompt,
+                    plan,
+                    task_ids=("EX-01", "EX-02"),
+                    executor=sa.ScriptedExecutor(("implemented",)),
+                    controls=ExecuteControls(plan_approved=True, task="EX-02", resume=True),
+                )
+            )
             self.assertTrue(resumed.ok, resumed.message)
 
     def test_resume_repeating_attest_dependency_must_match_exactly(self) -> None:
         with TemporaryDirectory() as directory:
             root, prompt, plan = self._seed(directory)
             self._make_source_run(
-                root, "source-feature", prompt, plan,
-                tasks=(("EX-01", []),), verified_ids=("EX-01",))
-            first = execute_run(self._request(
-                root, prompt, plan, task_ids=("EX-01", "EX-02"),
-                executor=sa.ScriptedExecutor(("implemented",)),
-                controls=ExecuteControls(
-                    plan_approved=True, task="EX-02",
-                    attested_dependencies=(("EX-01", "source-feature"),))))
+                root,
+                "source-feature",
+                prompt,
+                plan,
+                tasks=(("EX-01", []),),
+                verified_ids=("EX-01",),
+            )
+            first = execute_run(
+                self._request(
+                    root,
+                    prompt,
+                    plan,
+                    task_ids=("EX-01", "EX-02"),
+                    executor=sa.ScriptedExecutor(("implemented",)),
+                    controls=ExecuteControls(
+                        plan_approved=True,
+                        task="EX-02",
+                        attested_dependencies=(("EX-01", "source-feature"),),
+                    ),
+                )
+            )
             self.assertTrue(first.ok, first.message)
 
             self._make_source_run(
-                root, "other-feature", prompt, plan,
-                tasks=(("EX-01", []),), verified_ids=("EX-01",))
+                root, "other-feature", prompt, plan, tasks=(("EX-01", []),), verified_ids=("EX-01",)
+            )
 
-            resumed = execute_run(self._request(
-                root, prompt, plan, task_ids=("EX-01", "EX-02"),
-                controls=ExecuteControls(
-                    plan_approved=True, task="EX-02", resume=True,
-                    attested_dependencies=(("EX-01", "other-feature"),))))
+            resumed = execute_run(
+                self._request(
+                    root,
+                    prompt,
+                    plan,
+                    task_ids=("EX-01", "EX-02"),
+                    controls=ExecuteControls(
+                        plan_approved=True,
+                        task="EX-02",
+                        resume=True,
+                        attested_dependencies=(("EX-01", "other-feature"),),
+                    ),
+                )
+            )
             self.assertEqual(resumed.status, "error")
             self.assertIn("attestation-mismatch", resumed.message)
 
     def test_resume_rejects_dependency_chain_control_drift(self) -> None:
         with TemporaryDirectory() as directory:
             root, prompt, plan = self._seed(directory)
-            first = execute_run(self._request(
-                root, prompt, plan, task_ids=("EX-01", "EX-02"),
-                executor=sa.ScriptedExecutor(("implemented", "implemented")),
-                controls=ExecuteControls(plan_approved=True, task="EX-02",
-                    verify_dependency_chain=True)))
+            first = execute_run(
+                self._request(
+                    root,
+                    prompt,
+                    plan,
+                    task_ids=("EX-01", "EX-02"),
+                    executor=sa.ScriptedExecutor(("implemented", "implemented")),
+                    controls=ExecuteControls(
+                        plan_approved=True, task="EX-02", verify_dependency_chain=True
+                    ),
+                )
+            )
             self.assertTrue(first.ok, first.message)
 
-            resumed = execute_run(self._request(
-                root, prompt, plan, task_ids=("EX-01", "EX-02"),
-                controls=ExecuteControls(plan_approved=True, task="EX-02", resume=True)))
+            resumed = execute_run(
+                self._request(
+                    root,
+                    prompt,
+                    plan,
+                    task_ids=("EX-01", "EX-02"),
+                    controls=ExecuteControls(plan_approved=True, task="EX-02", resume=True),
+                )
+            )
             self.assertEqual(resumed.status, "error")
             self.assertIn("verify-dependency-chain-mismatch", resumed.message)
 
     def test_resume_retains_persisted_false_dependency_chain_when_unset(self) -> None:
         with TemporaryDirectory() as directory:
             root, prompt, plan = self._seed(directory)
-            first = execute_run(self._request(
-                root, prompt, plan, task_ids=("EX-01", "EX-02"),
-                executor=sa.ScriptedExecutor(("implemented", "implemented")),
-                controls=ExecuteControls(plan_approved=True, task="EX-02",
-                    verify_dependency_chain=False)))
+            first = execute_run(
+                self._request(
+                    root,
+                    prompt,
+                    plan,
+                    task_ids=("EX-01", "EX-02"),
+                    executor=sa.ScriptedExecutor(("implemented", "implemented")),
+                    controls=ExecuteControls(
+                        plan_approved=True, task="EX-02", verify_dependency_chain=False
+                    ),
+                )
+            )
             self.assertTrue(first.ok, first.message)
 
-            resumed = execute_run(self._request(
-                root, prompt, plan, task_ids=("EX-01", "EX-02"),
-                controls=ExecuteControls(plan_approved=True, task="EX-02", resume=True,
-                    verify_dependency_chain=None)))
+            resumed = execute_run(
+                self._request(
+                    root,
+                    prompt,
+                    plan,
+                    task_ids=("EX-01", "EX-02"),
+                    controls=ExecuteControls(
+                        plan_approved=True, task="EX-02", resume=True, verify_dependency_chain=None
+                    ),
+                )
+            )
             self.assertTrue(resumed.ok, resumed.message)
 
 
@@ -1170,33 +1691,64 @@ class RuntimeSupersessionDefaultReuseTests(unittest.TestCase):
             prompt, plan = root / "prompt.md", root / "plan.md"
             prompt.write_text("feature prompt", encoding="utf-8")
             plan.write_text("# plan\n", encoding="utf-8")
-            tasks = root / "tasks"; tasks.mkdir()
+            tasks = root / "tasks"
+            tasks.mkdir()
+
             def spec(task_id: str, depends_on: tuple[str, ...] = ()) -> TaskSpec:
                 path = tasks / f"{task_id}.md"
                 path.write_text(
-                    f"# {task_id}\n" + (
-                        "\n## Supersession\n- Supersedes: TC-04\n" if task_id == "REC-01" else ""
-                    ), encoding="utf-8")
-                return TaskSpec.build(id=task_id, title=task_id, path=str(path), task_type="python",
-                    executor="python-executor", depends_on=depends_on, allowed_scope=("src/**",),
-                    out_of_scope=(), acceptance_criteria=("works",), verification_commands=(),
-                    max_repair_attempts=0)
+                    f"# {task_id}\n"
+                    + ("\n## Supersession\n- Supersedes: TC-04\n" if task_id == "REC-01" else ""),
+                    encoding="utf-8",
+                )
+                return TaskSpec.build(
+                    id=task_id,
+                    title=task_id,
+                    path=str(path),
+                    task_type="python",
+                    executor="python-executor",
+                    depends_on=depends_on,
+                    allowed_scope=("src/**",),
+                    out_of_scope=(),
+                    acceptance_criteria=("works",),
+                    verification_commands=(),
+                    max_repair_attempts=0,
+                )
+
             tc04, rec01, tc05 = spec("TC-04"), spec("REC-01"), spec("TC-05", ("TC-04",))
-            source = Run.create("rec01-verified", prompt, plan, root / "runs" / "rec01-verified", root)
+            source = Run.create(
+                "rec01-verified", prompt, plan, root / "runs" / "rec01-verified", root
+            )
             source_life = RunLifecycle.initialize(source, tasks=[("REC-01", [])])
             source_life.transition("REC-01", "running", actor=ACTOR_RUNNER)
             source_life.transition("REC-01", "implemented", actor=ACTOR_RUNNER)
             source.record_verdicts("REC-01", "PASS", "PASS")
-            persist_task_contracts(source, (rec01,)); source.status = "verified"; source.save()
+            persist_task_contracts(source, (rec01,))
+            source.status = "verified"
+            source.save()
             historical_bytes = (source.run_dir / "run.json").read_bytes()
             executor = sa.ScriptedExecutor(("implemented",))
-            result = execute_run(ExecuteRequest(
-                feature="tc05-runtime", repo_root=root, run_dir=root / "runs" / "tc05-runtime",
-                prompt_path=prompt, plan_path=plan, specs=(tc04, rec01, tc05), adapter=executor,
-                launchers=VerifierLaunchers(task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))),
-                envelope_anchors=EnvelopeAnchors(project_root=".", agents_root=".agents"),
-                verifier_anchors=VerifierAnchors(project_root=str(root), agents_root=str(root / ".agents")),
-                environment={"claude": True}, controls=ExecuteControls(plan_approved=True, task="TC-05"), plan_prompt_path="plan.md"))
+            result = execute_run(
+                ExecuteRequest(
+                    feature="tc05-runtime",
+                    repo_root=root,
+                    run_dir=root / "runs" / "tc05-runtime",
+                    prompt_path=prompt,
+                    plan_path=plan,
+                    specs=(tc04, rec01, tc05),
+                    adapter=executor,
+                    launchers=VerifierLaunchers(
+                        task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))
+                    ),
+                    envelope_anchors=EnvelopeAnchors(project_root=".", agents_root=".agents"),
+                    verifier_anchors=VerifierAnchors(
+                        project_root=str(root), agents_root=str(root / ".agents")
+                    ),
+                    environment={"claude": True},
+                    controls=ExecuteControls(plan_approved=True, task="TC-05"),
+                    plan_prompt_path="plan.md",
+                )
+            )
             self.assertTrue(result.ok, result.message)
             self.assertEqual([call["task_id"] for call in executor.calls], ["TC-05"])
             run = Run.load(result.run_dir, root)
@@ -1211,37 +1763,67 @@ class RuntimeSupersessionDefaultReuseTests(unittest.TestCase):
             prompt, plan = root / "prompt.md", root / "plan.md"
             prompt.write_text("feature prompt", encoding="utf-8")
             plan.write_text("# plan\n", encoding="utf-8")
-            tasks = root / "tasks"; tasks.mkdir()
+            tasks = root / "tasks"
+            tasks.mkdir()
 
             def spec(task_id: str, depends_on: tuple[str, ...] = ()) -> TaskSpec:
                 path = tasks / f"{task_id}.md"
                 path.write_text(
-                    f"# {task_id}\n" + (
-                        "\n## Supersession\n- Supersedes: TC-04\n" if task_id == "REC-01" else ""
-                    ), encoding="utf-8")
-                return TaskSpec.build(id=task_id, title=task_id, path=str(path), task_type="python",
-                    executor="python-executor", depends_on=depends_on, allowed_scope=("src/**",),
-                    out_of_scope=(), acceptance_criteria=("works",), verification_commands=(),
-                    max_repair_attempts=0)
+                    f"# {task_id}\n"
+                    + ("\n## Supersession\n- Supersedes: TC-04\n" if task_id == "REC-01" else ""),
+                    encoding="utf-8",
+                )
+                return TaskSpec.build(
+                    id=task_id,
+                    title=task_id,
+                    path=str(path),
+                    task_type="python",
+                    executor="python-executor",
+                    depends_on=depends_on,
+                    allowed_scope=("src/**",),
+                    out_of_scope=(),
+                    acceptance_criteria=("works",),
+                    verification_commands=(),
+                    max_repair_attempts=0,
+                )
 
             tc04, rec01, tc05 = spec("TC-04"), spec("REC-01"), spec("TC-05", ("TC-04",))
-            source = Run.create("rec01-verified", prompt, plan, root / "runs" / "rec01-verified", root)
+            source = Run.create(
+                "rec01-verified", prompt, plan, root / "runs" / "rec01-verified", root
+            )
             source_life = RunLifecycle.initialize(source, tasks=[("REC-01", [])])
             source_life.transition("REC-01", "running", actor=ACTOR_RUNNER)
             source_life.transition("REC-01", "implemented", actor=ACTOR_RUNNER)
             source.record_verdicts("REC-01", "PASS", "PASS")
-            persist_task_contracts(source, (rec01,)); source.status = "verified"; source.save()
+            persist_task_contracts(source, (rec01,))
+            source.status = "verified"
+            source.save()
 
             executor = sa.ScriptedExecutor(("implemented", "implemented"))
-            result = execute_run(ExecuteRequest(
-                feature="tc05-strict", repo_root=root, run_dir=root / "runs" / "tc05-strict",
-                prompt_path=prompt, plan_path=plan, specs=(tc04, rec01, tc05), adapter=executor,
-                launchers=VerifierLaunchers(task=sa.ScriptedVerifier(("PASS", "PASS")), test=sa.ScriptedVerifier(("PASS", "PASS"))),
-                envelope_anchors=EnvelopeAnchors(project_root=".", agents_root=".agents"),
-                verifier_anchors=VerifierAnchors(project_root=str(root), agents_root=str(root / ".agents")),
-                environment={"claude": True},
-                controls=ExecuteControls(plan_approved=True, task="TC-05", verify_dependency_chain=True),
-                plan_prompt_path="plan.md"))
+            result = execute_run(
+                ExecuteRequest(
+                    feature="tc05-strict",
+                    repo_root=root,
+                    run_dir=root / "runs" / "tc05-strict",
+                    prompt_path=prompt,
+                    plan_path=plan,
+                    specs=(tc04, rec01, tc05),
+                    adapter=executor,
+                    launchers=VerifierLaunchers(
+                        task=sa.ScriptedVerifier(("PASS", "PASS")),
+                        test=sa.ScriptedVerifier(("PASS", "PASS")),
+                    ),
+                    envelope_anchors=EnvelopeAnchors(project_root=".", agents_root=".agents"),
+                    verifier_anchors=VerifierAnchors(
+                        project_root=str(root), agents_root=str(root / ".agents")
+                    ),
+                    environment={"claude": True},
+                    controls=ExecuteControls(
+                        plan_approved=True, task="TC-05", verify_dependency_chain=True
+                    ),
+                    plan_prompt_path="plan.md",
+                )
+            )
 
             self.assertTrue(result.ok, result.message)
             self.assertEqual([call["task_id"] for call in executor.calls], ["REC-01", "TC-05"])
@@ -1260,10 +1842,16 @@ class RuntimeSupersessionDefaultReuseTests(unittest.TestCase):
             dependency_path.write_text("# TSL-01\n", encoding="utf-8")
             selected_path.write_text("# TSL-02\n", encoding="utf-8")
             dependency = replace(
-                _specs(("EX-01",))[0], id="TSL-01", title="TSL-01", path="tasks/TSL-01.md",
+                _specs(("EX-01",))[0],
+                id="TSL-01",
+                title="TSL-01",
+                path="tasks/TSL-01.md",
             )
             selected = replace(
-                _specs(("EX-02",))[0], id="TSL-02", title="TSL-02", path="tasks/TSL-02.md",
+                _specs(("EX-02",))[0],
+                id="TSL-02",
+                title="TSL-02",
+                path="tasks/TSL-02.md",
                 depends_on=("TSL-01",),
             )
             source_prompt = root / "source-prompt.md"
@@ -1271,7 +1859,11 @@ class RuntimeSupersessionDefaultReuseTests(unittest.TestCase):
             source_prompt.write_text("source prompt", encoding="utf-8")
             source_plan.write_text("{}\n", encoding="utf-8")
             source = Run.create(
-                "source-tsl-01", source_prompt, source_plan, root / "runs" / "source-tsl-01", root,
+                "source-tsl-01",
+                source_prompt,
+                source_plan,
+                root / "runs" / "source-tsl-01",
+                root,
             )
             source_life = RunLifecycle.initialize(source, tasks=[("TSL-01", [])])
             source_life.transition("TSL-01", "in_progress", actor=ACTOR_RUNNER)
@@ -1283,9 +1875,12 @@ class RuntimeSupersessionDefaultReuseTests(unittest.TestCase):
             executor = sa.ScriptedExecutor(("implemented",))
             result = execute_run(
                 _request(
-                    root, (dependency, selected), executor=executor,
+                    root,
+                    (dependency, selected),
+                    executor=executor,
                     launchers=VerifierLaunchers(
-                        task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))),
+                        task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))
+                    ),
                     controls=ExecuteControls(plan_approved=True, task="TSL-02"),
                     environment={"claude": True},
                 )
@@ -1359,12 +1954,18 @@ class BoardProjectionWiringTests(unittest.TestCase):
             executor = _BoardSnapshotExecutor(("implemented", "implemented"), board)
             result = execute_run(
                 _request(
-                    root, _specs(("EX-01", "EX-02")), executor=executor,
+                    root,
+                    _specs(("EX-01", "EX-02")),
+                    executor=executor,
                     launchers=VerifierLaunchers(
                         task=sa.ScriptedVerifier(("PASS", "PASS")),
-                        test=sa.ScriptedVerifier(("PASS", "PASS"))),
-                    controls=ExecuteControls(plan_approved=True), environment={"claude": True},
-                    board_path=board))
+                        test=sa.ScriptedVerifier(("PASS", "PASS")),
+                    ),
+                    controls=ExecuteControls(plan_approved=True),
+                    environment={"claude": True},
+                    board_path=board,
+                )
+            )
 
             self.assertTrue(result.ok, result.message)
             self.assertEqual(len(executor.board_snapshots), 2)
@@ -1383,11 +1984,17 @@ class BoardProjectionWiringTests(unittest.TestCase):
             task_path = root / "fixtures/execution/tasks/EX-01_direct-success.md"
             result = execute_run(
                 _request(
-                    root, _specs(("EX-01",)), executor=sa.ScriptedExecutor(("implemented",)),
+                    root,
+                    _specs(("EX-01",)),
+                    executor=sa.ScriptedExecutor(("implemented",)),
                     launchers=VerifierLaunchers(
-                        task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))),
-                    controls=ExecuteControls(plan_approved=True), environment={"claude": True},
-                    board_path=board))
+                        task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))
+                    ),
+                    controls=ExecuteControls(plan_approved=True),
+                    environment={"claude": True},
+                    board_path=board,
+                )
+            )
 
             self.assertTrue(result.ok, result.message)
             board_text = board.read_text(encoding="utf-8")
@@ -1440,12 +2047,19 @@ class BoardProjectionWiringTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             board = _seed_board(root)
-            task_path = root / "fixtures/execution/tasks/EX-01_direct-success.md"
             subprocess.run(("git", "init", "-q"), cwd=root, check=True)
             subprocess.run(("git", "add", "."), cwd=root, check=True)
             subprocess.run(
-                ("git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
-                 "commit", "-qm", "fixture baseline"),
+                (
+                    "git",
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "-qm",
+                    "fixture baseline",
+                ),
                 cwd=root,
                 check=True,
             )
@@ -1453,18 +2067,23 @@ class BoardProjectionWiringTests(unittest.TestCase):
             test_verifier = AmendmentReviewVerifier(("PASS", "PASS"), role="test_verifier")
             result = execute_run(
                 _request(
-                    root, _specs(("EX-01",)),
+                    root,
+                    _specs(("EX-01",)),
                     executor=ScopeAmendmentExecutor(("implemented", "implemented")),
-                    launchers=VerifierLaunchers(
-                        task=task_verifier, test=test_verifier),
-                    controls=ExecuteControls(plan_approved=True), environment={"claude": True},
-                    board_path=board))
+                    launchers=VerifierLaunchers(task=task_verifier, test=test_verifier),
+                    controls=ExecuteControls(plan_approved=True),
+                    environment={"claude": True},
+                    board_path=board,
+                )
+            )
 
             self.assertTrue(result.ok, result.message)
             run = Run.load(result.run_dir, root)
             record = run.task("EX-01")
             self.assertEqual(record.status, "done")
-            self.assertTrue(record.execution_evidence["implementation"]["scope_amendment"]["present"])
+            self.assertTrue(
+                record.execution_evidence["implementation"]["scope_amendment"]["present"]
+            )
             self.assertIn(
                 "fixtures/execution/tasks/EX-01_direct-success.md",
                 record.execution_evidence["implementation"]["scope_amendment"]["observed_paths"],
@@ -1475,7 +2094,9 @@ class BoardProjectionWiringTests(unittest.TestCase):
                 "amendment-justification review",
             )
             self.assertIn("failed", [entry["outcome"] for entry in record.operation_history])
-            self.assertNotIn("unblock", " ".join(entry["outcome"] for entry in record.operation_history))
+            self.assertNotIn(
+                "unblock", " ".join(entry["outcome"] for entry in record.operation_history)
+            )
             reports = task_verifier.amendment_reports + test_verifier.amendment_reports
             self.assertEqual(len(reports), 4)
             for report in reports:
@@ -1488,11 +2109,17 @@ class BoardProjectionWiringTests(unittest.TestCase):
             task_path = root / "fixtures/execution/tasks/EX-01_direct-success.md"
             result = execute_run(
                 _request(
-                    root, _specs(("EX-01",)), executor=sa.ScriptedExecutor(("implemented",)),
+                    root,
+                    _specs(("EX-01",)),
+                    executor=sa.ScriptedExecutor(("implemented",)),
                     launchers=VerifierLaunchers(
-                        task=sa.ScriptedVerifier(("FAIL",)), test=sa.ScriptedVerifier(("PASS",))),
+                        task=sa.ScriptedVerifier(("FAIL",)), test=sa.ScriptedVerifier(("PASS",))
+                    ),
                     controls=ExecuteControls(plan_approved=True, max_repair_attempts=0),
-                    environment={"claude": True}, board_path=board))
+                    environment={"claude": True},
+                    board_path=board,
+                )
+            )
 
             self.assertEqual(result.status, "blocked")
             board_text = board.read_text(encoding="utf-8")
@@ -1518,18 +2145,29 @@ class BoardProjectionWiringTests(unittest.TestCase):
             # durable transition and the (never-attempted) projection.
             first = execute_run(
                 _request(
-                    root, _specs(("EX-01",)), executor=sa.ScriptedExecutor(("implemented",)),
+                    root,
+                    _specs(("EX-01",)),
+                    executor=sa.ScriptedExecutor(("implemented",)),
                     launchers=VerifierLaunchers(
-                        task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))),
-                    controls=ExecuteControls(plan_approved=True), environment={"claude": True}))
+                        task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))
+                    ),
+                    controls=ExecuteControls(plan_approved=True),
+                    environment={"claude": True},
+                )
+            )
             self.assertTrue(first.ok, first.message)
             run = Run.load(first.run_dir, root)
             self.assertEqual(run.task("EX-01").status, "done")
             reports_dir = first.run_dir / "reports"
-            source_report_bytes = {
-                path.relative_to(reports_dir): path.read_bytes()
-                for path in sorted(reports_dir.rglob("*")) if path.is_file()
-            } if reports_dir.is_dir() else {}
+            source_report_bytes = (
+                {
+                    path.relative_to(reports_dir): path.read_bytes()
+                    for path in sorted(reports_dir.rglob("*"))
+                    if path.is_file()
+                }
+                if reports_dir.is_dir()
+                else {}
+            )
 
             # The board and task file still show the pre-completion state — the stale
             # projection this resume must repair.
@@ -1543,10 +2181,15 @@ class BoardProjectionWiringTests(unittest.TestCase):
             test_verifier = sa.ScriptedVerifier(("PASS",))
             resumed = execute_run(
                 _request(
-                    root, _specs(("EX-01",)), executor=executor,
+                    root,
+                    _specs(("EX-01",)),
+                    executor=executor,
                     launchers=VerifierLaunchers(task=task_verifier, test=test_verifier),
                     controls=ExecuteControls(plan_approved=True, resume=True),
-                    environment={"claude": True}, board_path=board))
+                    environment={"claude": True},
+                    board_path=board,
+                )
+            )
 
             self.assertTrue(resumed.ok, resumed.message)
             self.assertEqual(executor.launches, 0)
@@ -1562,13 +2205,20 @@ class BoardProjectionWiringTests(unittest.TestCase):
 
             # The resume's own reconciliation is a durable-evidence projection, not a
             # rewrite of the original completed task's report evidence.
-            resumed_report_bytes = {
-                path.relative_to(reports_dir): path.read_bytes()
-                for path in sorted(reports_dir.rglob("*")) if path.is_file()
-            } if reports_dir.is_dir() else {}
+            resumed_report_bytes = (
+                {
+                    path.relative_to(reports_dir): path.read_bytes()
+                    for path in sorted(reports_dir.rglob("*"))
+                    if path.is_file()
+                }
+                if reports_dir.is_dir()
+                else {}
+            )
             self.assertEqual(resumed_report_bytes, source_report_bytes)
-            self.assertEqual(Run.load(first.run_dir, root).task("EX-01").verification,
-                              run.task("EX-01").verification)
+            self.assertEqual(
+                Run.load(first.run_dir, root).task("EX-01").verification,
+                run.task("EX-01").verification,
+            )
 
     def test_execute_run_projects_a_registry_named_historical_task_done_from_its_replacement(
         self,
@@ -1628,16 +2278,36 @@ class BoardProjectionWiringTests(unittest.TestCase):
             replacement_path = _write_named_task("REPL-01")
             replacement = load_task_spec(replacement_path)
 
-            registry = root / "tools" / "feature-pipeline" / "config" / "legacy_reconciliation_registry.json"
+            registry = (
+                root
+                / "tools"
+                / "feature-pipeline"
+                / "config"
+                / "legacy_reconciliation_registry.json"
+            )
             registry.parent.mkdir(parents=True)
-            registry.write_text(json.dumps({"mappings": [{
-                "historical_task": "HIST-01", "replacement_task": "REPL-01",
-                "source_run": "repl-01-verified", "project_completion": True,
-            }]}), encoding="utf-8")
+            registry.write_text(
+                json.dumps(
+                    {
+                        "mappings": [
+                            {
+                                "historical_task": "HIST-01",
+                                "replacement_task": "REPL-01",
+                                "source_run": "repl-01-verified",
+                                "project_completion": True,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
 
             source = Run.create(
-                "repl-01-verified", root / "prompt.md", None,
-                root / "runs" / "repl-01-verified", root,
+                "repl-01-verified",
+                root / "prompt.md",
+                None,
+                root / "runs" / "repl-01-verified",
+                root,
             )
             RunLifecycle.initialize(source, tasks=[("REPL-01", ())])
             persist_task_contracts(source, (replacement,))
@@ -1649,11 +2319,17 @@ class BoardProjectionWiringTests(unittest.TestCase):
             executor = sa.ScriptedExecutor(("implemented",))
             result = execute_run(
                 _request(
-                    root, _specs(("EX-01",)), executor=executor,
+                    root,
+                    _specs(("EX-01",)),
+                    executor=executor,
                     launchers=VerifierLaunchers(
-                        task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))),
-                    controls=ExecuteControls(plan_approved=True), environment={"claude": True},
-                    board_path=board))
+                        task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))
+                    ),
+                    controls=ExecuteControls(plan_approved=True),
+                    environment={"claude": True},
+                    board_path=board,
+                )
+            )
 
             self.assertTrue(result.ok, result.message)
             board_text = board.read_text(encoding="utf-8")
@@ -1664,9 +2340,7 @@ class BoardProjectionWiringTests(unittest.TestCase):
             historical_text = historical_path.read_text(encoding="utf-8")
             self.assertIn("- [x] Done", historical_text)
             self.assertEqual(historical_text.count("## Result"), 1)
-            self.assertIn(
-                f"HIST-01 completed from REPL-01 run `{source.run_id}`", historical_text
-            )
+            self.assertIn(f"HIST-01 completed from REPL-01 run `{source.run_id}`", historical_text)
             self.assertIn("runs/repl-01-verified/run.json", historical_text)
 
     def test_fresh_reuse_projects_the_reused_dependency_after_pruning_its_ancestor(self) -> None:
@@ -1678,8 +2352,7 @@ class BoardProjectionWiringTests(unittest.TestCase):
             target_task = root / "fixtures/execution/tasks/EX-03_repair-then-verify.md"
             target_task.write_text(source_task.read_text(encoding="utf-8"), encoding="utf-8")
             board.write_text(
-                board.read_text(encoding="utf-8")
-                + "- [EX-03: Repair then verify task]"
+                board.read_text(encoding="utf-8") + "- [EX-03: Repair then verify task]"
                 "(../fixtures/execution/tasks/EX-03_repair-then-verify.md)\n",
                 encoding="utf-8",
             )
@@ -1687,7 +2360,9 @@ class BoardProjectionWiringTests(unittest.TestCase):
             plan = root / "plan.json"
             prompt.write_text("feature prompt", encoding="utf-8")
             plan.write_text(json.dumps(PLAN, indent=2) + "\n", encoding="utf-8")
-            source = Run.create("source-feature", prompt, plan, root / "runs" / "source-feature", root)
+            source = Run.create(
+                "source-feature", prompt, plan, root / "runs" / "source-feature", root
+            )
             source_life = RunLifecycle.initialize(source, tasks=[("EX-02", [])])
             source_life.transition("EX-02", "running", actor=ACTOR_RUNNER)
             source_life.transition("EX-02", "implemented", actor=ACTOR_RUNNER)
@@ -1699,11 +2374,17 @@ class BoardProjectionWiringTests(unittest.TestCase):
             executor = sa.ScriptedExecutor(("implemented",))
             result = execute_run(
                 _request(
-                    root, _specs(("EX-01", "EX-02", "EX-03")), executor=executor,
+                    root,
+                    _specs(("EX-01", "EX-02", "EX-03")),
+                    executor=executor,
                     launchers=VerifierLaunchers(
-                        task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))),
+                        task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))
+                    ),
                     controls=ExecuteControls(plan_approved=True, task="EX-03"),
-                    environment={"claude": True}, board_path=board))
+                    environment={"claude": True},
+                    board_path=board,
+                )
+            )
 
             self.assertTrue(result.ok, result.message)
             self.assertEqual([call["task_id"] for call in executor.calls], ["EX-03"])
@@ -1717,10 +2398,16 @@ class BoardProjectionWiringTests(unittest.TestCase):
             root = Path(directory)
             result = execute_run(
                 _request(
-                    root, _specs(("EX-01",)), executor=sa.ScriptedExecutor(("implemented",)),
+                    root,
+                    _specs(("EX-01",)),
+                    executor=sa.ScriptedExecutor(("implemented",)),
                     launchers=VerifierLaunchers(
-                        task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))),
-                    controls=ExecuteControls(plan_approved=True), environment={"claude": True}))
+                        task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))
+                    ),
+                    controls=ExecuteControls(plan_approved=True),
+                    environment={"claude": True},
+                )
+            )
             self.assertTrue(result.ok, result.message)
             self.assertFalse((root / "docs" / "kanban.md").exists())
 

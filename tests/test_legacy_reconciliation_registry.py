@@ -235,7 +235,7 @@ class RegistryDrivenReconciliationTests(unittest.TestCase):
             historical_bytes_before = historical.read_bytes()
             replacement = _write_task_file(root, "TSL-05")
             replacement_bytes_before = replacement.read_bytes()
-            unfinished = _write_task_file(root, "TSL-10")
+            _write_task_file(root, "TSL-10")
             unfinished_replacement = _write_task_file(root, "TSL-12")
 
             _write_registry(root, [

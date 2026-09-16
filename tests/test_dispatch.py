@@ -17,7 +17,11 @@ from pipeline_core.adapters import (
     CompletedProcess,
     LaunchResult,
 )
-from pipeline_core.dispatch import DispatchError, DispatchRequest, dispatch_executor as _dispatch_executor
+from pipeline_core.dispatch import (
+    DispatchError,
+    DispatchRequest,
+    dispatch_executor as _dispatch_executor,
+)
 from pipeline_core.lifecycle import RunLifecycle
 from pipeline_core.prompt_envelope import EnvelopeAnchors, build_executor_envelope
 from pipeline_core.reports import (
@@ -109,13 +113,19 @@ class ScriptedAdapter:
 
     def launch(self, request):  # noqa: ANN001 - test double
         self.calls.append(
-            {"role": request.role, "no_tools": request.no_tools,
-             "resume": request.resume_session_id, "prompt": request.prompt,
-             "allowed_tools": request.allowed_tools}
+            {
+                "role": request.role,
+                "no_tools": request.no_tools,
+                "resume": request.resume_session_id,
+                "prompt": request.prompt,
+                "allowed_tools": request.allowed_tools,
+            }
         )
         if request.no_tools or request.resume_session_id:
-            text = self.envelope_text if self.envelope_text is not None else _envelope(
-                self.envelope_status, request.task_id
+            text = (
+                self.envelope_text
+                if self.envelope_text is not None
+                else _envelope(self.envelope_status, request.task_id)
             )
             return self._deliver(request, text, self.envelope_exit, self.write_envelope)
         if self.raise_code:
@@ -124,10 +134,16 @@ class ScriptedAdapter:
             self.on_launch(request)
         text = self.prose_text if self.prose_text is not None else _prose(self.prose_status)
         return self._deliver(
-            request, text, self.launch_exit, self.write_report, self.written_report_text)
+            request, text, self.launch_exit, self.write_report, self.written_report_text
+        )
 
     def _deliver(
-        self, request, text: str, exit_code: int, write: bool, written_text: str | None = None,
+        self,
+        request,
+        text: str,
+        exit_code: int,
+        write: bool,
+        written_text: str | None = None,
     ) -> LaunchResult:  # noqa: ANN001
         if write:
             path = Path(request.report_path)
@@ -146,9 +162,18 @@ class CodexFinalAdapter:
         self.exit_code = exit_code
 
     def launch(self, request):  # noqa: ANN001 - test double
-        events = [json.dumps({"type": "item.completed", "item": {
-            "type": "agent_message", "text": json.dumps(payload),
-        }}) for payload in self.payloads]
+        events = [
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "agent_message",
+                        "text": json.dumps(payload),
+                    },
+                }
+            )
+            for payload in self.payloads
+        ]
         events.append(json.dumps({"type": "turn.completed"}))
         return LaunchResult(self.exit_code, "# Human report\n", "", "thread-1", "\n".join(events))
 
@@ -170,8 +195,11 @@ def _running_life(root: Path, spec: TaskSpec) -> RunLifecycle:
 
 def _request(spec: TaskSpec, **overrides: object) -> DispatchRequest:
     base: dict[str, object] = dict(
-        spec=spec, role_grant=("read", "run_checks", "write"), anchors=_anchors(),
-        execution_mode="separate", plan_path="docs/plans/2026-09-01-core-execution-engine.md",
+        spec=spec,
+        role_grant=("read", "run_checks", "write"),
+        anchors=_anchors(),
+        execution_mode="separate",
+        plan_path="docs/plans/2026-09-01-core-execution-engine.md",
     )
     base.update(overrides)
     return DispatchRequest(**base)  # type: ignore[arg-type]
@@ -200,7 +228,8 @@ class ProducerAttributionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             spec = _spec()
-            prompt = root / "prompt.md"; prompt.write_text("x", encoding="utf-8")
+            prompt = root / "prompt.md"
+            prompt.write_text("x", encoding="utf-8")
             run = Run.create("direct", prompt, None, root / "runs" / "direct", root)
             life = RunLifecycle.initialize(run, tasks=[(spec.id, ())])
             life.transition(spec.id, "running", actor=ACTOR_RUNNER)
@@ -210,12 +239,18 @@ class ProducerAttributionTests(unittest.TestCase):
 
     def test_status_envelope_is_strict_about_shape_and_identity(self) -> None:
         self.assertEqual(
-            parse_status_envelope(_envelope("implemented"), role="executor",
-                                  task_id="RDS-04", attempt=1),
+            parse_status_envelope(
+                _envelope("implemented"), role="executor", task_id="RDS-04", attempt=1
+            ),
             "implemented",
         )
-        for bad in ('{"role": "executor"}', '{not json', _envelope("verified"),
-                    _envelope("implemented", "RDS-99"), _envelope("implemented", attempt=2)):
+        for bad in (
+            '{"role": "executor"}',
+            "{not json",
+            _envelope("verified"),
+            _envelope("implemented", "RDS-99"),
+            _envelope("implemented", attempt=2),
+        ):
             with self.assertRaises(ReportError) as ctx:
                 parse_status_envelope(bad, role="executor", task_id="RDS-04", attempt=1)
             self.assertEqual(ctx.exception.code, "unparseable-status-envelope")
@@ -225,13 +260,18 @@ class ProducerAttributionTests(unittest.TestCase):
             settle_executor_status(
                 prose_text="- Status: implemented",
                 envelope_text=_envelope("blocked", reason="declared check unavailable"),
-                role="executor", task_id="RDS-04", attempt=1,
+                role="executor",
+                task_id="RDS-04",
+                attempt=1,
             )
         self.assertEqual(ctx.exception.code, "status-envelope-mismatch")
 
         resolution = settle_executor_status(
-            prose_text="no status here", envelope_text=_envelope("implemented"),
-            role="executor", task_id="RDS-04", attempt=1,
+            prose_text="no status here",
+            envelope_text=_envelope("implemented"),
+            role="executor",
+            task_id="RDS-04",
+            attempt=1,
         )
         self.assertEqual(resolution.token, "implemented")
         self.assertIsNone(resolution.prose_token)
@@ -259,18 +299,21 @@ class GenerationTests(unittest.TestCase):
             )
 
             self.assertEqual(outcome.status, "implemented")
-            self.assertEqual(outcome.artifacts.executor_report.read_text(encoding="utf-8"), captured)
+            self.assertEqual(
+                outcome.artifacts.executor_report.read_text(encoding="utf-8"), captured
+            )
 
     def test_runner_persists_generic_adapter_stdout_without_adapter_report_write(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             spec = _spec()
             life = _running_life(root, spec)
-            outcome = dispatch_executor(
-                life, _request(spec), ScriptedAdapter(write_report=False))
+            outcome = dispatch_executor(life, _request(spec), ScriptedAdapter(write_report=False))
 
             self.assertEqual(outcome.status, "implemented")
-            self.assertEqual(outcome.artifacts.executor_report.read_text(encoding="utf-8"), _prose())
+            self.assertEqual(
+                outcome.artifacts.executor_report.read_text(encoding="utf-8"), _prose()
+            )
 
     def test_success_consumes_one_generation_and_owns_its_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -292,8 +335,7 @@ class GenerationTests(unittest.TestCase):
             root = Path(directory)
             spec = _spec()
             life = _running_life(root, spec)
-            outcome = dispatch_executor(
-                life, _request(spec), ScriptedAdapter(launch_exit=1))
+            outcome = dispatch_executor(life, _request(spec), ScriptedAdapter(launch_exit=1))
 
             self.assertEqual(outcome.generation, 1)
             self.assertEqual(outcome.status, "retryable")
@@ -303,8 +345,7 @@ class GenerationTests(unittest.TestCase):
 
             # A fresh resume from run.json alone keeps the consumed counter.
             reloaded = RunLifecycle.load(life.run.run_dir, root)
-            self.assertEqual(
-                reloaded.run.task(spec.id).next_executor_launch_generation, 2)
+            self.assertEqual(reloaded.run.task(spec.id).next_executor_launch_generation, 2)
             self.assertEqual(reloaded.consume_launch_generation(spec.id, "executor"), 2)
 
     def test_failed_launch_preserves_exit_stdout_stderr_and_session_evidence(self) -> None:
@@ -312,8 +353,9 @@ class GenerationTests(unittest.TestCase):
             root = Path(directory)
             spec = _spec()
             life = _running_life(root, spec)
-            adapter = ScriptedAdapter(launch_exit=7, write_report=False,
-                                      prose_text="partial work\nstderr trace")
+            adapter = ScriptedAdapter(
+                launch_exit=7, write_report=False, prose_text="partial work\nstderr trace"
+            )
             outcome = dispatch_executor(life, _request(spec), adapter)
 
             self.assertEqual(outcome.status, "retryable")
@@ -332,7 +374,8 @@ class GenerationTests(unittest.TestCase):
             spec = _spec()
             life = _running_life(root, spec)
             outcome = dispatch_executor(
-                life, _request(spec), ScriptedAdapter(raise_code="adapter-unavailable"))
+                life, _request(spec), ScriptedAdapter(raise_code="adapter-unavailable")
+            )
 
             self.assertEqual(outcome.status, "retryable")
             self.assertEqual(life.run.task(spec.id).status, "in_progress")
@@ -445,8 +488,11 @@ class ResultTextExtractionTests(unittest.TestCase):
 class PromptEnvelopeTests(unittest.TestCase):
     def test_envelope_makes_report_evidence_runner_owned(self) -> None:
         text = build_executor_envelope(
-            _spec(), anchors=_anchors(), role_grant=("read", "write"),
-            execution_mode="separate", report_path="reports/RDS-04/launch-1/executor-1.md",
+            _spec(),
+            anchors=_anchors(),
+            role_grant=("read", "write"),
+            execution_mode="separate",
+            report_path="reports/RDS-04/launch-1/executor-1.md",
         )
         self.assertNotIn("Report path:", text)
         self.assertNotIn("Write the human Markdown report", text)
@@ -462,10 +508,8 @@ class PromptEnvelopeTests(unittest.TestCase):
 
         self.assertIn("- Task ID: RDS-04", text)
         self.assertIn("- Task type: python", text)
-        self.assertIn(
-            "- Allowed scope: feature-pipeline-skill/pipeline_core/dispatch.py", text)
-        self.assertIn(
-            "- Out of scope: feature-pipeline-skill/pipeline_core/worktree.py", text)
+        self.assertIn("- Allowed scope: feature-pipeline-skill/pipeline_core/dispatch.py", text)
+        self.assertIn("- Out of scope: feature-pipeline-skill/pipeline_core/worktree.py", text)
         self.assertIn(
             "- Required skills: .agents/skills/software-development/feature-pipeline/SKILL.md",
             text,
@@ -490,10 +534,20 @@ class StatusSettlementTests(unittest.TestCase):
             root = Path(directory)
             spec = _spec()
             life = _running_life(root, spec)
-            outcome = dispatch_executor(life, _request(spec), CodexFinalAdapter([{
-                "role": "executor", "task_id": spec.id, "attempt": 1,
-                "status": "implemented",
-            }]))
+            outcome = dispatch_executor(
+                life,
+                _request(spec),
+                CodexFinalAdapter(
+                    [
+                        {
+                            "role": "executor",
+                            "task_id": spec.id,
+                            "attempt": 1,
+                            "status": "implemented",
+                        }
+                    ]
+                ),
+            )
             self.assertEqual(outcome.status, "implemented")
             self.assertEqual(life.run.task(spec.id).status, "in_progress")
             captured = outcome.artifacts.executor_report.read_text(encoding="utf-8")
@@ -521,7 +575,8 @@ class RecoveryEvidenceTests(unittest.TestCase):
                 prompt,
             )
             self.assertIn(
-                "- This evidence is runner-owned; do not write any run artifacts.", prompt)
+                "- This evidence is runner-owned; do not write any run artifacts.", prompt
+            )
             self.assertNotIn(str(root), prompt)
 
     def test_no_runner_evidence_does_not_invent_an_envelope_status(self) -> None:
@@ -566,8 +621,12 @@ class RecoveryEvidenceTests(unittest.TestCase):
             root = Path(directory)
             spec = _spec()
             life = _running_life(root, spec)
-            payload = {"role": "executor", "task_id": spec.id, "attempt": 1,
-                       "status": "implemented"}
+            payload = {
+                "role": "executor",
+                "task_id": spec.id,
+                "attempt": 1,
+                "status": "implemented",
+            }
             outcome = dispatch_executor(life, _request(spec), CodexFinalAdapter([payload, payload]))
             self.assertEqual(outcome.status, "retryable")
             self.assertEqual(life.run.task(spec.id).status, "in_progress")
@@ -584,7 +643,9 @@ class RecoveryEvidenceTests(unittest.TestCase):
             artifacts.status_envelope.parent.mkdir(parents=True, exist_ok=True)
             artifacts.status_envelope.write_text(conflicting, encoding="utf-8")
             payload = {
-                "role": "executor", "task_id": spec.id, "attempt": 1,
+                "role": "executor",
+                "task_id": spec.id,
+                "attempt": 1,
                 "status": "implemented",
             }
 
@@ -592,7 +653,8 @@ class RecoveryEvidenceTests(unittest.TestCase):
 
             self.assertEqual(outcome.status, "retryable")
             diagnostic = json.loads(
-                outcome.artifacts.result_protocol_invalid.read_text(encoding="utf-8"))
+                outcome.artifacts.result_protocol_invalid.read_text(encoding="utf-8")
+            )
             self.assertEqual(diagnostic["envelope_stdout"], conflicting)
             self.assertIn('\\"status\\": \\"implemented\\"', diagnostic["stdout"])
 
@@ -604,17 +666,32 @@ class RecoveryEvidenceTests(unittest.TestCase):
             artifacts = launch_artifacts(life.run.run_dir, spec.id, 1)
             artifacts.status_envelope.parent.mkdir(parents=True, exist_ok=True)
             artifacts.status_envelope.write_text(
-                json.dumps({
-                    "status": "implemented", "attempt": 1,
-                    "task_id": spec.id, "role": "executor",
-                }, indent=2),
+                json.dumps(
+                    {
+                        "status": "implemented",
+                        "attempt": 1,
+                        "task_id": spec.id,
+                        "role": "executor",
+                    },
+                    indent=2,
+                ),
                 encoding="utf-8",
             )
 
-            outcome = dispatch_executor(life, _request(spec), CodexFinalAdapter([{
-                "role": "executor", "task_id": spec.id, "attempt": 1,
-                "status": "implemented",
-            }]))
+            outcome = dispatch_executor(
+                life,
+                _request(spec),
+                CodexFinalAdapter(
+                    [
+                        {
+                            "role": "executor",
+                            "task_id": spec.id,
+                            "attempt": 1,
+                            "status": "implemented",
+                        }
+                    ]
+                ),
+            )
 
             self.assertEqual(outcome.status, "implemented")
             self.assertFalse(outcome.artifacts.result_protocol_invalid.exists())
@@ -624,10 +701,21 @@ class RecoveryEvidenceTests(unittest.TestCase):
             root = Path(directory)
             spec = _spec()
             life = _running_life(root, spec)
-            outcome = dispatch_executor(life, _request(spec), CodexFinalAdapter([{
-                "role": "executor", "task_id": spec.id, "attempt": 1,
-                "status": "blocked", "reason": "required service is unavailable",
-            }]))
+            outcome = dispatch_executor(
+                life,
+                _request(spec),
+                CodexFinalAdapter(
+                    [
+                        {
+                            "role": "executor",
+                            "task_id": spec.id,
+                            "attempt": 1,
+                            "status": "blocked",
+                            "reason": "required service is unavailable",
+                        }
+                    ]
+                ),
+            )
             self.assertEqual(outcome.status, "blocked")
             wait = life.run.task(spec.id).operation_history[-1]
             self.assertEqual(wait["kind"], "wait")
@@ -636,10 +724,15 @@ class RecoveryEvidenceTests(unittest.TestCase):
     def test_codex_prompt_uses_the_current_repair_attempt(self) -> None:
         spec = _spec()
         prompt = build_executor_envelope(
-            spec, anchors=_anchors(), role_grant=("read",), execution_mode="separate",
-            report_path="report.md", attempt=2,
+            spec,
+            anchors=_anchors(),
+            role_grant=("read",),
+            execution_mode="separate",
+            report_path="report.md",
+            attempt=2,
         )
         self.assertIn('"attempt":2', prompt)
+
     def test_fresh_envelope_adapter_receives_the_runner_observed_status(self) -> None:
         class FreshEnvelopeAdapter(ScriptedAdapter):
             requires_fresh_envelope_context = True
@@ -668,21 +761,23 @@ class RecoveryEvidenceTests(unittest.TestCase):
             self.assertEqual(life.run.task(spec.id).status, "in_progress")
             evidence = life.run.task(spec.id).execution_evidence
             self.assertEqual(evidence["launch_generation"], 1)
-            self.assertTrue(
-                evidence["executor_report"].endswith("launch-1/executor-1.md"))
+            self.assertTrue(evidence["executor_report"].endswith("launch-1/executor-1.md"))
 
     def test_missing_prose_line_falls_back_to_the_envelope_and_records_drift(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             spec = _spec()
             life = _running_life(root, spec)
-            adapter = ScriptedAdapter(prose_text=_prose(with_line=False),
-                                      envelope_status="implemented")
+            adapter = ScriptedAdapter(
+                prose_text=_prose(with_line=False), envelope_status="implemented"
+            )
             outcome = dispatch_executor(life, _request(spec), adapter)
 
             self.assertEqual(outcome.status, "implemented")
             self.assertIsNotNone(outcome.drift)
-            drift_events = [e for e in life.run.history if e.get("note") and "envelope status" in e["note"]]
+            drift_events = [
+                e for e in life.run.history if e.get("note") and "envelope status" in e["note"]
+            ]
             self.assertTrue(drift_events)
 
     def test_prose_envelope_disagreement_is_retryable_not_a_task_block(self) -> None:
@@ -714,7 +809,9 @@ class RecoveryEvidenceTests(unittest.TestCase):
             self.assertIn("unparseable-status-envelope", outcome.failure or "")
             self.assertEqual(life.run.task(spec.id).status, "in_progress")
 
-    def test_executor_reported_blocked_without_a_reason_is_a_retryable_protocol_failure(self) -> None:
+    def test_executor_reported_blocked_without_a_reason_is_a_retryable_protocol_failure(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             spec = _spec()
@@ -742,7 +839,8 @@ class RecoveryEvidenceTests(unittest.TestCase):
             adapter = ScriptedAdapter(
                 prose_status="blocked",
                 envelope_text=_envelope(
-                    "blocked", spec.id, reason="required credential is unavailable"),
+                    "blocked", spec.id, reason="required credential is unavailable"
+                ),
             )
             outcome = dispatch_executor(life, _request(spec), adapter)
 
@@ -779,10 +877,13 @@ class StateAuthorityTests(unittest.TestCase):
     def test_dispatch_reaches_implemented_blocked_or_retryable(self) -> None:
         for adapter, expected in (
             (ScriptedAdapter(), "implemented"),
-            (ScriptedAdapter(
-                prose_status="blocked",
-                envelope_text=_envelope("blocked", reason="declared check unavailable"),
-            ), "blocked"),
+            (
+                ScriptedAdapter(
+                    prose_status="blocked",
+                    envelope_text=_envelope("blocked", reason="declared check unavailable"),
+                ),
+                "blocked",
+            ),
             (ScriptedAdapter(launch_exit=1), "retryable"),
         ):
             with tempfile.TemporaryDirectory() as directory:
@@ -818,7 +919,8 @@ class StateAuthorityTests(unittest.TestCase):
             self.assertTrue(outcome.artifacts.implementation_manifest.is_file())
             self.assertTrue(outcome.artifacts.implementation_diff.is_file())
             manifest = json.loads(
-                outcome.artifacts.implementation_manifest.read_text(encoding="utf-8"))
+                outcome.artifacts.implementation_manifest.read_text(encoding="utf-8")
+            )
             self.assertEqual(manifest["attribution_state"], "unavailable")
             self.assertEqual(manifest["changed_files"], [])
             self.assertIsNotNone(manifest["reason"])
@@ -826,17 +928,15 @@ class StateAuthorityTests(unittest.TestCase):
             implementation = life.run.task(spec.id).execution_evidence["implementation"]
             self.assertEqual(implementation["state"], "unavailable")
             self.assertTrue(
-                implementation["manifest"].endswith(
-                    "launch-1/implementation-manifest-1.json"))
-            self.assertTrue(
-                implementation["diff"].endswith("launch-1/implementation-diff-1.md"))
+                implementation["manifest"].endswith("launch-1/implementation-manifest-1.json")
+            )
+            self.assertTrue(implementation["diff"].endswith("launch-1/implementation-diff-1.md"))
 
 
 class ArtifactLayoutTests(unittest.TestCase):
     def test_layout_matches_the_required_shape(self) -> None:
         artifacts = launch_artifacts("run-dir", "RDS-04", 3)
-        self.assertEqual(
-            artifacts.directory.as_posix(), "run-dir/reports/RDS-04/launch-3")
+        self.assertEqual(artifacts.directory.as_posix(), "run-dir/reports/RDS-04/launch-3")
         self.assertEqual(artifacts.executor_report.name, "executor-3.md")
         self.assertEqual(artifacts.status_envelope.name, "executor-envelope-3.json")
         with self.assertRaises(ReportError) as ctx:
@@ -892,7 +992,8 @@ class DispatchAttributionTests(unittest.TestCase):
                 review.write_text("TC-03 review\n", encoding="utf-8")
 
             outcome = dispatch_executor(
-                life, _request(spec), ScriptedAdapter(on_launch=executor_writes_review))
+                life, _request(spec), ScriptedAdapter(on_launch=executor_writes_review)
+            )
 
             self.assertEqual(outcome.status, "implemented")
             self.assertEqual(
@@ -922,13 +1023,17 @@ class DispatchAttributionTests(unittest.TestCase):
 
             def executor_changes_protected(request) -> None:  # noqa: ANN001
                 (Path(request.working_root) / protected).write_text(
-                    "executor overwrite\n", encoding="utf-8")
+                    "executor overwrite\n", encoding="utf-8"
+                )
 
             outcome = dispatch_executor(
-                life, _request(spec), ScriptedAdapter(on_launch=executor_changes_protected))
+                life, _request(spec), ScriptedAdapter(on_launch=executor_changes_protected)
+            )
 
             self.assertEqual(outcome.status, "implemented")
-            amendment = life.run.task(spec.id).execution_evidence["implementation"]["scope_amendment"]
+            amendment = life.run.task(spec.id).execution_evidence["implementation"][
+                "scope_amendment"
+            ]
             self.assertEqual(amendment["observed_paths"], [protected])
             self.assertEqual(amendment["approval"], "pending-independent-verification")
             self.assertEqual(amendment["original_allowed_scope"], ["reviews/TC-03.md"])
@@ -946,11 +1051,12 @@ class DispatchAttributionTests(unittest.TestCase):
 
             def mutate(request) -> None:  # noqa: ANN001
                 workspace = Path(request.working_root)
-                (workspace / "src.py").write_text("print('changed by executor')\n", encoding="utf-8")
+                (workspace / "src.py").write_text(
+                    "print('changed by executor')\n", encoding="utf-8"
+                )
                 (workspace / "stray.txt").write_text("out of scope\n", encoding="utf-8")
 
-            outcome = dispatch_executor(
-                life, _request(spec), ScriptedAdapter(on_launch=mutate))
+            outcome = dispatch_executor(life, _request(spec), ScriptedAdapter(on_launch=mutate))
 
             self.assertEqual(outcome.status, "implemented")
             self.assertEqual(outcome.attribution.state, "known")
@@ -961,15 +1067,13 @@ class DispatchAttributionTests(unittest.TestCase):
             self.assertEqual(by_path["stray.txt"]["classification"], "out_of_scope")
 
             implementation = life.run.task(spec.id).execution_evidence["implementation"]
-            self.assertEqual(
-                implementation["scope_amendment"]["observed_paths"], ["stray.txt"])
+            self.assertEqual(implementation["scope_amendment"]["observed_paths"], ["stray.txt"])
             self.assertEqual((root / "stray.txt").read_text(encoding="utf-8"), "out of scope\n")
 
             diff = outcome.artifacts.implementation_diff.read_text(encoding="utf-8")
             self.assertIn("# attribution: known", diff)
             self.assertIn("changed by executor", diff)
-            self.assertEqual(
-                life.run.task(spec.id).changed_files, ["src.py", "stray.txt"])
+            self.assertEqual(life.run.task(spec.id).changed_files, ["src.py", "stray.txt"])
 
     def test_preexisting_dirt_is_excluded_but_a_further_edit_is_kept(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -983,10 +1087,10 @@ class DispatchAttributionTests(unittest.TestCase):
 
             def mutate(request) -> None:  # noqa: ANN001
                 (Path(request.working_root) / "src.py").write_text(
-                    "print('executor went further')\n", encoding="utf-8")
+                    "print('executor went further')\n", encoding="utf-8"
+                )
 
-            outcome = dispatch_executor(
-                life, _request(spec), ScriptedAdapter(on_launch=mutate))
+            outcome = dispatch_executor(life, _request(spec), ScriptedAdapter(on_launch=mutate))
 
             self.assertEqual(outcome.attribution.state, "known")
             paths = {row["path"] for row in outcome.attribution.changed_files}
@@ -1003,11 +1107,12 @@ class DispatchAttributionTests(unittest.TestCase):
             self.assertEqual(outcome.attribution.state, "known-empty")
             self.assertEqual(outcome.attribution.changed_files, [])
             manifest = json.loads(
-                outcome.artifacts.implementation_manifest.read_text(encoding="utf-8"))
+                outcome.artifacts.implementation_manifest.read_text(encoding="utf-8")
+            )
             self.assertEqual(manifest["attribution_state"], "known-empty")
             self.assertIn(
-                "known-empty",
-                outcome.artifacts.implementation_diff.read_text(encoding="utf-8"))
+                "known-empty", outcome.artifacts.implementation_diff.read_text(encoding="utf-8")
+            )
 
     def test_runner_records_commit_and_tag_created_inside_executor_window(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1018,13 +1123,14 @@ class DispatchAttributionTests(unittest.TestCase):
 
             def mutate(request) -> None:  # noqa: ANN001
                 workspace = Path(request.working_root)
-                (workspace / "src.py").write_text("print('committed by executor')\n", encoding="utf-8")
+                (workspace / "src.py").write_text(
+                    "print('committed by executor')\n", encoding="utf-8"
+                )
                 _git(workspace, "add", "src.py")
                 _git(workspace, "commit", "-qm", "executor commit")
                 _git(workspace, "tag", "executor-tag")
 
-            outcome = dispatch_executor(
-                life, _request(spec), ScriptedAdapter(on_launch=mutate))
+            outcome = dispatch_executor(life, _request(spec), ScriptedAdapter(on_launch=mutate))
 
             self.assertEqual(outcome.attribution.state, "known-empty")
             actions = life.run.task(spec.id).execution_evidence["external_actions"]
@@ -1043,8 +1149,7 @@ class DispatchAttributionTests(unittest.TestCase):
             def mutate(request) -> None:  # noqa: ANN001
                 (life.run.run_dir / "runner-note.txt").write_text("churn\n", encoding="utf-8")
 
-            outcome = dispatch_executor(
-                life, _request(spec), ScriptedAdapter(on_launch=mutate))
+            outcome = dispatch_executor(life, _request(spec), ScriptedAdapter(on_launch=mutate))
 
             self.assertEqual(outcome.attribution.state, "known-empty")
 
@@ -1063,7 +1168,8 @@ class DispatchAttributionTests(unittest.TestCase):
                 path.write_text("runner-owned artifact\n", encoding="utf-8")
 
             outcome = dispatch_executor(
-                life, _request(spec), ScriptedAdapter(on_launch=write_runner_artifact))
+                life, _request(spec), ScriptedAdapter(on_launch=write_runner_artifact)
+            )
 
             self.assertEqual(outcome.attribution.state, "known-empty")
             self.assertEqual(outcome.attribution.changed_files, [])
@@ -1087,7 +1193,9 @@ class DispatchAttributionTests(unittest.TestCase):
 
             def repair_report_is_readable(request) -> None:  # noqa: ANN001
                 visible = Path(request.working_root) / repair_path
-                self.assertEqual(visible.read_text(encoding="utf-8"), source.read_text(encoding="utf-8"))
+                self.assertEqual(
+                    visible.read_text(encoding="utf-8"), source.read_text(encoding="utf-8")
+                )
                 self.assertEqual(request.required_input_dirs, (str(visible.parent),))
 
             outcome = dispatch_executor(
@@ -1135,15 +1243,19 @@ class CodexIsolatedWorkspaceCompositionTests(unittest.TestCase):
                 target.write_text("print('written by codex')\n", encoding="utf-8")
                 observed["read_back"] = target.read_text(encoding="utf-8")
                 payload = {
-                    "role": "executor", "status": "implemented",
-                    "task_id": spec.id, "attempt": 1,
+                    "role": "executor",
+                    "status": "implemented",
+                    "task_id": spec.id,
+                    "attempt": 1,
                 }
                 events = [
                     json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
-                    json.dumps({
-                        "type": "item.completed",
-                        "item": {"type": "agent_message", "text": json.dumps(payload)},
-                    }),
+                    json.dumps(
+                        {
+                            "type": "item.completed",
+                            "item": {"type": "agent_message", "text": json.dumps(payload)},
+                        }
+                    ),
                     json.dumps({"type": "turn.completed"}),
                 ]
                 return CompletedProcess(0, "\n".join(events), "")
@@ -1167,10 +1279,10 @@ class CodexIsolatedWorkspaceCompositionTests(unittest.TestCase):
             # scoped sentinel/attributed-delta half of the handoff, proven through
             # the real attribution and promotion path rather than a bespoke fixture.
             self.assertEqual(
-                (root / "src.py").read_text(encoding="utf-8"), "print('written by codex')\n")
+                (root / "src.py").read_text(encoding="utf-8"), "print('written by codex')\n"
+            )
             self.assertEqual(outcome.attribution.state, "known")
-            self.assertEqual(
-                [row["path"] for row in outcome.attribution.changed_files], ["src.py"])
+            self.assertEqual([row["path"] for row in outcome.attribution.changed_files], ["src.py"])
             # The task status remains inside the three-state model throughout.
             self.assertEqual(life.run.task(spec.id).status, "in_progress")
 

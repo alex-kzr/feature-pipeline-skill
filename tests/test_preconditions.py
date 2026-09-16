@@ -340,7 +340,7 @@ class DispatchPreconditionsTests(unittest.TestCase):
             self.assertEqual(execute_run(request).exit_code, 20)
             approved = replace(request, controls=replace(request.controls, resume=True, approvals=("review",)))
             self.assertEqual(execute_run(approved).exit_code, 0)
-            life = RunLifecycle.load(request.run_dir, root)
+            RunLifecycle.load(request.run_dir, root)
             self.assertEqual(execute_run(replace(request, controls=replace(request.controls, resume=True))).exit_code, 20)
             self.assertEqual(execute_run(approved).exit_code, 0)
 
@@ -350,7 +350,7 @@ class DispatchPreconditionsTests(unittest.TestCase):
                 root = Path(directory)
                 request = self.request(root, predicates=(Precondition("approval", "review"),))
                 self.assertEqual(execute_run(request).exit_code, 20)
-                life = RunLifecycle.load(request.run_dir, root)
+                RunLifecycle.load(request.run_dir, root)
                 # Failed repair work remains an in-progress task with its operation evidence.
                 with patch("pipeline_core.execution._run_selected_task", side_effect=AssertionError("must not dispatch")):
                     result = execute_run(replace(request, controls=replace(request.controls, resume=True)))
