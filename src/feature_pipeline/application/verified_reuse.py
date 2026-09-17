@@ -495,6 +495,13 @@ def resolve_default_reuse(
     predecessor.  Once a replacement edge exists, failure to validate its evidence is a denial
     rather than permission to redispatch a retired task.
     """
+    from pipeline_core.reconciliation_registry import (
+        ReconciliationRegistryError,
+        default_registry_path,
+        load_reconciliation_registry,
+        reconciliation_supersession_graph,
+    )
+
     graph = supersession_graph(definitions, repo_root)
     if graph is None:
         # ``supersession_graph`` deliberately has a permissive public shape for legacy callers.
@@ -514,6 +521,21 @@ def resolve_default_reuse(
             raise EvidenceEligibilityError(
                 "supersession declarations are invalid or cyclic", "evidence-supersession-invalid"
             )
+    registry_error: EvidenceEligibilityError | None = None
+    registry: tuple[Any, Mapping[str, Any]] | None = None
+    try:
+        registry_mappings = load_reconciliation_registry(default_registry_path(repo_root))
+    except ReconciliationRegistryError:
+        registry_mappings = ()
+        registry_error = EvidenceEligibilityError(
+            "legacy reconciliation registry is invalid", "evidence-reconciliation-registry-invalid"
+        )
+    if registry_mappings:
+        registry = reconciliation_supersession_graph(repo_root)
+        if registry is None:
+            registry_error = EvidenceEligibilityError(
+                "legacy reconciliation registry is invalid", "evidence-reconciliation-registry-invalid"
+            )
     reused: dict[str, Mapping[str, str]] = {}
     selected_ids = set(selected)
     pre_resolved_ids = set(pre_resolved)
@@ -524,17 +546,37 @@ def resolve_default_reuse(
             reused[task_id] = store.find(definitions[task_id])
             continue
         except EvidenceEligibilityError as direct_denial:
-            if graph is None:
+            if graph is not None:
+                replacement_id = graph.replacement_for(task_id)
+                if replacement_id is not None:
+                    replacement = definitions.get(replacement_id)
+                    if replacement is None:
+                        raise direct_denial
+                    evidence = dict(store.find(replacement))
+                    evidence["dependency_id"] = task_id
+                    evidence["replacement_id"] = replacement_id
+                    reused[task_id] = MappingProxyType(evidence)
+                    continue
+            if registry_error is not None:
+                raise registry_error
+            if registry is None:
                 continue
-            replacement_id = graph.replacement_for(task_id)
-            if replacement_id is None:
+            registry_graph, registry_definitions = registry
+            edge = next(
+                (candidate for candidate in registry_graph.edges if candidate.superseded == task_id),
+                None,
+            )
+            if edge is None or not edge.project_completion:
                 continue
-            replacement = definitions.get(replacement_id)
+            replacement = registry_definitions.get(edge.replacement)
             if replacement is None:
                 raise direct_denial
-            evidence = dict(store.find(replacement))
+            if edge.source_run is None:
+                evidence = dict(store.find(replacement))
+            else:
+                evidence = dict(store.find_at(store.runs_root / edge.source_run, replacement))
             evidence["dependency_id"] = task_id
-            evidence["replacement_id"] = replacement_id
+            evidence["replacement_id"] = edge.replacement
             reused[task_id] = MappingProxyType(evidence)
     return reused
 
