@@ -687,6 +687,122 @@ class SupersessionReuseDenialTests(unittest.TestCase):
                 self.assertEqual(denied.exception.code, "evidence-supersession-invalid")
 
 
+class ReconciledDefaultReuseTests(unittest.TestCase):
+    """REC-31: registry-owned historical completion can satisfy a dependency."""
+
+    def test_project_completion_mapping_reuses_its_named_replacement_for_tc05(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tasks = root / "docs" / "plans" / "tasks"
+            tasks.mkdir(parents=True)
+
+            def write_task(task_id: str, *, depends_on: str = "none") -> TaskDefinition:
+                path = tasks / f"{task_id}_example.md"
+                path.write_text(
+                    f"# {task_id} - {task_id} title\n\n"
+                    "## Status\n- [ ] To Do\n- [ ] In Progress\n- [ ] Done\n\n"
+                    "## Execution Metadata\n"
+                    f"- Type: python\n- Executor: python-executor\n- Depends on: {depends_on}\n"
+                    "- Allowed scope: `src/**`\n- Out of scope: none\n- Required skills: none\n"
+                    "- Maximum repair attempts: 1\n- Documentation impact: none\n"
+                    "- Verification commands:\n  - `.` -> `git diff --check`\n"
+                    "- Blocking conditions: none\n",
+                    encoding="utf-8",
+                )
+                return TaskDefinition(spec=load_task_spec(path), source_format=MARKDOWN_TASK_FILE)
+
+            tc05 = write_task("TC-05")
+            rec28 = write_task("REC-28")
+            tc06 = write_task("TC-06", depends_on="TC-05")
+            registry = root / "tools" / "feature-pipeline" / "config" / "legacy_reconciliation_registry.json"
+            registry.parent.mkdir(parents=True)
+            registry.write_text(json.dumps({"mappings": [{
+                "historical_task": "TC-05",
+                "replacement_task": "REC-28",
+                "source_run": "rec28-tc05-independent-verification",
+                "project_completion": True,
+            }]}), encoding="utf-8")
+            source = _source(
+                root,
+                run_id="rec28-tc05-independent-verification",
+                definition=rec28,
+            )
+            payload = json.loads(source.read_text(encoding="utf-8"))
+            payload["tasks"][0]["task_path"] = "docs/plans/tasks/REC-28_example.md"
+            source.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+            before = source.read_bytes()
+
+            reused = resolve_default_reuse(
+                VerifiedEvidenceStore(root / "runs", root),
+                {definition.id: definition for definition in (tc05, rec28, tc06)},
+                ["TC-05", "TC-06"],
+                ["TC-06"],
+                root,
+            )
+
+            self.assertEqual(reused["TC-05"]["dependency_id"], "TC-05")
+            self.assertEqual(reused["TC-05"]["replacement_id"], "REC-28")
+            self.assertEqual(
+                reused["TC-05"]["source_run_id"], "rec28-tc05-independent-verification"
+            )
+            self.assertEqual(source.read_bytes(), before)
+
+    def test_nonterminal_project_completion_source_is_denied_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tasks = root / "docs" / "plans" / "tasks"
+            tasks.mkdir(parents=True)
+
+            def write_task(task_id: str, *, depends_on: str = "none") -> TaskDefinition:
+                path = tasks / f"{task_id}_example.md"
+                path.write_text(
+                    f"# {task_id} - {task_id} title\n\n"
+                    "## Status\n- [ ] To Do\n- [ ] In Progress\n- [ ] Done\n\n"
+                    "## Execution Metadata\n"
+                    f"- Type: python\n- Executor: python-executor\n- Depends on: {depends_on}\n"
+                    "- Allowed scope: `src/**`\n- Out of scope: none\n- Required skills: none\n"
+                    "- Maximum repair attempts: 1\n- Documentation impact: none\n"
+                    "- Verification commands:\n  - `.` -> `git diff --check`\n"
+                    "- Blocking conditions: none\n",
+                    encoding="utf-8",
+                )
+                return TaskDefinition(spec=load_task_spec(path), source_format=MARKDOWN_TASK_FILE)
+
+            tc05 = write_task("TC-05")
+            rec28 = write_task("REC-28")
+            tc06 = write_task("TC-06", depends_on="TC-05")
+            registry = root / "tools" / "feature-pipeline" / "config" / "legacy_reconciliation_registry.json"
+            registry.parent.mkdir(parents=True)
+            registry.write_text(json.dumps({"mappings": [{
+                "historical_task": "TC-05",
+                "replacement_task": "REC-28",
+                "source_run": "rec28-tc05-independent-verification",
+                "project_completion": True,
+            }]}), encoding="utf-8")
+            source = _source(
+                root,
+                run_id="rec28-tc05-independent-verification",
+                definition=rec28,
+                run_status="running",
+            )
+            payload = json.loads(source.read_text(encoding="utf-8"))
+            payload["tasks"][0]["task_path"] = "docs/plans/tasks/REC-28_example.md"
+            source.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+            before = source.read_bytes()
+
+            with self.assertRaises(EvidenceEligibilityError) as denied:
+                resolve_default_reuse(
+                    VerifiedEvidenceStore(root / "runs", root),
+                    {definition.id: definition for definition in (tc05, rec28, tc06)},
+                    ["TC-05", "TC-06"],
+                    ["TC-06"],
+                    root,
+                )
+
+            self.assertEqual(denied.exception.code, "evidence-source-run-not-closed")
+            self.assertEqual(source.read_bytes(), before)
+
+
 class CancelledResolutionReuseDenialTests(unittest.TestCase):
     """ROC-02 AC-3 — a cancelled prerequisite is not verified functionality and must never
     silently satisfy a functional dependency, whether read from persisted evidence or seen
