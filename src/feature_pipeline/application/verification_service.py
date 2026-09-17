@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Mapping, Sequence
 
 from feature_pipeline.contracts import TaskSpec
+from feature_pipeline.domain.plan import ResolvedCheck
 
 from pipeline_core.commands import (
     VerificationRun,
@@ -41,7 +42,16 @@ from pipeline_core.verification import (
     remote_evidence_required,
 )
 
-__all__ = ["VerificationRequest", "VerificationService"]
+__all__ = [
+    "VerificationContractError",
+    "VerificationRequest",
+    "VerificationService",
+    "validate_declared_commands",
+]
+
+
+class VerificationContractError(ValueError):
+    """A task-local verification declaration diverges from its selected profile checks."""
 
 
 @dataclass(frozen=True)
@@ -59,6 +69,10 @@ class VerificationRequest:
     #: Executor-claimed checks, so a claim with no runner-recorded command surfaces as a
     #: fact-only ``FAIL`` rather than a prompt to re-run the check.
     claimed_checks: tuple[object, ...] = field(default_factory=tuple)
+    #: The selected profile checks, when the caller has a compiled task.  The runner still
+    #: executes ``spec.verification_commands`` and records their original argv/cwd; this is a
+    #: pre-execution contract check, not a second command path.
+    expected_checks: tuple[ResolvedCheck, ...] = field(default_factory=tuple)
     #: A runner-wired, read-only port. It is invoked only for a task contract that requires
     #: remote acceptance facts, after local command capture and before verdict settlement.
     #: ``None`` deliberately means no observation is available; settlement then fails closed.
@@ -71,6 +85,8 @@ class VerificationService:
     def verify(self, run: Run, request: VerificationRequest) -> VerificationOutcome:
         spec = request.spec
         task_id = spec.id
+        if request.expected_checks:
+            validate_declared_commands(spec, request.expected_checks)
         revision = active_revision(run, task_id)
         stage = verification_stage(task_id, attempt=request.attempt, revision=revision)
         command_ids = run.stage_command_ids(stage)
@@ -121,3 +137,21 @@ class VerificationService:
         )
         run.save()
         return outcome
+
+
+def validate_declared_commands(
+    spec: TaskSpec, expected_checks: Sequence[ResolvedCheck]
+) -> None:
+    """Require a task's declared commands to be exactly its compiled check contract.
+
+    Command execution remains task-local: the verification service passes the original
+    :attr:`TaskSpec.verification_commands` to the runner unchanged.  This comparison simply
+    prevents a caller that already has a compiled route from dropping a required repository
+    check or introducing an unrelated stack command.
+    """
+    declared = tuple((command.cwd, tuple(command.argv)) for command in spec.verification_commands)
+    expected = tuple((str(check.cwd), check.argv) for check in expected_checks)
+    if declared != expected:
+        raise VerificationContractError(
+            f"{spec.id} verification commands do not match its selected profile checks"
+        )

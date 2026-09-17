@@ -3,9 +3,9 @@
   "project": "routing-baseline",
   "anchors": {"agents_root": "shared", "core_root": "core"},
   "task_routing": [
-    {"task_type": "python", "working_root": "packages/python"},
-    {"task_type": "rust", "working_root": "packages/rust"},
-    {"task_type": "docs", "working_root": "docs"}
+    {"task_type": "python", "working_root": "packages/python", "stack": "python"},
+    {"task_type": "rust", "working_root": "packages/rust", "stack": "rust"},
+    {"task_type": "docs", "working_root": "docs", "stack": "docs"}
   ],
   "run_state_path": "runs",
   "roles": [

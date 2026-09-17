@@ -129,8 +129,10 @@ def _from_project_profile(
         raise SchemaError("roles must not be empty")
 
     check_entries = _sequence((checks_doc or {}).get("checks", []), "checks.json checks")
-    checks_registry: dict[str, list[str]] = {}
-    stack_names: list[str] = []
+    checks_registry: dict[str, dict[str, Any]] = {}
+    check_stacks: dict[str, str] = {}
+    required_checks: set[str] = set()
+    declared_stacks: set[str] = set()
     for index, entry in enumerate(check_entries):
         obj = _mapping(entry, f"checks.json checks[{index}]")
         check_name = _non_empty_str(obj.get("name"), f"checks.json checks[{index}].name")
@@ -139,16 +141,20 @@ def _from_project_profile(
                 for tok in _sequence(obj.get("argv"), f"checks.json checks[{index}].argv")]
         if not argv:
             raise SchemaError(f"checks.json checks[{index}].argv must not be empty")
-        checks_registry[check_name] = argv
-        if stack not in stack_names:
-            stack_names.append(stack)
+        cwd = _non_empty_str(obj.get("cwd", "."), f"checks.json checks[{index}].cwd")
+        required = bool(obj.get("required", False))
+        checks_registry[check_name] = {
+            "argv": argv, "stack": stack, "cwd": cwd, "required": required,
+        }
+        check_stacks[check_name] = stack
+        declared_stacks.add(stack)
+        if required:
+            required_checks.add(check_name)
     if not checks_registry:
         raise SchemaError(
             "a generated project profile needs at least one check in checks.json to "
             "build a runnable task route"
         )
-    stack_names.sort()
-    check_names = sorted(checks_registry)
 
     roots_registry: dict[str, str] = {}
     task_types: dict[str, dict[str, Any]] = {}
@@ -157,14 +163,25 @@ def _from_project_profile(
         task_type = _non_empty_str(obj.get("task_type"), f"task_routing[{index}].task_type")
         working_root = _non_empty_str(
             obj.get("working_root"), f"task_routing[{index}].working_root")
+        stack = _non_empty_str(obj.get("stack"), f"task_routing[{index}].stack")
         if task_type in roots_registry:
             raise SchemaError(f"task_routing has a duplicate task type: {task_type!r}")
         roots_registry[task_type] = working_root
+        declared_stacks.add(stack)
+        route_checks = sorted(
+            name for name in checks_registry
+            if check_stacks[name] == stack or name in required_checks
+        )
+        if not route_checks:
+            raise SchemaError(
+                f"task_routing[{index}] stack {stack!r} resolves no checks — declare a "
+                "matching checks.json check or mark a check 'required'"
+            )
         task_types[task_type] = {
-            "stack": stack_names[0],
+            "stack": stack,
             "subagents": [_EXECUTOR],
             "root": task_type,
-            "checks": check_names,
+            "checks": route_checks,
             "storage": "run_state",
         }
 
@@ -189,7 +206,7 @@ def _from_project_profile(
         "stages": [{"name": "implement", "subagents": [_EXECUTOR], "argv": ["plan-only"]}],
         "registry": {
             "task_types": task_types,
-            "stacks": {stack: {"runtime": stack} for stack in stack_names},
+            "stacks": {stack: {"runtime": stack} for stack in sorted(declared_stacks)},
             "subagents": {_EXECUTOR: {"grant": _EXECUTOR}},
             "roots": roots_registry,
             "checks": checks_registry,

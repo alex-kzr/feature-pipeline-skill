@@ -229,6 +229,21 @@ class TaskRoute:
 
 
 @dataclass(frozen=True)
+class CheckEntry:
+    """One registry-declared check: argv plus its explicit stack/cwd/required identity.
+
+    ``stack`` and ``cwd`` default to ``""`` / ``"."`` for the legacy bare-argv registry shape
+    (``{"name": [...]}``), which carries no per-check stack or working directory of its own.
+    """
+
+    name: str
+    argv: tuple[str, ...]
+    stack: str = ""
+    cwd: str = "."
+    required: bool = False
+
+
+@dataclass(frozen=True)
 class ProfileRegistry:
     """Closed project registry used to resolve task routing data."""
 
@@ -236,7 +251,7 @@ class ProfileRegistry:
     stacks: Mapping[str, Mapping[str, Any]]
     subagents: Mapping[str, Mapping[str, Any]]
     roots: Mapping[str, str]
-    checks: Mapping[str, tuple[str, ...]]
+    checks: Mapping[str, CheckEntry]
     storage: Mapping[str, str]
 
     @classmethod
@@ -248,7 +263,7 @@ class ProfileRegistry:
         stacks = _named_objects(value["stacks"], "registry.stacks")
         subagents = _named_objects(value["subagents"], "registry.subagents")
         roots = _named_paths(value["roots"], "registry.roots")
-        checks = _named_argv(value["checks"], "registry.checks")
+        checks = _named_checks(value["checks"], "registry.checks")
         storage = _named_paths(value["storage"], "registry.storage")
         registries: Mapping[str, object] = {"stacks": stacks, "subagents": subagents,
                                              "roots": roots, "checks": checks, "storage": storage}
@@ -300,16 +315,35 @@ def _named_paths(value: object, field: str) -> Mapping[str, str]:
             for name, path in entries.items()}
 
 
-def _named_argv(value: object, field: str) -> Mapping[str, tuple[str, ...]]:
+def _named_checks(value: object, field: str) -> Mapping[str, "CheckEntry"]:
+    """Parse ``registry.checks`` in either shape: legacy bare argv, or an explicit object
+    carrying ``argv`` plus ``stack``/``cwd``/``required``. Both round-trip through the same
+    :class:`CheckEntry`, so a hand-authored native profile that only ever declared argv keeps
+    working unchanged (the legacy shape) while a generated profile's checks.json can carry its
+    stack/cwd/required identity all the way into the native registry.
+    """
     entries = _mapping(value, field)
     if not entries:
         raise SchemaError(f"{field} must not be empty")
-    result: dict[str, tuple[str, ...]] = {}
-    for name, argv_value in entries.items():
-        argv = tuple(_string(item, f"{field}.{name}") for item in _sequence(argv_value, f"{field}.{name}"))
+    result: dict[str, CheckEntry] = {}
+    for name, raw in entries.items():
+        check_name = _string(name, field)
+        if isinstance(raw, Mapping):
+            argv = tuple(_string(item, f"{field}.{check_name}.argv")
+                        for item in _sequence(raw.get("argv"), f"{field}.{check_name}.argv"))
+            stack_value = raw.get("stack", "")
+            if not isinstance(stack_value, str):
+                raise SchemaError(f"{field}.{check_name}.stack must be a string")
+            cwd = validate_relative_path(raw.get("cwd", "."), f"{field}.{check_name}.cwd")
+            required = bool(raw.get("required", False))
+        else:
+            argv = tuple(_string(item, f"{field}.{check_name}") for item in _sequence(raw, f"{field}.{check_name}"))
+            stack_value = ""
+            cwd = "."
+            required = False
         if not argv or any(any(symbol in token for symbol in SHELL_TOKENS) for token in argv):
-            raise SchemaError(f"{field}.{name} must be a non-empty shell-free argv")
-        result[_string(name, field)] = argv
+            raise SchemaError(f"{field}.{check_name} must be a non-empty shell-free argv")
+        result[check_name] = CheckEntry(check_name, argv, stack_value, cwd, required)
     return result
 
 

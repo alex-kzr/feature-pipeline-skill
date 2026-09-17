@@ -54,9 +54,13 @@ class UnsupportedControl(PlanCompilationError):
 
 @dataclass(frozen=True)
 class ResolvedCheck:
-    """One verification command, resolved from the profile: name, argv, working directory."""
+    """One verification command, resolved from the profile: name, stack, argv, working
+    directory. ``stack`` is the profile-declared stack identity this check belongs to
+    (``""`` for a legacy check with no declared stack), preserved end-to-end from the
+    profile so a task's checks are never silently mixed across stacks."""
 
     name: str
+    stack: str
     argv: tuple[str, ...]
     cwd: RelativePath
 
@@ -149,7 +153,12 @@ def _canonical_control(resolved: ResolvedControl[object]) -> dict[str, object]:
 
 
 def _canonical_check(check: ResolvedCheck) -> dict[str, object]:
-    return {"name": check.name, "argv": list(check.argv), "cwd": str(check.cwd)}
+    return {
+        "name": check.name,
+        "stack": check.stack,
+        "argv": list(check.argv),
+        "cwd": str(check.cwd),
+    }
 
 
 def _canonical_task(task: ResolvedTask) -> dict[str, object]:

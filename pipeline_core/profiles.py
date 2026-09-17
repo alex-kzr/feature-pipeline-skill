@@ -6,7 +6,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from feature_pipeline.contracts import Profile, SchemaError, TaskRoute
+from feature_pipeline.contracts import CheckEntry, Profile, SchemaError, TaskRoute
 
 
 @dataclass(frozen=True)
@@ -33,7 +33,7 @@ class ResolvedRoute:
     route: TaskRoute
     root: Path
     storage: Path
-    checks: tuple[tuple[str, ...], ...]
+    checks: tuple[CheckEntry, ...]
 
 
 def resolve_paths(profile: Profile, anchors: Anchors) -> ResolvedPaths:

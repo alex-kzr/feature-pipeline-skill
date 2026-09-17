@@ -626,7 +626,12 @@ class RouteParityTests(unittest.TestCase):
                 tuple(c.name for c in task.checks), tuple(shipped.route.checks)
             )
             self.assertEqual(
-                tuple(tuple(c.argv) for c in task.checks), tuple(shipped.checks)
+                tuple(tuple(c.argv) for c in task.checks),
+                tuple(tuple(check.argv) for check in shipped.checks),
+            )
+            self.assertEqual(
+                tuple(c.stack for c in task.checks),
+                tuple(check.stack for check in shipped.checks),
             )
 
 

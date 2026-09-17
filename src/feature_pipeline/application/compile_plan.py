@@ -199,7 +199,7 @@ def compile_run_plan(
         storage_roots[str(storage_root)] = storage_root
 
         checks = tuple(
-            ResolvedCheck(command.name, command.argv, command.cwd)
+            ResolvedCheck(command.name, command.stack, command.argv, command.cwd)
             for command in (
                 profile.check_command(name) for name in route.check_names
             )
