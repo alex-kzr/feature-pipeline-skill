@@ -49,7 +49,10 @@ class ProfileRegistryTests(unittest.TestCase):
         self.assertEqual(python_route.route.stack, "python")
         self.assertEqual(docs_route.route.stack, "docs")
         self.assertNotEqual(python_route.root, docs_route.root)
-        self.assertEqual(docs_route.checks, (("spellcheck",),))
+        # ``ResolvedRoute.checks`` carries each check's full declared identity (TC-07):
+        # legacy bare-argv registry entries default to stack="" / cwd=".".
+        self.assertEqual(tuple(check.argv for check in docs_route.checks), (("spellcheck",),))
+        self.assertEqual(tuple(check.stack for check in docs_route.checks), ("",))
 
     def test_incomplete_unknown_and_escaping_profiles_fail_before_dispatch(self) -> None:
         incomplete = copy.deepcopy(profile_data())

@@ -38,8 +38,8 @@ def _generated_profile() -> dict:
         "project": "sample-repo",
         "anchors": {"agents_root": ".agents", "core_root": "feature-pipeline-skill"},
         "task_routing": [
-            {"task_type": "python", "working_root": "feature-pipeline-skill"},
-            {"task_type": "docs", "working_root": "docs"},
+            {"task_type": "python", "working_root": "feature-pipeline-skill", "stack": "python"},
+            {"task_type": "docs", "working_root": "docs", "stack": "docs"},
         ],
         "run_state_path": ".pipeline/runs",
         "roles": [
@@ -60,7 +60,8 @@ def _generated_checks() -> dict:
                 "argv": ["uv", "run", "python", "-m", "unittest"],
                 "cwd": "feature-pipeline-skill",
             },
-            {"stack": "repo", "name": "whitespace-check", "argv": ["git", "diff", "--check"], "cwd": "."},
+            {"stack": "repo", "name": "whitespace-check", "argv": ["git", "diff", "--check"],
+             "cwd": ".", "required": True},
         ],
     }
 

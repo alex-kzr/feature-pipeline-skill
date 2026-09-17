@@ -85,11 +85,11 @@ def compiled_profile_from_core(profile: Profile) -> CompiledProfile:
     checks: dict[str, CheckCommand] = {
         name: CheckCommand(
             name=name,
-            stack="",
-            argv=tuple(argv),
-            cwd=RelativePath.parse("."),
+            stack=entry.stack,
+            argv=tuple(entry.argv),
+            cwd=RelativePath.parse(entry.cwd or "."),
         )
-        for name, argv in registry.checks.items()
+        for name, entry in registry.checks.items()
     }
 
     routes: dict[str, RoutePolicy] = {}

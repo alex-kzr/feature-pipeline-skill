@@ -10,11 +10,12 @@ rejection is a :class:`~feature_pipeline.domain.errors.DomainError` raised befor
 artifact exists.
 
 The route synthesis mirrors ``project_profile._from_project_profile`` exactly: every declared
-task type is routed to its ``working_root``; the neutral ``executor`` subagent runs every
-route; each route lists *all* declared check names; storage is the single ``run_state`` key
-bound to ``run_state_path``. Parity against the shipped
-:func:`pipeline_core.profiles.resolve_route` is pinned by
-``tests/test_execution_plan_compiler.py``.
+task type is routed to its ``working_root`` and its own explicitly declared ``stack``; the
+neutral ``executor`` subagent runs every route; each route lists the checks whose ``stack``
+matches the route's stack, plus every check explicitly marked ``required`` (a repository-wide
+gate no route may silently drop); storage is the single ``run_state`` key bound to
+``run_state_path``. Parity against the shipped :func:`pipeline_core.profiles.resolve_route` is
+pinned by ``tests/test_execution_plan_compiler.py``.
 
 Standard library only.
 """
@@ -65,12 +66,18 @@ class UnknownCheck(DomainError):
 
 @dataclass(frozen=True)
 class CheckCommand:
-    """One repository-declared verification command."""
+    """One repository-declared verification command.
+
+    ``required`` marks a check that every route must carry regardless of its own stack (a
+    repository-wide gate such as a whitespace check) — it is never a substitute for a route's
+    own stack-matched checks, only an addition to them.
+    """
 
     name: str
     stack: str
     argv: tuple[str, ...]
     cwd: RelativePath
+    required: bool = False
 
 
 @dataclass(frozen=True)
@@ -170,8 +177,7 @@ class CompiledProfile:
         run_state_path = _relative(raw.get("run_state_path"), "run_state_path")
 
         checks = _parse_checks(checks_doc)
-        stacks = sorted({check.stack for check in checks.values()})
-        check_names = tuple(sorted(checks))
+        required_checks = frozenset(name for name, check in checks.items() if check.required)
 
         routing = _sequence(raw.get("task_routing"), "task_routing")
         if not routing:
@@ -185,14 +191,24 @@ class CompiledProfile:
             working_root = _relative(
                 obj.get("working_root"), f"task_routing[{index}].working_root"
             )
+            stack = _non_empty_str(obj.get("stack"), f"task_routing[{index}].stack")
             if task_type in routes:
                 raise InvalidProfile(f"task_routing has a duplicate task type: {task_type!r}")
+            route_checks = tuple(sorted(
+                name for name, check in checks.items()
+                if check.stack == stack or name in required_checks
+            ))
+            if not route_checks:
+                raise InvalidProfile(
+                    f"task_routing[{index}] stack {stack!r} resolves no checks — declare a "
+                    "matching checks.json check or mark a check 'required'"
+                )
             routes[task_type] = RoutePolicy(
                 task_type=task_type,
                 working_root=working_root,
-                stack=stacks[0],
+                stack=stack,
                 subagents=(_EXECUTOR,),
-                check_names=check_names,
+                check_names=route_checks,
                 storage_key=_STORAGE_KEY,
             )
 
@@ -248,7 +264,8 @@ def _parse_checks(checks_doc: Mapping[str, Any] | None) -> dict[str, CheckComman
         if not argv:
             raise InvalidProfile(f"checks.json checks[{index}].argv must not be empty")
         cwd = _relative(obj.get("cwd", "."), f"checks.json checks[{index}].cwd")
-        checks[name] = CheckCommand(name=name, stack=stack, argv=argv, cwd=cwd)
+        required = bool(obj.get("required", False))
+        checks[name] = CheckCommand(name=name, stack=stack, argv=argv, cwd=cwd, required=required)
     if not checks:
         raise InvalidProfile(
             "a generated project profile needs at least one check in checks.json to build a "
