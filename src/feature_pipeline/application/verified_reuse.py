@@ -525,7 +525,7 @@ def resolve_default_reuse(
     registry: tuple[Any, Mapping[str, Any]] | None = None
     try:
         registry_mappings = load_reconciliation_registry(default_registry_path(repo_root))
-    except ReconciliationRegistryError as exc:
+    except ReconciliationRegistryError:
         registry_mappings = ()
         registry_error = EvidenceEligibilityError(
             "legacy reconciliation registry is invalid", "evidence-reconciliation-registry-invalid"
