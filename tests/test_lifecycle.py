@@ -482,6 +482,40 @@ class AmendmentRequestValidationTests(unittest.TestCase):
         self.assertEqual(revision.approved_by, "a-human")
         self.assertTrue(revision.rationale)
 
+    def test_retained_legacy_agents_scope_path_is_not_revalidated(self) -> None:
+        """A `.agents` path already present in the prior contract is historical context,
+        not a newly amended path, so it must not trip the forbidden-scope-path check when
+        it is carried over unchanged into the new contract."""
+        request = self._request(
+            prior_contract={
+                "allowed_scope": ["a.py", ".agents/legacy-exception.md"],
+                "max_repair_attempts": 2,
+            },
+            new_contract={
+                "allowed_scope": ["a.py", ".agents/legacy-exception.md"],
+                "max_repair_attempts": 3,
+            },
+        )
+        revision = build_amendment_revision(request, next_revision=1, next_epoch=1)
+        self.assertIn("max_repair_attempts", revision.changed_fields)
+
+    def test_rejects_a_newly_introduced_agents_scope_path(self) -> None:
+        """A `.agents` path that is genuinely new (absent from the prior contract) must
+        still be rejected, even when other legacy `.agents` paths are retained unchanged."""
+        request = self._request(
+            prior_contract={
+                "allowed_scope": ["a.py", ".agents/legacy-exception.md"],
+                "max_repair_attempts": 2,
+            },
+            new_contract={
+                "allowed_scope": ["a.py", ".agents/legacy-exception.md", ".agents/new-one.md"],
+                "max_repair_attempts": 2,
+            },
+        )
+        with self.assertRaises(AmendmentError) as ctx:
+            validate_amendment_request(request, expected_task_id="TAM-EX")
+        self.assertEqual(ctx.exception.code, "forbidden-scope-path")
+
 
 def _git(root: Path, *argv: str) -> None:
     import subprocess

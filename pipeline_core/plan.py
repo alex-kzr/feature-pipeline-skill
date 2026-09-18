@@ -220,12 +220,14 @@ def validate_amendment_request(request: AmendmentRequest, *, expected_task_id: s
                 "an amendment may change only its declared amendable contract fields",
                 "immutable-contract-field",
             )
-    for path in request.added_paths:
-        _validate_path(path)
-    for path in canonical_amendment_fields(request.new_contract)["allowed_scope"]:
-        _validate_path(path)
     prior_fields = canonical_amendment_fields(request.prior_contract)
     new_fields = canonical_amendment_fields(request.new_contract)
+    for path in request.added_paths:
+        _validate_path(path)
+    prior_allowed_scope = set(prior_fields["allowed_scope"])
+    for path in new_fields["allowed_scope"]:
+        if path not in prior_allowed_scope:
+            _validate_path(path)
     if prior_fields == new_fields:
         raise AmendmentError(
             "an amendment must actually change the task's amendable contract fields",

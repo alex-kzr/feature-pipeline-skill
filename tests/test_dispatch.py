@@ -959,6 +959,26 @@ def _init_repo(root: Path) -> None:
 
 
 class DispatchAttributionTests(unittest.TestCase):
+    def test_isolated_executor_promotes_a_preexisting_task_owned_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _init_repo(root)
+            target = root / "docs" / "validation.md"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("runner baseline\n", encoding="utf-8")
+            spec = _spec(allowed_scope=("docs/validation.md",))
+            life = _running_life(root, spec)
+
+            def mutate(request) -> None:  # noqa: ANN001
+                (Path(request.working_root) / "docs" / "validation.md").write_text(
+                    "executor evidence\n", encoding="utf-8"
+                )
+
+            outcome = dispatch_executor(life, _request(spec), ScriptedAdapter(on_launch=mutate))
+
+            self.assertEqual(outcome.status, "implemented")
+            self.assertEqual(target.read_text(encoding="utf-8"), "executor evidence\n")
+
     def test_tc03_runner_projection_is_durable_and_not_charged_to_allowed_review(self) -> None:
         """TC-03: prior runner projections are protected context, not executor work.
 

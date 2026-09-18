@@ -738,9 +738,8 @@ def _amendment_assessment_failure(
     # the exact governing pair; otherwise a PASS could settle a different amendment epoch.
     revision = amendment.get("revision")
     epoch = amendment.get("epoch")
-    markup = r"[\s*_`]*"
     identity = re.compile(
-        rf"revision{markup}{re.escape(str(revision))}{markup},{markup}epoch{markup}{re.escape(str(epoch))}\b",
+        rf"revision\D*{re.escape(str(revision))}\D{{0,120}}?epoch\D*{re.escape(str(epoch))}\b",
         re.IGNORECASE,
     )
     if not identity.search(report_text):
