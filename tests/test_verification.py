@@ -816,6 +816,20 @@ class ProseEnvelopeSettlementTests(unittest.TestCase):
             )
         self.assertIn("amendment-justification-missing-revision-identity", outcome.failure or "")
 
+    def test_amended_revision_accepts_separately_stated_prompted_identity(self) -> None:
+        prose = (
+            "# verifier\n\n- Verdict: PASS\n\n- Findings: none\n"
+            "- Amendment-justification finding: scope amendment shows \"revision 1\" "
+            "and \"epoch 1\"; rationale is supported.\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            run = _implemented_run(Path(directory))
+            outcome = _orchestrate(
+                run, _spec(), FakeVerifier(prose=prose), FakeVerifier(prose=prose),
+                evidence_kw={"amendment": {"revision": 1, "epoch": 1, "rationale": "scope"}},
+            )
+        self.assertEqual(outcome.status, "done")
+
     def test_agreeing_prose_and_envelope_leave_no_drift(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             run = _implemented_run(Path(directory))

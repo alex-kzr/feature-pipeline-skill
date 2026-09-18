@@ -321,6 +321,32 @@ class RepairReportConsolidationTests(unittest.TestCase):
             self.assertIn("## Task-verifier report (verbatim)", text)
             self.assertIn("## Test-verifier report (verbatim)", text)
 
+    def test_report_embeds_complete_runner_command_evidence_for_its_source_gate(self) -> None:
+        """REC-34: a repair executor needs immutable command output, not a summary."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            life = _run(root)
+            spec = _spec()
+            life.record_command(
+                "task:VR-03:verify:1:revision:3", ".",
+                ["python", "setup_project.py", "--confirm"], 0, 0.01,
+                "generator stdout\n", "generator stderr\n",
+            )
+            report = write_repair_report(
+                life.run, spec, 1,
+                task_verifier_text="- Verdict: FAIL\n- document actual evidence\n",
+                test_verifier_text="- Verdict: PASS\n",
+                source_attempt=1,
+                revision=3,
+            )
+            text = report.path.read_text(encoding="utf-8")
+
+            self.assertIn("## Runner-owned command evidence (immutable)", text)
+            self.assertIn("task:VR-03:verify:1:revision:3", text)
+            self.assertIn("python setup_project.py --confirm", text)
+            self.assertIn("generator stdout", text)
+            self.assertIn("generator stderr", text)
+
     def test_newest_repair_report_picks_the_highest_number(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

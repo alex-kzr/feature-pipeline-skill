@@ -402,6 +402,8 @@ def _promote_reviewable_paths(
     workspace: Path,
     attribution: AttributionResult,
     before_snapshot,
+    protected_paths: Sequence[str] = (),
+    promotable_preexisting_paths: Sequence[str] = (),
 ) -> list[str]:
     """Apply every non-safety executor delta so independent verification sees the work.
 
@@ -413,7 +415,13 @@ def _promote_reviewable_paths(
         relative = Path(str(row["path"]))
         # The disposable workspace starts as a copy of the primary worktree. A path in the
         # opening snapshot was already dirty or untracked, so promotion must preserve it.
-        if relative.as_posix() in before_snapshot.files:
+        if (
+            relative.as_posix() in before_snapshot.files
+            and (
+                row.get("classification") != "in_allowed_scope"
+                or relative.as_posix() not in promotable_preexisting_paths
+            )
+        ):
             continue
         source, destination = workspace / relative, primary / relative
         if row.get("status") == "deleted":
@@ -724,7 +732,11 @@ def dispatch_executor(
             report_text, resolution.drift, scope_block, attribution,
         )
     if workspace != primary_root:
-        _promote_reviewable_paths(primary_root, workspace, attribution, before_snapshot)
+        _promote_reviewable_paths(
+            primary_root, workspace, attribution, before_snapshot,
+            tuple(str(row["path"]) for row in run.task(task_id).runner_owned_writes),
+            tuple(run.task(task_id).changed_files),
+        )
     if resolution.drift:
         run.record_event(
             f"executor:{task_id}", to=str(generation), note=resolution.drift)
@@ -823,7 +835,11 @@ def _settle_codex_final_result(
                                result, None, report_text, failure=scope_block,
                                attribution=attribution)
     if workspace != primary_root:
-        _promote_reviewable_paths(primary_root, workspace, attribution, before_snapshot)
+        _promote_reviewable_paths(
+            primary_root, workspace, attribution, before_snapshot,
+            tuple(str(row["path"]) for row in run.task(request.spec.id).runner_owned_writes),
+            tuple(run.task(request.spec.id).changed_files),
+        )
     life.record_operation(request.spec.id, "executor", "succeeded",
                           f"executor launch-{generation} reported implemented",
                           generation=generation)
