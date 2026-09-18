@@ -1,0 +1,10 @@
+{
+  "id": "rust-standard-library",
+  "classification": "stack:rust",
+  "permitted_roles": ["executor", "task_verifier", "test_verifier"],
+  "source": "catalogs/skill_bundles/v1/rust.json",
+  "sha256": "d5ec237b2b13278023d6c843b0871a7c4fc2cad94c7e9867796d478695d3fc88",
+  "content": "# Rust stack guidance\n\nUse typed, standard-library-only Rust and the declared test contract.\n",
+  "required_dependencies": ["neutral-pipeline-contract"],
+  "optional_references": []
+}

@@ -1,0 +1,116 @@
+"""TC-10 manifest resolution rejects cross-stack and stale-content bundles."""
+from __future__ import annotations
+
+import hashlib
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+from feature_pipeline.application.skill_bundles import (
+    SkillBundleError, load_manifests, load_project_skill_bundle, resolve_skill_bundle,
+)
+from feature_pipeline.inputs.profile import CompiledProfile
+
+
+def _manifest(skill_id: str, classification: str, *, content: str = "reviewed text",
+              dependencies: list[str] | None = None) -> dict[str, object]:
+    return {"id": skill_id, "classification": classification,
+            "permitted_roles": ["executor", "test_verifier"],
+            "source": f"skills/{skill_id}/SKILL.md",
+            "sha256": hashlib.sha256(content.encode()).hexdigest(), "content": content,
+            "required_dependencies": dependencies or [], "optional_references": []}
+
+
+def _profile() -> CompiledProfile:
+    raw = {"schema_version": 1, "project": "p", "anchors": {"agents_root": ".agents", "core_root": "core"},
+           "run_state_path": ".pipeline/runs", "roles": [
+               {"role": "executor", "min_grants": ["read", "write"]},
+               {"role": "test_verifier", "min_grants": ["read"]}],
+           "stacks": [{"id": "python", "role": "executor", "checks": ["py"]}],
+           "task_routing": [{"task_type": "python", "working_root": ".", "stack": "python"}]}
+    checks = {"schema_version": 1, "checks": [{"name": "py", "stack": "python", "argv": ["true"], "cwd": "."}]}
+    return CompiledProfile.from_mapping(raw, checks)
+
+
+class SkillBundleTests(unittest.TestCase):
+    def test_resolves_matching_stack_and_neutral_dependencies_deterministically(self) -> None:
+        manifests = load_manifests([_manifest("python", "stack:python", dependencies=["neutral"]),
+                                    _manifest("neutral", "neutral")])
+        bundle = resolve_skill_bundle(_profile(), stack="python", requested_role="executor",
+                                      requested_ids=["python"], manifests=manifests)
+        self.assertEqual([item.id for item in bundle.manifests], ["neutral", "python"])
+        self.assertIn("reviewed text", bundle.render())
+
+    def test_rejects_cross_stack_required_dependency(self) -> None:
+        manifests = load_manifests([_manifest("python", "stack:python", dependencies=["rust"]),
+                                    _manifest("rust", "stack:rust")])
+        with self.assertRaisesRegex(SkillBundleError, "incompatible with stack"):
+            resolve_skill_bundle(_profile(), stack="python", requested_role="executor",
+                                 requested_ids=["python"], manifests=manifests)
+
+    def test_rejects_a_stack_without_a_canonical_binding(self) -> None:
+        manifests = load_manifests([_manifest("rust", "stack:rust")])
+        with self.assertRaisesRegex(SkillBundleError, "canonical stack binding"):
+            resolve_skill_bundle(_profile(), stack="rust", requested_role="executor",
+                                 requested_ids=["rust"], manifests=manifests)
+
+    def test_rejects_unknown_role_and_dependency_cycle(self) -> None:
+        manifests = load_manifests([_manifest("one", "stack:python", dependencies=["two"]),
+                                    _manifest("two", "neutral", dependencies=["one"])])
+        with self.assertRaisesRegex(SkillBundleError, "incompatible"):
+            resolve_skill_bundle(_profile(), stack="python", requested_role="test_verifier",
+                                 requested_ids=["one"], manifests=manifests)
+        with self.assertRaisesRegex(SkillBundleError, "cycle"):
+            resolve_skill_bundle(_profile(), stack="python", requested_role="executor",
+                                 requested_ids=["one"], manifests=manifests)
+
+    def test_rejects_changed_content_with_a_stale_hash(self) -> None:
+        raw = _manifest("python", "stack:python")
+        raw["content"] = "changed after review"
+        with self.assertRaisesRegex(SkillBundleError, "does not match sha256"):
+            load_manifests([raw])
+
+    def test_project_bundle_uses_canonical_route_and_recipient_role(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "tools" / "feature-pipeline" / "config"
+            catalog = root / "feature-pipeline-skill" / "src" / "feature_pipeline" / "catalogs"
+            config.mkdir(parents=True)
+            catalog.mkdir(parents=True)
+            profile = {
+                "schema_version": 1, "project": "p",
+                "anchors": {"agents_root": ".agents", "core_root": "feature-pipeline-skill"},
+                "run_state_path": ".pipeline/runs",
+                "roles": [
+                    {"role": "executor", "min_grants": ["read", "write"]},
+                    {"role": "test_verifier", "min_grants": ["read"]},
+                ],
+                "stacks": [{"id": "python", "role": "executor", "checks": ["py"]}],
+                "task_routing": [{"task_type": "python", "working_root": ".", "stack": "python"}],
+            }
+            checks = {"schema_version": 1, "checks": [
+                {"name": "py", "stack": "python", "argv": ["true"], "cwd": "."},
+            ]}
+            (config / "pipeline.profile.json").write_text(json.dumps(profile), encoding="utf-8")
+            (config / "checks.json").write_text(json.dumps(checks), encoding="utf-8")
+            raw = _manifest("python", "stack:python")
+            raw["permitted_roles"] = ["executor", "test_verifier"]
+            source = catalog / "python.json"
+            source.write_text(json.dumps(raw), encoding="utf-8")
+            (config / "skill-python.json").write_text(json.dumps({
+                "catalog": "feature_pipeline.catalogs.skill_bundles.v1",
+                "id": "python", "source": "feature-pipeline-skill/src/feature_pipeline/catalogs/python.json",
+            }), encoding="utf-8")
+
+            bundle = load_project_skill_bundle(root, task_type="python", recipient_role="test_verifier")
+
+        self.assertEqual(bundle.stack, "python")
+        self.assertEqual(bundle.role, "test_verifier")
+        self.assertIn("reviewed text", bundle.render())
+
+    def test_shipped_rust_bundle_is_hashed_and_classified_for_rust_only(self) -> None:
+        path = Path(__file__).parents[1] / "src" / "feature_pipeline" / "catalogs" / "skill_bundles" / "v1" / "rust.json"
+        manifest = load_manifests([path.read_text(encoding="utf-8")])["rust-standard-library"]
+        self.assertEqual(manifest.classification, "stack:rust")
+        self.assertIn("neutral-pipeline-contract", manifest.required_dependencies)

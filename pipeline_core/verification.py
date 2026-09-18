@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
 from feature_pipeline.application.diagnostic_service import DiagnosticService
+from feature_pipeline.application.skill_bundles import SkillBundleError, load_project_skill_bundle
 from feature_pipeline.application.work_items import WorkItemError, require_active_work_item
 
 from .adapters import (
@@ -57,11 +58,11 @@ VERDICTS = frozenset({"PASS", "FAIL", "BLOCKED"})
 _DIAGNOSTICS = DiagnosticService()
 
 #: The command-record keys carried into the evidence payload. Redacted, budgeted stdout/stderr
-#: text stays in the persisted log files; the payload references those logs, it never inlines
-#: their content (Implementation Notes).
+#: is embedded so a tool-free verifier receives the complete immutable command evidence rather
+#: than an inaccessible log-path promise.
 _COMMAND_REFERENCE_KEYS = (
     "id", "stage", "cwd", "argv", "exit_code", "disposition", "duration",
-    "stdout_log", "stderr_log", "reason", "command_index", "task_id", "attempt",
+    "stdout_log", "stderr_log", "stdout", "stderr", "reason", "command_index", "task_id", "attempt",
     "snapshot", "revision",
 )
 
@@ -645,6 +646,7 @@ def build_verifier_prompt(
     evidence_payload: str,
     attempt: int,
     plan_path: str | None = None,
+    skill_content: str = "",
 ) -> str:
     """Render one fresh, read-only verifier context.
 
@@ -685,6 +687,7 @@ def build_verifier_prompt(
         "```json",
         evidence_payload,
         "```",
+        *( ["", skill_content.rstrip("\n")] if skill_content else [] ),
         "",
         "Final report:",
         "- Verdict: PASS | FAIL | BLOCKED",
@@ -798,9 +801,17 @@ def _run_one_verifier(
     # The task verifier's prompt says "You may read the worktree"; grant exactly that and
     # nothing that writes. The test verifier stays deliberately tool-free (`no_tools=True`).
     verifier_grant: tuple[str, ...] = () if tool_less else ("read",)
+    try:
+        bundle = load_project_skill_bundle(
+            run.repo_root, task_type=spec.task_type, recipient_role=normalized)
+    except (SkillBundleError, ValueError) as exc:
+        return _diagnose(
+            run, spec, artifacts, role=normalized, attempt=attempt,
+            reason=f"skill-bundle-invalid: {exc}")
     prompt = build_verifier_prompt(
         normalized, spec, anchors=anchors, feature_prompt=run.prompt_path,
         evidence_payload=evidence_payload, attempt=attempt, plan_path=plan_path,
+        skill_content="" if bundle is None else bundle.render(),
     )
     write_text_atomic(artifacts.prompt(normalized), prompt, repo_root=run.repo_root)
 

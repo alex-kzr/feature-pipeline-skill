@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Sequence
 
 from feature_pipeline.contracts import TaskSpec
+from feature_pipeline.application.skill_bundles import SkillBundleError, load_project_skill_bundle
 from feature_pipeline.application.work_items import WorkItemError, require_active_work_item
 
 from .adapters import (
@@ -505,6 +506,15 @@ def dispatch_executor(
     if repair_report_path is not None:
         repair_report_path = _validated_repair_report_path(run, task_id, repair_report_path)
 
+    # Resolve before consuming a generation or writing launch artifacts. A configured project's
+    # missing route/binding or an incompatible manifest is a dispatch preflight failure, not a
+    # partially launched executor attempt.
+    try:
+        bundle = load_project_skill_bundle(
+            run.repo_root, task_type=spec.task_type, recipient_role=EXECUTOR_ROLE)
+    except (SkillBundleError, ValueError) as exc:
+        raise DispatchError(f"skill-bundle-invalid: {exc}", "skill-bundle-invalid") from None
+
     # Consume the generation *before* the launch: a failed attempt still owns its number.
     generation = life.consume_launch_generation(task_id, EXECUTOR_ROLE)
     life.record_operation(task_id, "executor", "started", "executor window opened",
@@ -531,6 +541,7 @@ def dispatch_executor(
         plan_path=request.plan_path,
         repair_report_path=repair_report_path,
         runner_evidence_satisfied=runner_evidence_satisfied,
+        skill_content="" if bundle is None else bundle.render(),
     )
     write_text_atomic(artifacts.prompt_envelope, envelope, repo_root=run.repo_root)
 

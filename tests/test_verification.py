@@ -484,6 +484,20 @@ class FreshReadOnlyToollessTests(unittest.TestCase):
         self.assertIn("limited to runner-recorded verification-command evidence", prompt)
         self.assertIn("functional failure/resume scenarios", prompt)
 
+    def test_tool_free_verifier_evidence_includes_command_output_not_only_log_paths(self) -> None:
+        evidence = VerificationEvidence(
+            "VR-02", 1,
+            commands=({"id": "command-1", "stdout_log": "logs/out.txt",
+                       "stdout": "complete immutable command output", "stderr": ""},),
+        )
+
+        prompt = build_verifier_prompt(
+            "test_verifier", _spec(), anchors=ANCHORS, feature_prompt="prompt.md",
+            evidence_payload=evidence.serialized(), attempt=1,
+        )
+
+        self.assertIn("complete immutable command output", prompt)
+
 
 class CurrentRunMutationEvidenceTests(unittest.TestCase):
     """UGA-15: no-mutation criteria must not inherit historical task evidence."""

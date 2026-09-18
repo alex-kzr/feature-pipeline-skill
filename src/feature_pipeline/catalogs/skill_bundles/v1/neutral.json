@@ -1,0 +1,10 @@
+{
+  "id": "neutral-pipeline-contract",
+  "classification": "neutral",
+  "permitted_roles": ["executor", "task_verifier", "test_verifier"],
+  "source": "catalogs/skill_bundles/v1/neutral.json",
+  "sha256": "c8035428063482418b87b9a7cd81266d000992b3aaa76af1d48d05b188257eb3",
+  "content": "# Pipeline contract\n\nUse only the canonical profile stack-role binding and immutable runner evidence.\n",
+  "required_dependencies": [],
+  "optional_references": ["docs/agents/task-metadata-contract.md"]
+}

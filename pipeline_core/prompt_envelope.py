@@ -48,6 +48,7 @@ def build_executor_envelope(
     plan_path: str | None = None,
     repair_report_path: str | None = None,
     runner_evidence_satisfied: bool = False,
+    skill_content: str = "",
 ) -> str:
     """Render the filled envelope; the runner captures all executor evidence itself."""
     lines = [
@@ -78,6 +79,8 @@ def build_executor_envelope(
             "- Runner evidence: satisfied — reverse-diff-and-restore completed by the runner.",
             "- This evidence is runner-owned; do not write any run artifacts.",
         ]
+    if skill_content:
+        lines += ["", skill_content.rstrip("\n")]
     lines += [
         "",
         "Role:",

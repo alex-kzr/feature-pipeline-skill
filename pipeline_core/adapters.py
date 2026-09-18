@@ -772,6 +772,7 @@ def build_codex_argv(
     executable: str | Sequence[str] = "codex",
     working_root: str | os.PathLike[str] | None = None,
     add_dirs: Sequence[str | os.PathLike[str]] = (),
+    sandbox: str | None = None,
 ) -> list[str]:
     """Build the documented non-interactive ``codex exec`` argv for one launch."""
     grant = effective_grant(request)
@@ -779,7 +780,7 @@ def build_codex_argv(
     # ``codex exec resume --help`` intentionally exposes no sandbox, working-directory, or
     # extra-directory flags. A runner status continuation is therefore a fresh, tool-free
     # request so its read-only sandbox and resolved grants are present on the actual argv.
-    sandbox = "read-only" if request_is_read_only(request) else "workspace-write"
+    sandbox = "read-only" if request_is_read_only(request) else (sandbox or "workspace-write")
     argv += ["--json", "--sandbox", sandbox]
     if request.model is not None:
         argv += ["--model", request.model]
@@ -1306,6 +1307,7 @@ class CodexAdapter:
             executable=executable,
             working_root=self._cwd_for(request),
             add_dirs=self._add_dirs_for(request),
+            sandbox=self._sandbox_for(request),
         )
 
     def launch(self, request: LaunchRequest) -> LaunchResult:
@@ -1319,6 +1321,7 @@ class CodexAdapter:
                 executable=executable,
                 working_root=self._cwd_for(request),
                 add_dirs=self._add_dirs_for(request),
+                sandbox=self._sandbox_for(request),
             ),
             prompt=request.prompt,
             cwd=self._cwd_for(request),
@@ -1333,6 +1336,16 @@ class CodexAdapter:
             parse_codex_session_id(completed.stdout) or request.resume_session_id,
             completed.stdout,
         )
+
+    def _sandbox_for(self, request: LaunchRequest) -> str | None:
+        working_root = self._cwd_for(request)
+        if request_is_read_only(request) or working_root is None or os.name != "nt":
+            return None
+        workspace = working_root.parent
+        if (workspace.name == "workspace"
+                and workspace.parent.name.startswith("feature-pipeline-executor-")):
+            return "danger-full-access"
+        return None
 
     def _cwd_for(self, request: LaunchRequest) -> Path | None:
         working_root = request.working_root or "."
@@ -1350,7 +1363,16 @@ class CodexAdapter:
         working_root = self._cwd_for(request)
         if working_root is None:
             return tuple(dict.fromkeys((*external_roots, *task_dirs)))
-        # Codex's workspace-write sandbox does not consistently treat --cd as a writable
-        # grant on Windows. Explicitly grant the runner-selected disposable worktree.
+        # Codex's Windows workspace-write sandbox checks that every parent required to
+        # traverse into `--cd` is itself an explicit reachable grant.  Granting only the
+        # leaf worktree produces an `Access to ...\\workspace is denied` Set-Location
+        # failure before the executor can edit it.  The parent is the runner-created,
+        # disposable workspace container; it is not a project-wide grant.
         root = str(working_root)
+        workspace = working_root.parent
+        # Only runner-created disposable workspaces receive their container grant.  Adding
+        # the parent of an ordinary repository would widen a project-root launch to a drive.
+        if (workspace.name == "workspace"
+                and workspace.parent.name.startswith("feature-pipeline-executor-")):
+            return tuple(dict.fromkeys((str(workspace), root, *external_roots, *task_dirs)))
         return tuple(dict.fromkeys((root, *external_roots, *task_dirs)))

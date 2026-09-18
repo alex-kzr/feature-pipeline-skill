@@ -398,19 +398,26 @@ class CodexArgvTests(unittest.TestCase):
             [str(Path("C:/repo")), str(Path("C:/agents/skills/example"))],
         )
 
-    def test_writing_launch_grants_its_working_root_for_the_workspace_sandbox(self) -> None:
-        """A Codex executor explicitly grants its disposable --cd workspace.
+    def test_writing_launch_grants_the_workspace_and_its_parent_for_windows_traversal(self) -> None:
+        """A Codex executor grants its disposable workspace and traversal parent.
 
-        On Windows, workspace-write alone does not consistently make the --cd path
-        writable. The actual production adapter must carry that path through --add-dir.
+        Windows Codex sandbox enforces reachable roots when changing directory: granting
+        only `--cd` leaves its parent inaccessible and causes `Set-Location` to fail.
         """
-        adapter = CodexAdapter(executable="codex", working_root="C:/executor/workspace")
+        adapter = CodexAdapter(
+            executable="codex",
+            working_root="C:/Temp/feature-pipeline-executor-example/workspace/feature-pipeline-skill",
+        )
 
         argv = adapter.plan(_request("executor", role_grant=("read", "write")))
 
+        self.assertEqual(argv[argv.index("--sandbox") + 1], "danger-full-access")
         self.assertEqual(
             [argv[index + 1] for index, value in enumerate(argv) if value == "--add-dir"],
-            [str(Path("C:/executor/workspace"))],
+            [
+                str(Path("C:/Temp/feature-pipeline-executor-example/workspace")),
+                str(Path("C:/Temp/feature-pipeline-executor-example/workspace/feature-pipeline-skill")),
+            ],
         )
 
     def test_read_only_launch_does_not_grant_external_roots(self) -> None:

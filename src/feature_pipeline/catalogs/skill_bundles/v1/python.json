@@ -1,0 +1,10 @@
+{
+  "id": "python-standard-library",
+  "classification": "stack:python",
+  "permitted_roles": ["executor", "task_verifier", "test_verifier"],
+  "source": "catalogs/skill_bundles/v1/python.json",
+  "sha256": "ea5bc7835f7ebf739d8db65e079c1ff762ad8a4be90e3778e4d9101142d1fda9",
+  "content": "# Python stack guidance\n\nUse typed, standard-library-only Python and the declared test contract.\n",
+  "required_dependencies": ["neutral-pipeline-contract"],
+  "optional_references": []
+}
