@@ -11,11 +11,11 @@ artifact exists.
 
 The route synthesis mirrors ``project_profile._from_project_profile`` exactly: every declared
 task type is routed to its ``working_root`` and its own explicitly declared ``stack``; the
-neutral ``executor`` subagent runs every route; each route lists the checks whose ``stack``
-matches the route's stack, plus every check explicitly marked ``required`` (a repository-wide
-gate no route may silently drop); storage is the single ``run_state`` key bound to
-``run_state_path``. Parity against the shipped :func:`pipeline_core.profiles.resolve_route` is
-pinned by ``tests/test_execution_plan_compiler.py``.
+neutral ``executor`` subagent runs every route; each route lists the checks the profile's
+canonical ``stacks[]`` binding (``{id, role, checks}``, TC-08) claims for that stack, plus every
+check explicitly marked ``required`` (a repository-wide gate no route may silently drop);
+storage is the single ``run_state`` key bound to ``run_state_path``. Parity against the shipped
+:func:`pipeline_core.profiles.resolve_route` is pinned by ``tests/test_execution_plan_compiler.py``.
 
 Standard library only.
 """
@@ -23,7 +23,7 @@ Standard library only.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -33,8 +33,11 @@ from feature_pipeline.domain.paths import RelativePath
 #: The only project-profile ``schema_version`` this core understands.
 SUPPORTED_SCHEMA_VERSION = 1
 
-#: Keys a ``schema_version`` project profile must carry.
-_REQUIRED_KEYS = ("project", "anchors", "task_routing", "run_state_path", "roles")
+#: Keys a ``schema_version`` project profile must carry. ``stacks`` is the canonical
+#: ``{id, role, checks}`` binding introduced in TC-08; a project profile that predates it is a
+#: legacy document rejected with an explicit diagnostic (see :class:`InvalidProfile`'s message
+#: below), never silently synthesised from a route or a task type.
+_REQUIRED_KEYS = ("project", "anchors", "task_routing", "stacks", "run_state_path", "roles")
 
 #: Keys that only ever appear in a native core profile — their presence is ambiguity.
 _NATIVE_ONLY_KEYS = ("version", "logical_paths", "stages", "registry")
@@ -64,6 +67,12 @@ class UnknownCheck(DomainError):
     code = "unknown-check"
 
 
+class UnknownStack(DomainError):
+    """A route or check names a stack id no ``stacks[]`` entry declares."""
+
+    code = "unknown-stack"
+
+
 @dataclass(frozen=True)
 class CheckCommand:
     """One repository-declared verification command.
@@ -78,6 +87,20 @@ class CheckCommand:
     argv: tuple[str, ...]
     cwd: RelativePath
     required: bool = False
+
+
+@dataclass(frozen=True)
+class StackBinding:
+    """One profile-declared ``stacks[]`` entry: the canonical ``{id, role, checks}`` binding a
+    route's ``stack`` resolves through (TC-08). ``role`` is the one semantic role this stack is
+    bound to (a name from the profile's own ``roles[]``, never inferred), and ``check_names`` is
+    exactly the set of checks this stack owns — a route's resolved checks are this set plus any
+    check explicitly marked ``required`` elsewhere.
+    """
+
+    id: str
+    role: str
+    check_names: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -104,6 +127,10 @@ class CompiledProfile:
     role_grants: Mapping[str, tuple[str, ...]]
     checks: Mapping[str, CheckCommand]
     storage: Mapping[str, RelativePath]
+    #: The canonical ``stacks[]`` binding (TC-08). Defaults to empty for profiles built
+    #: directly (not through :meth:`from_mapping`) by hand-authored test fixtures that predate
+    #: this concept; :meth:`from_mapping` always populates it from the generated document.
+    stacks: Mapping[str, StackBinding] = field(default_factory=dict)
 
     # -- lookups (fail closed) --------------------------------------------------------
 
@@ -118,6 +145,12 @@ class CompiledProfile:
             return self.checks[name]
         except KeyError:
             raise UnknownCheck(f"unknown check: {name}") from None
+
+    def stack_for(self, stack_id: str) -> StackBinding:
+        try:
+            return self.stacks[stack_id]
+        except KeyError:
+            raise UnknownStack(f"unregistered stack id: {stack_id}") from None
 
     def storage_root(self, key: str) -> RelativePath:
         try:
@@ -162,6 +195,13 @@ class CompiledProfile:
             )
         for key in _REQUIRED_KEYS:
             if key not in raw:
+                if key == "stacks":
+                    raise InvalidProfile(
+                        "project profile is missing required key 'stacks' — this profile "
+                        "predates the explicit {id, role, checks} stack binding (TC-08); "
+                        "regenerate it with the current feature-pipeline-project-setup "
+                        "generator rather than hand-patching a stacks array onto it"
+                    )
                 raise InvalidProfile(f"project profile is missing required key {key!r}")
         for key in _NATIVE_ONLY_KEYS:
             if key in raw:
@@ -179,39 +219,6 @@ class CompiledProfile:
         checks = _parse_checks(checks_doc)
         required_checks = frozenset(name for name, check in checks.items() if check.required)
 
-        routing = _sequence(raw.get("task_routing"), "task_routing")
-        if not routing:
-            raise InvalidProfile("task_routing must not be empty")
-        routes: dict[str, RoutePolicy] = {}
-        for index, entry in enumerate(routing):
-            obj = _mapping(entry, f"task_routing[{index}]")
-            task_type = _non_empty_str(
-                obj.get("task_type"), f"task_routing[{index}].task_type"
-            )
-            working_root = _relative(
-                obj.get("working_root"), f"task_routing[{index}].working_root"
-            )
-            stack = _non_empty_str(obj.get("stack"), f"task_routing[{index}].stack")
-            if task_type in routes:
-                raise InvalidProfile(f"task_routing has a duplicate task type: {task_type!r}")
-            route_checks = tuple(sorted(
-                name for name, check in checks.items()
-                if check.stack == stack or name in required_checks
-            ))
-            if not route_checks:
-                raise InvalidProfile(
-                    f"task_routing[{index}] stack {stack!r} resolves no checks — declare a "
-                    "matching checks.json check or mark a check 'required'"
-                )
-            routes[task_type] = RoutePolicy(
-                task_type=task_type,
-                working_root=working_root,
-                stack=stack,
-                subagents=(_EXECUTOR,),
-                check_names=route_checks,
-                storage_key=_STORAGE_KEY,
-            )
-
         roles = _sequence(raw.get("roles"), "roles")
         if not roles:
             raise InvalidProfile("roles must not be empty")
@@ -227,6 +234,45 @@ class CompiledProfile:
                 raise InvalidProfile(f"roles[{index}].min_grants must not be empty")
             role_grants[role] = grants
 
+        stacks = _parse_stacks(raw.get("stacks"), checks, frozenset(role_grants))
+
+        routing = _sequence(raw.get("task_routing"), "task_routing")
+        if not routing:
+            raise InvalidProfile("task_routing must not be empty")
+        routes: dict[str, RoutePolicy] = {}
+        for index, entry in enumerate(routing):
+            obj = _mapping(entry, f"task_routing[{index}]")
+            task_type = _non_empty_str(
+                obj.get("task_type"), f"task_routing[{index}].task_type"
+            )
+            working_root = _relative(
+                obj.get("working_root"), f"task_routing[{index}].working_root"
+            )
+            stack = _non_empty_str(obj.get("stack"), f"task_routing[{index}].stack")
+            if task_type in routes:
+                raise InvalidProfile(f"task_routing has a duplicate task type: {task_type!r}")
+            try:
+                binding = stacks[stack]
+            except KeyError:
+                raise InvalidProfile(
+                    f"task_routing[{index}] stack {stack!r} is not declared in this "
+                    "profile's stacks[]"
+                ) from None
+            route_checks = tuple(sorted(set(binding.check_names) | required_checks))
+            if not route_checks:
+                raise InvalidProfile(
+                    f"task_routing[{index}] stack {stack!r} resolves no declared checks — "
+                    "declare a check under its stacks[] entry or mark a check 'required'"
+                )
+            routes[task_type] = RoutePolicy(
+                task_type=task_type,
+                working_root=working_root,
+                stack=stack,
+                subagents=(_EXECUTOR,),
+                check_names=route_checks,
+                storage_key=_STORAGE_KEY,
+            )
+
         return cls(
             project=project,
             agents_root=agents_root,
@@ -236,10 +282,73 @@ class CompiledProfile:
             role_grants=role_grants,
             checks=checks,
             storage={_STORAGE_KEY: run_state_path},
+            stacks=stacks,
         )
 
 
 # --- parsing helpers -----------------------------------------------------------------------
+
+
+def _parse_stacks(
+    value: object,
+    checks: Mapping[str, CheckCommand],
+    declared_roles: frozenset[str],
+) -> dict[str, StackBinding]:
+    """Parse and cross-validate the canonical ``stacks[]`` binding.
+
+    Rejects a duplicate stack id, an unknown role (not one of the profile's own declared
+    ``roles[]`` names), a stack that claims a check ``checks.json`` does not declare, and a
+    stack/check-id mismatch (the check's own declared ``stack`` disagrees with the stacks[]
+    entry claiming it). Every ``checks.json`` check must also be claimed by exactly one stack —
+    an orphaned check is as much a mismatch as a wrongly claimed one.
+    """
+    entries = _sequence(value, "stacks")
+    if not entries:
+        raise InvalidProfile("stacks must not be empty")
+    stacks: dict[str, StackBinding] = {}
+    claimed_by: dict[str, str] = {}
+    for index, entry in enumerate(entries):
+        obj = _mapping(entry, f"stacks[{index}]")
+        stack_id = _non_empty_str(obj.get("id"), f"stacks[{index}].id")
+        role = _non_empty_str(obj.get("role"), f"stacks[{index}].role")
+        if role not in declared_roles:
+            raise InvalidProfile(
+                f"stacks[{index}].role {role!r} is not one of the declared roles: "
+                f"{sorted(declared_roles)}"
+            )
+        if stack_id in stacks:
+            raise InvalidProfile(f"stacks has a duplicate id: {stack_id!r}")
+        check_names = tuple(
+            _non_empty_str(name, f"stacks[{index}].checks[]")
+            for name in _sequence(obj.get("checks"), f"stacks[{index}].checks")
+        )
+        for name in check_names:
+            check = checks.get(name)
+            if check is None:
+                raise InvalidProfile(
+                    f"stacks[{index}] ({stack_id!r}) claims check {name!r}, which is not "
+                    "declared in checks.json"
+                )
+            if check.stack != stack_id:
+                raise InvalidProfile(
+                    f"checks.json check {name!r} declares stack {check.stack!r}, but "
+                    f"stacks[{index}] claims it under {stack_id!r}"
+                )
+            prior_owner = claimed_by.get(name)
+            if prior_owner is not None and prior_owner != stack_id:
+                raise InvalidProfile(
+                    f"check {name!r} is claimed by both stacks {prior_owner!r} and "
+                    f"{stack_id!r}"
+                )
+            claimed_by[name] = stack_id
+        stacks[stack_id] = StackBinding(id=stack_id, role=role, check_names=check_names)
+
+    orphaned = sorted(set(checks) - set(claimed_by))
+    if orphaned:
+        raise InvalidProfile(
+            f"checks.json declares check(s) not claimed by any stacks[] entry: {orphaned}"
+        )
+    return stacks
 
 
 def _parse_checks(checks_doc: Mapping[str, Any] | None) -> dict[str, CheckCommand]:
@@ -311,7 +420,9 @@ __all__ = [
     "InvalidProfile",
     "UnknownRoute",
     "UnknownCheck",
+    "UnknownStack",
     "CheckCommand",
+    "StackBinding",
     "RoutePolicy",
     "CompiledProfile",
 ]

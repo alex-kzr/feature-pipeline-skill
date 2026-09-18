@@ -41,6 +41,11 @@ def _generated_profile() -> dict:
             {"task_type": "python", "working_root": "feature-pipeline-skill", "stack": "python"},
             {"task_type": "docs", "working_root": "docs", "stack": "docs"},
         ],
+        "stacks": [
+            {"id": "python", "role": "executor", "checks": ["core-unittests"]},
+            {"id": "docs", "role": "executor", "checks": []},
+            {"id": "repo", "role": "executor", "checks": ["whitespace-check"]},
+        ],
         "run_state_path": ".pipeline/runs",
         "roles": [
             {"role": "executor", "min_grants": ["read", "write"]},

@@ -28,6 +28,7 @@ from feature_pipeline.inputs.profile import (
     CheckCommand,
     CompiledProfile,
     RoutePolicy,
+    StackBinding,
 )
 
 #: Task types the core recognises but deliberately leaves unrouted — a ``design`` task needs
@@ -103,6 +104,22 @@ def compiled_profile_from_core(profile: Profile) -> CompiledProfile:
             storage_key=route.storage,
         )
 
+    # ``registry.stacks`` is a native profile's closed stack registry (contracts.py already
+    # rejects a route naming an undeclared stack id there). A stack entry's ``role`` is optional
+    # here — a hand-authored native profile that predates the explicit stack/role binding (TC-08)
+    # has none, and keeps working unchanged; a generated profile's stacks[] always carries one,
+    # so :func:`pipeline_core.project_profile._from_project_profile` always populates it.
+    stacks: dict[str, StackBinding] = {
+        stack_id: StackBinding(
+            id=stack_id,
+            role=str(entry.get("role", "")),
+            check_names=tuple(
+                sorted(name for name, check in registry.checks.items() if check.stack == stack_id)
+            ),
+        )
+        for stack_id, entry in registry.stacks.items()
+    }
+
     storage = {
         key: RelativePath.parse(value) for key, value in registry.storage.items()
     }
@@ -119,4 +136,5 @@ def compiled_profile_from_core(profile: Profile) -> CompiledProfile:
         },
         checks=checks,
         storage=storage,
+        stacks=stacks,
     )
