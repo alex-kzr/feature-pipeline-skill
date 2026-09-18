@@ -7,6 +7,12 @@
     {"task_type": "rust", "working_root": "packages/rust", "stack": "rust"},
     {"task_type": "docs", "working_root": "docs", "stack": "docs"}
   ],
+  "stacks": [
+    {"id": "python", "role": "executor", "checks": ["python-tests"]},
+    {"id": "rust", "role": "executor", "checks": ["rust-tests"]},
+    {"id": "docs", "role": "executor", "checks": []},
+    {"id": "repo", "role": "executor", "checks": ["repo-check"]}
+  ],
   "run_state_path": "runs",
   "roles": [
     {"role": "executor", "min_grants": ["read", "write", "run_checks"]},
