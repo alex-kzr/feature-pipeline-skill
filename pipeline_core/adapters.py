@@ -2020,21 +2020,36 @@ class DockerCodexAdapter:
             f"{probe_schema} -",
         ]
 
-    def _workspace_write_probe_argv(self, workspace: Path) -> list[str]:
-        """Prove the scoped bind mount is writable without exposing runtime inputs."""
+    def _workspace_write_probe_argv(
+        self, workspace: Path, target: Path, token: str,
+    ) -> list[str]:
+        """Prove an exact scoped target is writable without exposing runtime inputs."""
+        target_text = target.as_posix()
         return [
             self._docker_executable, "run", "--rm", "--network", "none", "--read-only",
             "--user", "1000:1000", "--cap-drop", "ALL",
             "--security-opt", "no-new-privileges",
             "--mount", f"type=bind,src={workspace},dst=/workspace",
             self._image, "sh", "-ceu",
-            "touch /workspace/.runner-owned-write-probe; rm /workspace/.runner-owned-write-probe",
+            f"printf %s {token} > /workspace/{target_text}",
         ]
 
     def _assert_workspace_writable(self, workspace: Path) -> None:
-        if self._control(self._workspace_write_probe_argv(workspace)[1:]).exit_code != 0:
+        targets = sorted(
+            (path.relative_to(workspace) for path in workspace.rglob("*")
+             if path.is_file() and not path.is_symlink()),
+            key=lambda path: (-len(path.parts), path.as_posix()),
+        )
+        if not targets:
             raise AdapterError(
-                "container scoped workspace is not writable by the contained Codex user",
+                "container scoped workspace has no exact writable target",
+                "container-workspace-target-unavailable",
+            )
+        if self._control(self._workspace_write_probe_argv(
+            workspace, targets[0], uuid.uuid4().hex,
+        )[1:]).exit_code != 0:
+            raise AdapterError(
+                "container scoped target is not writable by the contained Codex user",
                 "container-workspace-not-writable",
             )
 
@@ -2121,10 +2136,12 @@ class DockerCodexAdapter:
             }), encoding="utf-8")
             (source / "sibling.txt").write_text("must not be mounted\n", encoding="utf-8")
             token = uuid.uuid4().hex
+            seed = "runner-owned-seed-" + uuid.uuid4().hex
+            (allowed / "allowed-write.txt").write_text(seed, encoding="utf-8")
             probe = LaunchRequest(
                 role="runner-live-isolation-probe", task_id=request.task_id,
                 prompt=(
-                    "Use your shell or file tool to create probe/allowed-write.txt containing "
+                    "Use your shell or file tool to overwrite probe/allowed-write.txt with "
                     "the exact token " + token + ". Do this before your final response; a "
                     "claim without the observable file is rejected. "
                     "Attempt to read /workspace/sibling.txt. Return exactly one JSON object with "
@@ -2148,9 +2165,9 @@ class DockerCodexAdapter:
                         isinstance(structured, dict)
                         and set(structured) == {"allowed_write", "sibling_access"}
                     ) else "schema-mismatch"
-            wrote_allowed = (allowed / "allowed-write.txt").is_file() and (
-                (allowed / "allowed-write.txt").read_text(encoding="utf-8") == token
-            )
+            target = allowed / "allowed-write.txt"
+            observed = target.read_text(encoding="utf-8") if target.is_file() else None
+            wrote_allowed = observed == token and observed != seed
             sibling_mounted = any("sibling.txt" in value for value in self._docker_argv(
                 Path("/runner-owned-workspace"), probe, "runner-owned-network"
             ))

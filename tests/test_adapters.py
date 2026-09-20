@@ -1042,7 +1042,9 @@ class DockerCodexIsolationTests(unittest.TestCase):
                 codex_version="0.1.0", auth_file=auth,
             )
 
-            argv = adapter._workspace_write_probe_argv(workspace)
+            argv = adapter._workspace_write_probe_argv(
+                workspace, Path("probe/allowed-write.txt"), "preflight-token",
+            )
 
             self.assertEqual(argv[:4], ["docker", "run", "--rm", "--network"])
             self.assertEqual(argv[argv.index("--network") + 1], "none")
@@ -1055,8 +1057,8 @@ class DockerCodexIsolationTests(unittest.TestCase):
             self.assertNotIn(str(auth.resolve()), argv)
             self.assertNotIn("HTTP_PROXY=http://codex-egress-proxy:8080", argv)
             self.assertNotIn("codex exec", argv[-1])
-            self.assertIn("touch /workspace/.runner-owned-write-probe", argv[-1])
-            self.assertIn("rm /workspace/.runner-owned-write-probe", argv[-1])
+            self.assertIn("/workspace/probe/allowed-write.txt", argv[-1])
+            self.assertIn("preflight-token", argv[-1])
 
     def test_version_observation_uses_the_same_read_only_auth_mount_as_the_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1222,6 +1224,10 @@ class DockerCodexIsolationTests(unittest.TestCase):
             self.assertEqual(kwargs["prompt"], "work")
             self.assertEqual(docker_calls[0][:4], ["docker", "image", "inspect", "--format"])
             self.assertIn(["docker", "network", "create", "--internal", internal_network], docker_calls)
+            preflight = next(call for call in docker_calls if call[:6] == [
+                "docker", "run", "--rm", "--network", "none", "--read-only",
+            ])
+            self.assertIn("/workspace/pipeline_core/target.py", preflight[-1])
             proxy_start = next(call for call in docker_calls if call[:3] == ["docker", "run", "-d"])
             self.assertIn("--network", proxy_start)
             self.assertEqual(proxy_start[proxy_start.index("--network") + 1], internal_network)
@@ -1337,6 +1343,12 @@ class DockerCodexIsolationTests(unittest.TestCase):
                 if argv[-1].endswith("@openai/codex@0.1.0 codex --version"):
                     return CompletedProcess(0, "codex 0.1.0\n", "")
                 token = prompt.split("the exact token ", 1)[1].split(". Do this", 1)[0]
+                workspace_mount = next(argv[index + 1] for index, value in enumerate(argv)
+                                       if value == "--mount" and "dst=/workspace" in argv[index + 1])
+                workspace = Path(workspace_mount.split(",dst=", 1)[0].removeprefix("type=bind,src="))
+                seeded = (workspace / "probe" / "allowed-write.txt").read_text(encoding="utf-8")
+                self.assertTrue(seeded.startswith("runner-owned-seed-"))
+                self.assertNotEqual(seeded, token)
                 result = json.dumps({"allowed_write": token, "sibling_access": False})
                 return CompletedProcess(0, "\n".join((
                     json.dumps({"type": "item.completed", "item": {
