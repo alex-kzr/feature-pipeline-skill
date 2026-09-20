@@ -42,6 +42,7 @@ from .adapters import (
     Adapter,
     AdapterError,
     LaunchRequest,
+    LaunchComposition,
     LaunchResult,
     check_command_allowances,
     parse_codex_final_result,
@@ -50,6 +51,7 @@ from .adapters import (
 from .artifacts import write_json_atomic, write_text_atomic
 from .commands import active_revision
 from .lifecycle import RunLifecycle
+from .plan import render_effective_task_contract
 from .prompt_envelope import EnvelopeAnchors, build_executor_envelope
 from .reports import (
     LaunchArtifacts,
@@ -543,6 +545,12 @@ def dispatch_executor(
         runner_evidence_satisfied=runner_evidence_satisfied,
         skill_content="" if bundle is None else bundle.render(),
     )
+    envelope += (
+        "\nRunner-authoritative effective task contract:\n"
+        + render_effective_task_contract(spec)
+        + "\n- This briefing overrides conflicting scope, verification-command, and repair-budget "
+        "text in the historical task Markdown.\n"
+    )
     write_text_atomic(artifacts.prompt_envelope, envelope, repo_root=run.repo_root)
 
     primary_root = Path(run.repo_root)
@@ -556,6 +564,12 @@ def dispatch_executor(
         repair_input_dirs = (str((workspace / repo_relative(repair_report_path, primary_root)).parent),)
     launch_working_root = str(workspace / request.working_root)
 
+    composition = LaunchComposition(
+        recipient_role=EXECUTOR_ROLE,
+        bundle_digest=None if bundle is None else bundle.digest,
+        allowed_scope=tuple(spec.allowed_scope),
+        role_grant=tuple(request.role_grant),
+    )
     launch_request = LaunchRequest(
         role=spec.executor,
         task_id=task_id,
@@ -586,6 +600,12 @@ def dispatch_executor(
         # Its prompt path remains .pipeline/...; grant only its copied parent so Claude can
         # read the diagnosis without access to the primary runner control plane.
         required_input_dirs=repair_input_dirs,
+        # Bind this launch to the exact role and skill-bundle digest it was composed for
+        # (TC-11 AC-1); an adapter rejects a request whose recipient role disagrees with the
+        # role actually being launched, so later adapter code can never substitute either.
+        recipient_role=EXECUTOR_ROLE,
+        bundle_digest=None if bundle is None else bundle.digest,
+        composition=composition,
     )
     # Runner-owned evidence: content snapshot of the whole worktree immediately before the
     # launch, with the runner's own run/lock/report directory excluded. Subtracting this
@@ -654,6 +674,9 @@ def dispatch_executor(
         timeout=request.timeout,
         model=request.model,
         effort=request.effort,
+        recipient_role=EXECUTOR_ROLE,
+        bundle_digest=None if bundle is None else bundle.digest,
+        composition=composition,
     )
     try:
         envelope_result = adapter.launch(envelope_request)

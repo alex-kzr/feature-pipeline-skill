@@ -19,7 +19,7 @@ import hashlib
 import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
@@ -102,6 +102,35 @@ def canonical_amendment_fields(contract: Mapping[str, Any] | object) -> dict[str
     }
 
 
+def effective_task_contract(contract: Mapping[str, Any] | object) -> dict[str, Any]:
+    """Project the runner-authoritative amendable task surface for an agent briefing.
+
+    Callers must pass the task contract selected by the runner, rather than re-reading a
+    Markdown task card.  That makes an accepted amendment govern both implementation and
+    independent review without granting an unapproved task-file edit any authority.
+    """
+    return canonical_amendment_fields(contract)
+
+
+def render_effective_task_contract(contract: Mapping[str, Any] | object) -> str:
+    """Render the one canonical effective-contract projection embedded in agent prompts."""
+    fields = effective_task_contract(contract)
+    commands = fields["verification_commands"]
+    command_lines = (
+        ["  none declared"] if not commands else [
+            f"  - {cwd} -> {' '.join(argv)}" for cwd, argv in commands
+        ]
+    )
+    return "\n".join([
+        f"- Allowed scope: {', '.join(fields['allowed_scope']) or 'none'}",
+        f"- Out of scope: {', '.join(fields['out_of_scope']) or 'none'}",
+        "- Verification commands:",
+        *command_lines,
+        f"- Maximum repair attempts: {fields['max_repair_attempts']}",
+        f"- Documentation impact: {', '.join(fields['documentation_impact']) or 'none'}",
+    ])
+
+
 def contract_digest(fields: Mapping[str, Any]) -> str:
     """A stable ``sha256:<hex>`` identity for one amendable-contract snapshot."""
     encoded = json.dumps(fields, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -157,6 +186,7 @@ class AmendmentRevision:
     source_evidence: str
     created_at: str
     epoch: int
+    new_contract: Mapping[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -171,6 +201,7 @@ class AmendmentRevision:
             "source_evidence": self.source_evidence,
             "created_at": self.created_at,
             "epoch": self.epoch,
+            "new_contract": dict(self.new_contract),
         }
 
     @classmethod
@@ -187,6 +218,7 @@ class AmendmentRevision:
             source_evidence=data["source_evidence"],
             created_at=data["created_at"],
             epoch=data["epoch"],
+            new_contract=data.get("new_contract", {}),
         )
 
 
@@ -258,6 +290,7 @@ def build_amendment_revision(
         source_evidence=request.source_evidence,
         created_at=_now(),
         epoch=next_epoch,
+        new_contract=new_fields,
     )
 
 

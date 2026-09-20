@@ -27,6 +27,7 @@ from pipeline_core import runner_cli
 from pipeline_core.adapters import LaunchRequest
 from pipeline_core.execution import persist_task_contracts
 from pipeline_core.lifecycle import RunLifecycle
+from pipeline_core.plan import AmendmentRequest, build_amendment_revision, canonical_amendment_fields, contract_digest
 from pipeline_core.state import ACTOR_RUNNER, Run
 from pipeline_core.task_files import load_task_spec, upsert_blockers_section
 from pipeline_core.verification import VerifierLaunchers
@@ -98,6 +99,176 @@ def _seed(fixture: str, dest: Path, *, tasks: list[dict], with_registry: bool = 
 
 
 class HelpAndFlagSurfaceTests(unittest.TestCase):
+    def test_live_probe_flags_are_typed_and_require_explicit_opt_in(self) -> None:
+        command = RunCommand.from_args(build_parser().parse_args([
+            "--live-isolation-probe", "--live-probe-opt-in", "--adapter", "codex",
+            "--live-probe-timeout", "1", "--live-probe-max-attempts", "1",
+        ]))
+        self.assertTrue(command.live_isolation_probe)
+        self.assertTrue(command.live_probe_opt_in)
+        self.assertEqual(command.live_probe_timeout, 1.0)
+
+    def test_live_probe_denies_a_pinned_adapter_mismatch_before_composition(self) -> None:
+        with TemporaryDirectory() as directory:
+            seed = _seed("library-guide", Path(directory) / "project", tasks=[RICH_EXECUTE_TASK])
+            run_dir = seed["project_dir"] / ".pipeline" / "runs" / "sample-feature"
+            run = Run.create("sample-feature", seed["project_dir"] / "plan.json", None,
+                             run_dir, seed["project_dir"])
+            run.add_task("TSK-01").adapter = "claude"
+            run.save()
+            command = RunCommand(
+                project_root=str(seed["dest"]), agents_root=str(seed["dest"] / "_agents"),
+                core_root=str(seed["dest"]), profile=seed["profile_rel"], project_skill=None,
+                plan="plan.json", task="TSK-01", through=None, feature="sample-feature",
+                adapter="codex", live_isolation_probe=True, live_probe_opt_in=True,
+                live_probe_timeout=1.0, live_probe_max_attempts=1, live_probe_request_count=1,
+            )
+            with patch.object(use_cases, "build_bootstrap", side_effect=AssertionError("composed")):
+                with self.assertRaises(use_cases.CliError) as raised:
+                    use_cases.dispatch(command)
+            self.assertIn("adapter differs", str(raised.exception))
+
+    def test_live_probe_uses_the_validated_durable_amendment_contract(self) -> None:
+        with TemporaryDirectory() as directory:
+            seed = _seed("library-guide", Path(directory) / "project", tasks=[RICH_EXECUTE_TASK])
+            run_dir = seed["project_dir"] / ".pipeline" / "runs" / "sample-feature"
+            run = Run.create("sample-feature", seed["project_dir"] / "plan.json", None,
+                             run_dir, seed["project_dir"])
+            spec = use_cases.load_execute_specs(seed["project_dir"] / "plan.json", None)[1][0]
+            task = run.add_task("TSK-01")
+            task.adapter, task.executor = "codex", spec.executor
+            prior = canonical_amendment_fields(spec)
+            amended = dict(prior, allowed_scope=["content/amended-tsk-01.txt"])
+            revision = build_amendment_revision(AmendmentRequest(
+                task_id="TSK-01", task_status=task.status, prior_contract=prior,
+                new_contract=amended, rationale="the probe boundary changed",
+                approved_by="reviewer", source_evidence="review:TC-11",
+                added_paths=("content/amended-tsk-01.txt",),
+            ), next_revision=1, next_epoch=1)
+            run.apply_amendment(
+                revision, new_digest=contract_digest(canonical_amendment_fields(amended)),
+                new_digest_version="tam01-amendment-v1")
+            run.save()
+            captured: dict[str, object] = {}
+            adapter = SimpleNamespace(name="codex", available=lambda: False)
+            command = RunCommand(
+                project_root=str(seed["dest"]), agents_root=str(seed["dest"] / "_agents"),
+                core_root=str(seed["dest"]), profile=seed["profile_rel"], project_skill=None,
+                plan="plan.json", task="TSK-01", through=None, feature="sample-feature",
+                adapter="codex", live_isolation_probe=True, live_probe_opt_in=True,
+                live_probe_timeout=1.0, live_probe_max_attempts=1, live_probe_request_count=1,
+            )
+
+            def record_probe(*_args, **kwargs):
+                captured.update(kwargs)
+                return {"disposition": "NO_BREACH_OBSERVED"}
+
+            bootstrap_stub = SimpleNamespace(make_execute_adapters=lambda _adapter: (adapter,))
+            with patch.object(use_cases, "build_bootstrap", return_value=bootstrap_stub), \
+                 patch.object(use_cases, "execute_live_probe", side_effect=record_probe):
+                result = use_cases.dispatch(command)
+
+            self.assertEqual(result.outcome.value, "ok")
+            self.assertEqual(captured["task_contract_digest"], revision.new_digest)
+            self.assertEqual(captured["request"].allowed_scope, tuple(amended["allowed_scope"]))
+
+    def test_live_probe_creates_a_runner_owned_redacted_report_before_a_launch_failure(self) -> None:
+        with TemporaryDirectory() as directory:
+            seed = _seed("library-guide", Path(directory) / "project", tasks=[RICH_EXECUTE_TASK])
+            profile_path = seed["dest"] / seed["profile_rel"]
+            profile = json.loads(profile_path.read_text(encoding="utf-8"))
+            profile["registry"]["storage"]["runs"] = ".pipeline/durable-selected-runs"
+            profile_path.write_text(json.dumps(profile, indent=2) + "\n", encoding="utf-8")
+            run_dir = (seed["project_dir"] / ".pipeline" / "durable-selected-runs" /
+                       "sample-feature")
+            run = Run.create("sample-feature", seed["project_dir"] / "plan.json", None,
+                             run_dir, seed["project_dir"])
+            run.add_task("TSK-01")
+            run.save()
+            report = run_dir / "reports" / "TSK-01" / "live-probe.json"
+            sentinel = "runner-private-live-probe-sentinel"
+            parents_at_launch: list[bool] = []
+
+            def launch_probe(request):
+                parents_at_launch.append(request.report_path.parent.is_dir())
+                raise RuntimeError(f"cannot launch from {seed['project_dir']} {sentinel}")
+
+            adapter = SimpleNamespace(
+                name="codex", available=lambda: False, launch_live_probe=launch_probe,
+            )
+            bootstrap_stub = SimpleNamespace(make_execute_adapters=lambda _adapter: (adapter,))
+            with patch.object(use_cases, "build_bootstrap", return_value=bootstrap_stub), \
+                 patch("pipeline_core.commands.secrets.token_urlsafe", return_value=sentinel):
+                code, _out, err = _run(seed["anchors"] + [
+                    "--profile", seed["profile_rel"], "--plan", "plan.json", "--task", "TSK-01",
+                    "--adapter", "codex", "--live-isolation-probe", "--live-probe-opt-in",
+                    "--live-probe-timeout", "1", "--live-probe-max-attempts", "1",
+                ])
+
+            self.assertEqual(code, 0, err)
+            self.assertEqual(parents_at_launch, [True])
+            self.assertTrue(report.is_file())
+            self.assertFalse((seed["project_dir"] / ".pipeline" / "runs" / "sample-feature").exists())
+            diagnostic = json.loads(report.read_text(encoding="utf-8"))
+            self.assertEqual(diagnostic["disposition"], "LAUNCH_FAILED")
+            self.assertNotIn(str(seed["project_dir"]), json.dumps(diagnostic))
+            self.assertNotIn(sentinel, json.dumps(diagnostic))
+
+    def test_live_probe_persists_launch_failure_when_cleanup_raises(self) -> None:
+        with TemporaryDirectory() as directory:
+            seed = _seed("library-guide", Path(directory) / "project", tasks=[RICH_EXECUTE_TASK])
+            run_dir = seed["project_dir"] / ".pipeline" / "runs" / "sample-feature"
+            run = Run.create("sample-feature", seed["project_dir"] / "plan.json", None,
+                             run_dir, seed["project_dir"])
+            run.add_task("TSK-01")
+            run.save()
+            report = run_dir / "reports" / "TSK-01" / "live-probe.json"
+            adapter = SimpleNamespace(
+                name="codex", available=lambda: False,
+                launch_live_probe=lambda _: SimpleNamespace(exit_code=1, stdout="", stderr=""),
+            )
+            bootstrap_stub = SimpleNamespace(make_execute_adapters=lambda _adapter: (adapter,))
+            remove_tree = shutil.rmtree
+
+            def cleanup_raises_after_removal(path):
+                remove_tree(path)
+                raise RuntimeError("cleanup crash")
+
+            with patch.object(use_cases, "build_bootstrap", return_value=bootstrap_stub), \
+                 patch("pipeline_core.commands.shutil.rmtree", side_effect=cleanup_raises_after_removal):
+                code, _out, err = _run(seed["anchors"] + [
+                    "--profile", seed["profile_rel"], "--plan", "plan.json", "--task", "TSK-01",
+                    "--adapter", "codex", "--live-isolation-probe", "--live-probe-opt-in",
+                    "--live-probe-timeout", "1", "--live-probe-max-attempts", "1",
+                ])
+
+            self.assertEqual(code, 0, err)
+            diagnostic = json.loads(report.read_text(encoding="utf-8"))
+            self.assertEqual(diagnostic["disposition"], "LAUNCH_FAILED")
+            self.assertEqual(diagnostic["reason"], "runner-private probe material could not be removed")
+
+    def test_live_probe_rejects_unapproved_durable_contract_drift(self) -> None:
+        with TemporaryDirectory() as directory:
+            seed = _seed("library-guide", Path(directory) / "project", tasks=[RICH_EXECUTE_TASK])
+            run_dir = seed["project_dir"] / ".pipeline" / "runs" / "sample-feature"
+            run = Run.create("sample-feature", seed["project_dir"] / "plan.json", None,
+                             run_dir, seed["project_dir"])
+            task = run.add_task("TSK-01")
+            task.adapter, task.executor = "codex", "docs-executor"
+            task.task_contract_digest = "sha256:unapproved-drift"
+            run.save()
+            command = RunCommand(
+                project_root=str(seed["dest"]), agents_root=str(seed["dest"] / "_agents"),
+                core_root=str(seed["dest"]), profile=seed["profile_rel"], project_skill=None,
+                plan="plan.json", task="TSK-01", through=None, feature="sample-feature",
+                adapter="codex", live_isolation_probe=True, live_probe_opt_in=True,
+                live_probe_timeout=1.0, live_probe_max_attempts=1, live_probe_request_count=1,
+            )
+            with patch.object(use_cases, "build_bootstrap", side_effect=AssertionError("composed")), \
+                 self.assertRaises(use_cases.CliError) as raised:
+                use_cases.dispatch(command)
+            self.assertIn("task contract differs", str(raised.exception))
+
     def test_operational_unblock_flags_are_typed_runner_controls(self) -> None:
         command = RunCommand.from_args(build_parser().parse_args([
             "--mode", "execute", "--resume", "--operational-unblock", "T-01",

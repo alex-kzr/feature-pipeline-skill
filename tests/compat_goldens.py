@@ -81,7 +81,7 @@ _DURATION_SUFFIX_RE = re.compile(r"\(\d+\.\d+s\)")
 #: ``python3`` / ``python3.13`` ``sys.executable``) is consumed too, so the token is
 #: ``<python>`` on every platform.
 _INTERPRETER_RE = re.compile(
-    r"<(?:home|workdir|project_root)>[^\s`]*python(?:\.exe|\d+(?:\.\d+)*)?"
+    r"<(?:home|tmp|workdir|project_root)>[^\s`]*python(?:\.exe|\d+(?:\.\d+)*)?"
 )
 
 

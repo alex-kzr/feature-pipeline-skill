@@ -16,8 +16,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from pipeline_core.execution import ExecutionError, TaskExecution, run_task
+from pipeline_core.execution import (
+    ExecutionError,
+    TaskExecution,
+    _apply_approved_amendments,
+    run_task,
+)
 from pipeline_core.lifecycle import RunLifecycle
+from pipeline_core.plan import AmendmentRequest, build_amendment_revision, canonical_amendment_fields
 from pipeline_core.state import Run
 from pipeline_core.task_files import render_blocker_entry, upsert_blockers_section
 from feature_pipeline.contracts import TaskSpec
@@ -58,6 +64,70 @@ class HappyPathTests(unittest.TestCase):
             self.assertEqual(result.passes[0].task_verdict, "PASS")
             self.assertEqual(life.run.task("VR-03").status, "done")
             self.assertEqual(executor.launches, 1)
+
+    def test_rec35_approved_contract_controls_executor_and_verifier_briefings(self) -> None:
+        """REC-35: the actual dispatch path never falls back to task-card scope after approval."""
+        class AmendmentVerifier(StubVerifier):
+            def launch(self, request):  # noqa: ANN001 - test adapter protocol
+                result = super().launch(request)
+                if not request.resume_session_id:
+                    Path(request.report_path).write_text(
+                        f"# {request.role}\n\n- Verdict: PASS\n\n"
+                        "- Amendment-justification finding: revision 1, epoch 1: approved\n",
+                        encoding="utf-8",
+                    )
+                return result
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            task_card = root / "REC-35.md"
+            task_card.write_text("# Historical task card\n\nAllowed scope: src/**\n", encoding="utf-8")
+            life = _run(root, tasks=(("REC-35", ()),))
+            original = _spec(
+                task_id="REC-35", path="REC-35.md", allowed_scope=("src/**",),
+                out_of_scope=("reviews/**",), max_repair_attempts=1,
+            )
+            revision = build_amendment_revision(
+                AmendmentRequest(
+                    task_id="REC-35", task_status="to_do",
+                    prior_contract=canonical_amendment_fields(original),
+                    new_contract={
+                        "allowed_scope": ["reviews/**", "src/**"],
+                        "out_of_scope": [],
+                        "verification_commands": [],
+                        "max_repair_attempts": 3,
+                        "documentation_impact": [],
+                    },
+                    rationale="repair needs the review artifact", approved_by="reviewer",
+                    source_evidence="baseline:REC-35",
+                ),
+                next_revision=1, next_epoch=1,
+            )
+            life.run.apply_amendment(
+                revision, new_digest=revision.new_digest,
+                new_digest_version="tam01-amendment-v1",
+            )
+            effective = _apply_approved_amendments(life.run, (original,))[0]
+            executor = ScriptedExecutor(("implemented",))
+            task_verifier = AmendmentVerifier(("PASS",))
+            test_verifier = AmendmentVerifier(("PASS",))
+
+            result = run_task(life, _execution(effective, executor, task_verifier, test_verifier))
+
+            self.assertTrue(result.ok)
+            for prompt in (
+                executor.calls[0]["prompt"],
+                task_verifier.calls[0]["prompt"],
+                test_verifier.calls[0]["prompt"],
+            ):
+                self.assertIn("- Allowed scope: reviews/**, src/**", prompt)
+                self.assertIn("- Maximum repair attempts: 3", prompt)
+                self.assertIn("runner-authoritative", prompt.casefold())
+                self.assertTrue(
+                    "historical context" in prompt or "cannot override" in prompt
+                    or "overrides conflicting" in prompt,
+                    prompt,
+                )
 
     def test_resumed_in_progress_task_starts_a_fresh_operation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

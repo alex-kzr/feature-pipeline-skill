@@ -21,6 +21,7 @@ Standard library only.
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
@@ -31,8 +32,10 @@ from feature_pipeline.bootstrap import (
     POST_TASK_STAGES,
     ReleasePolicy,
     Run,
+    ExecutionError,
     StateError,
     build_bootstrap,
+    docker_factories_for_command,
     build_rules,
     load_markdown_plan,
     load_release_policy,
@@ -71,6 +74,7 @@ from feature_pipeline.application.selection import (
 )
 from feature_pipeline.domain.errors import DomainError
 from feature_pipeline.domain.graph import TaskGraph
+from feature_pipeline.ports.adapters import AdapterUnavailable
 from feature_pipeline.contracts import SchemaError, validate_preconditions, validate_relative_path
 
 from feature_pipeline.bootstrap import (
@@ -79,9 +83,13 @@ from feature_pipeline.bootstrap import (
     build_amendment_revision,
     canonical_amendment_fields,
     contract_digest,
+    effective_task_spec,
 )
-
-from .commands import RunCommand
+from .commands import (
+    RunCommand,
+    build_live_probe_request,
+    execute_live_probe,
+)
 from .errors import CliError
 from .parser import (
     AMEND_MODE,
@@ -115,6 +123,28 @@ def _require(value: str | None, field: str) -> str:
     if not value:
         raise CliError(EXIT_ERROR, f"{field} is required")
     return value
+
+
+def _validate_live_probe_request(command: RunCommand) -> None:
+    """Reject every unsafe probe request before anchor resolution, state, or child launch."""
+    if not command.live_isolation_probe:
+        if any((command.live_probe_opt_in, command.live_probe_timeout is not None,
+                command.live_probe_max_attempts is not None)):
+            raise CliError(EXIT_ERROR, "live-probe controls require --live-isolation-probe")
+        return
+    if command.live_probe_request_count != 1:
+        raise CliError(EXIT_ERROR, "exactly one --live-isolation-probe request is required")
+    if not command.live_probe_opt_in:
+        raise CliError(EXIT_ERROR, "--live-isolation-probe requires --live-probe-opt-in")
+    if command.adapter not in {"codex", "claude"}:
+        raise CliError(EXIT_ERROR, "live isolation probes require an explicit supported adapter")
+    timeout = command.live_probe_timeout
+    if (not isinstance(timeout, (int, float)) or isinstance(timeout, bool)
+            or not math.isfinite(timeout) or timeout <= 0):
+        raise CliError(EXIT_ERROR, "live isolation probe timeout must be positive and finite")
+    attempts = command.live_probe_max_attempts
+    if not isinstance(attempts, int) or isinstance(attempts, bool) or attempts <= 0:
+        raise CliError(EXIT_ERROR, "live isolation probe attempt budget must be positive")
 
 
 def _logical_relative(value: str, field: str) -> str:
@@ -415,7 +445,11 @@ def run_command(command: RunCommand) -> PipelineResult:
     release_policy, wrapper_dir, output_count = _load_post_task_config(profile_path, post_task)
 
     project_dir = _resolve_under(project_root, profile.logical_paths.project, "project path")
-    composition = build_bootstrap(project_dir, agents_root, core_root)
+    try:
+        factories = docker_factories_for_command(command)
+    except Exception as exc:
+        raise CliError(EXIT_ERROR, "Docker Codex runtime configuration is invalid") from exc
+    composition = build_bootstrap(project_dir, agents_root, core_root, factories=factories)
     plan_rel = _logical_relative(_require(command.plan, "--plan"), "--plan")
     plan_path = _resolve_under(project_dir, plan_rel, "--plan")
     prompt_rel = _logical_relative(command.prompt, "--prompt") if command.prompt else plan_rel
@@ -691,6 +725,101 @@ def run_execute(
     )
 
 
+def run_live_probe(command: RunCommand) -> PipelineResult:
+    """Run the one explicitly opted-in containment observation through the selected adapter."""
+    timeout = command.live_probe_timeout
+    if timeout is None:
+        raise CliError(EXIT_ERROR, "live isolation probe timeout must be positive and finite")
+    max_attempts = command.live_probe_max_attempts
+    if max_attempts is None:
+        raise CliError(EXIT_ERROR, "live isolation probe attempt budget must be positive")
+    project_root = Path(_require(command.project_root, "--project-root"))
+    agents_root = Path(_require(command.agents_root, "--agents-root"))
+    core_root = Path(_require(command.core_root, "--core-root"))
+    profile_path = _resolve_under(project_root, _logical_relative(
+        _require(command.profile, "--profile"), "--profile"), "--profile")
+    profile = _load_profile(profile_path)
+    project_dir = _resolve_under(project_root, profile.logical_paths.project, "project path")
+    plan_path = _resolve_under(project_dir, _logical_relative(
+        _require(command.plan, "--plan"), "--plan"), "--plan")
+    feature, specs = load_execute_specs(plan_path, command.feature)
+    if not feature or not FEATURE_RE.match(feature):
+        raise CliError(EXIT_ERROR, "feature name must be a single [A-Za-z0-9._-] token")
+    task_id = _require(command.task, "--task")
+    spec = next((item for item in specs if item.id == task_id), None)
+    if spec is None:
+        raise CliError(EXIT_ERROR, f"unknown task id: {task_id}")
+    route_reason = route_reasons(profile, (spec.task_type,)).get(spec.task_type)
+    if route_reason is not None:
+        raise CliError(EXIT_ERROR, route_reason)
+    registry = profile.registry
+    if registry is None:
+        raise CliError(EXIT_ERROR, "unresolved-executor")
+    route = registry.task_types[spec.task_type]
+    run_dir = project_dir / registry.storage[route.storage] / feature
+    try:
+        run = Run.load(run_dir, project_dir)
+        task = run.task(task_id)
+    except StateError as exc:
+        raise CliError(EXIT_ERROR, f"live probe target run could not be loaded: {exc}") from None
+    try:
+        spec, task_digest = effective_task_spec(run, spec)
+    except ExecutionError:
+        raise CliError(EXIT_ERROR, "live probe task contract differs from durable state") from None
+    # These comparisons are deliberately complete before adapter composition: a probe must
+    # never construct, let alone launch, a runtime against a different persisted task.
+    if task.adapter is not None and task.adapter != command.adapter:
+        raise CliError(EXIT_ERROR, "live probe adapter differs from the selected task adapter")
+    if task.executor is not None and task.executor != spec.executor:
+        raise CliError(EXIT_ERROR, "live probe role differs from the selected task contract")
+    if task.task_contract_digest is not None and task.task_contract_digest != task_digest:
+        raise CliError(EXIT_ERROR, "live probe task contract differs from durable state")
+    task.adapter = command.adapter
+    task.executor = spec.executor
+    task.task_contract_digest = task_digest
+    try:
+        composition = build_bootstrap(
+            project_dir, agents_root, core_root,
+            factories=docker_factories_for_command(command),
+        )
+        adapter = composition.make_execute_adapters(command.adapter)[0]
+    except AdapterUnavailable:
+        # An unavailable binary is a durable non-capability observation, never a launch retry.
+        adapter = SimpleNamespace(name=command.adapter)
+    request = build_live_probe_request(
+        task_id=task_id,
+        report_path=run.run_dir / "reports" / task_id / "live-probe.json",
+        allowed_scope=tuple(spec.allowed_scope),
+        timeout=timeout,
+    )
+    cli_version = _observed_cli_version(adapter, timeout)
+    record = execute_live_probe(
+        run, task_id=task_id, adapter=adapter, request=request, cli_version=cli_version,
+        task_contract_digest=task_digest,
+        bundle_digest=contract_digest(canonical_amendment_fields(spec)),
+        timeout_s=timeout, max_attempts=max_attempts,
+        attempt_id=f"probe-{len(run.live_probe_evidence) + 1}",
+    )
+    run.save()
+    return _result(f"live isolation probe recorded: {record['disposition']}\n", EXIT_OK)
+
+
+def _observed_cli_version(adapter: object, timeout: float) -> str:
+    """Read a selected runtime's bounded version observation, never a placeholder."""
+    if not getattr(adapter, "available", lambda: False)():
+        return "unavailable"
+    observe = getattr(adapter, "observe_cli_version", None)
+    if not callable(observe):
+        raise CliError(EXIT_ERROR, "selected adapter cannot observe its CLI version")
+    try:
+        version = observe(timeout)
+    except Exception as exc:
+        raise CliError(EXIT_ERROR, f"selected adapter CLI version observation failed: {exc}") from None
+    if not isinstance(version, str) or not version or version == "unknown":
+        raise CliError(EXIT_ERROR, "selected adapter returned no observed CLI version")
+    return version
+
+
 def dispatch(command: RunCommand) -> PipelineResult:
     """Resolve the typed command and run whichever use case it names.
 
@@ -701,6 +830,9 @@ def dispatch(command: RunCommand) -> PipelineResult:
     preview — no plan render, no gate text — so it branches into :func:`run_execute` before
     any of the preview-only resolution runs.
     """
+    _validate_live_probe_request(command)
+    if command.live_isolation_probe:
+        return run_live_probe(command)
     return run_command(command)
 
 
@@ -708,6 +840,7 @@ __all__ = [
     "dispatch",
     "run_command",
     "run_execute",
+    "run_live_probe",
     "run_amend",
     "make_execute_adapters",
 ]

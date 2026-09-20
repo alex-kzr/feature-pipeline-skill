@@ -66,6 +66,7 @@ from pipeline_core.verification import (
 from feature_pipeline.contracts import CommandSpec, TaskSpec
 from feature_pipeline.application.verification_service import VerificationRequest, VerificationService
 from feature_pipeline.application.work_items import activate_work_item, register_work_items
+from tests.support.isolation import proven_isolation_capabilities
 
 ANCHORS = VerifierAnchors(project_root="/repo", agents_root="/repo/.agents")
 
@@ -258,7 +259,7 @@ def _orchestrate(run: Run, spec: TaskSpec, task: FakeVerifier, test: FakeVerifie
     register_work_items(run, (spec,))
     with activate_work_item(run, spec.id):
         return orchestrate_verification(
-            run, spec, _evidence(**kw.pop("evidence_kw", {})),
+            run, spec, _evidence(task_id=spec.id, **kw.pop("evidence_kw", {})),
             launchers=VerifierLaunchers(task=task, test=test),
             anchors=ANCHORS, attempt=1,
         )
@@ -420,10 +421,11 @@ class VerifierResultTextExtractionTests(unittest.TestCase):
             executable = [sys.executable, str(script)]
 
             run = _implemented_run(root)
+            proven = proven_isolation_capabilities("claude", runtime="\0".join(executable))
             outcome = _orchestrate(
                 run, _spec(),
-                ClaudeAdapter(executable=executable),
-                ClaudeAdapter(executable=executable),
+                ClaudeAdapter(executable=executable, isolation_capabilities=proven),
+                ClaudeAdapter(executable=executable, isolation_capabilities=proven),
             )
 
             self.assertEqual(outcome.status, "done")
@@ -941,6 +943,48 @@ class LaunchFailureTests(unittest.TestCase):
                 run, _spec(), FakeVerifier(raise_code="adapter-unavailable"), FakeVerifier())
             self.assertEqual(outcome.status, "in_progress")
             self.assertIn("adapter-unavailable", outcome.failure)
+
+    def test_tc11_uses_two_runner_owned_fallback_verdicts_only_after_structural_rejection(self) -> None:
+        class IsolationVerifier:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def verify(self, *, task_id: str, role: str):  # noqa: ANN001
+                self.calls.append(role)
+                return type("Verdict", (), {
+                    "token": "PASS",
+                    "report": {"task_id": task_id, "role": role, "source": "live-probe"},
+                })()
+
+        with tempfile.TemporaryDirectory() as directory:
+            run = _implemented_run(Path(directory), task_id="TC-11")
+            spec = _spec(id="TC-11")
+            fallback = IsolationVerifier()
+            register_work_items(run, (spec,))
+            with activate_work_item(run, spec.id):
+                outcome = orchestrate_verification(
+                    run, spec, _evidence(task_id="TC-11"),
+                    launchers=VerifierLaunchers(
+                        task=FakeVerifier(raise_code="stack-isolation-unsupported"),
+                        test=FakeVerifier(raise_code="stack-isolation-unsupported"),
+                        deterministic_isolation=fallback,
+                    ), anchors=ANCHORS, attempt=1,
+                )
+
+            self.assertEqual(outcome.status, "done")
+            self.assertEqual((outcome.task_verdict, outcome.test_verdict), ("PASS", "PASS"))
+            self.assertEqual(fallback.calls, ["task_verifier", "test_verifier"])
+
+    def test_structural_rejection_without_the_runner_owned_fallback_stays_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run = _implemented_run(Path(directory), task_id="TC-11")
+            spec = _spec(id="TC-11")
+            outcome = _orchestrate(
+                run, spec, FakeVerifier(raise_code="stack-isolation-unsupported"), FakeVerifier(),
+            )
+
+        self.assertEqual(outcome.status, "in_progress")
+        self.assertIn("stack-isolation-unsupported", outcome.failure or "")
 
     def test_a_missing_session_id_blocks_before_the_envelope_request(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

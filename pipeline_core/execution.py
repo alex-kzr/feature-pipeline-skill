@@ -75,7 +75,7 @@ from feature_pipeline.domain.stages import (
     compile_stage_sequence,
 )
 from feature_pipeline.domain.vocabulary import StageId
-from feature_pipeline.contracts import TaskSpec
+from feature_pipeline.contracts import CommandSpec, TaskSpec
 from feature_pipeline.infrastructure.board_projection import (
     BoardProjectionError,
     CompletionEvidence,
@@ -90,7 +90,7 @@ from .adapter_resolution import (
     pin_adapter,
     resolve_adapter,
 )
-from .adapters import Adapter
+from .adapters import Adapter, LaunchRequest
 from .commands import (
     DIAGNOSTIC_OUTPUT_BUDGET,
     ROUTINE_OUTPUT_BUDGET,
@@ -100,11 +100,15 @@ from .dispatch import DispatchError
 from .lease import LeaseHeldError
 from .lifecycle import RunLifecycle
 from .plan import (
+    AMENDABLE_FIELDS,
+    AmendmentError,
     AmendmentRequiredResult,
     CLASSIFICATION_AMENDMENT_REQUIRED,
+    FORBIDDEN_SCOPE_PREFIXES,
     classify_baseline_failure,
     canonical_amendment_fields,
     contract_digest as amendment_contract_digest,
+    render_effective_task_contract,
 )
 from .prompt_envelope import EnvelopeAnchors
 from .reconciliation_registry import reconciliation_supersession_graph
@@ -142,6 +146,7 @@ __all__ = [
     "ExecuteRequest",
     "ExecuteResult",
     "ExecutionError",
+    "effective_task_spec",
     "RepairPass",
     "TaskExecution",
     "TaskRunResult",
@@ -176,6 +181,241 @@ def persist_task_contracts(run: Run, specs: Sequence[TaskSpec]) -> None:
         )
 
 
+def _current_approved_amendment_fields(
+    record, task_id: str, spec: TaskSpec | None = None,
+) -> Mapping[str, Any] | None:
+    """Return the canonical current amendment snapshot, or reject an invalid record.
+
+    ``run_amend`` persists the digest of ``canonical_amendment_fields(new_contract)``.
+    Resume validates that representation when it is available.  Earlier runner-created
+    records have only the approved digest; their complete runner-owned approval trail is
+    validated separately because the omitted snapshot cannot be re-created safely.
+    """
+    if record.current_revision == 0 and not record.amendment_revisions:
+        return None
+    if (
+        not isinstance(record.current_revision, int)
+        or isinstance(record.current_revision, bool)
+        or record.current_revision <= 0
+        or not isinstance(record.amendment_revisions, list)
+        or not record.amendment_revisions
+        or record.task_contract_version != "tam01-amendment-v1"
+    ):
+        raise ExecutionError(
+            f"resume amendment record is invalid for {task_id}",
+            "task-contract-mismatch",
+        )
+    revision = record.amendment_revisions[-1]
+    if not isinstance(revision, Mapping):
+        raise ExecutionError(
+            f"resume amendment record is invalid for {task_id}",
+            "task-contract-mismatch",
+        )
+    fields = revision.get("new_contract")
+    if (
+        revision.get("task_id") != task_id
+        or revision.get("revision") != record.current_revision
+        or revision.get("epoch") != record.current_revision
+        or not all(isinstance(revision.get(name), str) and revision[name].strip()
+                   for name in ("approved_by", "rationale", "source_evidence"))
+        or revision.get("new_digest") != record.task_contract_digest
+    ):
+        raise ExecutionError(
+            f"resume amendment record is invalid for {task_id}",
+            "task-contract-mismatch",
+        )
+    if "new_contract" not in revision:
+        if spec is None or not _is_runner_created_legacy_amendment(record, task_id):
+            raise ExecutionError(
+                f"resume amendment record is invalid for {task_id}",
+                "task-contract-mismatch",
+            )
+        # TAM-01 initially persisted just the approved digest.  Its digest identifies the
+        # historical approved contract, but cannot be recomputed from a later task file:
+        # the old record deliberately has no snapshot to overlay.  Accept only the complete
+        # runner-shaped approval record below, then retain the freshly parsed task contract.
+        try:
+            return canonical_amendment_fields(spec)
+        except AmendmentError as exc:
+            raise ExecutionError(
+                f"resume amendment record is invalid for {task_id}",
+                "task-contract-mismatch",
+            ) from exc
+    try:
+        canonical = canonical_amendment_fields(fields) if isinstance(fields, Mapping) else None
+    except AmendmentError as exc:
+        raise ExecutionError(
+            f"resume amendment record is invalid for {task_id}",
+            "task-contract-mismatch",
+        ) from exc
+    digest = amendment_contract_digest(canonical) if canonical is not None else None
+    if (
+        canonical is None
+        # The runner writes canonical fields.  Do not normalize a hand-edited record into
+        # validity during resume.
+        or dict(fields) != canonical
+        or revision.get("new_digest") != digest
+        or record.task_contract_digest != digest
+    ):
+        raise ExecutionError(
+            f"resume amendment record is invalid for {task_id}",
+            "task-contract-mismatch",
+        )
+    return canonical
+
+
+def _is_runner_created_legacy_amendment(record, task_id: str) -> bool:
+    """Recognize the digest-only TAM-01 record emitted before snapshots were persisted.
+
+    This is deliberately narrower than "a revision without ``new_contract``": every
+    append in the chain must have runner-compatible identities and a matching approved
+    operation.  There is no snapshot to rehash, so treating an arbitrary digest-only map as
+    current would make a hand-edited state file an authorization bypass.
+    """
+    revisions = record.amendment_revisions
+    if not isinstance(revisions, list) or len(revisions) != record.current_revision:
+        return False
+    for expected_revision, revision in enumerate(revisions, start=1):
+        if not isinstance(revision, Mapping):
+            return False
+        if (
+            revision.get("task_id") != task_id
+            or revision.get("revision") != expected_revision
+            or revision.get("epoch") != expected_revision
+            or "new_contract" in revision
+            or not all(
+                isinstance(revision.get(name), str) and revision[name].strip()
+                for name in ("prior_digest", "new_digest", "approved_by", "rationale",
+                             "source_evidence", "created_at")
+            )
+            or not all(
+                re.fullmatch(r"sha256:[0-9a-f]{64}", revision[name])
+                for name in ("prior_digest", "new_digest")
+            )
+        ):
+            return False
+        changed = revision.get("changed_fields")
+        if (
+            not isinstance(changed, list)
+            or not changed
+            or any(not isinstance(field, str) for field in changed)
+            or changed != sorted(set(changed))
+            or any(field not in AMENDABLE_FIELDS for field in changed)
+        ):
+            return False
+        added_paths = revision.get("added_paths")
+        if (
+            not isinstance(added_paths, list)
+            or any(not _is_safe_legacy_amendment_path(path) for path in added_paths)
+        ):
+            return False
+        expected_detail = (
+            f"revision {expected_revision} approved by {revision['approved_by']}: "
+            f"{revision['rationale']}"
+        )
+        if not any(
+            operation.get("kind") == "amendment"
+            and operation.get("outcome") == "approved"
+            and operation.get("detail") == expected_detail
+            for operation in record.operation_history
+            if isinstance(operation, Mapping)
+        ):
+            return False
+    return revisions[-1].get("new_digest") == record.task_contract_digest
+
+
+def _is_safe_legacy_amendment_path(path: object) -> bool:
+    """Apply the original amendment path boundary without normalizing legacy bytes."""
+    if not isinstance(path, str) or not path or path.startswith(("/", "~")):
+        return False
+    normalized = path.replace("\\", "/")
+    if re.match(r"^[A-Za-z]:/", normalized) or ".." in normalized.split("/"):
+        return False
+    return not any(
+        normalized == forbidden.rstrip("/") or normalized.startswith(forbidden)
+        for forbidden in FORBIDDEN_SCOPE_PREFIXES
+    )
+
+
+def _apply_approved_amendments(run: Run, specs: Sequence[TaskSpec]) -> tuple[TaskSpec, ...]:
+    """Overlay each accepted TAM-01 contract before a resumed task is validated or run."""
+    effective: list[TaskSpec] = []
+    for spec in specs:
+        if spec.id not in run.tasks:
+            effective.append(spec)
+            continue
+        record = run.task(spec.id)
+        fields = _current_approved_amendment_fields(record, spec.id, spec)
+        if fields is None:
+            effective.append(spec)
+            continue
+        commands = tuple(
+            CommandSpec(str(command[0]), tuple(str(arg) for arg in command[1]))
+            for command in fields["verification_commands"]
+        )
+        effective.append(replace(
+            spec,
+            allowed_scope=tuple(fields["allowed_scope"]),
+            out_of_scope=tuple(fields["out_of_scope"]),
+            verification_commands=commands,
+            max_repair_attempts=fields["max_repair_attempts"],
+            documentation_impact=tuple(fields["documentation_impact"]),
+        ))
+    return tuple(effective)
+
+
+def effective_task_spec(run: Run, spec: TaskSpec) -> tuple[TaskSpec, str]:
+    """Return the validated durable contract that governs ``spec``'s next launch.
+
+    An approved amendment is durable authority over its amendable fields. Callers must use
+    the returned spec and digest together so a later Markdown parse cannot substitute a
+    stale pre-amendment contract at a launch boundary.
+    """
+    if spec.id not in run.tasks:
+        return spec, task_contract_digest(spec)
+    record = run.task(spec.id)
+    effective = _apply_approved_amendments(run, (spec,))[0]
+    if record.current_revision:
+        # The overlay validates the persisted revision, including its fields and digest.
+        return effective, record.task_contract_digest
+    digest = task_contract_digest(effective)
+    if record.task_contract_digest is not None and record.task_contract_digest != digest:
+        raise ExecutionError(
+            f"durable task contract differs from current contract for {spec.id}",
+            "task-contract-mismatch",
+        )
+    return effective, digest
+
+
+class _EffectiveContractBriefingAdapter:
+    """Add the runner-selected contract to a fresh verifier briefing without changing grants."""
+
+    def __init__(self, adapter: Adapter, spec: TaskSpec) -> None:
+        self._adapter = adapter
+        self._briefing = (
+            "\nRunner-authoritative effective task contract:\n"
+            + render_effective_task_contract(spec)
+            + "\n- This briefing overrides conflicting scope, verification-command, and repair-budget "
+            "text in the historical task Markdown.\n"
+        )
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._adapter, name)
+
+    def launch(self, request: LaunchRequest):
+        if request.resume_session_id is None:
+            request = replace(request, prompt=request.prompt + self._briefing)
+        return self._adapter.launch(request)
+
+
+def _brief_verifier_launchers(launchers: VerifierLaunchers, spec: TaskSpec) -> VerifierLaunchers:
+    """Give both independent verifier contexts the same selected effective contract."""
+    return VerifierLaunchers(
+        task=_EffectiveContractBriefingAdapter(launchers.task, spec),
+        test=_EffectiveContractBriefingAdapter(launchers.test, spec),
+    )
+
+
 def run_task(life: RunLifecycle, request: TaskExecution) -> TaskRunResult:
     """Drive ``request.spec`` from ``ready`` (or a resumed ``implemented``/repair state) to a
     terminal ``verified`` or ``blocked``, including bounded repair.
@@ -188,6 +428,8 @@ def run_task(life: RunLifecycle, request: TaskExecution) -> TaskRunResult:
     keeps the ``run_task`` / :class:`TaskExecution` / :class:`TaskRunResult` names the
     execute-mode integration and the existing tests import.
     """
+    request = replace(
+        request, launchers=_brief_verifier_launchers(request.launchers, request.spec))
     register_work_items(life.run, (request.spec,))
     with activate_work_item(life.run, request.spec.id):
         return TaskEngine().run(life, request)
@@ -1104,16 +1346,15 @@ def _matches_approved_amendment(record, spec: TaskSpec) -> bool:
     amendment control can use the amendment digest, and its entire amendable surface must
     match the reloaded task definition.
     """
-    return (
-        record.current_revision > 0
-        and record.amendment_revisions
-        and record.task_contract_version == "tam01-amendment-v1"
-        and record.task_contract_digest == amendment_contract_digest(
-            canonical_amendment_fields(spec)
-        )
-        and record.amendment_revisions[-1].get("revision") == record.current_revision
-        and record.amendment_revisions[-1].get("new_digest") == record.task_contract_digest
-    )
+    try:
+        fields = _current_approved_amendment_fields(record, spec.id, spec)
+    except ExecutionError:
+        return False
+    if fields is None:
+        return False
+    if "new_contract" not in record.amendment_revisions[-1]:
+        return _is_runner_created_legacy_amendment(record, spec.id)
+    return fields == canonical_amendment_fields(spec)
 
 
 def _check_preconditions(life: RunLifecycle, request: ExecuteRequest, spec: TaskSpec,
@@ -1391,7 +1632,9 @@ def _plan_fingerprint(plan: CompiledRunPlan) -> dict[str, str]:
     return out
 
 
-def _ensure_plan_compatible(run: Run, plan: CompiledRunPlan) -> None:
+def _ensure_plan_compatible(
+    run: Run, plan: CompiledRunPlan, specs: Sequence[TaskSpec] = (),
+) -> None:
     """Resume guard: the freshly compiled plan must match the recorded one field for field.
 
     Raises :class:`ExecutionError` naming the first divergent field, before the run is
@@ -1399,6 +1642,15 @@ def _ensure_plan_compatible(run: Run, plan: CompiledRunPlan) -> None:
     """
     recorded = run.controls.get("plan_fingerprint", {}).get("value")
     now = _plan_fingerprint(plan)
+    for spec in specs:
+        if spec.id not in run.tasks:
+            continue
+        if _matches_approved_amendment(run.task(spec.id), spec):
+            prefix = f"task.{spec.id}"
+            now[f"{prefix}.repair_bound"] = repr(spec.max_repair_attempts)
+            now[f"{prefix}.control.max_repair_attempts"] = (
+                f"{spec.max_repair_attempts} (default)"
+            )
     if not isinstance(recorded, dict):
         # A run created before CP-02 (or by the pre-CP-02 wiring) recorded no fingerprint;
         # a bare digest check is the strongest statement available.
@@ -1780,7 +2032,7 @@ def _resume_open_run(
             "precondition-binding-mismatch",
         )
     if plan is not None:
-        _ensure_plan_compatible(recorded, plan)
+        _ensure_plan_compatible(recorded, plan, specs)
     cache_dir = _validate_operational_unblock(
         request, recorded, resolution, execution_scope, specs, plan)
     life = RunLifecycle.resume(
@@ -2120,6 +2372,13 @@ def execute_run(request: ExecuteRequest) -> ExecuteResult:
     else:
         by_id = _apply_repair_bound(specs, request.controls.max_repair_attempts)
     specs = [by_id[tid] for tid in order]
+    if request.controls.resume:
+        try:
+            recorded = Run.load(request.run_dir, request.repo_root)
+            specs = list(_apply_approved_amendments(recorded, specs))
+        except (StateError, ExecutionError) as exc:
+            return _error(f"{getattr(exc, 'code', 'state-error')}: {exc}", request)
+        by_id = {spec.id: spec for spec in specs}
 
     controls_map = _controls_map(request.controls, resolution)
     execution_scope = tuple(scope)

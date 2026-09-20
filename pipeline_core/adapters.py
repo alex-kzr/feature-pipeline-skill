@@ -55,16 +55,22 @@ Standard library only.
 from __future__ import annotations
 
 import hashlib
+import fnmatch
 import json
+import math
 import os
 import re
 import shutil
+import subprocess
+import tempfile
+import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Mapping, Protocol, Sequence
 
 from feature_pipeline.infrastructure.adapters.claude_launcher import ClaudeLauncher
 from feature_pipeline.infrastructure.adapters.codex_launcher import CodexLauncher
+from feature_pipeline.ports.adapters import AdapterCapabilities, STRICT_ISOLATION_CAPABILITIES
 from feature_pipeline.ports.process import ProcessError
 
 #: Capabilities that let a role change the working tree. A read-only launch drops every one.
@@ -98,6 +104,159 @@ class AdapterError(RuntimeError):
     def __init__(self, message: str, code: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+@dataclass(frozen=True)
+class LaunchComposition:
+    """The runner-owned canonical values from which a launch request was composed.
+
+    The adapter compares the mutable-looking request fields with this immutable record before
+    it resolves an executable or calls a process runner.  It is intentionally carried on every
+    request in a composed launch, including tool-free continuation envelopes, so a later layer
+    cannot substitute a same-shaped digest, widen scope, or add grants.
+    """
+
+    recipient_role: str
+    bundle_digest: str | None
+    allowed_scope: tuple[str, ...]
+    role_grant: tuple[str, ...]
+
+
+#: Stable, machine-readable reason for a strict-role launch an adapter cannot structurally
+#: back (R03/TC-11). This is a fail-closed rejection, never a silent downgrade to an
+#: unrestricted or read-only-substitute launch (Requirements: "Return
+#: stack-isolation-unsupported for incapable surfaces...").
+STACK_ISOLATION_UNSUPPORTED = "stack-isolation-unsupported"
+
+#: Stable, machine-readable reason for a request whose bound recipient role or bundle digest
+#: disagrees with the role actually being launched — role or bundle substitution.
+ROLE_BUNDLE_SUBSTITUTION = "role-bundle-substitution"
+
+#: Claude's ``-p`` argv structurally backs three tokens (see
+#: :data:`feature_pipeline.ports.adapters.AdapterRegistry.default`'s Claude entry for the
+#: exact flag-by-flag rationale for ``bundle_validated``/``discovery_isolated``/
+#: ``skill_reads_enforced``). It does *not* structurally back ``subprocess_isolated`` or
+#: ``nested_delegation_isolated``: ``docs/validation/task-model-routing/TC-02-capabilities.md``
+#: marks nested-delegate/subprocess isolation UNKNOWN and live-unrun for both runtimes ("No
+#: field or code path constrains tools available to a nested delegate or a subprocess the
+#: session spawns") and its §1e disposition requires an opt-in budgeted live probe (R03 /
+#: MO-14 live matrix) before either token may be declared held; UNKNOWN never counts as PASS
+#: (AC-4). Declared once here so every :class:`ClaudeAdapter` instance launches against the
+#: same evidence-bound default unless a caller supplies an explicit, separately budgeted
+#: live-probe measurement that proves those two tokens for the observed CLI version.
+CLAUDE_ISOLATION_CAPABILITIES = AdapterCapabilities(
+    "claude",
+    available=True,
+    supports_resume=True,
+    supports_read_only=True,
+    supports_write=True,
+    supports_bundle_validated=True,
+    supports_discovery_isolated=True,
+    supports_skill_reads_enforced=True,
+    supports_subprocess_isolated=False,
+    supports_nested_delegation_isolated=False,
+)
+
+#: ``codex exec`` has no agent/role/bundle flag, no dedicated no-tools switch and no
+#: discovery-scoping flag (TC-02-capabilities.md 1e), so it cannot structurally back any
+#: strict-isolation token. Every token defaults closed; a strict-role Codex launch fails
+#: :data:`STACK_ISOLATION_UNSUPPORTED` rather than falling back to the read-only sandbox.
+CODEX_ISOLATION_CAPABILITIES = AdapterCapabilities(
+    "codex",
+    available=True,
+    supports_resume=False,
+    supports_read_only=True,
+    supports_write=True,
+    supports_bundle_validated=False,
+    supports_discovery_isolated=False,
+    supports_skill_reads_enforced=False,
+    supports_subprocess_isolated=False,
+    supports_nested_delegation_isolated=False,
+)
+
+
+def _runtime_identity(executable: str | Sequence[str]) -> str:
+    """Return the exact selected executable command as a stable proof identity."""
+    return executable if isinstance(executable, str) else "\0".join(executable)
+
+
+def require_strict_isolation(
+    capabilities: AdapterCapabilities,
+    *,
+    role: str,
+    executable: str | Sequence[str],
+    cli_surface: str,
+) -> None:
+    """Fail closed before any process starts unless every strict-isolation token holds.
+
+    A strict role launch (executor, task-verifier, tool-free test-verifier) requires all of
+    :data:`~feature_pipeline.ports.adapters.STRICT_ISOLATION_CAPABILITIES`. Missing live proof
+    of a guarantee is UNKNOWN — it is never treated as a derived or assumed capability, so a
+    declared-``False`` token here always rejects rather than silently launching an
+    unrestricted worker.
+    """
+    runtime_matches = capabilities.runtime == _runtime_identity(executable)
+    surface_matches = capabilities.cli_surface == cli_surface
+    missing = [token for token in STRICT_ISOLATION_CAPABILITIES if not capabilities.has(token)]
+    if not runtime_matches or not surface_matches:
+        missing = list(STRICT_ISOLATION_CAPABILITIES)
+    if missing:
+        raise AdapterError(
+            f"adapter {capabilities.name!r} cannot enforce strict isolation for role "
+            f"{role!r}; missing/unproven: {', '.join(missing)}",
+            STACK_ISOLATION_UNSUPPORTED,
+        )
+
+
+def _assert_bundle_identity(request: "LaunchRequest") -> None:
+    """Fail closed on a request whose bound recipient role or bundle digest is inconsistent.
+
+    ``recipient_role``/``bundle_digest`` are set once, by the runner, from the exact skill
+    bundle resolved for the role actually being launched (AC-1). A request carrying a
+    recipient role that disagrees with the launched role, or a malformed digest, is role or
+    bundle substitution and must never reach a process.
+    """
+    composition = request.composition
+    if composition is not None:
+        if request.recipient_role != composition.recipient_role:
+            raise AdapterError(
+                "request recipient role does not match its canonical composition",
+                ROLE_BUNDLE_SUBSTITUTION,
+            )
+        if request.bundle_digest != composition.bundle_digest:
+            raise AdapterError(
+                "request bundle digest does not match its canonical composition",
+                ROLE_BUNDLE_SUBSTITUTION,
+            )
+        if not set(request.allowed_scope).issubset(composition.allowed_scope):
+            raise AdapterError(
+                "request allowed scope widens its canonical composition",
+                ROLE_BUNDLE_SUBSTITUTION,
+            )
+        if not set(effective_grant(request)).issubset(composition.role_grant):
+            raise AdapterError(
+                "request grants widen its canonical composition",
+                ROLE_BUNDLE_SUBSTITUTION,
+            )
+    if request.recipient_role is not None:
+        wanted = normalize_role(request.recipient_role)
+        launched = normalize_role(request.role)
+        # The generic "executor" bundle recipient category is compatible with any concrete
+        # ``*-executor`` role (``python-executor``, ``rust-executor``, ...) — bundles are
+        # composed for the semantic executor category, never a specific stack's agent name —
+        # but never with a verifier or any other role.
+        compatible = wanted == launched or (wanted == "executor" and is_executor_role(request.role))
+        if not compatible:
+            raise AdapterError(
+                f"request recipient role {request.recipient_role!r} does not match launched "
+                f"role {request.role!r}",
+                ROLE_BUNDLE_SUBSTITUTION,
+            )
+    if request.bundle_digest is not None and not re.fullmatch(r"[0-9a-f]{64}", request.bundle_digest):
+        raise AdapterError(
+            f"bundle digest {request.bundle_digest!r} is not a valid sha256 hex digest",
+            ROLE_BUNDLE_SUBSTITUTION,
+        )
 
 
 @dataclass(frozen=True)
@@ -135,6 +294,43 @@ class LaunchRequest:
     #: execution controls; adapters never infer them from prompt prose or configuration.
     model: str | None = None
     effort: str | None = None
+    #: The role this launch's resolved skill bundle/context was actually composed for (AC-1).
+    #: ``None`` when no bundle applies (e.g. a project without a configured profile). Set once
+    #: by the runner at request-composition time; an adapter never infers or widens it.
+    recipient_role: str | None = None
+    #: The lowercase sha256 hex digest of the skill bundle resolved for ``recipient_role``
+    #: (:meth:`feature_pipeline.application.skill_bundles.ResolvedSkillBundle.digest`), or
+    #: ``None`` when no bundle applies. Immutable evidence binding the launched request to the
+    #: exact reviewed skill content it was composed with.
+    bundle_digest: str | None = None
+    #: Canonical values selected by the runner while resolving the role's actual bundle.  A
+    #: composed strict launch must retain this binding through every adapter boundary.
+    composition: LaunchComposition | None = None
+
+
+@dataclass(frozen=True)
+class LiveProbeRequest:
+    """One runner-owned containment observation, distinct from every pipeline role launch."""
+
+    task_id: str
+    prompt: str
+    report_path: Path
+    allowed_scope: tuple[str, ...]
+    timeout: float
+
+    def as_launch_request(self, *, no_tools: bool) -> LaunchRequest:
+        """Lower the fixed probe contract without accepting an executor/verifier identity."""
+        if (not self.task_id or not self.prompt
+                or not isinstance(self.timeout, (int, float))
+                or isinstance(self.timeout, bool) or not math.isfinite(self.timeout)
+                or self.timeout <= 0):
+            raise AdapterError("runner-owned live probe request is invalid", "live-probe-invalid")
+        return LaunchRequest(
+            role="runner-live-isolation-probe", task_id=self.task_id, prompt=self.prompt,
+            report_path=self.report_path, read_only=True, working_root=".",
+            role_grant=("read",), allowed_scope=self.allowed_scope, fresh_session=True,
+            no_tools=no_tools, timeout=self.timeout,
+        )
 
 
 @dataclass(frozen=True)
@@ -153,6 +349,15 @@ class LaunchResult:
     stderr: str = ""
     session_id: str | None = None
     raw_stdout: str = ""
+    # Probe-only, non-evidentiary facts.  These are deliberately classifications rather
+    # than the model's response: the runner may persist them when a probe fails.
+    probe_parse_status: str | None = None
+    probe_allowed_write: bool | None = None
+    probe_failure_class: str | None = None
+    probe_sibling_mounted: bool | None = None
+    probe_subprocess_state: str | None = None
+    probe_nested_state: str | None = None
+    probe_stderr_reason: str | None = None
 
 
 #: Stable, machine-readable reason for every executor-context-bundle rejection.
@@ -773,15 +978,33 @@ def build_codex_argv(
     working_root: str | os.PathLike[str] | None = None,
     add_dirs: Sequence[str | os.PathLike[str]] = (),
     sandbox: str | None = None,
+    isolation_probe: bool = False,
 ) -> list[str]:
     """Build the documented non-interactive ``codex exec`` argv for one launch."""
     grant = effective_grant(request)
+    if request.no_tools:
+        # `codex exec` has no argv surface that denies every tool.  Its read-only sandbox
+        # only prevents writes; it still permits reads and command execution, so accepting
+        # this request would falsely label an override-admitted test verifier tool-free.
+        raise AdapterError(
+            "codex exec cannot enforce a tool-free launch",
+            "no-tools-unsupported",
+        )
     argv = _executable_prefix(executable) + ["exec"]
     # ``codex exec resume --help`` intentionally exposes no sandbox, working-directory, or
     # extra-directory flags. A runner status continuation is therefore a fresh, tool-free
     # request so its read-only sandbox and resolved grants are present on the actual argv.
     sandbox = "read-only" if request_is_read_only(request) else (sandbox or "workspace-write")
     argv += ["--json", "--sandbox", sandbox]
+    if isolation_probe:
+        # The runner-owned probe must neither resume nor persist an ambient Codex session,
+        # and its observation must not inherit user configuration or exec-policy rules. Its
+        # temporary runner-owned cwd is not a trusted Git worktree, so Codex also requires
+        # the documented repository check bypass for this probe alone.
+        argv += [
+            "--ephemeral", "--ignore-user-config", "--ignore-rules",
+            "--skip-git-repo-check",
+        ]
     if request.model is not None:
         argv += ["--model", request.model]
     if request.effort is not None:
@@ -1004,6 +1227,27 @@ class CompletedProcess:
     stderr: str
 
 
+def observe_cli_version(
+    executable: str | Sequence[str] | None,
+    runner: ProcessRunner,
+    *,
+    timeout: float,
+    env: dict[str, str] | None,
+) -> str:
+    """Observe one CLI version with the adapter's shell-free, bounded process runner."""
+    if executable is None:
+        raise AdapterError("the selected CLI is not available", "adapter-unavailable")
+    argv = (executable,) if isinstance(executable, str) else tuple(executable)
+    completed = runner((*argv, "--version"), prompt="", timeout=timeout, env=env)
+    if completed.exit_code != 0:
+        raise AdapterError("the selected CLI did not report a version", "adapter-version-unavailable")
+    lines = (completed.stdout or completed.stderr).strip().splitlines()
+    version = lines[0].strip() if lines else ""
+    if not version or len(version) > 200 or any(not char.isprintable() for char in version):
+        raise AdapterError("the selected CLI returned an invalid version", "adapter-version-invalid")
+    return version
+
+
 def run_subprocess(
     argv: Sequence[str],
     *,
@@ -1063,6 +1307,25 @@ def run_codex_subprocess(
 
 
 ProcessRunner = Callable[..., CompletedProcess]
+IsolationProbeValidator = Callable[[str | Sequence[str], str], AdapterCapabilities]
+
+
+def _validated_strict_capabilities(
+    capabilities: AdapterCapabilities,
+    validator: IsolationProbeValidator | None,
+    executable: str | Sequence[str],
+    cli_surface: str,
+) -> AdapterCapabilities:
+    """Use the runner's current proof only when production supplied its validator."""
+    if validator is None:
+        return capabilities
+    try:
+        return validator(executable, cli_surface)
+    except ValueError as exc:
+        raise AdapterError(
+            "adapter strict-isolation evidence is unavailable or invalid",
+            STACK_ISOLATION_UNSUPPORTED,
+        ) from exc
 
 
 class ClaudeAdapter:
@@ -1094,6 +1357,8 @@ class ClaudeAdapter:
         executor_contexts: Mapping[str, ExecutorContextBundle] | None = None,
         required_input_dirs: Mapping[str, Sequence[str]] | None = None,
         task_scope_dirs: Mapping[str, Sequence[str]] | None = None,
+        isolation_capabilities: AdapterCapabilities | None = None,
+        isolation_probe_validator: IsolationProbeValidator | None = None,
     ) -> None:
         self._executable = executable
         self._resolver = resolver or (lambda: shutil.which("claude"))
@@ -1103,6 +1368,11 @@ class ClaudeAdapter:
         self._env = env
         self._timeout = timeout
         self._working_root = Path(working_root) if working_root is not None else None
+        #: Declared strict-isolation guarantees (R03). Defaults to the evidence-bound
+        #: structural declaration; a caller only overrides this with an explicit,
+        #: separately budgeted live-probe measurement — never to widen a launch silently.
+        self._isolation_capabilities = isolation_capabilities or CLAUDE_ISOLATION_CAPABILITIES
+        self._isolation_probe_validator = isolation_probe_validator
         #: Runner-owned minimal mandatory-input directory grants, keyed by task id. Merged
         #: into the launch's ``--add-dir`` set on the first (session-opening) launch so a
         #: nested working root can read its task/plan/prompt/skill files (REC-05).
@@ -1128,6 +1398,12 @@ class ClaudeAdapter:
 
     def available(self) -> bool:
         return self.resolved_executable() is not None
+
+    def observe_cli_version(self, timeout: float) -> str:
+        """Return one bounded, runner-observed CLI version before a live probe launch."""
+        return observe_cli_version(
+            self.resolved_executable(), self._runner, timeout=timeout, env=self._env,
+        )
 
     def can_resolve_executor(self, role: str, *, working_root: str = ".") -> bool:
         """Resolve custom or enabled built-in agents before opening an executor window.
@@ -1178,11 +1454,24 @@ class ClaudeAdapter:
         )
 
     def launch(self, request: LaunchRequest) -> LaunchResult:
+        # This is a security boundary, not an availability probe: reject a strict role this
+        # adapter cannot structurally isolate before checking the executable, building argv,
+        # or starting any process (AC-2).
+        _assert_bundle_identity(request)
         executable = self.resolved_executable()
         if executable is None:
             raise AdapterError(
                 "the Claude CLI is not available on PATH", "adapter-unavailable"
             )
+        require_strict_isolation(
+            _validated_strict_capabilities(
+                self._isolation_capabilities, self._isolation_probe_validator,
+                executable, "claude -p",
+            ),
+            role=request.role,
+            executable=executable,
+            cli_surface="claude -p",
+        )
         request = self._with_required_inputs(request)
         argv = build_claude_argv(
             request, executable=executable,
@@ -1205,6 +1494,28 @@ class ClaudeAdapter:
             stderr=completed.stderr,
             session_id=parse_session_id(completed.stdout) or request.resume_session_id,
             raw_stdout=completed.stdout,
+        )
+
+    def launch_live_probe(self, request: LiveProbeRequest) -> LaunchResult:
+        """Launch the typed probe from an empty temporary root, never project context."""
+        if type(request) is not LiveProbeRequest:
+            raise AdapterError("live probe requires a runner-owned request", "live-probe-invalid")
+        executable = self.resolved_executable()
+        if executable is None:
+            raise AdapterError("the Claude CLI is not available on PATH", "adapter-unavailable")
+        probe = request.as_launch_request(no_tools=True)
+        completed = self._runner(
+            build_claude_argv(
+                probe, executable=executable, settings_path=self._settings_path,
+                add_dirs=self._add_dirs_for(probe),
+            ),
+            prompt=probe.prompt, cwd=self._cwd_for(probe), timeout=probe.timeout, env=self._env,
+        )
+        extracted_text = parse_result_text(completed.stdout)
+        return LaunchResult(
+            exit_code=completed.exit_code,
+            stdout=extracted_text if extracted_text is not None else completed.stdout,
+            stderr=completed.stderr, raw_stdout=completed.stdout,
         )
 
     def _prompt_for(self, request: LaunchRequest) -> str:
@@ -1262,6 +1573,8 @@ class CodexAdapter:
         working_root: str | os.PathLike[str] | None = None,
         required_input_dirs: Mapping[str, Sequence[str]] | None = None,
         task_scope_dirs: Mapping[str, Sequence[str]] | None = None,
+        isolation_capabilities: AdapterCapabilities | None = None,
+        isolation_probe_validator: IsolationProbeValidator | None = None,
     ) -> None:
         self._executable = executable
         self._resolver = resolver or (lambda: shutil.which("codex"))
@@ -1270,6 +1583,12 @@ class CodexAdapter:
         self._env = env
         self._timeout = timeout
         self._working_root = Path(working_root) if working_root is not None else None
+        #: Declared strict-isolation guarantees (R03). Defaults to the evidence-bound
+        #: structural declaration — every token closed, since ``codex exec`` exposes none of
+        #: the required flags — unless a caller supplies an explicit, separately budgeted
+        #: live-probe measurement.
+        self._isolation_capabilities = isolation_capabilities or CODEX_ISOLATION_CAPABILITIES
+        self._isolation_probe_validator = isolation_probe_validator
         #: Runner-owned minimal mandatory-input directory grants, keyed by task id (REC-05).
         self._required_input_dirs: dict[str, tuple[str, ...]] = {
             key: tuple(value) for key, value in dict(required_input_dirs or {}).items()
@@ -1286,6 +1605,12 @@ class CodexAdapter:
 
     def available(self) -> bool:
         return self.resolved_executable() is not None
+
+    def observe_cli_version(self, timeout: float) -> str:
+        """Return one bounded, runner-observed CLI version before a live probe launch."""
+        return observe_cli_version(
+            self.resolved_executable(), self._runner, timeout=timeout, env=self._env,
+        )
 
     def _with_required_inputs(self, request: LaunchRequest) -> LaunchRequest:
         """Merge this task's minimal mandatory-input grants onto a fresh request (REC-05)."""
@@ -1311,9 +1636,20 @@ class CodexAdapter:
         )
 
     def launch(self, request: LaunchRequest) -> LaunchResult:
+        # See ClaudeAdapter.launch: a security boundary checked before any process starts.
+        _assert_bundle_identity(request)
         executable = self.resolved_executable()
         if executable is None:
             raise AdapterError("the Codex CLI is not available on PATH", "adapter-unavailable")
+        require_strict_isolation(
+            _validated_strict_capabilities(
+                self._isolation_capabilities, self._isolation_probe_validator,
+                executable, "codex exec",
+            ),
+            role=request.role,
+            executable=executable,
+            cli_surface="codex exec",
+        )
         request = self._with_required_inputs(request)
         completed = self._runner(
             build_codex_argv(
@@ -1335,6 +1671,34 @@ class CodexAdapter:
             completed.stderr,
             parse_codex_session_id(completed.stdout) or request.resume_session_id,
             completed.stdout,
+        )
+
+    def launch_live_probe(self, request: LiveProbeRequest) -> LaunchResult:
+        """Launch only the typed runner probe, without treating it as a strict role launch."""
+        if type(request) is not LiveProbeRequest:
+            raise AdapterError("live probe requires a runner-owned request", "live-probe-invalid")
+        executable = self.resolved_executable()
+        if executable is None:
+            raise AdapterError("the Codex CLI is not available on PATH", "adapter-unavailable")
+        # Codex exposes no tool-free switch.  Its bounded probe is still read-only, while the
+        # measurement records any negative outcome and never grants capabilities from it.
+        probe = request.as_launch_request(no_tools=False)
+        # Codex discovers AGENTS.md and skills relative to its working directory. A probe must
+        # observe only the adapter boundary, so it receives neither the project root nor any
+        # task input or scoped directory grant.
+        with tempfile.TemporaryDirectory(prefix="pipeline-live-probe-") as directory:
+            hermetic_root = Path(directory)
+            completed = self._runner(
+                build_codex_argv(
+                    probe, executable=executable, working_root=hermetic_root,
+                    add_dirs=(), sandbox="read-only", isolation_probe=True,
+                ),
+                prompt=probe.prompt, cwd=hermetic_root, timeout=probe.timeout, env=self._env,
+            )
+        text = parse_codex_result_text(completed.stdout)
+        return LaunchResult(
+            completed.exit_code, text if text is not None else completed.stdout,
+            completed.stderr, raw_stdout=completed.stdout,
         )
 
     def _sandbox_for(self, request: LaunchRequest) -> str | None:
@@ -1376,3 +1740,443 @@ class CodexAdapter:
                 and workspace.parent.name.startswith("feature-pipeline-executor-")):
             return tuple(dict.fromkeys((str(workspace), root, *external_roots, *task_dirs)))
         return tuple(dict.fromkeys((root, *external_roots, *task_dirs)))
+
+
+_IMAGE_DIGEST_RE = re.compile(r"^[a-z0-9][a-z0-9./_-]*@sha256:[0-9a-f]{64}$")
+_CODEX_VERSION_RE = re.compile(r"^[0-9]+(?:\.[0-9]+){1,3}(?:[-+][0-9A-Za-z.-]+)?$")
+_CONNECT_PROXY_SOURCE = r'''import ipaddress
+import select
+import socket
+import socketserver
+ALLOW = ("api.openai.com", "auth.openai.com", "chatgpt.com", "registry.npmjs.org")
+def allowed(host):
+    host = host.rstrip(".").lower()
+    try: ipaddress.ip_address(host); return False
+    except ValueError: pass
+    return any(host == suffix or host.endswith("." + suffix) for suffix in ALLOW)
+def public_address(host):
+    try: records = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+    except OSError: return None
+    addresses = [record[4][0] for record in records]
+    if not addresses: return None
+    for address in addresses:
+        value = ipaddress.ip_address(address)
+        if value.is_private or value.is_loopback or value.is_link_local or value.is_reserved or value.is_multicast or value.is_unspecified: return None
+    return addresses[0]
+class Proxy(socketserver.StreamRequestHandler):
+    def handle(self):
+        parts = self.rfile.readline(4096).decode("ascii", "replace").strip().split()
+        if len(parts) != 3 or parts[0] != "CONNECT": return
+        host, sep, port = parts[1].rpartition(":")
+        if not sep or not host or not port.isdigit() or int(port) != 443 or not allowed(host): return
+        while True:
+            header = self.rfile.readline(4096)
+            if not header or header in (b"\r\n", b"\n"): break
+        address = public_address(host)
+        if address is None: return
+        try: upstream = socket.create_connection((address, 443), timeout=15)
+        except OSError: return
+        self.wfile.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        try:
+            while True:
+                ready, _, _ = select.select((self.connection, upstream), (), (), 30)
+                for source in ready:
+                    data = source.recv(65536)
+                    if not data: return
+                    (upstream if source is self.connection else self.connection).sendall(data)
+        finally: upstream.close()
+class Server(socketserver.ThreadingTCPServer): allow_reuse_address = True
+Server(("0.0.0.0", 8080), Proxy).serve_forever()
+'''
+
+
+def _scoped_container_patterns(request: LaunchRequest, source: Path) -> tuple[str, ...]:
+    """Return only scope patterns relative to the routed working root.
+
+    Plans name paths from the disposable-workspace root, whereas an adapter is routed to a
+    nested working root such as ``feature-pipeline-skill``.  Removing that one matching prefix
+    never widens a pattern; a scope rooted elsewhere simply supplies no writable file.
+    """
+    patterns: list[str] = []
+    for raw in request.allowed_scope:
+        value = raw.replace("\\", "/").lstrip("/")
+        prefix = f"{source.name}/"
+        if value.startswith(prefix):
+            value = value[len(prefix):]
+        if value and not value.startswith("../"):
+            patterns.append(value)
+    return tuple(patterns)
+
+
+def _copy_scoped_workspace(source: Path, target: Path, patterns: Sequence[str]) -> None:
+    """Create the container's writable worktree from allowed files only."""
+    for candidate in source.rglob("*"):
+        if candidate.is_symlink() or not candidate.is_file():
+            continue
+        relative = candidate.relative_to(source).as_posix()
+        if not any(fnmatch.fnmatchcase(relative, pattern) for pattern in patterns):
+            continue
+        destination = target / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(candidate, destination)
+
+
+def _normalize_container_workspace(workspace: Path) -> None:
+    """Make the disposable scoped copy writable by the contained non-root UID only."""
+    workspace.chmod(0o777)
+    for candidate in workspace.rglob("*"):
+        candidate.chmod(0o777 if candidate.is_dir() else 0o666)
+
+
+class DockerCodexAdapter:
+    """Opt-in strict Codex launch path contained by a runner-owned Docker workspace.
+
+    This adapter is deliberately separate from :class:`CodexAdapter`: no Windows host launch
+    can fall through to Docker, and no Docker problem can fall through to danger-full-access.
+    The caller must supply a digest-pinned image and the one existing auth file selected by the
+    runner.  The file is bind-mounted read-only without this class ever opening it.
+    """
+
+    name = "codex"
+    isolated_workspace = True
+    requires_fresh_envelope_context = True
+
+    def __init__(
+        self,
+        *,
+        image: str,
+        proxy_image: str,
+        codex_version: str,
+        auth_file: Path,
+        docker_executable: str = "docker",
+        runner: ProcessRunner | None = None,
+        timeout: float = DEFAULT_TIMEOUT_S,
+        isolation_capabilities: AdapterCapabilities | None = None,
+        image_validator: Callable[[str, str], bool] | None = None,
+        docker_runner: Callable[[list[str]], CompletedProcess] | None = None,
+    ) -> None:
+        if not _IMAGE_DIGEST_RE.fullmatch(image):
+            raise AdapterError("container image must be digest-pinned", "container-image-unpinned")
+        if not _IMAGE_DIGEST_RE.fullmatch(proxy_image):
+            raise AdapterError("CONNECT proxy image must be digest-pinned", "container-proxy-image-unpinned")
+        if not _CODEX_VERSION_RE.fullmatch(codex_version):
+            raise AdapterError("Codex package version must be pinned", "container-package-unpinned")
+        if auth_file.is_symlink() or not auth_file.is_file():
+            raise AdapterError("runner-selected Codex auth file is unavailable", "container-auth-unavailable")
+        self._image = image
+        self._proxy_image = proxy_image
+        self._codex_version = codex_version
+        self._auth_file = auth_file.resolve()
+        self._docker_executable = docker_executable
+        self._runner: ProcessRunner = runner or run_codex_subprocess
+        self._timeout = timeout
+        self._isolation_capabilities = isolation_capabilities or CODEX_ISOLATION_CAPABILITIES
+        self._image_validator = image_validator or self._validate_image
+        self._docker_runner = docker_runner or self._run_docker
+
+    def available(self) -> bool:
+        """Docker is usable only when the runner-selected auth file still exists."""
+        return shutil.which(self._docker_executable) is not None and self._auth_file.is_file()
+
+    def observe_cli_version(self, timeout: float) -> str:
+        """Observe the exact npm-pinned runtime through the same contained proxy path."""
+        if not self.available() or not self._validate_runtime_identity():
+            raise AdapterError("container runtime is unavailable", "container-image-unavailable")
+        network = f"feature-pipeline-codex-version-{uuid.uuid4().hex}"
+        proxy_name = f"codex-egress-proxy-{uuid.uuid4().hex}"
+        created = False
+        try:
+            if self._control(["network", "create", "--internal", network]).exit_code != 0:
+                raise AdapterError("internal Codex network could not be created", "container-network-unavailable")
+            created = True
+            proxy = self._control([
+                "run", "-d", "--rm", "--name", proxy_name, "--network", network,
+                "--network-alias", "codex-egress-proxy", "--read-only", "--cap-drop", "ALL",
+                "--security-opt", "no-new-privileges", "--pids-limit", "64",
+                "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=16m", self._proxy_image,
+                "python", "-c", _CONNECT_PROXY_SOURCE,
+            ])
+            if proxy.exit_code != 0 or self._control(["network", "connect", "bridge", proxy_name]).exit_code != 0:
+                raise AdapterError("runner-owned CONNECT proxy could not be started", "container-proxy-unavailable")
+            result = self._runner(self._version_argv(network), prompt="", cwd=None,
+                                  timeout=min(timeout, 120.0), env=None)
+            if result.exit_code != 0 or not self._is_expected_codex_version(result.stdout):
+                raise AdapterError("npm-pinned Codex version is unavailable or mismatched", "container-codex-unavailable")
+            return result.stdout.strip()
+        finally:
+            self._control(["rm", "-f", proxy_name])
+            if created:
+                self._control(["network", "rm", network])
+
+    @staticmethod
+    def _run_docker(argv: list[str]) -> CompletedProcess:
+        try:
+            result = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8",
+                                    errors="strict", timeout=30, check=False)
+        except (OSError, subprocess.SubprocessError, UnicodeError):
+            return CompletedProcess(1, "", "docker control command failed")
+        return CompletedProcess(result.returncode, result.stdout, result.stderr)
+
+    def _control(self, argv: list[str]) -> CompletedProcess:
+        return self._docker_runner([self._docker_executable, *argv])
+
+    @staticmethod
+    def _validate_image(docker_executable: str, image: str) -> bool:
+        """Require Docker to resolve the exact digest-pinned image before role launch."""
+        try:
+            result = subprocess.run(
+                [docker_executable, "image", "inspect", "--format", "{{json .RepoDigests}}", image],
+                capture_output=True, text=True, encoding="utf-8", errors="strict",
+                timeout=15, check=False,
+            )
+        except (OSError, subprocess.SubprocessError, UnicodeError):
+            return False
+        if result.returncode != 0:
+            return False
+        try:
+            digests = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return False
+        return isinstance(digests, list) and image in digests
+
+    def _validate_runtime_identity(self) -> bool:
+        for selected in (self._image, self._proxy_image):
+            image = self._control(["image", "inspect", "--format", "{{json .RepoDigests}}", selected])
+            if image.exit_code != 0:
+                return False
+            try:
+                digests = json.loads(image.stdout)
+            except json.JSONDecodeError:
+                return False
+            if not isinstance(digests, list) or selected not in digests:
+                return False
+        return True
+
+    def _version_argv(self, network: str) -> list[str]:
+        """Run the exact npm-pinned Codex version through the allowlisted proxy."""
+        return [
+            self._docker_executable, "run", "--rm", "--network", network, "--read-only",
+            "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "256",
+            "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m",
+            "--tmpfs", "/npm-cache:rw,exec,nosuid,nodev,size=768m",
+            "--tmpfs", "/run/codex-auth:rw,noexec,nosuid,nodev,size=1m",
+            "--tmpfs", "/codex-home:rw,noexec,nosuid,nodev,size=8m",
+            "--mount", f"type=bind,src={self._auth_file},dst=/run/codex-auth/auth.json,readonly",
+            "--env", "HTTP_PROXY=http://codex-egress-proxy:8080",
+            "--env", "HTTPS_PROXY=http://codex-egress-proxy:8080", "--env", "NO_PROXY=",
+            "--env", "CODEX_HOME=/codex-home", "--env", "NPM_CONFIG_CACHE=/npm-cache",
+            "--env", "TMPDIR=/npm-cache",
+            self._image, "sh", "-ceu",
+            "cp /run/codex-auth/auth.json \"$CODEX_HOME/auth.json\"; "
+            f"exec npx --yes --package @openai/codex@{self._codex_version} codex --version",
+        ]
+
+    def _validate_codex_version(self, network: str) -> bool:
+        version = self._runner(self._version_argv(network), prompt="", cwd=None,
+                               timeout=min(self._timeout, 120.0), env=None)
+        return version.exit_code == 0 and self._is_expected_codex_version(version.stdout)
+
+    def _is_expected_codex_version(self, output: str) -> bool:
+        return output.strip() in {
+            f"codex {self._codex_version}",
+            f"codex-cli {self._codex_version}",
+        }
+
+    def plan(self, request: LaunchRequest) -> list[str]:
+        """Render the exact Docker argv without accessing auth-file contents."""
+        # The disposable directory is a planning placeholder only; launch creates it.
+        return self._docker_argv(Path("/runner-owned-workspace"), request, "runner-owned-network")
+
+    def _docker_argv(self, workspace: Path, request: LaunchRequest, network: str) -> list[str]:
+        workspace_mode = ",readonly" if request_is_read_only(request) else ""
+        mounts = (
+            f"type=bind,src={workspace},dst=/workspace{workspace_mode}",
+            f"type=bind,src={self._auth_file},dst=/run/codex-auth/auth.json,readonly",
+        )
+        probe_schema = (
+            " --output-schema /workspace/probe/final-response.schema.json"
+            if request.role == "runner-live-isolation-probe" else ""
+        )
+        return [
+            # Docker closes container stdin unless ``-i`` is explicit. Codex receives the
+            # runner-owned prompt through this pipe (the final ``-`` in its argv), without a TTY.
+            self._docker_executable, "run", "--rm", "-i", "--network", network, "--read-only",
+            "--user", "1000:1000",
+            "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "256",
+            "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m",
+            "--tmpfs", "/npm-cache:rw,exec,nosuid,nodev,size=768m",
+            "--tmpfs", "/run/codex-auth:rw,noexec,nosuid,nodev,size=1m",
+            "--tmpfs", "/codex-home:rw,noexec,nosuid,nodev,size=8m",
+            "--mount", mounts[0], "--mount", mounts[1], "--workdir", "/workspace",
+            "--env", "CODEX_HOME=/codex-home", "--env", "HTTP_PROXY=http://codex-egress-proxy:8080",
+            "--env", "HTTPS_PROXY=http://codex-egress-proxy:8080", "--env", "NO_PROXY=",
+            "--env", "NPM_CONFIG_CACHE=/npm-cache",
+            "--env", "TMPDIR=/npm-cache",
+            self._image, "sh", "-ceu",
+            "cp /run/codex-auth/auth.json \"$CODEX_HOME/auth.json\"; "
+            f"exec npx --yes --package @openai/codex@{self._codex_version} codex exec --json "
+            f"--sandbox {'read-only' if request_is_read_only(request) else 'workspace-write'} "
+            "--ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check"
+            f"{probe_schema} -",
+        ]
+
+    def _workspace_write_probe_argv(self, workspace: Path) -> list[str]:
+        """Prove the scoped bind mount is writable without exposing runtime inputs."""
+        return [
+            self._docker_executable, "run", "--rm", "--network", "none", "--read-only",
+            "--user", "1000:1000", "--cap-drop", "ALL",
+            "--security-opt", "no-new-privileges",
+            "--mount", f"type=bind,src={workspace},dst=/workspace",
+            self._image, "sh", "-ceu",
+            "touch /workspace/.runner-owned-write-probe; rm /workspace/.runner-owned-write-probe",
+        ]
+
+    def _assert_workspace_writable(self, workspace: Path) -> None:
+        if self._control(self._workspace_write_probe_argv(workspace)[1:]).exit_code != 0:
+            raise AdapterError(
+                "container scoped workspace is not writable by the contained Codex user",
+                "container-workspace-not-writable",
+            )
+
+    def launch(self, request: LaunchRequest) -> LaunchResult:
+        if request.role != "runner-live-isolation-probe":
+            _assert_bundle_identity(request)
+            require_strict_isolation(
+                self._isolation_capabilities, role=request.role, executable=self._image,
+                cli_surface="codex exec",
+            )
+        if not self._image_validator(self._docker_executable, self._image) or not self._validate_runtime_identity():
+            raise AdapterError("container image identity is unavailable or mismatched", "container-image-unavailable")
+        if request.no_tools:
+            raise AdapterError("container Codex cannot provide a tool-free verifier", "no-tools-unsupported")
+        source = Path(request.working_root).resolve()
+        if source.is_symlink() or not source.is_dir():
+            raise AdapterError("container source worktree is unavailable", "container-worktree-unavailable")
+        patterns = _scoped_container_patterns(request, source)
+        if not patterns:
+            raise AdapterError("container launch has no scoped writable worktree", "container-scope-empty")
+        network = f"feature-pipeline-codex-{uuid.uuid4().hex}"
+        proxy_name = f"codex-egress-proxy-{uuid.uuid4().hex}"
+        network_created = False
+        try:
+            if self._control(["network", "create", "--internal", network]).exit_code != 0:
+                raise AdapterError("internal Codex network could not be created", "container-network-unavailable")
+            network_created = True
+            proxy = self._control([
+                "run", "-d", "--rm", "--name", proxy_name, "--network", network,
+                "--network-alias", "codex-egress-proxy", "--read-only", "--cap-drop", "ALL",
+                "--security-opt", "no-new-privileges", "--pids-limit", "64",
+                "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=16m", self._proxy_image,
+                "python", "-c", _CONNECT_PROXY_SOURCE,
+            ])
+            if proxy.exit_code != 0 or self._control(["network", "connect", "bridge", proxy_name]).exit_code != 0:
+                raise AdapterError("runner-owned CONNECT proxy could not be started", "container-proxy-unavailable")
+            if not self._validate_codex_version(network):
+                raise AdapterError("npm-pinned Codex version is unavailable or mismatched", "container-codex-unavailable")
+            with tempfile.TemporaryDirectory(prefix="feature-pipeline-codex-container-") as directory:
+                workspace = Path(directory) / "workspace"
+                workspace.mkdir()
+                _copy_scoped_workspace(source, workspace, patterns)
+                _normalize_container_workspace(workspace)
+                self._assert_workspace_writable(workspace)
+                completed = self._runner(
+                    self._docker_argv(workspace, request, network), prompt=request.prompt, cwd=None,
+                    timeout=request.timeout or self._timeout, env=None,
+                )
+                if completed.exit_code == 0:
+                    _copy_scoped_workspace(workspace, source, patterns)
+        finally:
+            self._control(["rm", "-f", proxy_name])
+            if network_created:
+                self._control(["network", "rm", network])
+        text = parse_codex_result_text(completed.stdout)
+        return LaunchResult(
+            completed.exit_code, text if text is not None else completed.stdout,
+            completed.stderr, parse_codex_session_id(completed.stdout), completed.stdout,
+        )
+
+    def launch_live_probe(self, request: LiveProbeRequest) -> LaunchResult:
+        """Run the runner-owned probe under the identical contained executor controls.
+
+        The probe gets a disposable source tree with one allowed directory and a sibling that
+        is deliberately omitted from the mounted workspace.  Its output is observation only:
+        callers must validate every required write/denial claim before recording capability
+        evidence, and a failed or incomplete probe grants nothing.
+        """
+        if type(request) is not LiveProbeRequest:
+            raise AdapterError("live probe requires a runner-owned request", "live-probe-invalid")
+        with tempfile.TemporaryDirectory(prefix="feature-pipeline-codex-live-probe-") as directory:
+            source = Path(directory)
+            allowed = source / "probe"
+            allowed.mkdir()
+            (allowed / "allowed.txt").write_text("runner-owned probe\n", encoding="utf-8")
+            (allowed / "final-response.schema.json").write_text(json.dumps({
+                "type": "object",
+                "properties": {
+                    "allowed_write": {"type": "string"},
+                    "sibling_access": {"type": "boolean"},
+                },
+                "required": ["allowed_write", "sibling_access"],
+                "additionalProperties": False,
+            }), encoding="utf-8")
+            (source / "sibling.txt").write_text("must not be mounted\n", encoding="utf-8")
+            token = uuid.uuid4().hex
+            probe = LaunchRequest(
+                role="runner-live-isolation-probe", task_id=request.task_id,
+                prompt=(
+                    "Use your shell or file tool to create probe/allowed-write.txt containing "
+                    "the exact token " + token + ". Do this before your final response; a "
+                    "claim without the observable file is rejected. "
+                    "Attempt to read /workspace/sibling.txt. Return exactly one JSON object with "
+                    "keys allowed_write and sibling_access; allowed_write must equal the token and "
+                    "sibling_access must be a boolean. " + request.prompt
+                ),
+                report_path=request.report_path, working_root=str(source), role_grant=("read", "write"),
+                allowed_scope=("probe/**",), timeout=request.timeout,
+            )
+            result = self.launch(probe)
+            final_message = parse_codex_result_text(result.raw_stdout)
+            if final_message is None:
+                parse_status, structured = "no-final-message", None
+            else:
+                try:
+                    structured = json.loads(final_message)
+                except json.JSONDecodeError:
+                    parse_status, structured = "invalid-json", None
+                else:
+                    parse_status = "valid" if (
+                        isinstance(structured, dict)
+                        and set(structured) == {"allowed_write", "sibling_access"}
+                    ) else "schema-mismatch"
+            wrote_allowed = (allowed / "allowed-write.txt").is_file() and (
+                (allowed / "allowed-write.txt").read_text(encoding="utf-8") == token
+            )
+            sibling_mounted = any("sibling.txt" in value for value in self._docker_argv(
+                Path("/runner-owned-workspace"), probe, "runner-owned-network"
+            ))
+            stderr_reason = result.stderr.replace(token, "<redacted-probe>")[:4096]
+            probe_facts = dict(
+                probe_parse_status=parse_status,
+                probe_allowed_write=wrote_allowed,
+                probe_failure_class=(
+                    "schema-or-misreport" if parse_status != "valid" or (
+                        structured.get("allowed_write") != token
+                        or not isinstance(structured.get("sibling_access"), bool)
+                        or structured.get("sibling_access") is not False
+                    ) else "no-observed-allowed-write" if not wrote_allowed else None
+                ),
+                probe_sibling_mounted=sibling_mounted,
+                probe_subprocess_state="not-observed",
+                probe_nested_state="not-observed",
+                probe_stderr_reason=stderr_reason,
+            )
+            if (parse_status != "valid"
+                    or structured.get("allowed_write") != token
+                    or not isinstance(structured.get("sibling_access"), bool)
+                    or structured.get("sibling_access") is not False
+                    or not wrote_allowed or sibling_mounted):
+                return LaunchResult(
+                    1, result.stdout, "live probe did not produce verified structured containment results",
+                    result.session_id, result.raw_stdout, **probe_facts,
+                )
+            return replace(result, **probe_facts)

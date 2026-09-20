@@ -18,8 +18,12 @@ usage: run_pipeline.py [-h] [--project-root DIR] [--agents-root DIR]
                        [--approve-plan] [--approve-final-diff] [--commit]
                        [--commit-approved-manifest] [--dry-run] [--push]
                        [--status] [--unattended] [--adapter NAME]
-                       [--model MODEL] [--effort LEVEL]
-                       [--max-repair-attempts N]
+                       [--codex-runtime {host,docker}]
+                       [--docker-codex-image IMAGE]
+                       [--docker-proxy-image IMAGE]
+                       [--docker-codex-version VERSION]
+                       [--docker-codex-auth-file FILE] [--model MODEL]
+                       [--effort LEVEL] [--max-repair-attempts N]
                        [--routine-output-byte-budget N]
                        [--diagnostic-output-byte-budget N] [--verbose]
                        [--quiet]
@@ -130,6 +134,20 @@ compatibility surface (forwarded from the legacy CLI; see scripts/README.md):
   --unattended          alias of --mode unattended
   --adapter NAME        execution adapter for --mode execute (real control
                         there); accepted as a no-op in plan-only/unattended
+  --codex-runtime {host,docker}
+                        Codex runtime for execute/live-probe: host (default,
+                        fail-closed) or the explicitly configured Docker
+                        runtime
+  --docker-codex-image IMAGE
+                        digest-pinned Node image for --codex-runtime docker
+  --docker-proxy-image IMAGE
+                        digest-pinned Python CONNECT-proxy image for Docker
+                        Codex
+  --docker-codex-version VERSION
+                        exact package version for Docker Codex
+  --docker-codex-auth-file FILE
+                        runner-selected Codex auth file for Docker Codex
+                        (never logged)
   --model MODEL         adapter-native model for --mode execute only
   --effort LEVEL        adapter-native reasoning effort for --mode execute
                         only

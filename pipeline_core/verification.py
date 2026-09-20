@@ -8,11 +8,12 @@ implementation manifest/diff/report references into one immutable :class:`Verifi
 test-verifier request builders are handed byte-identical facts.
 
 :func:`orchestrate_verification` completes stage 8: it builds two separate, fresh, read-only
-verifier contexts over that one evidence payload, settles each verifier's strict JSON verdict
-envelope against its prose report, and lets *only* the parsed ``PASS``/``FAIL``/``BLOCKED``
-combination move task state (via :meth:`pipeline_core.state.Run.record_verdicts`). A launch
-that fails, a malformed envelope, or a prose/envelope disagreement is written to a diagnostic
-and blocks the task — it can never produce ``verified``.
+    verifier contexts over that one evidence payload, settles each verifier's strict JSON verdict
+    envelope against its prose report, and lets *only* the parsed ``PASS``/``FAIL``/``BLOCKED``
+    combination move task state (via :meth:`pipeline_core.state.Run.record_verdicts`). A launch
+    that fails, a malformed envelope, or a prose/envelope disagreement is written to a diagnostic
+    and blocks the task — except TC-11's structural strict-isolation rejection, which may use its
+    separate runner-owned durable-live-probe verifier.
 
 Command *execution* lives in :mod:`pipeline_core.commands`; this module only packages the
 result and interprets verdicts — it never launches a command itself.
@@ -24,7 +25,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence
+from typing import Iterable, Mapping, Protocol, Sequence
 
 from feature_pipeline.application.diagnostic_service import DiagnosticService
 from feature_pipeline.application.skill_bundles import SkillBundleError, load_project_skill_bundle
@@ -34,6 +35,7 @@ from .adapters import (
     Adapter,
     AdapterError,
     LaunchRequest,
+    LaunchComposition,
     LaunchResult,
     grant_tool_names,
     normalize_role,
@@ -536,6 +538,12 @@ class VerifierAnchors:
     kanban_path: str = "docs/kanban.md"
 
 
+class DeterministicIsolationVerifier(Protocol):
+    """Read-only TC-11 fallback; it is never an adapter or executor."""
+
+    def verify(self, *, task_id: str, role: str) -> object: ...
+
+
 @dataclass(frozen=True)
 class VerifierLaunchers:
     """The injectable independent launcher pair.
@@ -548,6 +556,7 @@ class VerifierLaunchers:
 
     task: Adapter
     test: Adapter
+    deterministic_isolation: DeterministicIsolationVerifier | None = None
 
 
 _VERIFIER_RULES: dict[str, tuple[str, ...]] = {
@@ -815,6 +824,12 @@ def _run_one_verifier(
     )
     write_text_atomic(artifacts.prompt(normalized), prompt, repo_root=run.repo_root)
 
+    composition = LaunchComposition(
+        recipient_role=normalized,
+        bundle_digest=None if bundle is None else bundle.digest,
+        allowed_scope=tuple(getattr(spec, "allowed_scope", ()) or ()),
+        role_grant=verifier_grant,
+    )
     request = LaunchRequest(
         role=normalized,
         task_id=spec.id,
@@ -830,6 +845,13 @@ def _run_one_verifier(
         no_tools=tool_less,
         model=model,
         effort=effort,
+        # Bind this launch to the exact role and skill-bundle digest it was composed for
+        # (TC-11 AC-1); an adapter rejects a request whose recipient role disagrees with the
+        # role actually being launched, so later adapter code can never widen or substitute
+        # either — and neither verifier's bundle can leak into the other's launch.
+        recipient_role=normalized,
+        bundle_digest=None if bundle is None else bundle.digest,
+        composition=composition,
     )
     try:
         result = adapter.launch(request)
@@ -872,6 +894,9 @@ def _run_one_verifier(
         no_tools=True,
         model=model,
         effort=effort,
+        recipient_role=normalized,
+        bundle_digest=None if bundle is None else bundle.digest,
+        composition=composition,
     )
     try:
         envelope_result = adapter.launch(envelope_request)
@@ -922,6 +947,32 @@ def _run_one_verifier(
     )
 
 
+def _deterministic_isolation_fallback(
+    run: Run, spec: object, role: str, artifacts: object, attempt: int,
+    verifier: DeterministicIsolationVerifier | None,
+) -> _SettledVerifier | None:
+    """Settle TC-11 from durable live-probe evidence after structural launch rejection."""
+    if verifier is None or spec.id != "TC-11":
+        return None
+    verdict = verifier.verify(task_id=spec.id, role=role)
+    token = getattr(verdict, "token", None)
+    report = getattr(verdict, "report", None)
+    if token not in VERDICTS or not isinstance(report, Mapping):
+        return _diagnose(
+            run, spec, artifacts, role=role, attempt=attempt,
+            reason="deterministic-isolation-verifier-invalid-result",
+        )
+    report_text = json.dumps(dict(report), sort_keys=True) + "\n"
+    write_text_atomic(
+        artifacts.directory / f"{normalize_role(role)}-deterministic-isolation.json",
+        report_text, repo_root=run.repo_root,
+    )
+    return _SettledVerifier(
+        token=token, result=None, envelope_result=None, report_text=report_text,
+        drift="deterministic-isolation-fallback", failure=None, diagnostic=None,
+    )
+
+
 def _block(run: Run, task_id: str, reason: str) -> str:
     """Record an unavailable verifier as an operation, leaving the task resumable."""
     record = run.task(task_id)
@@ -951,8 +1002,10 @@ def orchestrate_verification(
     The task must be ``implemented`` and ``evidence`` must be this exact task/attempt. Both
     verifiers receive :func:`verifier_evidence_payload` verbatim. Every failure mode — a launch
     that will not start or exits non-zero, a missing session id, a malformed verdict envelope,
-    or a prose/envelope disagreement — writes a diagnostic and blocks the task; none can reach
-    ``verified``. An unbacked executor check (:func:`evidence_forces_fail`) forces the test
+    or a prose/envelope disagreement — writes a diagnostic and blocks the task. The sole
+    structural exception is TC-11's ``stack-isolation-unsupported`` result: each rejected
+    verifier role may be independently settled by the injected runner-owned live-probe
+    verifier, which never launches Claude/Codex. An unbacked executor check (:func:`evidence_forces_fail`) forces the test
     verdict to ``FAIL`` regardless of what the tool-less test verifier returned (AC-4).
     """
     task_id = spec.id
@@ -978,6 +1031,10 @@ def orchestrate_verification(
     task_settled = _run_one_verifier(
         run, spec, "task_verifier", launchers.task, artifacts, anchors, payload, attempt,
         plan_path, model, effort, evidence.amendment, evidence.scope_observation)
+    if task_settled.failure and "(stack-isolation-unsupported)" in task_settled.failure:
+        task_settled = _deterministic_isolation_fallback(
+            run, spec, "task_verifier", artifacts, attempt,
+            launchers.deterministic_isolation) or task_settled
     if task_settled.failure:
         status = _block(run, task_id, f"task_verifier: {task_settled.failure}")
         return VerificationOutcome(
@@ -988,6 +1045,10 @@ def orchestrate_verification(
     test_settled = _run_one_verifier(
         run, spec, "test_verifier", launchers.test, artifacts, anchors, payload, attempt,
         plan_path, model, effort, evidence.amendment, evidence.scope_observation)
+    if test_settled.failure and "(stack-isolation-unsupported)" in test_settled.failure:
+        test_settled = _deterministic_isolation_fallback(
+            run, spec, "test_verifier", artifacts, attempt,
+            launchers.deterministic_isolation) or test_settled
     if test_settled.failure:
         status = _block(run, task_id, f"test_verifier: {test_settled.failure}")
         return VerificationOutcome(

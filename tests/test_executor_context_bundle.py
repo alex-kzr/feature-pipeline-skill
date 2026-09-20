@@ -25,6 +25,7 @@ from pipeline_core.adapters import (
     LaunchRequest,
     build_claude_argv,
 )
+from tests.support.isolation import proven_isolation_capabilities
 
 
 def _sha(text: str) -> str:
@@ -132,6 +133,7 @@ class ExecutorContextBundleValidationTests(unittest.TestCase):
 
 class ClaudeAdapterContextDeliveryTests(unittest.TestCase):
     def _adapter(self, runner, **kw):
+        kw.setdefault("isolation_capabilities", proven_isolation_capabilities("claude"))
         return ClaudeAdapter(executable="claude", runner=runner, **kw)
 
     def test_exact_task_plan_prompt_skill_content_reaches_the_child_prompt(self) -> None:

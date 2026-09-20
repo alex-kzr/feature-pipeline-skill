@@ -52,6 +52,8 @@ FEATURE_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 #: profile's run-storage root — no path separator, ``.``, ``..``, or absolute/drive path.
 #: ``execution._resolve_source_run_dir`` re-checks containment independently of this check.
 SOURCE_FEATURE_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+DOCKER_CODEX_IMAGE = "node@sha256:b6f26b36c8ff49624cfdac716b8ea1138d606df02586a77d364bb5536a634f85"
+DOCKER_PROXY_IMAGE = "python@sha256:1a63a53928ce53d2b0baf08092a703f4840ac5dfbd61fd48802dbf48e08c801e"
 
 
 class _StableHelpFormatter(argparse.HelpFormatter):
@@ -179,6 +181,17 @@ def build_parser() -> argparse.ArgumentParser:
     compat.add_argument("--adapter", metavar="NAME", choices=["claude", "codex", "auto"],
                         help="execution adapter for --mode execute (real control there); "
                              "accepted as a no-op in plan-only/unattended")
+    compat.add_argument("--codex-runtime", choices=["host", "docker"], default="host",
+                        help="Codex runtime for execute/live-probe: host (default, fail-closed) "
+                             "or the explicitly configured Docker runtime")
+    compat.add_argument("--docker-codex-image", metavar="IMAGE", default=DOCKER_CODEX_IMAGE,
+                        help="digest-pinned Node image for --codex-runtime docker")
+    compat.add_argument("--docker-proxy-image", metavar="IMAGE", default=DOCKER_PROXY_IMAGE,
+                        help="digest-pinned Python CONNECT-proxy image for Docker Codex")
+    compat.add_argument("--docker-codex-version", metavar="VERSION",
+                        help="exact package version for Docker Codex")
+    compat.add_argument("--docker-codex-auth-file", metavar="FILE",
+                        help="runner-selected Codex auth file for Docker Codex (never logged)")
     compat.add_argument("--model", metavar="MODEL",
                         help="adapter-native model for --mode execute only")
     compat.add_argument("--effort", metavar="LEVEL",
@@ -196,6 +209,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="accepted; reporter verbosity is owned by the project launcher")
     compat.add_argument("--quiet", action="store_true",
                         help="accepted; reporter verbosity is owned by the project launcher")
+    probe = parser.add_argument_group("runner-owned live isolation probe (explicit opt-in only)")
+    probe.add_argument("--live-isolation-probe", action="count", default=0,
+                       dest="live_isolation_probe_count", help=argparse.SUPPRESS)
+    probe.add_argument("--live-probe-opt-in", action="store_true", help=argparse.SUPPRESS)
+    probe.add_argument("--live-probe-timeout", type=float, metavar="SECONDS", help=argparse.SUPPRESS)
+    probe.add_argument("--live-probe-max-attempts", type=int, metavar="N", help=argparse.SUPPRESS)
     return parser
 
 
@@ -213,4 +232,6 @@ __all__ = [
     "EXIT_MEANINGS",
     "FEATURE_RE",
     "SOURCE_FEATURE_RE",
+    "DOCKER_CODEX_IMAGE",
+    "DOCKER_PROXY_IMAGE",
 ]

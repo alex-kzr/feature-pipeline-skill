@@ -94,6 +94,16 @@ class ResolvedSkillBundle:
     role: str
     manifests: tuple[SkillManifest, ...]
 
+    @property
+    def digest(self) -> str:
+        """The lowercase sha256 hex digest binding this exact ordered set of skill contents.
+
+        Deterministic over ``(id, sha256)`` pairs in the bundle's own stable (sorted-id)
+        order, so two resolutions of the same manifests always agree and any change to
+        which skills or content were selected changes the digest (TC-11 AC-1).
+        """
+        return _digest("|".join(f"{manifest.id}:{manifest.sha256}" for manifest in self.manifests))
+
     def render(self) -> str:
         lines = ["Reviewed permitted skills and references (immutable):"]
         for manifest in self.manifests:

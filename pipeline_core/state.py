@@ -6,6 +6,7 @@ import json
 import os
 import re
 import hashlib
+import math
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,6 +37,93 @@ RESUME_ROLLBACKS: dict[str, str] = {}
 #: condition, never a defect, so it takes precedence over ``FAIL`` when the two verifiers
 #: disagree and it never consumes a repair attempt.
 VERDICT_TOKENS = ("PASS", "FAIL", "BLOCKED")
+
+LIVE_PROBE_SCHEMA_VERSION = 1
+_LIVE_PROBE_FIELDS = (
+    "schema_version", "task_id", "run_id", "task_contract_digest", "attempt_id", "adapter", "cli_version",
+    "role", "bundle_digest", "allowed_scope", "grants", "timeout_s", "max_attempts",
+    "started_at", "ended_at", "disposition", "reason", "cleanup", "task_contract_revision",
+)
+_LIVE_PROBE_DISPOSITIONS = frozenset({
+    "NO_BREACH_OBSERVED", "UNKNOWN", "INCONCLUSIVE", "BREACH_DETECTED",
+    "NESTED_DELEGATION_DETECTED", "SUBPROCESS_ACCESS_DETECTED", "SCOPE_WIDENING",
+    "GRANT_WIDENING", "TIMEOUT", "LAUNCH_FAILED", "MALFORMED_OUTPUT",
+})
+
+
+@dataclass(frozen=True)
+class LiveProbeEvidence:
+    """Versioned runner observation; deliberately never expresses a positive capability."""
+
+    schema_version: int
+    task_id: str
+    run_id: str
+    task_contract_digest: str
+    attempt_id: str
+    adapter: str
+    cli_version: str
+    role: str
+    bundle_digest: str
+    allowed_scope: tuple[str, ...]
+    grants: tuple[str, ...]
+    timeout_s: float
+    max_attempts: int
+    started_at: str
+    ended_at: str
+    disposition: str
+    reason: str
+    cleanup: str
+    task_contract_revision: int = 0
+
+    def validate(self) -> None:
+        if (not isinstance(self.schema_version, int) or isinstance(self.schema_version, bool)
+                or self.schema_version != LIVE_PROBE_SCHEMA_VERSION):
+            raise StateError("unknown live-probe evidence schema version", "unknown-live-probe-schema")
+        if self.disposition not in _LIVE_PROBE_DISPOSITIONS:
+            raise StateError("live-probe evidence may not assert a positive capability", "invalid-live-probe-disposition")
+        if self.adapter not in {"codex", "claude"}:
+            raise StateError("live-probe adapter is unsupported", "invalid-live-probe-evidence")
+        if (not re.fullmatch(r"[A-Za-z0-9._-]+", self.attempt_id)
+                or not all(isinstance(item, str) and item for item in (
+            self.task_id, self.run_id, self.task_contract_digest, self.attempt_id, self.cli_version, self.role,
+        self.bundle_digest, self.started_at, self.ended_at, self.reason,
+        )) or self.cli_version == "unknown" or self.cleanup not in {"removed", "failed"} or not isinstance(self.timeout_s, (int, float))
+                or isinstance(self.timeout_s, bool) or not math.isfinite(self.timeout_s)
+                or self.timeout_s <= 0
+                or not isinstance(self.max_attempts, int) or isinstance(self.max_attempts, bool)
+                or self.max_attempts <= 0
+                or not isinstance(self.task_contract_revision, int)
+                or isinstance(self.task_contract_revision, bool)
+                or self.task_contract_revision < 0
+                or len(set(self.allowed_scope)) != len(self.allowed_scope)
+                or any(not isinstance(item, str) or not item or "\\" in item
+                       or item.startswith("/") or ".." in item.split("/")
+                       for item in self.allowed_scope)
+                or len(set(self.grants)) != len(self.grants)
+                or any(not isinstance(item, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", item)
+                       for item in self.grants)):
+            raise StateError("malformed live-probe evidence", "invalid-live-probe-evidence")
+
+    def as_dict(self) -> dict[str, Any]:
+        self.validate()
+        row = {name: getattr(self, name) for name in _LIVE_PROBE_FIELDS}
+        # The durable representation is JSON-shaped.  Keep tuple-backed fields
+        # as arrays here so validation of a later persisted row reaches the
+        # identity and budget checks rather than failing on an internal type.
+        row["allowed_scope"] = list(self.allowed_scope)
+        row["grants"] = list(self.grants)
+        return row
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "LiveProbeEvidence":
+        if set(data) != set(_LIVE_PROBE_FIELDS):
+            raise StateError("live-probe evidence has unknown or missing fields", "invalid-live-probe-evidence")
+        if not isinstance(data["allowed_scope"], list) or not isinstance(data["grants"], list):
+            raise StateError("live-probe scope and grants must be arrays", "invalid-live-probe-evidence")
+        row = cls(**{**dict(data), "allowed_scope": tuple(data["allowed_scope"]),
+                     "grants": tuple(data["grants"])})
+        row.validate()
+        return row
 
 
 class StateError(Exception):
@@ -291,6 +379,14 @@ class Run:
     artifacts: dict[str, str] = field(default_factory=dict)
     #: Immutable provenance for a linked pre-implementation replacement run.
     recovery: dict[str, Any] | None = None
+    #: Runner-owned, append-only observations from explicitly opted-in containment probes.
+    live_probe_evidence: list[dict[str, Any]] = field(default_factory=list)
+    #: Canonical copies of observations at the last successful persistence boundary.  This
+    #: is deliberately not serialized: the evidence rows remain the versioned public
+    #: format, while this guard prevents an in-memory caller from rewriting their prefix.
+    _persisted_live_probe_evidence: tuple[str, ...] = field(
+        default_factory=tuple, init=False, repr=False,
+    )
 
     @classmethod
     def create(cls, feature: str, prompt_path: str | Path, plan_path: str | Path | None, run_dir: str | Path, repo_root: str | Path) -> "Run":
@@ -430,6 +526,154 @@ class Run:
         self.commands.append(entry)
         self.stages.setdefault(stage, {}).setdefault("commands", []).append(entry["id"])
         return entry
+
+    def record_live_probe_evidence(self, evidence: LiveProbeEvidence) -> dict[str, Any]:
+        """Append one identity-bound probe observation without granting any capability."""
+        evidence.validate()
+        if evidence.run_id != self.run_id or evidence.task_id not in self.tasks:
+            raise StateError("live-probe evidence does not belong to this task/run", "live-probe-identity-mismatch")
+        task = self.task(evidence.task_id)
+        if task.adapter and task.adapter != evidence.adapter:
+            raise StateError("live-probe adapter differs from the selected task adapter", "live-probe-identity-mismatch")
+        if not self._probe_contract_matches(task, evidence):
+            raise StateError(
+                "live-probe evidence differs from the selected task contract",
+                "live-probe-contract-mismatch",
+            )
+        if any(
+            row.get("attempt_id") == evidence.attempt_id
+            and row.get("task_contract_revision", 0) == evidence.task_contract_revision
+            for row in self.live_probe_evidence
+        ):
+            raise StateError("live-probe attempt identity is already recorded", "duplicate-live-probe-attempt")
+        row = evidence.as_dict()
+        row["allowed_scope"] = list(evidence.allowed_scope)
+        row["grants"] = list(evidence.grants)
+        self._validate_live_probe_rows([*self.live_probe_evidence, row])
+        self.live_probe_evidence.append(row)
+        self.record_event(
+            f"live-probe:{evidence.task_id}", to=evidence.disposition,
+            note="runner-owned bounded live-isolation observation",
+        )
+        return row
+
+    def _validate_live_probe_rows(self, rows: Sequence[Mapping[str, Any]]) -> None:
+        """Validate persisted observations against their selected task and fixed budget."""
+        seen: set[tuple[str, int, str]] = set()
+        task_limits: dict[tuple[str, int], int] = {}
+        task_counts: dict[tuple[str, int], int] = {}
+        for raw_row in rows:
+            evidence = LiveProbeEvidence.from_dict(raw_row)
+            if evidence.run_id != self.run_id or evidence.task_id not in self.tasks:
+                raise StateError(
+                    "live-probe evidence does not belong to this task/run",
+                    "live-probe-identity-mismatch",
+                )
+            task = self.task(evidence.task_id)
+            if task.adapter != evidence.adapter:
+                raise StateError(
+                    "live-probe adapter differs from the selected task adapter",
+                    "live-probe-identity-mismatch",
+                )
+            if not self._probe_contract_matches(task, evidence):
+                raise StateError(
+                    "live-probe evidence differs from the selected task contract",
+                    "live-probe-contract-mismatch",
+                )
+            attempt_key = (evidence.task_id, evidence.task_contract_revision, evidence.attempt_id)
+            if attempt_key in seen:
+                raise StateError(
+                    "live-probe attempt identity is already recorded",
+                    "duplicate-live-probe-attempt",
+                )
+            seen.add(attempt_key)
+            epoch_key = (evidence.task_id, evidence.task_contract_revision)
+            prior_limit = task_limits.setdefault(epoch_key, evidence.max_attempts)
+            if prior_limit != evidence.max_attempts:
+                raise StateError(
+                    "live-probe attempt budget cannot change after the first observation",
+                    "live-probe-budget-mismatch",
+                )
+            task_counts[epoch_key] = task_counts.get(epoch_key, 0) + 1
+            if task_counts[epoch_key] > prior_limit:
+                raise StateError(
+                    "live-probe attempt budget is exhausted",
+                    "live-probe-budget-exhausted",
+                )
+
+    @staticmethod
+    def _probe_contract_matches(task: TaskRecord, evidence: LiveProbeEvidence) -> bool:
+        """Match a probe observation to the immutable digest for its recorded epoch."""
+        return evidence.task_contract_revision in Run._probe_contract_revisions(task).get(
+            evidence.task_contract_digest, set(),
+        )
+
+    @staticmethod
+    def _probe_contract_revisions(task: TaskRecord) -> dict[str, set[int]]:
+        """Return every revision asserted for each immutable task-contract digest."""
+        revisions: dict[str, set[int]] = {}
+
+        def add(revision: Any, digest: Any) -> None:
+            if (isinstance(revision, int) and not isinstance(revision, bool)
+                    and revision >= 0 and isinstance(digest, str) and digest):
+                revisions.setdefault(digest, set()).add(revision)
+
+        add(task.current_revision, task.task_contract_digest)
+        for entry in task.revision_history:
+            if isinstance(entry, Mapping):
+                add(entry.get("revision"), entry.get("contract_digest"))
+        for entry in task.amendment_revisions:
+            if isinstance(entry, Mapping):
+                revision = entry.get("revision")
+                add(revision, entry.get("new_digest"))
+                if isinstance(revision, int) and not isinstance(revision, bool):
+                    add(revision - 1, entry.get("prior_digest"))
+        return revisions
+
+    @classmethod
+    def _migrate_legacy_live_probe_revisions(cls, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Add a missing legacy probe revision only when its digest names one epoch."""
+        rows = payload.get("live_probe_evidence")
+        if not isinstance(rows, list):
+            return dict(payload)
+        tasks = {
+            item.get("id"): TaskRecord.from_dict(item)
+            for item in payload.get("tasks", [])
+            if isinstance(item, Mapping) and isinstance(item.get("id"), str)
+        }
+        migrated_rows: list[Any] = []
+        changed = False
+        for row in rows:
+            if not isinstance(row, Mapping) or "task_contract_revision" in row:
+                migrated_rows.append(row)
+                continue
+            task = tasks.get(row.get("task_id"))
+            matches = (cls._probe_contract_revisions(task).get(row.get("task_contract_digest"), set())
+                       if task is not None else set())
+            if len(matches) != 1:
+                raise StateError(
+                    "legacy live-probe evidence does not identify one task contract revision",
+                    "live-probe-contract-mismatch",
+                )
+            migrated_rows.append({**row, "task_contract_revision": matches.pop()})
+            changed = True
+        return {**payload, "live_probe_evidence": migrated_rows} if changed else dict(payload)
+
+    @staticmethod
+    def _live_probe_row_fingerprint(row: Mapping[str, Any]) -> str:
+        """Return a stable JSON representation used solely for append-only checking."""
+        return json.dumps(row, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+    def _validate_live_probe_append_only(self) -> tuple[str, ...]:
+        """Reject removal or replacement of any observation already persisted."""
+        current = tuple(self._live_probe_row_fingerprint(row) for row in self.live_probe_evidence)
+        prior = self._persisted_live_probe_evidence
+        if len(current) < len(prior) or current[:len(prior)] != prior:
+            raise StateError(
+                "live-probe evidence history may only be extended",
+                "live-probe-history-rewritten",
+            )
+        return current
 
     def record_executor_evidence(
         self,
@@ -829,10 +1073,18 @@ class Run:
             "stages": self.stages,
             "artifacts": self.artifacts,
             "recovery": self.recovery,
+            **({"live_probe_evidence": self.live_probe_evidence}
+               if self.live_probe_evidence else {}),
         }
 
     def save(self) -> Path:
-        return write_json_atomic(self.run_dir / "run.json", self.to_dict(), repo_root=self.repo_root)
+        # Validate every persisted row before any write, including rows injected through a
+        # legacy caller rather than the append-only method above.
+        self._validate_live_probe_rows(self.live_probe_evidence)
+        evidence_snapshot = self._validate_live_probe_append_only()
+        path = write_json_atomic(self.run_dir / "run.json", self.to_dict(), repo_root=self.repo_root)
+        self._persisted_live_probe_evidence = evidence_snapshot
+        return path
 
     @classmethod
     def load(cls, run_dir: str | Path, repo_root: str | Path) -> "Run":
@@ -843,6 +1095,7 @@ class Run:
         except ArtifactReadError as exc:
             raise StateError(str(exc), "unreadable-state") from None
         data = migrate_run_state(raw)
+        data = cls._migrate_legacy_live_probe_revisions(data)
         # Compatibility reads must not turn into in-place migrations.  When normalising a
         # legacy source would change its bytes, continue from a sibling checkpoint instead
         # and retain a content-addressed pointer to the immutable source artifact.
@@ -873,14 +1126,52 @@ class Run:
             else:
                 recovery = source_recovery
         tasks = {entry["id"]: TaskRecord.from_dict(entry) for entry in data.get("tasks", [])}
-        return cls(
+        probe_rows = data.get("live_probe_evidence", [])
+        if not isinstance(probe_rows, list):
+            raise StateError("live-probe evidence must be a list", "invalid-live-probe-evidence")
+        seen_probe_attempts: set[tuple[str, int, str]] = set()
+        probe_limits: dict[tuple[str, int], int] = {}
+        probe_counts: dict[tuple[str, int], int] = {}
+        for raw_row in probe_rows:
+            if not isinstance(raw_row, Mapping):
+                raise StateError("malformed live-probe evidence", "invalid-live-probe-evidence")
+            evidence = LiveProbeEvidence.from_dict(raw_row)
+            if evidence.run_id != data["run_id"] or evidence.task_id not in tasks:
+                raise StateError("live-probe evidence does not belong to this task/run", "live-probe-identity-mismatch")
+            task = tasks[evidence.task_id]
+            if task.adapter != evidence.adapter:
+                raise StateError("live-probe adapter differs from the selected task adapter", "live-probe-identity-mismatch")
+            if not cls._probe_contract_matches(task, evidence):
+                raise StateError(
+                    "live-probe evidence differs from the selected task contract",
+                    "live-probe-contract-mismatch",
+                )
+            attempt_key = (evidence.task_id, evidence.task_contract_revision, evidence.attempt_id)
+            if attempt_key in seen_probe_attempts:
+                raise StateError("live-probe attempt identity is already recorded", "duplicate-live-probe-attempt")
+            seen_probe_attempts.add(attempt_key)
+            epoch_key = (evidence.task_id, evidence.task_contract_revision)
+            prior_limit = probe_limits.setdefault(epoch_key, evidence.max_attempts)
+            if prior_limit != evidence.max_attempts:
+                raise StateError(
+                    "live-probe attempt budget cannot change after the first observation",
+                    "live-probe-budget-mismatch",
+                )
+            probe_counts[epoch_key] = probe_counts.get(epoch_key, 0) + 1
+            if probe_counts[epoch_key] > prior_limit:
+                raise StateError("live-probe attempt budget is exhausted", "live-probe-budget-exhausted")
+        run = cls(
             data["feature"], data["prompt_path"], data.get("plan_path"), active_directory,
             Path(os.path.abspath(repo_root)), data["run_id"], data.get("status", "pending"),
             tasks, data.get("history", []), data.get("commands", []),
             data.get("controls", {}), data.get("environment", {}),
             data.get("current_task"), data.get("stages", {}), data.get("artifacts", {}),
-            recovery,
+            recovery, list(probe_rows),
         )
+        run._persisted_live_probe_evidence = tuple(
+            run._live_probe_row_fingerprint(row) for row in run.live_probe_evidence
+        )
+        return run
 
     def resume(self, *, feature: str, prompt_path: str | Path, plan_path: str | Path | None) -> None:
         if feature != self.feature or repo_relative(prompt_path, self.repo_root) != self.prompt_path or (repo_relative(plan_path, self.repo_root) if plan_path else None) != self.plan_path:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,7 +37,10 @@ from pipeline_core.adapters import (
     Adapter,
     AdapterError,
     ClaudeAdapter,
+    CLAUDE_ISOLATION_CAPABILITIES,
     CodexAdapter,
+    DockerCodexAdapter,
+    CODEX_ISOLATION_CAPABILITIES,
     ContextEntry,
     ExecutorContextBundle,
     RequiredInput,
@@ -46,6 +50,7 @@ from pipeline_core.execution import (
     ExecuteControls,
     ExecuteRequest,
     ExecutionError,
+    effective_task_spec,
     _resolve_source_run_dir,
     _validate_attestation_scope,
     execute_run,
@@ -99,6 +104,10 @@ class AdapterRuntime:
     #: a nested-root task whose allowed scope names a repository-internal path it cannot
     #: otherwise reach.
     scope_dirs: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    #: The exact resolved record used by plan compilation.  Concrete adapters must enforce
+    #: this same record rather than silently falling back to a local default.
+    isolation_capabilities: AdapterCapabilities | None = None
+    isolation_probe_validator: Callable[[str | Sequence[str], str], AdapterCapabilities] | None = None
 
 
 @dataclass(frozen=True)
@@ -112,15 +121,37 @@ class AdapterFactory:
     supports_read_only: bool
     supports_write: bool
     default_timeout_s: float = 3600.0
+    isolation_capabilities: AdapterCapabilities | None = None
+    isolation_probe_validator: Callable[[str | Sequence[str], str], AdapterCapabilities] | None = None
 
     def capabilities(self) -> AdapterCapabilities:
+        declared = self.isolation_capabilities
         return AdapterCapabilities(
-            self.name,
-            self.available(),
-            self.supports_resume,
-            self.supports_read_only,
-            self.supports_write,
-            self.default_timeout_s,
+            name=self.name,
+            available=self.available(),
+            supports_resume=self.supports_resume,
+            supports_read_only=self.supports_read_only,
+            supports_write=self.supports_write,
+            default_timeout_s=self.default_timeout_s,
+            supports_bundle_validated=(
+                declared.supports_bundle_validated if declared is not None else False
+            ),
+            supports_discovery_isolated=(
+                declared.supports_discovery_isolated if declared is not None else False
+            ),
+            supports_skill_reads_enforced=(
+                declared.supports_skill_reads_enforced if declared is not None else False
+            ),
+            supports_subprocess_isolated=(
+                declared.supports_subprocess_isolated if declared is not None else False
+            ),
+            supports_nested_delegation_isolated=(
+                declared.supports_nested_delegation_isolated if declared is not None else False
+            ),
+            isolation_proofs=declared.isolation_proofs if declared is not None else (),
+            runtime=declared.runtime if declared is not None else "",
+            cli_surface=declared.cli_surface if declared is not None else "",
+            observed_version=declared.observed_version if declared is not None else "",
         )
 
 
@@ -143,6 +174,7 @@ class BootstrapComposition:
     ) -> tuple[Adapter, VerifierLaunchers, dict[str, bool]]:
         registry = self.adapter_registry
         resolved = registry.select(adapter_name)
+        factory = next(factory for factory in self.factories if factory.name == resolved.name)
         runtime = AdapterRuntime(
             project_dir=self.project_dir,
             agents_root=self.agents_root,
@@ -156,10 +188,19 @@ class BootstrapComposition:
             executor_contexts=self.executor_contexts,
             required_input_dirs=self.required_input_dirs,
             scope_dirs=self.scope_dirs,
+            isolation_capabilities=resolved,
+            isolation_probe_validator=factory.isolation_probe_validator,
         )
-        factory = next(factory for factory in self.factories if factory.name == resolved.name)
         executor = factory.create(runtime)
-        launchers = VerifierLaunchers(task=executor, test=executor)
+        launchers = VerifierLaunchers(
+            task=executor,
+            test=executor,
+            # A runner probe currently observes only a private-marker non-leak.  It does
+            # not exercise the executor's workspace-write controls or prove denial of
+            # sibling/outside-workspace reads and command execution, so it cannot settle
+            # either independent verifier after a strict launch rejection.
+            deterministic_isolation=None,
+        )
         environment = {cap.name: cap.available for cap in registry.adapters}
         environment.setdefault(CODEX, False)
         return executor, launchers, environment
@@ -168,6 +209,7 @@ class BootstrapComposition:
 def codex_factory(
     *,
     resolver: Callable[[], str | Sequence[str] | None] | None = None,
+    isolation_probe_validator: Callable[[str | Sequence[str], str], AdapterCapabilities] | None = None,
 ) -> AdapterFactory:
     """Declare the Codex runtime and construct it with the run's resolved anchors."""
     def create_codex(runtime: AdapterRuntime) -> CodexAdapter:
@@ -177,6 +219,8 @@ def codex_factory(
             scope_roots=runtime.scope_roots,
             required_input_dirs=runtime.required_input_dirs,
             task_scope_dirs=runtime.scope_dirs,
+            isolation_capabilities=runtime.isolation_capabilities,
+            isolation_probe_validator=runtime.isolation_probe_validator,
         )
 
     def codex_available() -> bool:
@@ -189,10 +233,82 @@ def codex_factory(
         supports_resume=False,
         supports_read_only=True,
         supports_write=True,
+        # A durable observation is diagnostic evidence, not a positive strict capability.
+        # Keep the production composition fail-closed until an executor-equivalent probe
+        # has a separately implemented and verified proof contract.
+        isolation_capabilities=CODEX_ISOLATION_CAPABILITIES,
+        isolation_probe_validator=isolation_probe_validator,
     )
 
 
-def _production_factories() -> tuple[AdapterFactory, ...]:
+def docker_codex_factory(
+    *,
+    image: str,
+    proxy_image: str,
+    codex_version: str,
+    auth_file: Path,
+    docker_executable: str = "docker",
+    image_validator: Callable[[str, str], bool] | None = None,
+) -> AdapterFactory:
+    """Build the opt-in, digest-pinned Docker Codex path.
+
+    This is intentionally not part of :func:`_production_factories`: a caller must explicitly
+    supply both the pinned image and runner-selected auth file.  The ordinary host Codex path
+    therefore remains fail-closed and cannot fall back to Docker (or vice versa).
+    """
+    def create_container_codex(runtime: AdapterRuntime) -> DockerCodexAdapter:
+        return DockerCodexAdapter(
+            image=image, proxy_image=proxy_image, codex_version=codex_version,
+            auth_file=auth_file, docker_executable=docker_executable,
+            isolation_capabilities=runtime.isolation_capabilities,
+            image_validator=image_validator,
+        )
+
+    return AdapterFactory(
+        name=CODEX,
+        create=create_container_codex,
+        available=lambda: shutil.which(docker_executable) is not None and auth_file.is_file(),
+        supports_resume=False,
+        supports_read_only=True,
+        supports_write=True,
+        isolation_capabilities=CODEX_ISOLATION_CAPABILITIES,
+    )
+
+
+def docker_codex_factories(
+    *, image: str, proxy_image: str, codex_version: str, auth_file: Path,
+) -> tuple[AdapterFactory, ...]:
+    """Return the normal Claude entry plus one explicitly selected Docker Codex entry."""
+    factories = _production_factories(Path("."))
+    return (factories[0], docker_codex_factory(
+        image=image, proxy_image=proxy_image, codex_version=codex_version, auth_file=auth_file,
+    ))
+
+
+def docker_factories_for_command(command: RunCommand) -> tuple[AdapterFactory, ...] | None:
+    """Select Docker only from complete typed controls; host Codex remains the default."""
+    if command.codex_runtime != "docker":
+        return None
+    if command.adapter not in {None, CODEX}:
+        raise AdapterError("Docker Codex runtime requires --adapter codex", "docker-runtime-invalid")
+    values = (
+        command.docker_codex_image, command.docker_proxy_image,
+        command.docker_codex_version, command.docker_codex_auth_file,
+    )
+    if not all(isinstance(value, str) and value for value in values):
+        raise AdapterError(
+            "Docker Codex runtime requires pinned images, version, and auth file",
+            "docker-runtime-incomplete",
+        )
+    return docker_codex_factories(
+        image=command.docker_codex_image,
+        proxy_image=command.docker_proxy_image,
+        codex_version=command.docker_codex_version,
+        auth_file=Path(command.docker_codex_auth_file),
+    )
+
+
+def _production_factories(project_dir: Path) -> tuple[AdapterFactory, ...]:
     def create_claude(runtime: AdapterRuntime) -> ClaudeAdapter:
         return ClaudeAdapter(
             working_root=str(runtime.project_dir),
@@ -200,6 +316,8 @@ def _production_factories() -> tuple[AdapterFactory, ...]:
             executor_contexts=runtime.executor_contexts,
             required_input_dirs=runtime.required_input_dirs,
             task_scope_dirs=runtime.scope_dirs,
+            isolation_capabilities=runtime.isolation_capabilities,
+            isolation_probe_validator=runtime.isolation_probe_validator,
         )
 
     def claude_available() -> bool:
@@ -213,8 +331,10 @@ def _production_factories() -> tuple[AdapterFactory, ...]:
             supports_resume=True,
             supports_read_only=True,
             supports_write=True,
+            isolation_capabilities=CLAUDE_ISOLATION_CAPABILITIES,
         ),
-        codex_factory(),
+        codex_factory(
+        ),
     )
 
 
@@ -229,7 +349,9 @@ def build_bootstrap(
     required_input_dirs: Mapping[str, Sequence[str]] | None = None,
     scope_dirs: Mapping[str, Sequence[str]] | None = None,
 ) -> BootstrapComposition:
-    registered_factories = tuple(factories) if factories is not None else _production_factories()
+    registered_factories = (
+        tuple(factories) if factories is not None else _production_factories(Path(project_dir))
+    )
     paths = logical_paths or {"agents": ".agents", "core": "core"}
     return BootstrapComposition(
         Path(project_dir),
@@ -791,10 +913,15 @@ def run_execute(
         bad = ", ".join(f"{t} ({r})" for t, r in sorted(reason_by_type.items()))
         raise CliError(EXIT_ERROR, f"execute mode: unroutable task type(s): {bad}")
 
+    try:
+        factories = docker_factories_for_command(command)
+    except AdapterError as exc:
+        raise CliError(EXIT_ERROR, f"{exc.code}: {exc}") from None
     composition = build_bootstrap(
         project_dir,
         agents_root,
         anchors.core_root,
+        factories=factories,
         logical_paths={
             "agents": profile.logical_paths.agents,
             "core": profile.logical_paths.core,
@@ -1024,6 +1151,9 @@ __all__ = [
     "build_required_input_dirs",
     "build_scope_dirs",
     "codex_factory",
+    "docker_codex_factory",
+    "docker_codex_factories",
+    "docker_factories_for_command",
     "load_markdown_plan",
     "MarkdownPlanError",
     "load_runnable_profile",

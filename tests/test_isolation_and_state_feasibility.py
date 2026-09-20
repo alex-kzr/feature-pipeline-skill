@@ -148,11 +148,13 @@ class StrictIsolationUnsupportedTests(unittest.TestCase):
 
     def test_launch_request_has_no_stack_bundle_or_required_read_fields(self) -> None:
         names = {f.name for f in dataclasses.fields(LaunchRequest)}
-        # No validated per-stack bundle, no enforced transitive skill-read list, no nested
-        # delegate policy is representable at the launch boundary today.
-        self.assertEqual(names & {"stack", "skill_bundle", "bundle_digest", "required_reads",
-                                  "nested_tools"}, set())
-        self.assertTrue({"model", "effort"} <= names)
+        # No enforced transitive skill-read list, no nested delegate policy is representable
+        # at the launch boundary. TC-11 closed the `bundle_digest`/`recipient_role` gap this
+        # test originally characterized: the request now carries the digest-bound resolved
+        # skill bundle and its recipient role, so an adapter can reject role/bundle
+        # substitution before any process starts (AC-1).
+        self.assertEqual(names & {"stack", "skill_bundle", "required_reads", "nested_tools"}, set())
+        self.assertTrue({"model", "effort", "bundle_digest", "recipient_role"} <= names)
         self.assertEqual({f.name for f in dataclasses.fields(LaunchResult)} & {"stack"}, set())
 
     def test_skill_read_enforcement_is_only_one_line_of_prompt_prose(self) -> None:
@@ -167,13 +169,12 @@ class StrictIsolationUnsupportedTests(unittest.TestCase):
         self.assertNotIn("read-only", loose.lower())
         self.assertNotIn("--require-read", build_claude_argv(_verifier_request(), executable="claude"))
 
-    def test_no_tools_launch_is_a_claude_flag_with_no_codex_equivalent(self) -> None:
+    def test_no_tools_launch_is_rejected_when_codex_has_no_enforcing_surface(self) -> None:
         claude = build_claude_argv(_verifier_request(no_tools=True), executable="claude")
         self.assertEqual(claude[claude.index("--tools") + 1], "")
-        codex = build_codex_argv(_verifier_request(no_tools=True), executable="codex")
-        # Codex exposes only the read-only sandbox; there is no dedicated tool-free switch.
-        self.assertNotIn("--tools", codex)
-        self.assertEqual(codex[codex.index("--sandbox") + 1], "read-only")
+        with self.assertRaises(AdapterError) as raised:
+            build_codex_argv(_verifier_request(no_tools=True), executable="codex")
+        self.assertEqual(raised.exception.code, "no-tools-unsupported")
 
 
 class PersistenceOwnershipTests(unittest.TestCase):
