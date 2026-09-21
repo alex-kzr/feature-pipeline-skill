@@ -113,6 +113,23 @@ class SkillBundleTests(unittest.TestCase):
         with self.assertRaisesRegex(SkillBundleError, "must be an object"):
             load_manifests(["[]"])
 
+    def test_rejects_invalid_manifest_schema_and_conflicting_duplicates(self) -> None:
+        invalid_cases = [
+            ("permitted_roles", [""], "permitted_roles must be a list"),
+            ("id", "", "needs non-empty"),
+            ("classification", "python", "unknown skill classification"),
+            ("source", "../skill.json", "source escapes its anchor"),
+        ]
+        for key, value, message in invalid_cases:
+            with self.subTest(key=key):
+                raw = _manifest("python", "stack:python")
+                raw[key] = value
+                with self.assertRaisesRegex(SkillBundleError, message):
+                    load_manifests([raw])
+        with self.assertRaisesRegex(SkillBundleError, "duplicate skill id"):
+            load_manifests([_manifest("python", "stack:python"),
+                            _manifest("python", "stack:python", content="different")])
+
     def test_rejects_unknown_disallowed_and_stale_requested_skills(self) -> None:
         manifest = load_manifests([_manifest("python", "stack:python")])["python"]
         with self.assertRaisesRegex(SkillBundleError, "unknown required skill"):
@@ -150,6 +167,23 @@ class SkillBundleTests(unittest.TestCase):
                     descriptor.write_text(document, encoding="utf-8")
                     with self.assertRaisesRegex(SkillBundleError, message):
                         load_project_skill_bundle(root, task_type="python", recipient_role="executor")
+
+    def test_project_bundle_requires_descriptors_with_matching_manifest_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "tools" / "feature-pipeline" / "config"
+            _write_project_profile(config)
+            with self.assertRaisesRegex(SkillBundleError, "has no skill descriptors"):
+                load_project_skill_bundle(root, task_type="python", recipient_role="executor")
+            source = root / "skills" / "actual.json"
+            source.parent.mkdir()
+            source.write_text(json.dumps(_manifest("actual", "stack:python")), encoding="utf-8")
+            (config / "skill-python.json").write_text(json.dumps({
+                "catalog": "feature_pipeline.catalogs.skill_bundles.v1",
+                "id": "declared", "source": "skills/actual.json",
+            }), encoding="utf-8")
+            with self.assertRaisesRegex(SkillBundleError, "IDs do not match"):
+                load_project_skill_bundle(root, task_type="python", recipient_role="executor")
 
     def test_project_bundle_uses_canonical_route_and_recipient_role(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
