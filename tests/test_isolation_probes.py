@@ -9,11 +9,13 @@ import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 from feature_pipeline.infrastructure.isolation_probes import (
     DeterministicIsolationVerifier,
     IsolationProbeRecordError,
     ProductionIsolationProbe,
+    _assert_runner_owned_location,
     _observed_version,
     load_isolation_capabilities,
 )
@@ -165,6 +167,29 @@ class ProductionIsolationProbeTests(unittest.TestCase):
         )
         self.assertEqual(verdict.token, "FAIL")
         self.assertEqual(verdict.report["reason"], "deterministic-isolation-verifier-not-applicable")
+
+    def test_runner_owned_record_and_version_probe_fail_closed_on_execution_errors(self) -> None:
+        approved = self.root / ".pipeline" / "isolation-probes" / "codex.json"
+        with self.assertRaisesRegex(IsolationProbeRecordError, "record is unavailable"):
+            _assert_runner_owned_location(approved, project_dir=self.root, name="codex")
+
+        foreign = self.root / "foreign.json"
+        foreign.write_text("{}", encoding="utf-8")
+        with self.assertRaisesRegex(IsolationProbeRecordError, "not runner-owned"):
+            _assert_runner_owned_location(foreign, project_dir=self.root, name="codex")
+
+        with patch(
+            "feature_pipeline.infrastructure.isolation_probes.subprocess.run",
+            side_effect=OSError("unavailable"),
+        ):
+            with self.assertRaisesRegex(IsolationProbeRecordError, "version is unavailable"):
+                _observed_version(self.executable)
+        with patch(
+            "feature_pipeline.infrastructure.isolation_probes.subprocess.run",
+            return_value=subprocess.CompletedProcess(self.executable, 1, stdout="", stderr="bad"),
+        ):
+            with self.assertRaisesRegex(IsolationProbeRecordError, "version is unavailable"):
+                _observed_version(self.executable)
 
 
 if __name__ == "__main__":
