@@ -36,6 +36,26 @@ def _profile() -> CompiledProfile:
     return CompiledProfile.from_mapping(raw, checks)
 
 
+def _write_project_profile(config: Path) -> None:
+    config.mkdir(parents=True)
+    profile = {
+        "schema_version": 1, "project": "p",
+        "anchors": {"agents_root": ".agents", "core_root": "feature-pipeline-skill"},
+        "run_state_path": ".pipeline/runs",
+        "roles": [
+            {"role": "executor", "min_grants": ["read", "write"]},
+            {"role": "test_verifier", "min_grants": ["read"]},
+        ],
+        "stacks": [{"id": "python", "role": "executor", "checks": ["py"]}],
+        "task_routing": [{"task_type": "python", "working_root": ".", "stack": "python"}],
+    }
+    checks = {"schema_version": 1, "checks": [
+        {"name": "py", "stack": "python", "argv": ["true"], "cwd": "."},
+    ]}
+    (config / "pipeline.profile.json").write_text(json.dumps(profile), encoding="utf-8")
+    (config / "checks.json").write_text(json.dumps(checks), encoding="utf-8")
+
+
 class SkillBundleTests(unittest.TestCase):
     def test_resolves_matching_stack_and_neutral_dependencies_deterministically(self) -> None:
         manifests = load_manifests([_manifest("python", "stack:python", dependencies=["neutral"]),
@@ -108,6 +128,28 @@ class SkillBundleTests(unittest.TestCase):
             resolve_skill_bundle(_profile(), stack="python", requested_role="executor",
                                  requested_ids=["python"],
                                  manifests={"python": replace(manifest, content="changed")})
+
+    def test_project_bundle_rejects_malformed_and_unavailable_descriptors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "tools" / "feature-pipeline" / "config"
+            _write_project_profile(config)
+            descriptor = config / "skill-invalid.json"
+            cases = [
+                ("{", "invalid skill descriptor"),
+                ("[]", "must be an object"),
+                (json.dumps({"catalog": "unknown", "id": "python", "source": "skills/python.json"}),
+                 "unknown skill descriptor catalog"),
+                (json.dumps({"catalog": "feature_pipeline.catalogs.skill_bundles.v1", "id": "python", "source": "../escape"}),
+                 "unsafe skill descriptor"),
+                (json.dumps({"catalog": "feature_pipeline.catalogs.skill_bundles.v1", "id": "python", "source": "skills/missing.json"}),
+                 "source is unavailable"),
+            ]
+            for document, message in cases:
+                with self.subTest(message=message):
+                    descriptor.write_text(document, encoding="utf-8")
+                    with self.assertRaisesRegex(SkillBundleError, message):
+                        load_project_skill_bundle(root, task_type="python", recipient_role="executor")
 
     def test_project_bundle_uses_canonical_route_and_recipient_role(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
