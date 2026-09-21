@@ -181,7 +181,7 @@ def build_parser() -> argparse.ArgumentParser:
     compat.add_argument("--adapter", metavar="NAME", choices=["claude", "codex", "auto"],
                         help="execution adapter for --mode execute (real control there); "
                              "accepted as a no-op in plan-only/unattended")
-    compat.add_argument("--codex-runtime", choices=["host", "docker"], default="host",
+    compat.add_argument("--codex-runtime", choices=["host", "docker"], default=None,
                         help="Codex runtime for execute/live-probe: host (default, fail-closed) "
                              "or the explicitly configured Docker runtime")
     compat.add_argument("--docker-codex-image", metavar="IMAGE", default=DOCKER_CODEX_IMAGE,

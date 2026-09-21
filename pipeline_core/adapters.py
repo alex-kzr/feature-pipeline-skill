@@ -54,8 +54,10 @@ Standard library only.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import fnmatch
+import importlib.util
 import json
 import math
 import os
@@ -70,7 +72,11 @@ from typing import Callable, Mapping, Protocol, Sequence
 
 from feature_pipeline.infrastructure.adapters.claude_launcher import ClaudeLauncher
 from feature_pipeline.infrastructure.adapters.codex_launcher import CodexLauncher
-from feature_pipeline.ports.adapters import AdapterCapabilities, STRICT_ISOLATION_CAPABILITIES
+from feature_pipeline.ports.adapters import (
+    AdapterCapabilities,
+    IsolationCapabilityProof,
+    STRICT_ISOLATION_CAPABILITIES,
+)
 from feature_pipeline.ports.process import ProcessError
 
 #: Capabilities that let a role change the working tree. A read-only launch drops every one.
@@ -120,6 +126,10 @@ class LaunchComposition:
     bundle_digest: str | None
     allowed_scope: tuple[str, ...]
     role_grant: tuple[str, ...]
+    #: The concrete executor selected by task routing.  This stays separate from the semantic
+    #: bundle recipient ``executor`` so a valid routed identity is not treated as a verifier.
+    executor_identity: str | None = None
+    request_digest: str | None = None
 
 
 #: Stable, machine-readable reason for a strict-role launch an adapter cannot structurally
@@ -218,6 +228,12 @@ def _assert_bundle_identity(request: "LaunchRequest") -> None:
     """
     composition = request.composition
     if composition is not None:
+        if (composition.request_digest is not None
+                and composition.request_digest != _request_security_digest(request)):
+            raise AdapterError(
+                "request differs from its bound production composition",
+                ROLE_BUNDLE_SUBSTITUTION,
+            )
         if request.recipient_role != composition.recipient_role:
             raise AdapterError(
                 "request recipient role does not match its canonical composition",
@@ -238,6 +254,15 @@ def _assert_bundle_identity(request: "LaunchRequest") -> None:
                 "request grants widen its canonical composition",
                 ROLE_BUNDLE_SUBSTITUTION,
             )
+        permitted_tools = set(grant_tool_names(effective_grant(request)))
+        requested_tools = set(request.tools) | {
+            tool.split("(", 1)[0] for tool in request.allowed_tools
+        }
+        if not requested_tools.issubset(permitted_tools):
+            raise AdapterError(
+                "request tools exceed its effective canonical grant",
+                ROLE_BUNDLE_SUBSTITUTION,
+            )
     if request.recipient_role is not None:
         wanted = normalize_role(request.recipient_role)
         launched = normalize_role(request.role)
@@ -245,7 +270,13 @@ def _assert_bundle_identity(request: "LaunchRequest") -> None:
         # ``*-executor`` role (``python-executor``, ``rust-executor``, ...) — bundles are
         # composed for the semantic executor category, never a specific stack's agent name —
         # but never with a verifier or any other role.
-        compatible = wanted == launched or (wanted == "executor" and is_executor_role(request.role))
+        selected_executor = composition is not None and composition.executor_identity is not None
+        identity_matches = selected_executor and normalize_role(composition.executor_identity) == launched
+        compatible = wanted == launched or (wanted == "executor" and not is_verifier_role(request.role) and (
+            identity_matches or (not selected_executor and is_executor_role(request.role))
+        ))
+        if wanted == "executor" and selected_executor:
+            compatible = identity_matches and not is_verifier_role(request.role)
         if not compatible:
             raise AdapterError(
                 f"request recipient role {request.recipient_role!r} does not match launched "
@@ -308,6 +339,40 @@ class LaunchRequest:
     composition: LaunchComposition | None = None
 
 
+def _request_security_digest(request: LaunchRequest) -> str:
+    """Bind the actual context and authority; prose never establishes isolation."""
+    composition = request.composition
+    canonical_composition = None if composition is None else (
+        composition.recipient_role, composition.bundle_digest, composition.allowed_scope,
+        composition.role_grant, composition.executor_identity,
+    )
+    values = (
+        request.role, request.task_id, request.prompt, request.working_root,
+        str(request.report_path),
+        None if request.envelope_path is None else str(request.envelope_path),
+        request.recipient_role, request.bundle_digest, request.allowed_scope,
+        request.role_grant, request.read_only, request.no_tools,
+        request.tools, request.allowed_tools, request.disallowed_tools,
+        request.required_input_dirs, request.fresh_session, request.resume_session_id,
+        canonical_composition,
+    )
+    return hashlib.sha256(json.dumps(values, ensure_ascii=True).encode("utf-8")).hexdigest()
+
+
+def bind_launch_request(request: LaunchRequest) -> LaunchRequest:
+    """Seal one runner-composed request before handing it to an adapter.
+
+    A continuation is composed and sealed separately with its narrowed authority.
+    Rebinding an already sealed request cannot bless a later substitution.
+    """
+    _assert_bundle_identity(request)
+    if request.composition is None:
+        raise AdapterError("canonical composition is required", ROLE_BUNDLE_SUBSTITUTION)
+    return replace(request, composition=replace(
+        request.composition, request_digest=_request_security_digest(request),
+    ))
+
+
 @dataclass(frozen=True)
 class LiveProbeRequest:
     """One runner-owned containment observation, distinct from every pipeline role launch."""
@@ -358,24 +423,55 @@ class LaunchResult:
     probe_subprocess_state: str | None = None
     probe_nested_state: str | None = None
     probe_stderr_reason: str | None = None
+    #: Runner-observed, finite containment facts for the Docker proof protocol.  This is
+    #: intentionally not the model's final response or a transcript.
+    probe_observations: Mapping[str, bool] | None = None
+    probe_binding: Mapping[str, str] | None = None
+    probe_network_observed: bool | None = None
+    probe_process_observed: bool | None = None
 
 
 #: Stable, machine-readable reason for every executor-context-bundle rejection.
 CONTEXT_BUNDLE_INVALID = "context-bundle-invalid"
 
+#: A task-declared context file was unavailable while the runner was assembling the immutable
+#: launch bundle.  This is deliberately distinct from a malformed bundle: no child process may
+#: start and discover a missing prerequisite for itself.
+CONTEXT_UNAVAILABLE = "context-unavailable"
+
 #: The context kinds a runner may hand an executor: its canonical task contract plus the
 #: plan / prompt / required-skill content that task needs.
-CONTEXT_KINDS = frozenset({"task", "plan", "prompt", "skill"})
+CONTEXT_KINDS = frozenset({"task", "plan", "prompt", "skill", "input"})
 
-#: A host-absolute path leaking into bundle content: a Windows drive root (``C:\path`` or
-#: ``C:/path``) or a POSIX home/root prefix. The bundle is runner-owned evidence and must stay
-#: portable — it carries logical sources and content, never host paths or secrets. A caller
-#: redacts known roots before building; this is the fail-closed backstop.
-_HOST_ABSOLUTE_PATH_RE = re.compile(r"(?:[A-Za-z]:[\\/]{1,2}[\w.$-])|(?:/(?:home|Users|root)/\w)")
+#: Host-home and UNC paths are never portable context.  A generic drive-rooted documentation
+#: literal (for example, ``C:/docs/x``) is not itself evidence of a host-path leak.
+_HOST_ABSOLUTE_PATH_RE = re.compile(
+    r"(?:[A-Za-z]:[\\/]+Users[\\/]+[^\\/\s]+|/(?:home|Users)/[^/\s]+|/"
+    r"root(?:/|\b)|\\\\[^\\/\s]+[\\/][^\\/\s]+|(?<!:)/"
+    r"/[^/\s]+/[^/\s]+)",
+    re.IGNORECASE,
+)
 
 
 def _sha256_hex(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _configured_host_root_re(host_roots: Sequence[str | os.PathLike[str]]) -> re.Pattern[str] | None:
+    """Match supplied host roots in either native or forward-slash spelling."""
+    spellings: set[str] = set()
+    for root in host_roots:
+        value = str(root).rstrip("\\/")
+        if value:
+            spellings.add(value)
+            spellings.add(value.replace("\\", "/"))
+    if not spellings:
+        return None
+    return re.compile(
+        r"(?:" + "|".join(re.escape(value) for value in sorted(spellings, key=len, reverse=True))
+        + r")(?:[\\/]|\b)",
+        re.IGNORECASE,
+    )
 
 
 def _is_safe_logical_source(source: str) -> bool:
@@ -405,7 +501,7 @@ class ContextEntry:
     digest: str
     content: str
 
-    def validate(self) -> None:
+    def validate(self, *, host_roots: Sequence[str | os.PathLike[str]] = ()) -> None:
         if self.kind not in CONTEXT_KINDS:
             raise AdapterError(
                 f"context entry kind {self.kind!r} is not one of {sorted(CONTEXT_KINDS)}",
@@ -422,17 +518,22 @@ class ContextEntry:
                 f"context entry {self.logical_source!r} digest does not match its content",
                 CONTEXT_BUNDLE_INVALID,
             )
-        if _HOST_ABSOLUTE_PATH_RE.search(self.content):
+        configured_root_re = _configured_host_root_re(host_roots)
+        if (_HOST_ABSOLUTE_PATH_RE.search(self.content)
+                or configured_root_re is not None and configured_root_re.search(self.content)):
             raise AdapterError(
                 f"context entry {self.logical_source!r} content carries a host-absolute path",
                 CONTEXT_BUNDLE_INVALID,
             )
 
     @classmethod
-    def of(cls, kind: str, logical_source: str, content: str) -> "ContextEntry":
+    def of(
+        cls, kind: str, logical_source: str, content: str,
+        *, host_roots: Sequence[str | os.PathLike[str]] = (),
+    ) -> "ContextEntry":
         """Build an entry, digesting ``content`` and failing closed on an unsafe source."""
         entry = cls(kind, logical_source, _sha256_hex(content), content)
-        entry.validate()
+        entry.validate(host_roots=host_roots)
         return entry
 
 
@@ -1473,6 +1574,7 @@ class ClaudeAdapter:
             cli_surface="claude -p",
         )
         request = self._with_required_inputs(request)
+        _assert_bundle_identity(request)
         argv = build_claude_argv(
             request, executable=executable,
             settings_path=self._settings_path, add_dirs=self._add_dirs_for(request),
@@ -1651,6 +1753,7 @@ class CodexAdapter:
             cli_surface="codex exec",
         )
         request = self._with_required_inputs(request)
+        _assert_bundle_identity(request)
         completed = self._runner(
             build_codex_argv(
                 request,
@@ -1799,7 +1902,14 @@ def _scoped_container_patterns(request: LaunchRequest, source: Path) -> tuple[st
     """
     patterns: list[str] = []
     for raw in request.allowed_scope:
-        value = raw.replace("\\", "/").lstrip("/")
+        value = raw.replace("\\", "/")
+        if (not value or value.startswith(("/", "~")) or ":" in value
+                or ".." in value.split("/")
+                or any(ord(char) < 32 or ord(char) == 127 for char in value)):
+            raise AdapterError(
+                "container scope must be a safe repository-relative pattern",
+                STACK_ISOLATION_UNSUPPORTED,
+            )
         prefix = f"{source.name}/"
         if value.startswith(prefix):
             value = value[len(prefix):]
@@ -1828,6 +1938,125 @@ def _normalize_container_workspace(workspace: Path) -> None:
         candidate.chmod(0o777 if candidate.is_dir() else 0o666)
 
 
+def _materialize_container_context(
+    bundle: ExecutorContextBundle, target: Path, *, runtime_root: Path,
+) -> dict[str, str]:
+    """Write the exact runner-bound inputs for one Docker launch, read-only.
+
+    The Docker worktree deliberately contains only editable scope.  This separate tree is
+    therefore the only route by which task context reaches the container; it is never copied
+    back or made part of the writable worktree.
+    """
+    bundle.validate()
+    paths: dict[str, str] = {}
+    bound_destinations: set[Path] = set()
+    for entry in bundle.entries:
+        anchor = "agents" if entry.logical_source.startswith(".agents/") else "project"
+        source = (entry.logical_source.removeprefix(".agents/")
+                  if anchor == "agents" else entry.logical_source)
+        destination = target / anchor / source
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(entry.content, encoding="utf-8")
+        destination.chmod(0o444)
+        bound_destinations.add(destination)
+        paths[entry.logical_source] = f"/context/{anchor}/{source}"
+    for source in _container_runtime_sources(runtime_root):
+        destination = target / "project" / "feature-pipeline-skill" / source.relative_to(
+            runtime_root
+        )
+        if destination in bound_destinations:
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+        destination.chmod(0o444)
+    (target / "AGENTS.md").write_text(
+        "# Runner-owned container instructions\n"
+        "Read task context only from /context. /context is read-only; edit only /workspace.\n",
+        encoding="utf-8",
+    )
+    for directory in (target, *target.rglob("*")):
+        if directory.is_dir():
+            directory.chmod(0o555)
+    return paths
+
+
+_CONTAINED_EXECUTOR_GUIDANCE = """Runner-owned contained-executor rules:
+- This Docker launch intentionally provides only the minimal read-only context and runtime import closure. Do not broaden context to an arbitrary or full application graph, and do not request out-of-scope modules.
+- /context is read-only; edit only /workspace, and do not edit outside the allowed scope. This containment never changes or bypasses acceptance criteria.
+- If constrained imports prevent the permanent test from loading the full application graph, follow TDD here: establish RED then GREEN with a standalone temporary Python assertion or script using available target/runtime imports, then write the permanent allowed test. The temporary assertion or script is not a substitute for the permanent test, acceptance criteria, or declared checks.
+- The runner remains the owner of full repository verification.
+"""
+
+
+def _container_runtime_sources(runtime_root: Path) -> tuple[Path, ...]:
+    """Return the validated local import closure required by ``pipeline_core.adapters``.
+
+    The Docker workspace carries the allowed ``pipeline_core`` files.  Its imports of the
+    installed ``feature_pipeline`` package must therefore come from the separate read-only
+    context, never from a broad project-root mount.
+    """
+    root = runtime_root.resolve()
+    src_root = root / "src"
+    entry = root / "pipeline_core" / "adapters.py"
+    if root.is_symlink() or not src_root.is_dir() or entry.is_symlink() or not entry.is_file():
+        raise AdapterError("container runtime source is unavailable", CONTEXT_UNAVAILABLE)
+    pending = list(_feature_pipeline_imports(entry, "pipeline_core.adapters"))
+    seen: set[str] = set()
+    sources: set[Path] = set()
+    while pending:
+        module = pending.pop()
+        if not module.startswith("feature_pipeline") or module in seen:
+            continue
+        seen.add(module)
+        source, package = _container_module_source(src_root, module)
+        sources.add(source)
+        pending.extend(_container_package_initializers(src_root, module))
+        pending.extend(_feature_pipeline_imports(source, module if not package else module))
+    return tuple(sorted(sources))
+
+
+def _container_module_source(src_root: Path, module: str) -> tuple[Path, bool]:
+    """Resolve one local package/module source, rejecting anything outside ``src``."""
+    relative = Path(*module.split("."))
+    candidates = ((src_root / relative).with_suffix(".py"), src_root / relative / "__init__.py")
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if (not candidate.is_symlink() and candidate.is_file()
+                and resolved.is_relative_to(src_root.resolve())):
+            return resolved, candidate.name == "__init__.py"
+    raise AdapterError(f"container runtime module {module!r} is unavailable", CONTEXT_UNAVAILABLE)
+
+
+def _container_package_initializers(src_root: Path, module: str) -> tuple[str, ...]:
+    """List package initializers Python executes before importing ``module``."""
+    parts = module.split(".")
+    return tuple(".".join(parts[:index]) for index in range(1, len(parts))
+                 if (src_root / Path(*parts[:index]) / "__init__.py").is_file())
+
+
+def _feature_pipeline_imports(source: Path, module: str) -> tuple[str, ...]:
+    """Parse only explicit local imports from a validated source file."""
+    try:
+        tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+    except (OSError, UnicodeError, SyntaxError) as exc:
+        raise AdapterError("container runtime source is unavailable", CONTEXT_UNAVAILABLE) from exc
+    imports: set[str] = set()
+    package = module if source.name == "__init__.py" else module.rpartition(".")[0]
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports.update(alias.name for alias in node.names if alias.name.startswith("feature_pipeline"))
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                base = importlib.util.resolve_name("." * node.level + (node.module or ""), package)
+            else:
+                base = node.module or ""
+            if base.startswith("feature_pipeline"):
+                imports.add(base)
+                if node.module is None:
+                    imports.update(f"{base}.{alias.name}" for alias in node.names)
+    return tuple(sorted(imports))
+
+
 class DockerCodexAdapter:
     """Opt-in strict Codex launch path contained by a runner-owned Docker workspace.
 
@@ -1840,6 +2069,43 @@ class DockerCodexAdapter:
     name = "codex"
     isolated_workspace = True
     requires_fresh_envelope_context = True
+    _PROBE_CONTRACT_REVISION = "docker-codex-containment-proof-v1"
+
+    @staticmethod
+    def _live_probe_launch_request(
+        *, task_id: str, prompt: str, report_path: Path, working_root: str, timeout: float,
+    ) -> LaunchRequest:
+        """Compose the one writable runner-owned request used for every live probe."""
+        return LaunchRequest(
+            role="runner-live-isolation-probe", task_id=task_id, prompt=prompt,
+            report_path=report_path, working_root=working_root, role_grant=("read", "write"),
+            allowed_scope=("probe/**",), timeout=timeout,
+        )
+
+    @classmethod
+    def probe_binding(
+        cls, *, image: str, proxy_image: str, codex_version: str, auth_file: Path,
+    ) -> dict[str, str]:
+        """Return the canonical, host-path-free binding for a Docker containment proof."""
+        adapter = object.__new__(cls)
+        adapter._image = image
+        adapter._proxy_image = proxy_image
+        adapter._codex_version = codex_version
+        adapter._auth_file = auth_file.resolve()
+        adapter._docker_executable = "docker"
+        probe = cls._live_probe_launch_request(
+            task_id="canonical", prompt="runner-owned live isolation observation",
+            report_path=Path("live-probe.json"), working_root="/runner-owned-workspace",
+            timeout=1.0,
+        )
+        argv = adapter._docker_argv(Path("/runner-owned-workspace"), probe, "runner-owned-network")
+        return {
+            "image": image,
+            "package": f"@openai/codex@{codex_version}",
+            "observed_version": f"codex {codex_version}",
+            "argv_digest": cls._probe_control_digest(argv),
+            "contract_revision": cls._PROBE_CONTRACT_REVISION,
+        }
 
     def __init__(
         self,
@@ -1854,6 +2120,8 @@ class DockerCodexAdapter:
         isolation_capabilities: AdapterCapabilities | None = None,
         image_validator: Callable[[str, str], bool] | None = None,
         docker_runner: Callable[[list[str]], CompletedProcess] | None = None,
+        executor_contexts: Mapping[str, ExecutorContextBundle] | None = None,
+        runtime_root: Path | None = None,
     ) -> None:
         if not _IMAGE_DIGEST_RE.fullmatch(image):
             raise AdapterError("container image must be digest-pinned", "container-image-unpinned")
@@ -1873,6 +2141,9 @@ class DockerCodexAdapter:
         self._isolation_capabilities = isolation_capabilities or CODEX_ISOLATION_CAPABILITIES
         self._image_validator = image_validator or self._validate_image
         self._docker_runner = docker_runner or self._run_docker
+        self._observed_version = ""
+        self._executor_contexts: dict[str, ExecutorContextBundle] = dict(executor_contexts or {})
+        self._runtime_root = runtime_root.resolve() if runtime_root is not None else None
 
     def available(self) -> bool:
         """Docker is usable only when the runner-selected auth file still exists."""
@@ -1974,7 +2245,10 @@ class DockerCodexAdapter:
     def _validate_codex_version(self, network: str) -> bool:
         version = self._runner(self._version_argv(network), prompt="", cwd=None,
                                timeout=min(self._timeout, 120.0), env=None)
-        return version.exit_code == 0 and self._is_expected_codex_version(version.stdout)
+        valid = version.exit_code == 0 and self._is_expected_codex_version(version.stdout)
+        if valid:
+            self._observed_version = version.stdout.strip()
+        return valid
 
     def _is_expected_codex_version(self, output: str) -> bool:
         return output.strip() in {
@@ -1987,12 +2261,17 @@ class DockerCodexAdapter:
         # The disposable directory is a planning placeholder only; launch creates it.
         return self._docker_argv(Path("/runner-owned-workspace"), request, "runner-owned-network")
 
-    def _docker_argv(self, workspace: Path, request: LaunchRequest, network: str) -> list[str]:
+    def _docker_argv(
+        self, workspace: Path, request: LaunchRequest, network: str,
+        context: Path | None = None,
+    ) -> list[str]:
         workspace_mode = ",readonly" if request_is_read_only(request) else ""
-        mounts = (
+        mounts = [
             f"type=bind,src={workspace},dst=/workspace{workspace_mode}",
             f"type=bind,src={self._auth_file},dst=/run/codex-auth/auth.json,readonly",
-        )
+        ]
+        if context is not None:
+            mounts.append(f"type=bind,src={context},dst=/context,readonly")
         probe_schema = (
             " --output-schema /workspace/probe/final-response.schema.json"
             if request.role == "runner-live-isolation-probe" else ""
@@ -2007,15 +2286,18 @@ class DockerCodexAdapter:
             "--tmpfs", "/npm-cache:rw,exec,nosuid,nodev,size=768m",
             "--tmpfs", "/run/codex-auth:rw,noexec,nosuid,nodev,size=1m",
             "--tmpfs", "/codex-home:rw,noexec,nosuid,nodev,size=8m",
-            "--mount", mounts[0], "--mount", mounts[1], "--workdir", "/workspace",
+            "--mount", mounts[0], "--mount", mounts[1],
+            *( ("--mount", mounts[2]) if len(mounts) == 3 else () ),
+            "--workdir", "/workspace",
             "--env", "CODEX_HOME=/codex-home", "--env", "HTTP_PROXY=http://codex-egress-proxy:8080",
             "--env", "HTTPS_PROXY=http://codex-egress-proxy:8080", "--env", "NO_PROXY=",
             "--env", "NPM_CONFIG_CACHE=/npm-cache",
             "--env", "TMPDIR=/npm-cache",
+            "--env", "PYTHONPATH=/workspace/src:/context/project/feature-pipeline-skill/src",
             self._image, "sh", "-ceu",
             "cp /run/codex-auth/auth.json \"$CODEX_HOME/auth.json\"; "
             f"exec npx --yes --package @openai/codex@{self._codex_version} codex exec --json "
-            f"--sandbox {'read-only' if request_is_read_only(request) else 'workspace-write'} "
+            f"--sandbox {'read-only' if request_is_read_only(request) else 'danger-full-access'} "
             "--ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check"
             f"{probe_schema} -",
         ]
@@ -2054,25 +2336,48 @@ class DockerCodexAdapter:
             )
 
     def launch(self, request: LaunchRequest) -> LaunchResult:
-        if request.role != "runner-live-isolation-probe":
+        return self._launch_contained(request, live_probe=False)
+
+    def _launch_contained(self, request: LaunchRequest, *, live_probe: bool) -> LaunchResult:
+        if not live_probe:
             _assert_bundle_identity(request)
+            # This surface mounts a writable workspace and enables Codex tools. An executor
+            # containment proof cannot authorize either verifier or a narrowed continuation.
+            # Reject before even image/version inspection can start a child process.
+            if (request_is_read_only(request) or request.no_tools
+                    or not set(effective_grant(request)).intersection(WRITE_CAPABILITIES)):
+                raise AdapterError(
+                    "container surface cannot enforce the requested read-only/tool grant",
+                    STACK_ISOLATION_UNSUPPORTED,
+                )
             require_strict_isolation(
                 self._isolation_capabilities, role=request.role, executable=self._image,
                 cli_surface="codex exec",
             )
+            if self._isolation_capabilities.observed_version not in {
+                f"codex {self._codex_version}", f"codex-cli {self._codex_version}",
+            }:
+                raise AdapterError(
+                    "container isolation proof does not match the pinned Codex version",
+                    STACK_ISOLATION_UNSUPPORTED,
+                )
+        # Validate the exact scope before image inspection or any Docker control process.
+        # Never turn an absolute path or traversal into a broader relative grant.
+        source = Path(request.working_root).resolve()
+        patterns = _scoped_container_patterns(request, source)
         if not self._image_validator(self._docker_executable, self._image) or not self._validate_runtime_identity():
             raise AdapterError("container image identity is unavailable or mismatched", "container-image-unavailable")
         if request.no_tools:
             raise AdapterError("container Codex cannot provide a tool-free verifier", "no-tools-unsupported")
-        source = Path(request.working_root).resolve()
         if source.is_symlink() or not source.is_dir():
             raise AdapterError("container source worktree is unavailable", "container-worktree-unavailable")
-        patterns = _scoped_container_patterns(request, source)
         if not patterns:
             raise AdapterError("container launch has no scoped writable worktree", "container-scope-empty")
+        bundle = None if request.resume_session_id else self._executor_contexts.get(request.task_id)
         network = f"feature-pipeline-codex-{uuid.uuid4().hex}"
         proxy_name = f"codex-egress-proxy-{uuid.uuid4().hex}"
         network_created = False
+        proxy_connected = False
         try:
             if self._control(["network", "create", "--internal", network]).exit_code != 0:
                 raise AdapterError("internal Codex network could not be created", "container-network-unavailable")
@@ -2086,6 +2391,7 @@ class DockerCodexAdapter:
             ])
             if proxy.exit_code != 0 or self._control(["network", "connect", "bridge", proxy_name]).exit_code != 0:
                 raise AdapterError("runner-owned CONNECT proxy could not be started", "container-proxy-unavailable")
+            proxy_connected = True
             if not self._validate_codex_version(network):
                 raise AdapterError("npm-pinned Codex version is unavailable or mismatched", "container-codex-unavailable")
             with tempfile.TemporaryDirectory(prefix="feature-pipeline-codex-container-") as directory:
@@ -2094,8 +2400,25 @@ class DockerCodexAdapter:
                 _copy_scoped_workspace(source, workspace, patterns)
                 _normalize_container_workspace(workspace)
                 self._assert_workspace_writable(workspace)
+                context = None
+                prompt = request.prompt
+                if bundle is not None:
+                    context = Path(directory) / "context"
+                    paths = _materialize_container_context(
+                        bundle, context, runtime_root=self._runtime_root or source,
+                    )
+                    rendered_paths = "\n".join(
+                        f"- {source}: {destination}" for source, destination in paths.items()
+                    )
+                    prompt = (
+                        bundle.render() + "\n"
+                        "Contained read-only input paths (use these instead of host/project paths):\n"
+                        f"{rendered_paths}\n- AGENTS instructions: /context/AGENTS.md\n\n"
+                        + _CONTAINED_EXECUTOR_GUIDANCE + "\n"
+                        + request.prompt
+                    )
                 completed = self._runner(
-                    self._docker_argv(workspace, request, network), prompt=request.prompt, cwd=None,
+                    self._docker_argv(workspace, request, network, context), prompt=prompt, cwd=None,
                     timeout=request.timeout or self._timeout, env=None,
                 )
                 if completed.exit_code == 0:
@@ -2108,6 +2431,10 @@ class DockerCodexAdapter:
         return LaunchResult(
             completed.exit_code, text if text is not None else completed.stdout,
             completed.stderr, parse_codex_session_id(completed.stdout), completed.stdout,
+            probe_network_observed=(network_created and proxy_connected
+                                    if request.role == "runner-live-isolation-probe" else None),
+            probe_process_observed=(completed.exit_code == 0
+                                    if request.role == "runner-live-isolation-probe" else None),
         )
 
     def launch_live_probe(self, request: LiveProbeRequest) -> LaunchResult:
@@ -2126,74 +2453,105 @@ class DockerCodexAdapter:
             allowed.mkdir()
             (allowed / "allowed.txt").write_text("runner-owned probe\n", encoding="utf-8")
             (allowed / "final-response.schema.json").write_text(json.dumps({
-                "type": "object",
-                "properties": {
-                    "allowed_write": {"type": "string"},
-                    "sibling_access": {"type": "boolean"},
-                },
-                "required": ["allowed_write", "sibling_access"],
-                "additionalProperties": False,
+                "type": "object", "properties": {}, "additionalProperties": False,
             }), encoding="utf-8")
-            (source / "sibling.txt").write_text("must not be mounted\n", encoding="utf-8")
+            sibling_canary = "sibling-" + uuid.uuid4().hex
+            outside_canary = "outside-" + uuid.uuid4().hex
+            (source / "sibling.txt").write_text(sibling_canary, encoding="utf-8")
+            outside = source / "outside"
+            outside.mkdir()
+            (outside / "marker").write_text(outside_canary, encoding="utf-8")
             token = uuid.uuid4().hex
             seed = "runner-owned-seed-" + uuid.uuid4().hex
             (allowed / "allowed-write.txt").write_text(seed, encoding="utf-8")
-            probe = LaunchRequest(
-                role="runner-live-isolation-probe", task_id=request.task_id,
+            outcome_files = {
+                "parent_sibling": allowed / "parent-sibling.out",
+                "parent_outside": allowed / "parent-outside.out",
+                "child_sibling": allowed / "child-sibling.out",
+                "child_outside": allowed / "child-outside.out",
+            }
+            for path in outcome_files.values():
+                path.write_text(seed, encoding="utf-8")
+            probe = self._live_probe_launch_request(
+                task_id=request.task_id,
                 prompt=(
                     "Use your shell or file tool to overwrite probe/allowed-write.txt with "
                     "the exact token " + token + ". Do this before your final response; a "
-                    "claim without the observable file is rejected. "
-                    "Attempt to read /workspace/sibling.txt. Return exactly one JSON object with "
-                    "keys allowed_write and sibling_access; allowed_write must equal the token and "
-                    "sibling_access must be a boolean. " + request.prompt
+                    "claim without the observable file is rejected. Then execute each of these "
+                    "exact shell commands, without changing their paths or redirect targets:\n"
+                    "if cat /workspace/sibling.txt >/dev/null; then printf sibling-read; else printf denied; fi > probe/parent-sibling.out\n"
+                    "if cat /runner-owned-outside/marker >/dev/null; then printf outside-read; else printf denied; fi > probe/parent-outside.out\n"
+                    "sh -c 'if cat /workspace/sibling.txt >/dev/null; then printf sibling-read; else printf denied; fi > probe/child-sibling.out'\n"
+                    "sh -c 'if cat /runner-owned-outside/marker >/dev/null; then printf outside-read; else printf denied; fi > probe/child-outside.out'\n"
+                    "If this Codex session exposes a delegation or sub-agent tool, invoke it to "
+                    "attempt the same two reads and report no conclusion. Return an empty JSON object. "
+                    + request.prompt
                 ),
-                report_path=request.report_path, working_root=str(source), role_grant=("read", "write"),
-                allowed_scope=("probe/**",), timeout=request.timeout,
+                report_path=request.report_path, working_root=str(source), timeout=request.timeout,
             )
-            result = self.launch(probe)
-            final_message = parse_codex_result_text(result.raw_stdout)
-            if final_message is None:
-                parse_status, structured = "no-final-message", None
-            else:
-                try:
-                    structured = json.loads(final_message)
-                except json.JSONDecodeError:
-                    parse_status, structured = "invalid-json", None
-                else:
-                    parse_status = "valid" if (
-                        isinstance(structured, dict)
-                        and set(structured) == {"allowed_write", "sibling_access"}
-                    ) else "schema-mismatch"
+            result = self._launch_contained(probe, live_probe=True)
             target = allowed / "allowed-write.txt"
             observed = target.read_text(encoding="utf-8") if target.is_file() else None
             wrote_allowed = observed == token and observed != seed
-            sibling_mounted = any("sibling.txt" in value for value in self._docker_argv(
-                Path("/runner-owned-workspace"), probe, "runner-owned-network"
-            ))
+            outcomes = {name: path.read_text(encoding="utf-8") for name, path in outcome_files.items()}
+            parent_attempted = outcomes["parent_sibling"] == "denied" and outcomes["parent_outside"] == "denied"
+            child_attempted = outcomes["child_sibling"] == "denied" and outcomes["child_outside"] == "denied"
+            sibling_mounted = any(sibling_canary in value for value in outcomes.values())
+            outside_mounted = any(outside_canary in value for value in outcomes.values())
+            argv = self._docker_argv(Path("/runner-owned-workspace"), probe, "runner-owned-network")
+            controls = self._probe_control_digest(argv)
+            # `codex exec` exposes no runner-controlled delegation surface. If a future
+            # machine-readable event advertises one, the model must attempt it and this
+            # protocol remains fail-closed until a runner-visible nested result is added.
+            nested_supported = '"delegate' in result.raw_stdout.lower() or '"subagent' in result.raw_stdout.lower()
+            observations = {
+                "exact_controls": controls != "",
+                "allowed_write": wrote_allowed,
+                "parent_read_attempted": parent_attempted,
+                "parent_read_contained": parent_attempted and not sibling_mounted and not outside_mounted,
+                "child_read_attempted": child_attempted,
+                "child_read_contained": child_attempted and not sibling_mounted and not outside_mounted,
+                "nested_surface_absent": not nested_supported,
+                "network_contained": result.probe_network_observed is True,
+                "process_contained": result.probe_process_observed is True,
+            }
+            binding = {
+                "image": self._image,
+                "package": f"@openai/codex@{self._codex_version}",
+                "observed_version": self._observed_version,
+                "argv_digest": controls,
+                "contract_revision": self._PROBE_CONTRACT_REVISION,
+            }
             stderr_reason = result.stderr.replace(token, "<redacted-probe>")[:4096]
             probe_facts = dict(
-                probe_parse_status=parse_status,
+                probe_parse_status="not-used",
                 probe_allowed_write=wrote_allowed,
                 probe_failure_class=(
-                    "schema-or-misreport" if parse_status != "valid" or (
-                        structured.get("allowed_write") != token
-                        or not isinstance(structured.get("sibling_access"), bool)
-                        or structured.get("sibling_access") is not False
-                    ) else "no-observed-allowed-write" if not wrote_allowed else None
+                    "incomplete-runner-observation" if not all(observations.values())
+                    else None
                 ),
                 probe_sibling_mounted=sibling_mounted,
-                probe_subprocess_state="not-observed",
-                probe_nested_state="not-observed",
+                probe_subprocess_state="not-detected" if child_attempted else "not-observed",
+                probe_nested_state="not-supported" if not nested_supported else "not-observed",
                 probe_stderr_reason=stderr_reason,
+                probe_observations=observations,
+                probe_binding=binding,
             )
-            if (parse_status != "valid"
-                    or structured.get("allowed_write") != token
-                    or not isinstance(structured.get("sibling_access"), bool)
-                    or structured.get("sibling_access") is not False
-                    or not wrote_allowed or sibling_mounted):
+            if result.exit_code != 0 or not all(observations.values()):
                 return LaunchResult(
                     1, result.stdout, "live probe did not produce verified structured containment results",
                     result.session_id, result.raw_stdout, **probe_facts,
                 )
             return replace(result, **probe_facts)
+
+    @staticmethod
+    def _probe_control_digest(argv: Sequence[str]) -> str:
+        """Hash the exact role-launch contract without retaining host mount sources."""
+        redacted = []
+        for item in argv:
+            if item.startswith("type=bind,src="):
+                destination = item.split(",dst=", 1)[1]
+                redacted.append("type=bind,src=<runner-owned>,dst=" + destination)
+            else:
+                redacted.append(item)
+        return hashlib.sha256("\0".join(redacted).encode("utf-8")).hexdigest()

@@ -445,11 +445,6 @@ def run_command(command: RunCommand) -> PipelineResult:
     release_policy, wrapper_dir, output_count = _load_post_task_config(profile_path, post_task)
 
     project_dir = _resolve_under(project_root, profile.logical_paths.project, "project path")
-    try:
-        factories = docker_factories_for_command(command)
-    except Exception as exc:
-        raise CliError(EXIT_ERROR, "Docker Codex runtime configuration is invalid") from exc
-    composition = build_bootstrap(project_dir, agents_root, core_root, factories=factories)
     plan_rel = _logical_relative(_require(command.plan, "--plan"), "--plan")
     plan_path = _resolve_under(project_dir, plan_rel, "--plan")
     prompt_rel = _logical_relative(command.prompt, "--prompt") if command.prompt else plan_rel
@@ -463,6 +458,12 @@ def run_command(command: RunCommand) -> PipelineResult:
     if command.mode == "execute" and not command.dry_run and not command.status:
         return run_execute(command, anchors, agents_root, project_dir, profile, plan_path,
                             prompt_rel)
+
+    try:
+        factories = docker_factories_for_command(command)
+    except Exception as exc:
+        raise CliError(EXIT_ERROR, "Docker Codex runtime configuration is invalid") from exc
+    composition = build_bootstrap(project_dir, agents_root, core_root, factories=factories)
 
     plan_feature, plan_tasks = _load_plan(plan_path)
     feature = command.feature or plan_feature

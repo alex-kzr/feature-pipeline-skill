@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import re
 import shutil
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -29,10 +31,13 @@ from feature_pipeline.ports.adapters import (
     CODEX,
     AdapterCapabilities,
     AdapterRegistry,
+    IsolationCapabilityProof,
+    STRICT_ISOLATION_CAPABILITIES,
 )
 from feature_pipeline.contracts import SchemaError, TaskSpec
 
 from pipeline_core.adapters import (
+    CONTEXT_UNAVAILABLE,
     REQUIRED_INPUT_INVALID,
     Adapter,
     AdapterError,
@@ -74,7 +79,11 @@ from pipeline_core.release import ReleasePolicy, load_release_policy
 from pipeline_core.stages import plan_release_dry_run
 from pipeline_core.state import Run, StateError, pid_alive, read_lease
 from pipeline_core.task_files import load_task_spec
-from pipeline_core.verification import VerifierAnchors, VerifierLaunchers
+from pipeline_core.verification import (
+    RunnerOwnedIsolationProofVerifier,
+    VerifierAnchors,
+    VerifierLaunchers,
+)
 
 ExecuteAdapters = Callable[[Path, Path, Path], tuple[object, VerifierLaunchers, dict[str, bool]]]
 
@@ -170,7 +179,7 @@ class BootstrapComposition:
     scope_dirs: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
     def make_execute_adapters(
-        self, adapter_name: str | None = None
+        self, adapter_name: str | None = None, *, run: Run | None = None,
     ) -> tuple[Adapter, VerifierLaunchers, dict[str, bool]]:
         registry = self.adapter_registry
         resolved = registry.select(adapter_name)
@@ -192,14 +201,19 @@ class BootstrapComposition:
             isolation_probe_validator=factory.isolation_probe_validator,
         )
         executor = factory.create(runtime)
+        # Docker's executor surface cannot serve read-only verifiers. Retain the proof
+        # diagnostic hook for callers, but verification keeps an incompatible launch blocked:
+        # containment evidence cannot supply either independent semantic verdict.
+        deterministic_isolation = (
+            RunnerOwnedIsolationProofVerifier(run)
+            if run is not None and isinstance(executor, DockerCodexAdapter)
+            and all(resolved.has(token) for token in STRICT_ISOLATION_CAPABILITIES)
+            else None
+        )
         launchers = VerifierLaunchers(
             task=executor,
             test=executor,
-            # A runner probe currently observes only a private-marker non-leak.  It does
-            # not exercise the executor's workspace-write controls or prove denial of
-            # sibling/outside-workspace reads and command execution, so it cannot settle
-            # either independent verifier after a strict launch rejection.
-            deterministic_isolation=None,
+            deterministic_isolation=deterministic_isolation,
         )
         environment = {cap.name: cap.available for cap in registry.adapters}
         environment.setdefault(CODEX, False)
@@ -249,6 +263,7 @@ def docker_codex_factory(
     auth_file: Path,
     docker_executable: str = "docker",
     image_validator: Callable[[str, str], bool] | None = None,
+    isolation_capabilities: AdapterCapabilities | None = None,
 ) -> AdapterFactory:
     """Build the opt-in, digest-pinned Docker Codex path.
 
@@ -262,6 +277,8 @@ def docker_codex_factory(
             auth_file=auth_file, docker_executable=docker_executable,
             isolation_capabilities=runtime.isolation_capabilities,
             image_validator=image_validator,
+            executor_contexts=runtime.executor_contexts,
+            runtime_root=runtime.core_root,
         )
 
     return AdapterFactory(
@@ -271,23 +288,116 @@ def docker_codex_factory(
         supports_resume=False,
         supports_read_only=True,
         supports_write=True,
-        isolation_capabilities=CODEX_ISOLATION_CAPABILITIES,
+        isolation_capabilities=isolation_capabilities or CODEX_ISOLATION_CAPABILITIES,
     )
+
+
+def docker_capabilities_from_durable_proof(
+    run: Run,
+    *,
+    task_ids: Sequence[str],
+    image: str,
+    proxy_image: str,
+    codex_version: str,
+    auth_file: Path,
+) -> AdapterCapabilities:
+    """Materialize only one digest-checked, exact Docker containment proof.
+
+    A probe row is audit evidence, not a capability by itself.  It becomes capability evidence
+    only when its canonical artifact still hashes to the row and binds the selected image,
+    package/version, canonical Docker argv, current task contract, and probe contract.
+    """
+    baseline = CODEX_ISOLATION_CAPABILITIES
+    expected = DockerCodexAdapter.probe_binding(
+        image=image, proxy_image=proxy_image, codex_version=codex_version, auth_file=auth_file,
+    )
+    expected_observed = {f"codex {codex_version}", f"codex-cli {codex_version}"}
+    required_observations = {
+        "exact_controls", "allowed_write", "parent_read_attempted", "parent_read_contained",
+        "child_read_attempted", "child_read_contained", "nested_surface_absent",
+        "network_contained", "process_contained",
+    }
+    selected = set(task_ids)
+    # Capabilities are adapter-wide once composed.  Do not let one task's proof authorize a
+    # mixed-contract dispatch set; the strict caller must select the exact proved task.
+    if len(selected) != 1:
+        return baseline
+    for row in reversed(run.live_probe_evidence):
+        if not isinstance(row, dict) or row.get("task_id") not in selected:
+            continue
+        task_id = row["task_id"]
+        try:
+            task = run.task(task_id)
+            proof_rel = str(row["proof_path"])
+            if proof_rel != f"reports/{task_id}/live-probe.json":
+                continue
+            proof_path = Path(run.run_dir) / proof_rel
+            content = proof_path.read_bytes()
+            proof = json.loads(content)
+        except (KeyError, OSError, json.JSONDecodeError):
+            continue
+        if (
+            hashlib.sha256(content).hexdigest() != row.get("proof_digest")
+            or row.get("adapter") != CODEX
+            or row.get("role") != "runner-live-isolation-probe"
+            or row.get("disposition") != "CONTAINMENT_PROVEN"
+            or row.get("task_contract_digest") != task.task_contract_digest
+            or row.get("task_contract_revision") != task.current_revision
+            or row.get("cli_version") not in expected_observed
+            or not isinstance(proof, dict)
+            or proof.get("schema_version") != 1
+            or proof.get("task_id") != task_id
+            or proof.get("attempt_id") != row.get("attempt_id")
+            or proof.get("role") != "runner-live-isolation-probe"
+            or proof.get("disposition") != "CONTAINMENT_PROVEN"
+            or proof.get("cleanup_removed") is not True
+            or proof.get("exit_zero") is not True
+        ):
+            continue
+        observations = proof.get("observations")
+        binding = proof.get("binding")
+        if not isinstance(observations, dict) or set(observations) != required_observations:
+            continue
+        if any(value is not True for value in observations.values()) or not isinstance(binding, dict):
+            continue
+        observed = binding.get("observed_version")
+        if observed not in expected_observed or row.get("cli_version") != observed:
+            continue
+        bound = {**expected, "observed_version": observed}
+        if binding != bound:
+            continue
+        proofs = tuple(
+            IsolationCapabilityProof(token, CODEX, image, "codex exec", observed,
+                                     f"{row['proof_path']}#{row['proof_digest']}")
+            for token in STRICT_ISOLATION_CAPABILITIES
+        )
+        return AdapterCapabilities(
+            CODEX, True, False, True, True,
+            supports_bundle_validated=True, supports_discovery_isolated=True,
+            supports_skill_reads_enforced=True, supports_subprocess_isolated=True,
+            supports_nested_delegation_isolated=True, isolation_proofs=proofs,
+            runtime=image, cli_surface="codex exec", observed_version=observed,
+        )
+    return baseline
 
 
 def docker_codex_factories(
     *, image: str, proxy_image: str, codex_version: str, auth_file: Path,
+    isolation_capabilities: AdapterCapabilities | None = None,
 ) -> tuple[AdapterFactory, ...]:
     """Return the normal Claude entry plus one explicitly selected Docker Codex entry."""
     factories = _production_factories(Path("."))
     return (factories[0], docker_codex_factory(
         image=image, proxy_image=proxy_image, codex_version=codex_version, auth_file=auth_file,
+        isolation_capabilities=isolation_capabilities,
     ))
 
 
-def docker_factories_for_command(command: RunCommand) -> tuple[AdapterFactory, ...] | None:
+def docker_factories_for_command(
+    command: RunCommand, *, run: Run | None = None, task_ids: Sequence[str] = (),
+) -> tuple[AdapterFactory, ...] | None:
     """Select Docker only from complete typed controls; host Codex remains the default."""
-    if command.codex_runtime != "docker":
+    if command.codex_runtime in {None, "host"}:
         return None
     if command.adapter not in {None, CODEX}:
         raise AdapterError("Docker Codex runtime requires --adapter codex", "docker-runtime-invalid")
@@ -300,12 +410,37 @@ def docker_factories_for_command(command: RunCommand) -> tuple[AdapterFactory, .
             "Docker Codex runtime requires pinned images, version, and auth file",
             "docker-runtime-incomplete",
         )
+    capabilities = (
+        docker_capabilities_from_durable_proof(
+            run, task_ids=task_ids, image=command.docker_codex_image,
+            proxy_image=command.docker_proxy_image, codex_version=command.docker_codex_version,
+            auth_file=Path(command.docker_codex_auth_file),
+        ) if run is not None else None
+    )
     return docker_codex_factories(
         image=command.docker_codex_image,
         proxy_image=command.docker_proxy_image,
         codex_version=command.docker_codex_version,
         auth_file=Path(command.docker_codex_auth_file),
+        isolation_capabilities=capabilities,
     )
+
+
+def _docker_auth_file_control_value(value: str | None, project_dir: Path) -> str | None:
+    """Persist a Docker auth-file identity without leaking an absolute host path."""
+    if value is None:
+        return None
+    path = Path(value).resolve()
+    default_auth = (Path.home() / ".codex" / "auth.json").resolve()
+    if path == default_auth:
+        return "<home>/.codex/auth.json"
+    try:
+        return path.relative_to(project_dir.resolve()).as_posix()
+    except ValueError:
+        raise CliError(
+            EXIT_ERROR,
+            "docker-runtime-invalid: Docker Codex auth file must be project-local",
+        ) from None
 
 
 def _production_factories(project_dir: Path) -> tuple[AdapterFactory, ...]:
@@ -548,22 +683,173 @@ def resolve_scope_roots(
 
 
 def _redacted_logical_entry(
-    kind: str, base: Path, rel: str, rules
+    kind: str, base: Path, rel: str, rules, *, host_roots: tuple[Path, ...] = (),
 ) -> ContextEntry | None:
     """Read ``base/rel``, redact known host roots, and return a digest-bound entry.
 
-    Returns ``None`` when the file cannot be read or the declared path is not a safe logical
-    source — the caller keeps the rest of the bundle rather than failing the run.
+    Returns ``None`` only when the file cannot be read.  Content validation failures retain
+    their typed invalid-bundle error rather than being misclassified as unavailable.
     """
     rel_posix = Path(rel).as_posix().lstrip("/")
     try:
         raw = (base / rel).read_text(encoding="utf-8")
     except (OSError, ValueError):
         return None
-    try:
-        return ContextEntry.of(kind, rel_posix, redact_text(raw, rules))
-    except AdapterError:
+    return ContextEntry.of(
+        kind, rel_posix, redact_text(raw, rules), host_roots=host_roots,
+    )
+
+
+_CONTEXT_LINK_RE = re.compile(r"\[[^]]*\]\((?P<source>[^)#]+)(?:#[^)]*)?\)")
+_CONTEXT_CODE_PATH_RE = re.compile(r"`(?P<source>[^`]+)`")
+_SOURCE_LOCATION_SUFFIX_RE = re.compile(
+    r"^(?P<path>.+?):[1-9]\d*(?:,[1-9]\d*)*(?::[1-9]\d*)?$"
+)
+
+
+def _declared_context_source(
+    source: str, *, project_dir: Path, working_root: str, root: Path,
+) -> str | None:
+    """Resolve one safe declared source with a trailing positive line locator or list.
+
+    A literal filename always wins.  A location suffix is removed only when its unsuffixed
+    project- or working-root-relative file exists, so arbitrary colon-bearing text is never
+    reinterpreted as a path.
+    """
+    def safe_path(value: str) -> bool:
+        components = value.split("/")
+        if (
+            any(character.isspace() for character in value)
+            or any(character in value for character in "*?")
+            or value.startswith(("/", "./", "../"))
+            or any(component in {"", ".", ".."} for component in components)
+        ):
+            return False
+        if "/" not in value:
+            return (
+                (project_dir / value).is_file()
+                or (project_dir / working_root / value).is_file()
+            )
+        return True
+
+    def candidate_for(value: str) -> Path | None:
+        if not safe_path(value):
+            return None
+        project_candidate = (project_dir / value).resolve()
+        worker_candidate = (project_dir / working_root / value).resolve()
+        for candidate in (project_candidate, worker_candidate):
+            try:
+                candidate.relative_to(root)
+            except ValueError:
+                return None
+        if not project_candidate.exists() and worker_candidate.exists():
+            return worker_candidate
+        return project_candidate
+
+    candidate = candidate_for(source)
+    if candidate is None:
         return None
+    if not candidate.is_file():
+        match = _SOURCE_LOCATION_SUFFIX_RE.fullmatch(source)
+        if match is not None:
+            located = candidate_for(match.group("path"))
+            if located is not None and located.is_file():
+                candidate = located
+        elif ":" in source:
+            path, _, _ = source.partition(":")
+            located = candidate_for(path)
+            if located is not None and located.is_file():
+                return None
+    return candidate.relative_to(root).as_posix()
+
+
+def _declared_context_sources(
+    spec: TaskSpec,
+    specs: Sequence[TaskSpec],
+    *,
+    project_dir: Path,
+    working_root: str = ".",
+) -> tuple[str, ...]:
+    """Return only explicit project-local task prerequisites, in declaration order.
+
+    Markdown links are task-declared inputs, rather than hints to discover an arbitrary project
+    tree.  A task that explicitly requires the preceding review report receives the last prior
+    review task's one concrete report path; absence of that report is a launch precondition, not
+    an executor-side blocker.
+    """
+    task_source = _project_logical_source(spec.path, project_dir)
+    task_path = project_dir / task_source
+    try:
+        text = task_path.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        # A plan can legitimately be evaluated before a historical task file is materialized.
+        # There is then no declaration to extract; preserve the existing no-bundle behavior.
+        return ()
+    sources: list[str] = []
+    root = project_dir.resolve()
+    section = ""
+    for line in text.splitlines():
+        if line.startswith("## "):
+            section = line.strip().lower()
+            continue
+        for match in _CONTEXT_LINK_RE.finditer(line):
+            source = match.group("source").strip()
+            if not source or "://" in source or source.startswith(("/", "#")):
+                continue
+            candidate = (task_path.parent / source).resolve()
+            try:
+                logical = candidate.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            if logical not in sources:
+                sources.append(logical)
+
+        if section not in {"## context", "## affected files / components"}:
+            continue
+        for match in _CONTEXT_CODE_PATH_RE.finditer(line):
+            source = match.group("source").strip().replace("\\", "/")
+            logical = _declared_context_source(
+                source, project_dir=project_dir, working_root=working_root, root=root,
+            )
+            if logical is None:
+                continue
+            if logical not in sources:
+                sources.append(logical)
+
+    if "latest preceding review report" in text.lower():
+        try:
+            current = list(specs).index(spec)
+        except ValueError:  # pragma: no cover - callers pass the source plan specs
+            current = 0
+        report: str | None = None
+        for prior in reversed(specs[:current]):
+            if "review" not in prior.title.lower():
+                continue
+            candidates = [
+                path for path in prior.allowed_scope
+                if path.startswith("docs/validation/") and path.endswith(".md")
+                and "*" not in path and "?" not in path
+            ]
+            if len(candidates) == 1:
+                report = candidates[0]
+                break
+        if report is None:
+            raise AdapterError(
+                f"declared preceding review context for {spec.id!r} is unavailable",
+                CONTEXT_UNAVAILABLE,
+            )
+        if report not in sources:
+            sources.append(report)
+    return tuple(sources)
+
+
+def _required_context_entry(kind: str, base: Path, rel: str, rules) -> ContextEntry:
+    entry = _redacted_logical_entry(kind, base, rel, rules, host_roots=(base,))
+    if entry is None:
+        raise AdapterError(
+            f"declared {kind} context {rel!r} is unavailable", CONTEXT_UNAVAILABLE
+        )
+    return entry
 
 
 def build_executor_context_bundles(
@@ -574,46 +860,72 @@ def build_executor_context_bundles(
     plan_path: Path,
     prompt_path: Path,
     task_ids: Sequence[str] | None = None,
+    plan_specs: Sequence[TaskSpec] | None = None,
+    working_root_by_id: Mapping[str, str] | None = None,
 ) -> dict[str, ExecutorContextBundle]:
     """Assemble one runner-owned immutable context bundle per selected task.
 
-    Each bundle carries the task's canonical contract plus the plan, prompt, and required-skill
-    content it needs — every entry redacted of known host roots, then bound to a safe
-    project/agents-root logical source and a SHA-256 digest. Building is best-effort: a file the
-    runner cannot read here is omitted, and a task whose own contract file is unreadable gets
-    no bundle (the adapter then launches with the plain envelope, exactly as before). Every
-    entry that *is* built is validated and fails closed on a bad digest or unsafe source.
+    Each bundle carries the task's canonical contract plus every explicitly declared local
+    prerequisite, plan, prompt, and required skill.  Every entry is redacted of known host
+    roots and bound to a logical source and SHA-256 digest.  A missing declared input is a
+    typed pre-launch failure; it is never silently omitted for an executor to discover later.
     """
     rules = build_rules(project_dir)
+    prerequisite_specs = plan_specs if plan_specs is not None else specs
     wanted = set(task_ids) if task_ids is not None else {spec.id for spec in specs}
+    working_roots = dict(working_root_by_id or {})
     plan_rel = _project_logical_source(plan_path, project_dir)
-    plan_entry = _redacted_logical_entry("plan", project_dir, plan_rel, rules)
+    plan_entry = _required_context_entry("plan", project_dir, plan_rel, rules)
     prompt_rel = _project_logical_source(prompt_path, project_dir)
-    prompt_entry = _redacted_logical_entry("prompt", project_dir, prompt_rel, rules)
+    prompt_entry = _required_context_entry("prompt", project_dir, prompt_rel, rules)
     bundles: dict[str, ExecutorContextBundle] = {}
     for spec in specs:
         if spec.id not in wanted or not spec.path:
             continue
         task_rel = _project_logical_source(spec.path, project_dir)
-        task_entry = _redacted_logical_entry("task", project_dir, task_rel, rules)
+        # Historical gate/CLI tests and plan-only routes may carry a task spec before a physical
+        # task contract exists.  Preserve their external behavior: no contract means no bundle.
+        # Once a contract is readable, every explicit prerequisite it declares is mandatory.
+        task_entry = _redacted_logical_entry(
+            "task", project_dir, task_rel, rules, host_roots=(project_dir, agents_root),
+        )
         if task_entry is None:
             continue
         entries: list[ContextEntry] = [task_entry]
-        if plan_entry is not None:
-            entries.append(plan_entry)
-        if prompt_entry is not None:
+        entries.append(plan_entry)
+        if prompt_rel != plan_rel:
             entries.append(prompt_entry)
+        standard_sources = {task_rel, plan_rel, prompt_rel}
+        for input_rel in _declared_context_sources(
+            spec, prerequisite_specs, project_dir=project_dir,
+            working_root=working_roots.get(spec.id, "."),
+        ):
+            if input_rel not in standard_sources:
+                entries.append(_required_context_entry("input", project_dir, input_rel, rules))
         for skill_rel in spec.required_skills:
-            skill_entry = _redacted_logical_entry("skill", project_dir, skill_rel, rules)
+            skill_entry = _redacted_logical_entry(
+                "skill", project_dir, skill_rel, rules, host_roots=(project_dir, agents_root),
+            )
             if skill_entry is None and not Path(skill_rel).is_absolute():
-                skill_entry = _redacted_logical_entry("skill", agents_root, skill_rel, rules)
-            if skill_entry is not None:
-                entries.append(skill_entry)
+                agents_rel = skill_rel.removeprefix(".agents/")
+                skill_entry = _redacted_logical_entry(
+                    "skill", agents_root, agents_rel, rules,
+                    host_roots=(project_dir, agents_root),
+                )
+                if skill_entry is not None and agents_rel != skill_rel:
+                    skill_entry = ContextEntry.of(
+                        "skill", skill_rel, skill_entry.content,
+                    )
+            if skill_entry is None:
+                raise AdapterError(
+                    f"declared skill context {skill_rel!r} is unavailable", CONTEXT_UNAVAILABLE
+                )
+            entries.append(skill_entry)
         try:
             bundle = ExecutorContextBundle(spec.id, tuple(entries))
             bundle.validate()
         except AdapterError:
-            continue
+            raise
         bundles[spec.id] = bundle
     return bundles
 
@@ -721,6 +1033,7 @@ def build_required_input_dirs(
     prompt_path: Path,
     working_root_by_id: Mapping[str, str] | None = None,
     task_ids: Sequence[str] | None = None,
+    plan_specs: Sequence[TaskSpec] | None = None,
     agents_logical_prefix: str = ".agents",
 ) -> dict[str, tuple[str, ...]]:
     """Derive each selected task's minimal mandatory-input directory grants (REC-05 / REC-08).
@@ -740,6 +1053,7 @@ def build_required_input_dirs(
     project_dir = Path(project_dir)
     agents_root = Path(agents_root)
     working_roots = dict(working_root_by_id or {})
+    prerequisite_specs = plan_specs if plan_specs is not None else specs
     wanted = set(task_ids) if task_ids is not None else {spec.id for spec in specs}
     plan_rel = _project_logical_source(plan_path, project_dir)
     prompt_rel = _project_logical_source(prompt_path, project_dir)
@@ -763,6 +1077,21 @@ def build_required_input_dirs(
             )
             if required is not None:
                 inputs.append(required)
+        standard_sources = {str(rel) for _kind, rel in (
+            ("task", _project_logical_source(spec.path, project_dir)),
+            ("plan", plan_rel),
+            ("prompt", prompt_rel),
+        ) if rel is not None}
+        for source in _declared_context_sources(
+            spec, prerequisite_specs, project_dir=project_dir,
+            working_root=working_roots.get(spec.id, "."),
+        ):
+            if source not in standard_sources:
+                required = _project_required_input(
+                    "input", source, project_dir=project_dir, reachable=reachable
+                )
+                if required is not None:
+                    inputs.append(required)
         for skill_rel in spec.required_skills:
             skill_input = _resolve_required_skill(
                 skill_rel,
@@ -930,6 +1259,7 @@ def run_execute(
     executor = None
     launchers = None
     environment = None
+    recorded_run: Run | None = None
     if make_adapters is make_execute_adapters:
         adapter_registry = composition.adapter_registry
     else:
@@ -977,22 +1307,25 @@ def run_execute(
         (project_dir / storage_rel) if storage_rel else project_dir / ".pipeline" / "runs"
     ) / feature
 
-    # A resumed run owns its model/effort pair.  Hydrate an entirely omitted pair before
-    # recompiling so the immutable plan fingerprint and the dispatched runtime agree.
-    if command.resume and command.model is None and command.effort is None:
+    # A resumed run owns its adapter, model/effort pair, and Docker runtime identity. The first
+    # compilation only finds the storage root; then the durable controls replace omitted CLI
+    # values before final composition and immutable-plan compilation.
+    if command.resume:
         try:
-            recorded = Run.load(run_dir, project_dir)
+            recorded_run = Run.load(run_dir, project_dir)
         except StateError:
-            recorded = None
-        if recorded is not None:
+            recorded_run = None
+        if recorded_run is not None:
+            changed = False
             recorded_adapter = (
-                recorded.controls.get("adapter_requested", {}) or {}
+                recorded_run.controls.get("adapter_requested", {}) or {}
             ).get("value")
-            model = (recorded.controls.get("model", {}) or {}).get("value")
-            effort = (recorded.controls.get("effort", {}) or {}).get("value")
+            model = (recorded_run.controls.get("model", {}) or {}).get("value")
+            effort = (recorded_run.controls.get("effort", {}) or {}).get("value")
             if command.adapter is None and recorded_adapter in {"claude", "codex"}:
                 command = replace(command, adapter=recorded_adapter)
-            if model is not None or effort is not None:
+                changed = True
+            if command.model is None and command.effort is None and (model is not None or effort is not None):
                 if not isinstance(model, str) or not isinstance(effort, str):
                     raise CliError(
                         EXIT_ERROR,
@@ -1000,6 +1333,55 @@ def run_execute(
                         "must be a complete string pair",
                     )
                 command = replace(command, model=model, effort=effort)
+                changed = True
+            if command.codex_runtime is None and "codex_runtime" in recorded_run.controls:
+                runtime = recorded_run.controls["codex_runtime"].get("value")
+                image = recorded_run.controls.get("docker_codex_image", {}).get("value")
+                proxy_image = recorded_run.controls.get("docker_proxy_image", {}).get("value")
+                version = recorded_run.controls.get("docker_codex_version", {}).get("value")
+                auth_file = recorded_run.controls.get("docker_codex_auth_file", {}).get("value")
+                if runtime not in {"host", "docker"}:
+                    raise CliError(EXIT_ERROR, "runtime-control-invalid: recorded Codex runtime is invalid")
+                if runtime == "docker" and not all(
+                    isinstance(value, str) and value
+                    for value in (image, proxy_image, version, auth_file)
+                ):
+                    raise CliError(
+                        EXIT_ERROR,
+                        "runtime-control-invalid: recorded Docker runtime controls are incomplete",
+                    )
+                if runtime == "docker":
+                    if auth_file == "<home>/.codex/auth.json":
+                        auth_file = str(Path.home() / ".codex" / "auth.json")
+                    else:
+                        auth_path = Path(auth_file)
+                        if auth_path.is_absolute() or any(
+                            part in {"", ".", ".."} for part in auth_path.parts
+                        ):
+                            raise CliError(
+                                EXIT_ERROR,
+                                "runtime-control-invalid: recorded Docker auth-file identity is unsafe",
+                            )
+                        auth_file = str(project_dir / auth_path)
+                command = replace(
+                    command, codex_runtime=runtime, docker_codex_image=image,
+                    docker_proxy_image=proxy_image, docker_codex_version=version,
+                    docker_codex_auth_file=auth_file,
+                )
+                changed = True
+            if changed:
+                try:
+                    factories = docker_factories_for_command(
+                        command, run=recorded_run, task_ids=tuple(compiled_plan.selection),
+                    )
+                except AdapterError as exc:
+                    raise CliError(EXIT_ERROR, f"{exc.code}: {exc}") from None
+                composition = build_bootstrap(
+                    project_dir, agents_root, anchors.core_root, factories=factories,
+                    logical_paths={"agents": profile.logical_paths.agents, "core": profile.logical_paths.core},
+                )
+                if make_adapters is make_execute_adapters:
+                    adapter_registry = composition.adapter_registry
                 try:
                     compiled_plan = compile_run_plan(
                         feature=feature,
@@ -1035,6 +1417,18 @@ def run_execute(
 
     try:
         execution_scope = tuple(compiled_plan.execution_scope)
+        executor_contexts = build_executor_context_bundles(
+            specs,
+            project_dir=project_dir,
+            agents_root=agents_root,
+            plan_path=plan_path,
+            prompt_path=project_dir / prompt_rel,
+            task_ids=execution_scope,
+            plan_specs=specs,
+            working_root_by_id={
+                spec.id: _compiled_working_root(compiled_plan, spec.id) for spec in specs
+            },
+        )
         required_input_dirs = build_required_input_dirs(
             specs,
             project_dir=project_dir,
@@ -1045,6 +1439,7 @@ def run_execute(
                 spec.id: _compiled_working_root(compiled_plan, spec.id) for spec in specs
             },
             task_ids=execution_scope,
+            plan_specs=specs,
             agents_logical_prefix=profile.logical_paths.agents,
         )
         scope_dirs = build_scope_dirs(
@@ -1059,20 +1454,15 @@ def run_execute(
         raise CliError(EXIT_ERROR, f"{exc.code}: {exc}") from None
     composition = replace(
         composition,
-        executor_contexts=build_executor_context_bundles(
-            specs,
-            project_dir=project_dir,
-            agents_root=agents_root,
-            plan_path=plan_path,
-            prompt_path=project_dir / prompt_rel,
-            task_ids=execution_scope,
-        ),
+        executor_contexts=executor_contexts,
         required_input_dirs=required_input_dirs,
         scope_dirs=scope_dirs,
     )
 
     if executor is None or launchers is None or environment is None:
-        executor, launchers, environment = composition.make_execute_adapters(command.adapter)
+        executor, launchers, environment = composition.make_execute_adapters(
+            command.adapter, run=recorded_run,
+        )
     controls = ExecuteControls(
         plan_approved=command.approve_plan,
         unattended=command.unattended,
@@ -1081,6 +1471,13 @@ def run_execute(
         adapter_explicit=command.adapter is not None,
         model=command.model,
         effort=command.effort,
+        codex_runtime=command.codex_runtime,
+        docker_codex_image=command.docker_codex_image,
+        docker_proxy_image=command.docker_proxy_image,
+        docker_codex_version=command.docker_codex_version,
+        docker_codex_auth_file=_docker_auth_file_control_value(
+            command.docker_codex_auth_file, project_dir
+        ) if command.codex_runtime == "docker" else None,
         max_repair_attempts=command.max_repair_attempts,
         routine_output_byte_budget=command.routine_output_byte_budget,
         diagnostic_output_byte_budget=command.diagnostic_output_byte_budget,

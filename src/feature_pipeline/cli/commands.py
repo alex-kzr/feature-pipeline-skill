@@ -71,7 +71,9 @@ class RunCommand:
     status: bool = False
     unattended: bool = False
     adapter: str | None = None
-    codex_runtime: str = "host"
+    # ``None`` means the switch was omitted. A resume then inherits the persisted runtime
+    # identity instead of silently replacing Docker with the parser's host default.
+    codex_runtime: str | None = None
     docker_codex_image: str | None = None
     docker_proxy_image: str | None = None
     docker_codex_version: str | None = None

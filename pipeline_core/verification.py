@@ -12,8 +12,8 @@ test-verifier request builders are handed byte-identical facts.
     envelope against its prose report, and lets *only* the parsed ``PASS``/``FAIL``/``BLOCKED``
     combination move task state (via :meth:`pipeline_core.state.Run.record_verdicts`). A launch
     that fails, a malformed envelope, or a prose/envelope disagreement is written to a diagnostic
-    and blocks the task — except TC-11's structural strict-isolation rejection, which may use its
-    separate runner-owned durable-live-probe verifier.
+    and blocks the task — including a strict-isolation rejection. A containment proof cannot replace
+    independent task and test verdicts.
 
 Command *execution* lives in :mod:`pipeline_core.commands`; this module only packages the
 result and interprets verdicts — it never launches a command itself.
@@ -22,6 +22,7 @@ result and interprets verdicts — it never launches a command itself.
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,6 +37,7 @@ from .adapters import (
     AdapterError,
     LaunchRequest,
     LaunchComposition,
+    bind_launch_request,
     LaunchResult,
     grant_tool_names,
     normalize_role,
@@ -545,6 +547,42 @@ class DeterministicIsolationVerifier(Protocol):
 
 
 @dataclass(frozen=True)
+class RunnerOwnedIsolationProofVerifier:
+    """Validate a completed, digest-bound Docker proof; never assess launch configuration."""
+
+    run: Run
+
+    def verify(self, *, task_id: str, role: str) -> object:
+        rows = [row for row in self.run.live_probe_evidence if row.get("task_id") == task_id]
+        if not rows:
+            return type("Verdict", (), {"token": "FAIL", "report": {"reason": "missing-concrete-proof"}})()
+        row = rows[-1]
+        if row.get("disposition") != "CONTAINMENT_PROVEN":
+            return type("Verdict", (), {"token": "FAIL", "report": {"reason": "incomplete-concrete-proof"}})()
+        path = Path(self.run.run_dir) / str(row.get("proof_path", ""))
+        try:
+            content = path.read_bytes()
+            proof = json.loads(content)
+        except (OSError, json.JSONDecodeError):
+            return type("Verdict", (), {"token": "FAIL", "report": {"reason": "proof-artifact-unavailable"}})()
+        observations = proof.get("observations") if isinstance(proof, dict) else None
+        binding = proof.get("binding") if isinstance(proof, dict) else None
+        valid = (
+            hashlib.sha256(content).hexdigest() == row.get("proof_digest")
+            and isinstance(proof, dict) and proof.get("disposition") == "CONTAINMENT_PROVEN"
+            and isinstance(observations, dict) and bool(observations) and all(value is True for value in observations.values())
+            and isinstance(binding, dict)
+            and all(isinstance(binding.get(key), str) and binding[key] for key in
+                    ("image", "package", "observed_version", "argv_digest", "contract_revision"))
+        )
+        return type("Verdict", (), {
+            "token": "PASS" if valid else "FAIL",
+            "report": {"task_id": task_id, "role": role,
+                       "reason": "completed-concrete-runner-evidence" if valid else "invalid-concrete-proof"},
+        })()
+
+
+@dataclass(frozen=True)
 class VerifierLaunchers:
     """The injectable independent launcher pair.
 
@@ -854,7 +892,7 @@ def _run_one_verifier(
         composition=composition,
     )
     try:
-        result = adapter.launch(request)
+        result = adapter.launch(bind_launch_request(request))
     except AdapterError as exc:
         return _diagnose(
             run, spec, artifacts, role=normalized, attempt=attempt,
@@ -890,6 +928,7 @@ def _run_one_verifier(
         report_path=artifacts.envelope(normalized),
         read_only=True,
         working_root=".",
+        allowed_scope=tuple(getattr(spec, "allowed_scope", ()) or ()),
         resume_session_id=result.session_id,
         no_tools=True,
         model=model,
@@ -899,7 +938,7 @@ def _run_one_verifier(
         composition=composition,
     )
     try:
-        envelope_result = adapter.launch(envelope_request)
+        envelope_result = adapter.launch(bind_launch_request(envelope_request))
     except AdapterError as exc:
         return _diagnose(
             run, spec, artifacts, role=normalized, attempt=attempt,
@@ -951,25 +990,21 @@ def _deterministic_isolation_fallback(
     run: Run, spec: object, role: str, artifacts: object, attempt: int,
     verifier: DeterministicIsolationVerifier | None,
 ) -> _SettledVerifier | None:
-    """Settle TC-11 from durable live-probe evidence after structural launch rejection."""
+    """Keep structural rejection blocked even when a containment proof is available."""
     if verifier is None or spec.id != "TC-11":
         return None
-    verdict = verifier.verify(task_id=spec.id, role=role)
-    token = getattr(verdict, "token", None)
-    report = getattr(verdict, "report", None)
-    if token not in VERDICTS or not isinstance(report, Mapping):
+    if not isinstance(verifier, RunnerOwnedIsolationProofVerifier):
         return _diagnose(
             run, spec, artifacts, role=role, attempt=attempt,
-            reason="deterministic-isolation-verifier-invalid-result",
+            reason="deterministic-isolation-verifier-must-validate-concrete-runner-evidence",
         )
-    report_text = json.dumps(dict(report), sort_keys=True) + "\n"
-    write_text_atomic(
-        artifacts.directory / f"{normalize_role(role)}-deterministic-isolation.json",
-        report_text, repo_root=run.repo_root,
-    )
-    return _SettledVerifier(
-        token=token, result=None, envelope_result=None, report_text=report_text,
-        drift="deterministic-isolation-fallback", failure=None, diagnostic=None,
+    # A containment observation certifies only a launch boundary. It cannot assess the
+    # task's acceptance criteria or its command evidence, and reusing it for both roles
+    # would manufacture independent verdicts after their actual launches were rejected.
+    return _diagnose(
+        run, spec, artifacts, role=role, attempt=attempt,
+        reason="stack-isolation-unsupported: containment proof cannot replace "
+               "independent task and test verification",
     )
 
 
@@ -1002,10 +1037,8 @@ def orchestrate_verification(
     The task must be ``implemented`` and ``evidence`` must be this exact task/attempt. Both
     verifiers receive :func:`verifier_evidence_payload` verbatim. Every failure mode — a launch
     that will not start or exits non-zero, a missing session id, a malformed verdict envelope,
-    or a prose/envelope disagreement — writes a diagnostic and blocks the task. The sole
-    structural exception is TC-11's ``stack-isolation-unsupported`` result: each rejected
-    verifier role may be independently settled by the injected runner-owned live-probe
-    verifier, which never launches Claude/Codex. An unbacked executor check (:func:`evidence_forces_fail`) forces the test
+    or a prose/envelope disagreement — writes a diagnostic and blocks the task. A ``stack-isolation-unsupported`` result also stays blocked: a runner-owned
+    containment proof cannot substitute for either independent verifier. An unbacked executor check (:func:`evidence_forces_fail`) forces the test
     verdict to ``FAIL`` regardless of what the tool-less test verifier returned (AC-4).
     """
     task_id = spec.id

@@ -8,6 +8,7 @@ with an explicit ``argv`` so nothing depends on ``sys.argv`` or process exit.
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import os
 import shutil
@@ -22,9 +23,13 @@ from feature_pipeline.cli import use_cases
 from feature_pipeline import bootstrap
 from feature_pipeline.cli.commands import RunCommand
 from feature_pipeline.cli.parser import build_parser
-from feature_pipeline.ports.adapters import AdapterCapabilities, AdapterRegistry
+from feature_pipeline.ports.adapters import (
+    STRICT_ISOLATION_CAPABILITIES,
+    AdapterCapabilities,
+    AdapterRegistry,
+)
 from pipeline_core import runner_cli
-from pipeline_core.adapters import LaunchRequest
+from pipeline_core.adapters import DockerCodexAdapter, LaunchRequest
 from pipeline_core.execution import persist_task_contracts
 from pipeline_core.lifecycle import RunLifecycle
 from pipeline_core.plan import AmendmentRequest, build_amendment_revision, canonical_amendment_fields, contract_digest
@@ -1064,6 +1069,42 @@ class ExecuteModeTests(unittest.TestCase):
             encoding="utf-8")
         return seed
 
+    @staticmethod
+    def _record_docker_proof(run: Run, *, task_id: str, image: str, proxy_image: str,
+                             version: str, auth_file: Path) -> None:
+        binding = DockerCodexAdapter.probe_binding(
+            image=image, proxy_image=proxy_image, codex_version=version, auth_file=auth_file,
+        )
+        proof = {
+            "schema_version": 1, "task_id": task_id, "attempt_id": "probe-20",
+            "role": "runner-live-isolation-probe", "disposition": "CONTAINMENT_PROVEN",
+            "reason": "all runner-visible containment observations passed",
+            "observations": {name: True for name in (
+                "exact_controls", "allowed_write", "parent_read_attempted",
+                "parent_read_contained", "child_read_attempted", "child_read_contained",
+                "nested_surface_absent", "network_contained", "process_contained",
+            )},
+            "binding": binding, "cleanup_removed": True, "exit_zero": True,
+            "failure_class": None,
+        }
+        artifact = run.run_dir / "reports" / task_id / "live-probe.json"
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_text(json.dumps(proof), encoding="utf-8")
+        task = run.task(task_id)
+        run.live_probe_evidence.append({
+            "schema_version": 1, "task_id": task_id, "run_id": run.run_id,
+            "task_contract_digest": task.task_contract_digest, "attempt_id": "probe-20",
+            "adapter": "codex", "cli_version": binding["observed_version"],
+            "role": "runner-live-isolation-probe", "bundle_digest": "bundle-20",
+            "allowed_scope": [], "grants": [], "timeout_s": 1.0, "max_attempts": 1,
+            "started_at": "2026-09-20T00:00:00Z", "ended_at": "2026-09-20T00:00:01Z",
+            "disposition": "CONTAINMENT_PROVEN", "reason": proof["reason"],
+            "cleanup": "removed", "task_contract_revision": task.current_revision,
+            "proof_path": f"reports/{task_id}/live-probe.json",
+            "proof_digest": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+        })
+        run.save()
+
     def test_help_lists_execute_as_a_mode(self) -> None:
         out = io.StringIO()
         with self.assertRaises(SystemExit), redirect_stdout(out):
@@ -1097,6 +1138,148 @@ class ExecuteModeTests(unittest.TestCase):
                 (seed["project_dir"] / ".pipeline" / "runs" / "sample-feature" / "run.json")
                 .read_text(encoding="utf-8"))
             self.assertEqual(run["tasks"][0]["status"], "done")
+
+    def test_resume_docker_codex_authorizes_only_the_selected_task_proof_in_dependency_scope(self) -> None:
+        with TemporaryDirectory() as directory:
+            seed = self._seed_rich(directory, [
+                dict(RICH_EXECUTE_TASK, id="TC-10"),
+                dict(RICH_EXECUTE_TASK, id="TC-11", depends_on=["TC-10"]),
+            ])
+            image = "example.invalid/codex@sha256:" + "a" * 64
+            proxy_image = "example.invalid/python@sha256:" + "b" * 64
+            auth_file = seed["dest"] / "codex-auth.json"
+            auth_file.write_text("test-only", encoding="utf-8")
+            args = seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.json", "--mode", "execute",
+                "--approve-plan", "--adapter", "codex", "--model", "gpt-5.6-terra",
+                "--effort", "medium",
+            ]
+            def codex_adapters(_project_dir, _agents_root, _core_root=None):
+                executor, launchers, _environment = _fake_execute_adapters(
+                    _project_dir, _agents_root, _core_root)
+                return executor, launchers, {"claude": True, "codex": True}
+
+            with patch.object(use_cases, "make_execute_adapters", codex_adapters):
+                code, _out, err = _run(args)
+            self.assertEqual(code, 0, err)
+
+            run_dir = seed["project_dir"] / ".pipeline" / "runs" / "sample-feature"
+            run = Run.load(run_dir, seed["project_dir"])
+            run.task("TC-11").status = "in_progress"
+            run.status = "running"
+            run.save()
+            resume_args = seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.json", "--mode", "execute",
+                "--approve-plan", "--resume", "--task", "TC-11", "--codex-runtime", "docker",
+                "--docker-codex-image", image, "--docker-proxy-image", proxy_image,
+                "--docker-codex-version", "0.1.0", "--docker-codex-auth-file", str(auth_file),
+            ]
+            captured = []
+
+            def stop_after_selection(request):
+                captured.append(request.adapter)
+                return SimpleNamespace(status="ok", message="selected", exit_code=0)
+
+            with patch.object(bootstrap, "execute_run", stop_after_selection):
+                code, _out, err = _run(resume_args)
+            self.assertEqual(code, 0, err)
+            self.assertFalse(any(
+                captured[0]._isolation_capabilities.has(token)
+                for token in STRICT_ISOLATION_CAPABILITIES
+            ))
+
+            self._record_docker_proof(
+                run, task_id="TC-11", image=image, proxy_image=proxy_image,
+                version="0.1.0", auth_file=auth_file,
+            )
+            captured.clear()
+
+            with patch.object(bootstrap, "execute_run", stop_after_selection):
+                code, _out, err = _run(resume_args)
+
+            self.assertEqual(code, 0, err)
+            self.assertEqual(len(captured), 1)
+            capabilities = captured[0]._isolation_capabilities
+            self.assertTrue(all(capabilities.has(token) for token in STRICT_ISOLATION_CAPABILITIES))
+
+            artifact = run_dir / "reports" / "TC-11" / "live-probe.json"
+            proof = json.loads(artifact.read_text(encoding="utf-8"))
+            proof["binding"]["argv_digest"] = "0" * 64
+            artifact.write_text(json.dumps(proof), encoding="utf-8")
+            captured.clear()
+            with patch.object(bootstrap, "execute_run", stop_after_selection):
+                code, _out, err = _run(resume_args)
+            self.assertEqual(code, 0, err)
+            self.assertFalse(any(
+                captured[0]._isolation_capabilities.has(token)
+                for token in STRICT_ISOLATION_CAPABILITIES
+            ))
+
+            proof_run = Run.load(run_dir, seed["project_dir"])
+            self._record_docker_proof(
+                proof_run, task_id="TC-10", image=image, proxy_image=proxy_image,
+                version="0.1.0", auth_file=auth_file,
+            )
+            captured.clear()
+            with patch.object(bootstrap, "execute_run", stop_after_selection):
+                code, _out, err = _run(resume_args)
+            self.assertEqual(code, 0, err)
+            self.assertFalse(any(
+                captured[0]._isolation_capabilities.has(token)
+                for token in STRICT_ISOLATION_CAPABILITIES
+            ))
+
+    def test_resume_hydrates_recorded_docker_runtime_identity(self) -> None:
+        """A bare resume reuses the exact Docker controls that created the run."""
+        with TemporaryDirectory() as directory:
+            seed = self._seed_rich(directory, [dict(RICH_EXECUTE_TASK, id="TC-11")])
+            image = "example.invalid/codex@sha256:" + "a" * 64
+            proxy_image = "example.invalid/python@sha256:" + "b" * 64
+            auth_file = seed["dest"] / "codex-auth.json"
+            auth_file.write_text("test-only", encoding="utf-8")
+            args = seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.json", "--mode", "execute",
+                "--approve-plan", "--adapter", "codex", "--model", "gpt-5.6-terra",
+                "--effort", "medium", "--codex-runtime", "docker",
+                "--docker-codex-image", image, "--docker-proxy-image", proxy_image,
+                "--docker-codex-version", "0.1.0", "--docker-codex-auth-file", str(auth_file),
+            ]
+
+            def codex_adapters(_project_dir, _agents_root, _core_root=None):
+                executor, launchers, _environment = _fake_execute_adapters(
+                    _project_dir, _agents_root, _core_root)
+                return executor, launchers, {"claude": True, "codex": True}
+
+            with patch.object(use_cases, "make_execute_adapters", codex_adapters):
+                code, _out, err = _run(args)
+            self.assertEqual(code, 0, err)
+
+            run_dir = seed["project_dir"] / ".pipeline" / "runs" / "sample-feature"
+            run = Run.load(run_dir, seed["project_dir"])
+            run.task("TC-11").status = "in_progress"
+            run.status = "running"
+            run.save()
+            captured = []
+
+            def stop_after_resume(request):
+                captured.append(request.controls)
+                return SimpleNamespace(status="ok", message="selected", exit_code=0)
+
+            resume_args = seed["anchors"] + [
+                "--profile", seed["profile_rel"], "--plan", "plan.json", "--mode", "execute",
+                "--approve-plan", "--resume",
+            ]
+            with patch.object(use_cases, "make_execute_adapters", codex_adapters), \
+                 patch.object(bootstrap, "execute_run", stop_after_resume):
+                code, _out, err = _run(resume_args)
+
+            self.assertEqual(code, 0, err)
+            self.assertEqual(len(captured), 1)
+            self.assertEqual(captured[0].codex_runtime, "docker")
+            self.assertEqual(captured[0].docker_codex_image, image)
+            self.assertEqual(captured[0].docker_proxy_image, proxy_image)
+            self.assertEqual(captured[0].docker_codex_version, "0.1.0")
+            self.assertEqual(captured[0].docker_codex_auth_file, "codex-auth.json")
 
     def test_tsl02_cli_resume_inherits_persisted_false_dependency_chain_control(self) -> None:
         """TSL-02's historical false policy survives an omitted CLI switch on resume."""

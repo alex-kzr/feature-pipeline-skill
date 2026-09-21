@@ -350,6 +350,18 @@ def validate_topology(
             violations.append(Violation("unparseable-yaml", path.name, None, None, str(exc)))
             continue
 
+        if not isinstance(document, Mapping):
+            violations.append(
+                Violation(
+                    "non-mapping-document",
+                    path.name,
+                    None,
+                    None,
+                    "top-level YAML document must be a mapping",
+                )
+            )
+            continue
+
         jobs = document.get("jobs")
         if not isinstance(jobs, Mapping):
             jobs = {}

@@ -43,17 +43,19 @@ _LIVE_PROBE_FIELDS = (
     "schema_version", "task_id", "run_id", "task_contract_digest", "attempt_id", "adapter", "cli_version",
     "role", "bundle_digest", "allowed_scope", "grants", "timeout_s", "max_attempts",
     "started_at", "ended_at", "disposition", "reason", "cleanup", "task_contract_revision",
+    "proof_path", "proof_digest",
 )
 _LIVE_PROBE_DISPOSITIONS = frozenset({
     "NO_BREACH_OBSERVED", "UNKNOWN", "INCONCLUSIVE", "BREACH_DETECTED",
     "NESTED_DELEGATION_DETECTED", "SUBPROCESS_ACCESS_DETECTED", "SCOPE_WIDENING",
     "GRANT_WIDENING", "TIMEOUT", "LAUNCH_FAILED", "MALFORMED_OUTPUT",
+    "CONTAINMENT_PROVEN",
 })
 
 
 @dataclass(frozen=True)
 class LiveProbeEvidence:
-    """Versioned runner observation; deliberately never expresses a positive capability."""
+    """Versioned runner observation; a positive result is digest-bound concrete proof only."""
 
     schema_version: int
     task_id: str
@@ -74,13 +76,15 @@ class LiveProbeEvidence:
     reason: str
     cleanup: str
     task_contract_revision: int = 0
+    proof_path: str = ""
+    proof_digest: str = ""
 
     def validate(self) -> None:
         if (not isinstance(self.schema_version, int) or isinstance(self.schema_version, bool)
                 or self.schema_version != LIVE_PROBE_SCHEMA_VERSION):
             raise StateError("unknown live-probe evidence schema version", "unknown-live-probe-schema")
         if self.disposition not in _LIVE_PROBE_DISPOSITIONS:
-            raise StateError("live-probe evidence may not assert a positive capability", "invalid-live-probe-disposition")
+            raise StateError("invalid live-probe disposition", "invalid-live-probe-disposition")
         if self.adapter not in {"codex", "claude"}:
             raise StateError("live-probe adapter is unsupported", "invalid-live-probe-evidence")
         if (not re.fullmatch(r"[A-Za-z0-9._-]+", self.attempt_id)
@@ -103,6 +107,11 @@ class LiveProbeEvidence:
                 or any(not isinstance(item, str) or not re.fullmatch(r"[A-Za-z0-9._-]+", item)
                        for item in self.grants)):
             raise StateError("malformed live-probe evidence", "invalid-live-probe-evidence")
+        if self.disposition == "CONTAINMENT_PROVEN" and (
+            not re.fullmatch(r"reports/[A-Za-z0-9._-]+/live-probe\.json", self.proof_path)
+            or not re.fullmatch(r"[0-9a-f]{64}", self.proof_digest)
+        ):
+            raise StateError("positive live-probe evidence requires a bound proof artifact", "invalid-live-probe-evidence")
 
     def as_dict(self) -> dict[str, Any]:
         self.validate()
@@ -116,11 +125,13 @@ class LiveProbeEvidence:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "LiveProbeEvidence":
-        if set(data) != set(_LIVE_PROBE_FIELDS):
+        legacy_fields = set(_LIVE_PROBE_FIELDS) - {"proof_path", "proof_digest"}
+        if set(data) != set(_LIVE_PROBE_FIELDS) and set(data) != legacy_fields:
             raise StateError("live-probe evidence has unknown or missing fields", "invalid-live-probe-evidence")
         if not isinstance(data["allowed_scope"], list) or not isinstance(data["grants"], list):
             raise StateError("live-probe scope and grants must be arrays", "invalid-live-probe-evidence")
-        row = cls(**{**dict(data), "allowed_scope": tuple(data["allowed_scope"]),
+        row = cls(**{**dict(data), "proof_path": data.get("proof_path", ""),
+                     "proof_digest": data.get("proof_digest", ""), "allowed_scope": tuple(data["allowed_scope"]),
                      "grants": tuple(data["grants"])})
         row.validate()
         return row

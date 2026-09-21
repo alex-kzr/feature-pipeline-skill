@@ -971,9 +971,36 @@ class LaunchFailureTests(unittest.TestCase):
                     ), anchors=ANCHORS, attempt=1,
                 )
 
-            self.assertEqual(outcome.status, "done")
-            self.assertEqual((outcome.task_verdict, outcome.test_verdict), ("PASS", "PASS"))
-            self.assertEqual(fallback.calls, ["task_verifier", "test_verifier"])
+            self.assertEqual(outcome.status, "in_progress")
+            self.assertIn("must-validate-concrete-runner-evidence", outcome.failure or "")
+            self.assertEqual(fallback.calls, [])
+
+    def test_containment_proof_cannot_replace_independent_verifier_verdicts(self) -> None:
+        from unittest.mock import patch
+        from pipeline_core.verification import RunnerOwnedIsolationProofVerifier
+
+        with tempfile.TemporaryDirectory() as directory:
+            run = _implemented_run(Path(directory), task_id="TC-11")
+            spec = _spec(id="TC-11")
+            register_work_items(run, (spec,))
+            fallback = RunnerOwnedIsolationProofVerifier(run)
+            with activate_work_item(run, spec.id), patch.object(
+                RunnerOwnedIsolationProofVerifier, "verify",
+                return_value=type("Proof", (), {"token": "PASS", "report": {"containment": True}})(),
+            ) as proof_check:
+                outcome = orchestrate_verification(
+                    run, spec, _evidence(task_id="TC-11"),
+                    launchers=VerifierLaunchers(
+                        task=FakeVerifier(raise_code="stack-isolation-unsupported"),
+                        test=FakeVerifier(raise_code="stack-isolation-unsupported"),
+                        deterministic_isolation=fallback,
+                    ), anchors=ANCHORS, attempt=1,
+                )
+            self.assertEqual(outcome.status, "in_progress")
+            self.assertIn("stack-isolation-unsupported", outcome.failure or "")
+            self.assertIsNone(outcome.task_verdict)
+            self.assertIsNone(outcome.test_verdict)
+            proof_check.assert_not_called()
 
     def test_structural_rejection_without_the_runner_owned_fallback_stays_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

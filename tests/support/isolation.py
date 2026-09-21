@@ -9,7 +9,9 @@ from feature_pipeline.ports.adapters import (
 )
 
 
-def proven_isolation_capabilities(name: str, *, runtime: str | None = None) -> AdapterCapabilities:
+def proven_isolation_capabilities(
+    name: str, *, runtime: str | None = None, observed_version: str = "test-version",
+) -> AdapterCapabilities:
     """Construct an explicit test-only stand-in for a separately verified proof.
 
     Production diagnostic records intentionally cannot create these capabilities.
@@ -25,8 +27,8 @@ def proven_isolation_capabilities(name: str, *, runtime: str | None = None) -> A
         supports_nested_delegation_isolated=True,
         isolation_proofs=tuple(
             IsolationCapabilityProof(
-                token, name, selected_runtime, cli_surface, "test-version", evidence,
+                token, name, selected_runtime, cli_surface, observed_version, evidence,
             ) for token in STRICT_ISOLATION_CAPABILITIES
         ),
-        runtime=selected_runtime, cli_surface=cli_surface, observed_version="test-version",
+        runtime=selected_runtime, cli_surface=cli_surface, observed_version=observed_version,
     )

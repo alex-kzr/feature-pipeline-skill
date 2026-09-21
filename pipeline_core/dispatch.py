@@ -43,6 +43,7 @@ from .adapters import (
     AdapterError,
     LaunchRequest,
     LaunchComposition,
+    bind_launch_request,
     LaunchResult,
     check_command_allowances,
     parse_codex_final_result,
@@ -569,6 +570,7 @@ def dispatch_executor(
         bundle_digest=None if bundle is None else bundle.digest,
         allowed_scope=tuple(spec.allowed_scope),
         role_grant=tuple(request.role_grant),
+        executor_identity=spec.executor,
     )
     launch_request = LaunchRequest(
         role=spec.executor,
@@ -616,7 +618,7 @@ def dispatch_executor(
     git_boundary = _capture_git_mutation_boundary(workspace)
 
     try:
-        result = adapter.launch(launch_request)
+        result = adapter.launch(bind_launch_request(launch_request))
     except AdapterError as exc:
         return _retryable_failure(
             life, request, artifacts, generation,
@@ -668,6 +670,7 @@ def dispatch_executor(
         report_path=artifacts.status_envelope,
         working_root=launch_working_root,
         role_grant=tuple(request.role_grant),
+        allowed_scope=tuple(spec.allowed_scope),
         resume_session_id=result.session_id,
         no_tools=True,
         read_only=True,
@@ -679,7 +682,7 @@ def dispatch_executor(
         composition=composition,
     )
     try:
-        envelope_result = adapter.launch(envelope_request)
+        envelope_result = adapter.launch(bind_launch_request(envelope_request))
     except AdapterError as exc:
         return _retryable_failure(
             life, request, artifacts, generation, result, None,

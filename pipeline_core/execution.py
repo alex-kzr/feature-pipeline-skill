@@ -551,6 +551,13 @@ class ExecuteControls:
     adapter_explicit: bool = False
     model: str | None = None
     effort: str | None = None
+    # Docker controls are part of the immutable runtime identity. ``None`` means omitted and
+    # therefore inheritable only on resume; fresh execution resolves it to the host default.
+    codex_runtime: str | None = None
+    docker_codex_image: str | None = None
+    docker_proxy_image: str | None = None
+    docker_codex_version: str | None = None
+    docker_codex_auth_file: str | None = None
     max_repair_attempts: int | None = None
     routine_output_byte_budget: int | None = None
     diagnostic_output_byte_budget: int | None = None
@@ -796,14 +803,29 @@ def _ensure_attestations_match(run: Run, requested: tuple[tuple[str, str], ...])
 def _ensure_execution_controls_match(
     run: Run, scope: Sequence[str], verify_dependency_chain: bool,
     model: str | None = None, effort: str | None = None,
+    codex_runtime: str | None = None, docker_codex_image: str | None = None,
+    docker_proxy_image: str | None = None, docker_codex_version: str | None = None,
+    docker_codex_auth_file: str | None = None,
 ) -> None:
     """Reject a resume whose immutable scope or chain policy changed."""
     recorded_scope = run.controls.get("execution_scope", {}).get("value")
     if recorded_scope != list(scope):
-        raise ExecutionError(
-            "resume execution scope does not match the recorded scope",
-            "execution-scope-mismatch",
-        )
+        recorded_ids = set(recorded_scope or ())
+        current_ids = set(scope)
+        dropped = recorded_ids - current_ids
+        # Dependency reuse can shrink a historical scope on a later resume. This is safe only
+        # for IDs that never had task state in this run; an unfinished recorded task remains a
+        # hard mismatch and may not be silently discarded.
+        if (
+            not isinstance(recorded_scope, list)
+            or not current_ids.issubset(recorded_ids)
+            or any(task_id in run.tasks and run.task(task_id).status != "done" for task_id in dropped)
+        ):
+            raise ExecutionError(
+                f"resume execution scope does not match the recorded scope: "
+                f"recorded={recorded_scope!r}, current={list(scope)!r}",
+                "execution-scope-mismatch",
+            )
     recorded_chain = bool(
         (run.controls.get("verify_dependency_chain", {}) or {}).get("value", False)
     )
@@ -814,6 +836,19 @@ def _ensure_execution_controls_match(
         )
     for name, value in (("model", model), ("effort", effort)):
         if run.controls.get(name, {}).get("value") != value:
+            raise ExecutionError(
+                f"resume {name} does not match the recorded run", "runtime-control-mismatch"
+            )
+    for name, value in (
+        ("codex_runtime", codex_runtime),
+        ("docker_codex_image", docker_codex_image),
+        ("docker_proxy_image", docker_proxy_image),
+        ("docker_codex_version", docker_codex_version),
+        ("docker_codex_auth_file", docker_codex_auth_file),
+    ):
+        # Old runs have no Docker identity controls. Retain their compatibility path while
+        # requiring exact equality for every run created after this control was introduced.
+        if value is not None and name in run.controls and run.controls[name].get("value") != value:
             raise ExecutionError(
                 f"resume {name} does not match the recorded run", "runtime-control-mismatch"
             )
@@ -1506,6 +1541,26 @@ def _controls_map(
         "adapter_resolved": (resolution.resolved, resolution.sourced),
         "model": ((controls.model, "explicit") if controls.model is not None else (None, "default")),
         "effort": ((controls.effort, "explicit") if controls.effort is not None else (None, "default")),
+        "codex_runtime": (
+            (controls.codex_runtime, "explicit") if controls.codex_runtime is not None
+            else ("host", "default")
+        ),
+        "docker_codex_image": (
+            (controls.docker_codex_image, "explicit") if controls.codex_runtime == "docker"
+            else (None, "default")
+        ),
+        "docker_proxy_image": (
+            (controls.docker_proxy_image, "explicit") if controls.codex_runtime == "docker"
+            else (None, "default")
+        ),
+        "docker_codex_version": (
+            (controls.docker_codex_version, "explicit") if controls.codex_runtime == "docker"
+            else (None, "default")
+        ),
+        "docker_codex_auth_file": (
+            (controls.docker_codex_auth_file, "explicit") if controls.codex_runtime == "docker"
+            else (None, "default")
+        ),
         "max_repair_attempts": (
             (controls.max_repair_attempts, "explicit")
             if controls.max_repair_attempts is not None else (None, "default")),
@@ -1663,6 +1718,7 @@ def _ensure_plan_compatible(
             )
         return
     scoped_ids = set(plan.execution_scope)
+    recorded_scope = set(run.controls.get("execution_scope", {}).get("value") or ())
     for key in list(recorded) + [k for k in now if k not in recorded]:
         before = recorded.get(key, "<absent>")
         after = now.get(key, "<absent>")
@@ -1670,6 +1726,8 @@ def _ensure_plan_compatible(
             # Older runs persisted full-board order. Compare their recorded
             # scope's relative order only; new independent board work is irrelevant.
             before = ",".join(task_id for task_id in before.split(",") if task_id in scoped_ids)
+        if key == "execution_scope" and scoped_ids.issubset(recorded_scope):
+            continue
         if before != after:
             raise ExecutionError(
                 f"resume: compiled plan is incompatible with the recorded run at "
@@ -1957,19 +2015,36 @@ def _hydrate_resume_runtime_controls(request: ExecuteRequest) -> ExecuteRequest:
     with a persisted value.
     """
     controls = request.controls
-    if not controls.resume or controls.model is not None or controls.effort is not None:
+    if not controls.resume:
         return request
     recorded = Run.load(request.run_dir, request.repo_root)
-    model = (recorded.controls.get("model", {}) or {}).get("value")
-    effort = (recorded.controls.get("effort", {}) or {}).get("value")
-    if model is None and effort is None:
-        return request
-    if not isinstance(model, str) or not isinstance(effort, str):
-        raise ExecutionError(
-            "recorded model and effort controls must be a complete string pair",
-            "runtime-control-invalid",
-        )
-    return replace(request, controls=replace(controls, model=model, effort=effort))
+    updates: dict[str, str] = {}
+    if controls.model is None and controls.effort is None:
+        model = (recorded.controls.get("model", {}) or {}).get("value")
+        effort = (recorded.controls.get("effort", {}) or {}).get("value")
+        if model is not None or effort is not None:
+            if not isinstance(model, str) or not isinstance(effort, str):
+                raise ExecutionError(
+                    "recorded model and effort controls must be a complete string pair",
+                    "runtime-control-invalid",
+                )
+            updates.update(model=model, effort=effort)
+    if controls.codex_runtime is None and "codex_runtime" in recorded.controls:
+        runtime = recorded.controls["codex_runtime"].get("value")
+        values = {
+            "docker_codex_image": recorded.controls.get("docker_codex_image", {}).get("value"),
+            "docker_proxy_image": recorded.controls.get("docker_proxy_image", {}).get("value"),
+            "docker_codex_version": recorded.controls.get("docker_codex_version", {}).get("value"),
+            "docker_codex_auth_file": recorded.controls.get("docker_codex_auth_file", {}).get("value"),
+        }
+        if runtime not in {"host", "docker"} or (
+            runtime == "docker" and any(not isinstance(value, str) or not value for value in values.values())
+        ):
+            raise ExecutionError("recorded Docker runtime controls are invalid", "runtime-control-invalid")
+        updates["codex_runtime"] = runtime
+        if runtime == "docker":
+            updates.update(values)  # type: ignore[arg-type]
+    return replace(request, controls=replace(controls, **updates)) if updates else request
 
 
 def _substitute_superseded_scope(
@@ -2021,7 +2096,9 @@ def _resume_open_run(
     # deterministically continue the latest unfinished operation without a recovery selector.
     _ensure_execution_controls_match(
         recorded, execution_scope, request.controls.verify_dependency_chain,
-        request.controls.model, request.controls.effort,
+        request.controls.model, request.controls.effort, request.controls.codex_runtime,
+        request.controls.docker_codex_image, request.controls.docker_proxy_image,
+        request.controls.docker_codex_version, request.controls.docker_codex_auth_file,
     )
     _ensure_precondition_contracts_match(recorded, specs)
     recorded_bindings = recorded.controls.get("precondition_bindings", {}).get("value") or {}

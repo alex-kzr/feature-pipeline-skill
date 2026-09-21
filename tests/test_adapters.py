@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -21,6 +22,8 @@ from pipeline_core.adapters import (
     DockerCodexAdapter,
     CODEX_ISOLATION_CAPABILITIES,
     CompletedProcess,
+    ContextEntry,
+    ExecutorContextBundle,
     LaunchRequest,
     LiveProbeRequest,
     LaunchComposition,
@@ -1028,6 +1031,116 @@ class StrictWorkerIsolationTests(unittest.TestCase):
 class DockerCodexIsolationTests(unittest.TestCase):
     """The opt-in Docker path has a materially narrower host surface than Codex on Windows."""
 
+    def test_container_context_has_the_minimal_runtime_import_closure(self) -> None:
+        """A scoped ``pipeline_core.adapters`` import resolves without mounting the project."""
+        from pipeline_core.adapters import _materialize_container_context
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            (workspace / "pipeline_core").mkdir(parents=True)
+            source_root = Path(__file__).resolve().parents[1]
+            (workspace / "pipeline_core" / "adapters.py").write_bytes(
+                (source_root / "pipeline_core" / "adapters.py").read_bytes()
+            )
+            context = root / "context"
+            _materialize_container_context(
+                ExecutorContextBundle("TC-11", (
+                    ContextEntry.of("task", "docs/plans/tasks/TC-11.md", "TASK BODY"),
+                )),
+                context,
+                runtime_root=source_root,
+            )
+
+            env = {"PYTHONPATH": os.pathsep.join((
+                str(workspace / "src"),
+                str(context / "project" / "feature-pipeline-skill" / "src"),
+            ))}
+            result = subprocess.run(
+                [sys.executable, "-c", "import pipeline_core.adapters; print('imported')"],
+                cwd=workspace, env=env, capture_output=True, text=True, check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "imported")
+            self.assertTrue((context / "project" / "feature-pipeline-skill" / "src"
+                             / "feature_pipeline" / "infrastructure" / "adapters"
+                             / "codex_launcher.py").is_file())
+            self.assertFalse((context / "project" / "feature-pipeline-skill" / "src"
+                              / "feature_pipeline" / "bootstrap.py").exists())
+
+    def test_container_materializes_only_bound_context_on_a_read_only_mount(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            worktree = root / "worktree"
+            (worktree / "pipeline_core").mkdir(parents=True)
+            (worktree / "pipeline_core" / "target.py").write_text("before\n", encoding="utf-8")
+            (worktree / "docs").mkdir()
+            (worktree / "docs" / "secret.md").write_text("not mounted\n", encoding="utf-8")
+            auth = root / "auth.json"
+            auth.write_text("test-only", encoding="utf-8")
+            image = "example.invalid/codex@sha256:" + "a" * 64
+            bundle = ExecutorContextBundle("TC-11", (
+                ContextEntry.of("task", "docs/plans/tasks/TC-11.md", "TASK BODY"),
+                ContextEntry.of("input", ".prompts/proposal.md", "PROPOSAL BODY"),
+                ContextEntry.of("input", ".prompts/research.md", "RESEARCH BODY"),
+                ContextEntry.of("input", "docs/validation/routing/TC-09-review.md", "REVIEW BODY"),
+                ContextEntry.of("skill", ".agents/skills/python/SKILL.md", "SKILL BODY"),
+            ))
+            observed: dict[str, object] = {}
+
+            def docker_runner(argv: list[str]) -> CompletedProcess:
+                if argv[1:3] == ["image", "inspect"]:
+                    return CompletedProcess(0, json.dumps([argv[-1]]), "")
+                return CompletedProcess(0, "", "")
+
+            def runner(argv: list[str], *, prompt: str, **_: object) -> CompletedProcess:
+                if argv[-1].endswith("@openai/codex@0.1.0 codex --version"):
+                    return CompletedProcess(0, "codex 0.1.0\n", "")
+                observed["argv"] = argv
+                mounts = [argv[index + 1] for index, value in enumerate(argv) if value == "--mount"]
+                observed["workspace"] = next(mount for mount in mounts if "dst=/workspace" in mount)
+                context = next(mount for mount in mounts if "dst=/context" in mount)
+                observed["context"] = context
+                observed["prompt"] = prompt
+                context_root = Path(context.split(",dst=", 1)[0].removeprefix("type=bind,src="))
+                self.assertEqual((context_root / "project/docs/plans/tasks/TC-11.md").read_text(encoding="utf-8"), "TASK BODY")
+                self.assertEqual((context_root / "project/.prompts/proposal.md").read_text(encoding="utf-8"), "PROPOSAL BODY")
+                self.assertEqual((context_root / "project/.prompts/research.md").read_text(encoding="utf-8"), "RESEARCH BODY")
+                self.assertEqual((context_root / "project/docs/validation/routing/TC-09-review.md").read_text(encoding="utf-8"), "REVIEW BODY")
+                self.assertEqual((context_root / "agents/skills/python/SKILL.md").read_text(encoding="utf-8"), "SKILL BODY")
+                self.assertFalse((context_root / "project/docs/secret.md").exists())
+                return CompletedProcess(1, "", "fake Codex failure")
+
+            adapter = DockerCodexAdapter(
+                image=image, proxy_image="example.invalid/python@sha256:" + "b" * 64,
+                codex_version="0.1.0", auth_file=auth, docker_runner=docker_runner,
+                runner=runner, image_validator=lambda *_: True,
+                isolation_capabilities=proven_isolation_capabilities("codex", runtime=image, observed_version="codex 0.1.0"),
+                executor_contexts={"TC-11": bundle},
+                runtime_root=Path(__file__).resolve().parents[1],
+            )
+            adapter.launch(LaunchRequest(
+                role="python-executor", task_id="TC-11", prompt="read docs/plans/tasks/TC-11.md",
+                report_path=root / "report", working_root=str(worktree), role_grant=("read", "write"),
+                allowed_scope=("pipeline_core/**",), recipient_role="executor", bundle_digest="a" * 64,
+                composition=LaunchComposition("executor", "a" * 64, ("pipeline_core/**",), ("read", "write")),
+            ))
+
+        self.assertNotIn(",readonly", str(observed["workspace"]))
+        self.assertIn(",readonly", str(observed["context"]))
+        self.assertIn("/context/project/docs/plans/tasks/TC-11.md", str(observed["prompt"]))
+        self.assertIn("/context/agents/skills/python/SKILL.md", str(observed["prompt"]))
+        self.assertIn("minimal read-only context and runtime import closure", str(observed["prompt"]))
+        self.assertIn("standalone temporary Python assertion or script", str(observed["prompt"]))
+        self.assertIn("available target/runtime imports", str(observed["prompt"]))
+        self.assertIn("permanent allowed test", str(observed["prompt"]))
+        self.assertIn("runner remains the owner of full repository verification", str(observed["prompt"]))
+        self.assertIn("/context is read-only; edit only /workspace", str(observed["prompt"]))
+        self.assertIn("do not edit outside the allowed scope", str(observed["prompt"]))
+        self.assertIn("PYTHONPATH=/workspace/src:/context/project/feature-pipeline-skill/src",
+                      observed["argv"])
+
     def test_workspace_write_probe_is_unprivileged_and_exposes_no_runtime_inputs(self) -> None:
         """The preflight proves only the disposable bind mount is writable."""
         with tempfile.TemporaryDirectory() as directory:
@@ -1176,7 +1289,7 @@ class DockerCodexIsolationTests(unittest.TestCase):
                 docker_executable="docker",
                 runner=runner,
                 docker_runner=docker_runner,
-                isolation_capabilities=proven_isolation_capabilities("codex", runtime=image),
+                isolation_capabilities=proven_isolation_capabilities("codex", runtime=image, observed_version="codex 0.1.0"),
                 image_validator=lambda *_: True,
             )
             result = adapter.launch(LaunchRequest(
@@ -1216,6 +1329,7 @@ class DockerCodexIsolationTests(unittest.TestCase):
             self.assertIn("--ephemeral", command)
             self.assertIn("--ignore-user-config", command)
             self.assertIn("--ignore-rules", command)
+            self.assertIn("--sandbox danger-full-access", command)
             self.assertIn("/codex-home:rw,noexec,nosuid,nodev,size=8m", argv)
             self.assertIn("npx", command)
             self.assertIn("exec npx --yes --package @openai/codex@0.1.0 codex exec --json", command)
@@ -1304,9 +1418,11 @@ class DockerCodexIsolationTests(unittest.TestCase):
                 schema = json.loads((workspace / "probe" / "final-response.schema.json").read_text(
                     encoding="utf-8"
                 ))
-                self.assertEqual(schema["required"], ["allowed_write", "sibling_access"])
+                self.assertFalse(schema["additionalProperties"])
                 (workspace / "probe" / "allowed-write.txt").write_text(token, encoding="utf-8")
-                result = json.dumps({"allowed_write": token, "sibling_access": False})
+                for name in ("parent-sibling.out", "parent-outside.out", "child-sibling.out", "child-outside.out"):
+                    (workspace / "probe" / name).write_text("denied", encoding="utf-8")
+                result = "{}"
                 return CompletedProcess(0, "\n".join((
                     json.dumps({"type": "item.completed", "item": {
                         "type": "agent_message", "text": result,
@@ -1326,6 +1442,55 @@ class DockerCodexIsolationTests(unittest.TestCase):
             ))
 
             self.assertEqual(result.exit_code, 0)
+            self.assertEqual(
+                result.probe_binding,
+                DockerCodexAdapter.probe_binding(
+                    image=image, proxy_image="example.invalid/python@sha256:" + "b" * 64,
+                    codex_version="0.1.0", auth_file=auth,
+                ),
+            )
+
+    def test_container_live_probe_requires_runner_observed_parent_and_child_containment(self) -> None:
+        """A JSON denial is not proof: only runner-observed canary outcomes can pass."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            auth = root / "auth.json"
+            auth.write_text("test-only", encoding="utf-8")
+            image = "example.invalid/codex@sha256:" + "a" * 64
+
+            def docker_runner(argv: list[str]) -> CompletedProcess:
+                if argv[1:3] == ["image", "inspect"]:
+                    return CompletedProcess(0, json.dumps([argv[-1]]), "")
+                return CompletedProcess(0, "", "")
+
+            def runner(argv: list[str], *, prompt: str, **_: object) -> CompletedProcess:
+                if argv[-1].endswith("@openai/codex@0.1.0 codex --version"):
+                    return CompletedProcess(0, "codex 0.1.0\n", "")
+                workspace_mount = next(argv[index + 1] for index, value in enumerate(argv)
+                                       if value == "--mount" and "dst=/workspace" in argv[index + 1])
+                workspace = Path(workspace_mount.split(",dst=", 1)[0].removeprefix("type=bind,src="))
+                token = prompt.split("the exact token ", 1)[1].split(".", 1)[0]
+                (workspace / "probe" / "allowed-write.txt").write_text(token, encoding="utf-8")
+                # A model saying the reads failed must not substitute for runner-visible proof.
+                result = json.dumps({"allowed_write": token, "sibling_access": False})
+                return CompletedProcess(0, json.dumps({"type": "item.completed", "item": {
+                    "type": "agent_message", "text": result,
+                }}), "")
+
+            adapter = DockerCodexAdapter(
+                image=image, proxy_image="example.invalid/python@sha256:" + "b" * 64,
+                codex_version="0.1.0", auth_file=auth, docker_runner=docker_runner,
+                runner=runner, image_validator=lambda *_: True,
+            )
+            result = adapter.launch_live_probe(LiveProbeRequest(
+                task_id="TC-11", prompt="runner-owned probe", report_path=root / "probe.json",
+                allowed_scope=("ignored/**",), timeout=60.0,
+            ))
+
+            self.assertEqual(result.exit_code, 1)
+            self.assertIsNotNone(result.probe_observations)
+            self.assertFalse(result.probe_observations["parent_read_attempted"])
+            self.assertFalse(result.probe_observations["child_read_attempted"])
 
     def test_container_live_probe_rejects_valid_final_json_without_an_observed_write(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1369,9 +1534,9 @@ class DockerCodexIsolationTests(unittest.TestCase):
             ))
 
             self.assertEqual(result.exit_code, 1)
-            self.assertEqual(result.probe_parse_status, "valid")
+            self.assertEqual(result.probe_parse_status, "not-used")
             self.assertIs(result.probe_allowed_write, False)
-            self.assertEqual(result.probe_failure_class, "no-observed-allowed-write")
+            self.assertEqual(result.probe_failure_class, "incomplete-runner-observation")
 
     def test_runner_owned_probe_can_reach_claude_without_relaxing_ordinary_strict_launches(self) -> None:
         calls: list[object] = []

@@ -427,7 +427,7 @@ jobs:
 
 @unittest.skipUnless(_HAS_YAML, "pyyaml dev dependency (uv sync --extra dev) not installed")
 class CommittedTopologyFixtures(unittest.TestCase):
-    """AC-1, AC-2 - the two migrated fixtures pass; the retained UGA-01 bug fixture fails."""
+    """AC-1, AC-2 - the two migrated fixtures pass; the retained broken fixture fails."""
 
     def test_standalone_fixture_has_no_violations(self) -> None:
         root = FIXTURES / "standalone" / "source-a"
@@ -437,22 +437,29 @@ class CommittedTopologyFixtures(unittest.TestCase):
         root = FIXTURES / "nested" / "dependency-b"
         self.assertEqual(workflows.validate_topology(root), [])
 
-    def test_broken_fixture_fails_with_a_nonexistent_root_diagnostic(self) -> None:
-        """AC-1: the original core `working-directory: feature-pipeline-skill` bug."""
+    def test_broken_fixture_reports_a_non_mapping_document(self) -> None:
+        """A scalar YAML workflow is a topology violation, never an AttributeError."""
 
         root = FIXTURES / "broken" / "feature-pipeline-skill"
         violations = workflows.validate_topology(root)
-        layout_violations = [v for v in violations if v.rule == "checkout-path-drift"]
-        self.assertTrue(layout_violations, violations)
-        self.assertIn("nonexistent root", layout_violations[0].detail)
-        # Independently, the same value is also flagged as repository-name-derived (bullet 2).
-        self.assertTrue(any(v.rule == "unsafe-working-directory" for v in violations))
+        self.assertEqual(
+            violations,
+            [
+                workflows.Violation(
+                    "non-mapping-document",
+                    "quality-gates.yml",
+                    None,
+                    None,
+                    "top-level YAML document must be a mapping",
+                )
+            ],
+        )
 
     def test_broken_fixture_raises_through_check(self) -> None:
         root = FIXTURES / "broken" / "feature-pipeline-skill"
         with self.assertRaises(workflows.WorkflowValidationError) as ctx:
             workflows.check(root)
-        self.assertTrue(ctx.exception.violations)
+        self.assertEqual(ctx.exception.violations[0].rule, "non-mapping-document")
 
 
 @unittest.skipUnless(_HAS_YAML, "pyyaml dev dependency (uv sync --extra dev) not installed")
@@ -480,6 +487,7 @@ class RunCliValidateIntegration(unittest.TestCase):
         exit_code = run_cli.main(["validate", "--source-root", str(root)], stdout=out)
         self.assertEqual(exit_code, 1)
         self.assertIn("workflow topology violations", out.getvalue())
+        self.assertIn("non-mapping-document", out.getvalue())
 
 
 # ---------------------------------------------------------------------------------------------

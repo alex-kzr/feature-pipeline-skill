@@ -34,6 +34,7 @@ import os
 import math
 import re
 import base64
+import hashlib
 import secrets
 import shutil
 import tempfile
@@ -287,29 +288,36 @@ def run_live_isolation_probe(
             safe_stderr.replace(request.prompt, "<redacted-probe>"), marker,
             PROBE_STDERR_REASON_BUDGET, run.repo_root,
         )
-        if disposition == "LAUNCH_FAILED":
-            diagnostic = {
-                "schema_version": 1,
-                "task_id": task_id,
-                "attempt_id": attempt_id,
-                "role": "runner-live-isolation-probe",
-                "disposition": disposition,
-                "reason": reason,
-                "exit_code": exit_code,
-                "parse_status": _probe_parse_status(result) if "result" in locals() else "not-observed",
-                "allowed_write_observed": getattr(result, "probe_allowed_write", None) if "result" in locals() else None,
-                "failure_class": _probe_failure_class(result) if "result" in locals() else "not-observed",
-                "sibling_mounted": getattr(result, "probe_sibling_mounted", None) if "result" in locals() else None,
-                "subprocess_state": _probe_state(result, "probe_subprocess_state") if "result" in locals() else "not-observed",
-                "nested_state": _probe_state(result, "probe_nested_state") if "result" in locals() else "not-observed",
-                "stderr_reason": safe_stderr,
-                **(launch_error or {}),
-            }
-            write_json_atomic(
-                report_path,
-                diagnostic,
-                repo_root=run.repo_root,
-            )
+        raw_observations = getattr(result, "probe_observations", {}) if "result" in locals() else {}
+        required_observations = (
+            "exact_controls", "allowed_write", "parent_read_attempted", "parent_read_contained",
+            "child_read_attempted", "child_read_contained", "nested_surface_absent",
+            "network_contained", "process_contained",
+        )
+        observations = {
+            name: raw_observations.get(name) is True if isinstance(raw_observations, Mapping) else False
+            for name in required_observations
+        }
+        binding = getattr(result, "probe_binding", {}) if "result" in locals() else {}
+        binding = dict(binding) if isinstance(binding, Mapping) else {}
+        completed_proof = exit_code == 0 and cleanup == "removed" and all(observations.values()) and bool(binding)
+        if completed_proof:
+            disposition, reason = "CONTAINMENT_PROVEN", "all runner-visible containment observations passed"
+        proof = {
+            "schema_version": 1,
+            "task_id": task_id,
+            "attempt_id": attempt_id,
+            "role": "runner-live-isolation-probe",
+            "disposition": disposition,
+            "reason": reason,
+            "observations": observations,
+            "binding": binding,
+            "cleanup_removed": cleanup == "removed",
+            "exit_zero": exit_code == 0,
+            "failure_class": _probe_failure_class(result) if "result" in locals() else "not-observed",
+        }
+        proof_written = write_json_atomic(report_path, proof, repo_root=run.repo_root)
+        proof_digest = hashlib.sha256(Path(proof_written).read_bytes()).hexdigest()
     record = run.record_live_probe_evidence(LiveProbeEvidence(
         schema_version=1, task_id=task_id, run_id=run.run_id,
         task_contract_digest=task_contract_digest, attempt_id=attempt_id,
@@ -319,6 +327,8 @@ def run_live_isolation_probe(
         max_attempts=max_attempts, started_at=started, ended_at=ended,
         disposition=disposition, reason=reason, cleanup=cleanup,
         task_contract_revision=task_contract_revision,
+        proof_path=f"reports/{task_id}/live-probe.json",
+        proof_digest=proof_digest,
     ))
     return record
 
