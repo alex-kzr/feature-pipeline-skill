@@ -9,7 +9,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from pipeline_core.artifacts import ArtifactReadError, write_json_atomic
+from pipeline_core.artifacts import (
+    ArtifactReadError,
+    ArtifactSchemaError,
+    read_json,
+    write_json_atomic,
+    write_text_atomic,
+)
 from pipeline_core.commands import run_command
 from pipeline_core.lease import LeaseHeldError, PipelineLease
 from pipeline_core.redaction import build_rules, redact_text
@@ -95,6 +101,25 @@ class ArtifactCharacterizationTests(unittest.TestCase):
                 {"attribution_state": "known-empty"},
             )
             self.assertFalse(os.path.exists(_os_path(target.with_name(target.name + ".tmp"))))
+
+    def test_artifact_read_schema_and_text_write_failures_are_stable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            missing = root / "missing.json"
+            with self.assertRaises(ArtifactReadError) as caught:
+                read_json(missing)
+            self.assertEqual(caught.exception.code, "unreadable-artifact")
+
+            target = root / "result.json"
+            target.write_text('{"ok": true}', encoding="utf-8")
+            with self.assertRaises(ArtifactSchemaError) as caught:
+                read_json(target, schema=lambda _data: (_ for _ in ()).throw(ValueError("bad schema")))
+            self.assertEqual(caught.exception.code, "invalid-schema")
+
+            text_target = root / "reports" / "command.log"
+            write_text_atomic(text_target, f"path={root / 'secret'}", repo_root=root)
+            self.assertEqual(text_target.read_text(encoding="utf-8"), f"path=<repo>{os.sep}secret")
+            self.assertFalse(text_target.with_name("command.log.tmp").exists())
 
 
 class StateCharacterizationTests(unittest.TestCase):
