@@ -5,6 +5,7 @@ import hashlib
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from feature_pipeline.application.skill_bundles import (
@@ -91,6 +92,22 @@ class SkillBundleTests(unittest.TestCase):
     def test_rejects_a_non_object_manifest_document(self) -> None:
         with self.assertRaisesRegex(SkillBundleError, "must be an object"):
             load_manifests(["[]"])
+
+    def test_rejects_unknown_disallowed_and_stale_requested_skills(self) -> None:
+        manifest = load_manifests([_manifest("python", "stack:python")])["python"]
+        with self.assertRaisesRegex(SkillBundleError, "unknown required skill"):
+            resolve_skill_bundle(_profile(), stack="python", requested_role="executor",
+                                 requested_ids=["missing"], manifests={})
+        profile = _profile()
+        profile.role_grants["auditor"] = ("read",)
+        with self.assertRaisesRegex(SkillBundleError, "incompatible with role"):
+            resolve_skill_bundle(profile, stack="python", requested_role="executor",
+                                 requested_ids=["python"], manifests={"python": manifest},
+                                 recipient_role="auditor")
+        with self.assertRaisesRegex(SkillBundleError, "stale classification"):
+            resolve_skill_bundle(_profile(), stack="python", requested_role="executor",
+                                 requested_ids=["python"],
+                                 manifests={"python": replace(manifest, content="changed")})
 
     def test_project_bundle_uses_canonical_route_and_recipient_role(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
