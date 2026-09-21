@@ -32,8 +32,17 @@ from feature_pipeline.application.compile_plan import (
 from feature_pipeline.application.profile_bridge import compiled_profile_from_core
 from feature_pipeline.contracts import Profile, TaskSpec
 from pipeline_core import runner_cli
-from pipeline_core.execution import ExecutionError, _ensure_plan_compatible, _plan_fingerprint
+from pipeline_core.execution import (
+    ExecutionError,
+    _apply_approved_amendments,
+    _ensure_plan_compatible,
+    _ensure_precondition_contracts_match,
+    _matches_approved_amendment,
+    _plan_fingerprint,
+)
+from pipeline_core.plan import AmendmentRequest, build_amendment_revision, canonical_amendment_fields
 from pipeline_core.state import Run
+from pipeline_core.lifecycle import RunLifecycle
 
 
 # --- fixtures ----------------------------------------------------------------------------
@@ -276,11 +285,11 @@ class RejectBeforeStateTests(unittest.TestCase):
 
 
 class ResumeCompatibilityTests(unittest.TestCase):
-    def _plan(self, *, max_repair: int | None = None):
+    def _plan(self, *, max_repair: int | None = None, task_id: str = "DA-01"):
         profile = compiled_profile_from_core(Profile.from_data(_native_profile()))
         return compile_run_plan(
             feature="cutover-feature",
-            definitions=[ShallowTaskInput("DA-01", "docs")],
+            definitions=[ShallowTaskInput(task_id, "docs")],
             profile=profile,
             overrides=ControlOverrides(max_repair_attempts=max_repair),
         )
@@ -325,6 +334,95 @@ class ResumeCompatibilityTests(unittest.TestCase):
             run.save()
             _ensure_plan_compatible(run, plan)  # no raise
 
+    def test_resume_uses_an_approved_amendment_instead_of_the_original_plan_contract(self) -> None:
+        """REC-35: amendment → resume uses the accepted revision and a fresh epoch."""
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = Run.create(
+                "cutover-feature", root / "prompt.md", root / "plan.json",
+                root / "runs" / "cutover-feature", root,
+            )
+            original = TaskSpec.build(
+                id="REC-35", task_type="docs", executor="docs-executor",
+                allowed_scope=["content/**"], max_repair_attempts=2,
+            )
+            run.add_task("REC-35")
+            run.set_task_contract("REC-35", "tasks/REC-35.md", "sha256:original")
+            run.task("REC-35").attempts = 2
+            run.task("REC-35").verification = {
+                "task_verdict": "FAIL", "test_verdict": "PASS", "verified_at": None,
+            }
+            plan = self._plan(max_repair=2, task_id="REC-35")
+            run.set_control("plan_fingerprint", _plan_fingerprint(plan), sourced="explicit")
+            revision = build_amendment_revision(
+                AmendmentRequest(
+                    task_id="REC-35", task_status="to_do",
+                    prior_contract=canonical_amendment_fields(original),
+                    new_contract={
+                        "allowed_scope": ["content/**", "reviews/**"],
+                        "out_of_scope": [], "verification_commands": [],
+                        "max_repair_attempts": 3, "documentation_impact": [],
+                    },
+                    rationale="baseline needs a review artifact", approved_by="reviewer",
+                    source_evidence="baseline:1",
+                ), next_revision=1, next_epoch=1,
+            )
+            run.apply_amendment(
+                revision, new_digest=revision.new_digest,
+                new_digest_version="tam01-amendment-v1")
+            fingerprint = _plan_fingerprint(plan)
+            fingerprint["task.REC-35.repair_bound"] = "3"
+            fingerprint["task.REC-35.control.max_repair_attempts"] = "3 (default)"
+            run.set_control("plan_fingerprint", fingerprint, sourced="amendment")
+            run.save()
+
+            # Use the durable runner-created record, exactly as the public resume path does.
+            resumed_run = Run.load(run.run_dir, root)
+            resumed = _apply_approved_amendments(resumed_run, (original,))
+            self.assertEqual(resumed[0].allowed_scope, ("content/**", "reviews/**"))
+            self.assertEqual(resumed[0].max_repair_attempts, 3)
+            self.assertEqual(resumed_run.task("REC-35").current_revision, 1)
+            self.assertEqual(resumed_run.task("REC-35").attempts, 0)
+            self.assertEqual(resumed_run.task("REC-35").verification["task_verdict"], None)
+            self.assertEqual(resumed_run.task("REC-35").revision_history[-1]["attempts"], 2)
+            _ensure_precondition_contracts_match(resumed_run, resumed)
+            _ensure_plan_compatible(resumed_run, plan, resumed)
+
+            # REC-35's runner-created record predates embedded snapshots.  Its approved
+            # digest still authorizes the exact amended task, but not a different one.
+            digest_only_run = Run.load(run.run_dir, root)
+            digest_only_run.task("REC-35").amendment_revisions[-1].pop("new_contract")
+            self.assertEqual(
+                _apply_approved_amendments(digest_only_run, resumed)[0], resumed[0]
+            )
+            self.assertTrue(
+                _matches_approved_amendment(digest_only_run.task("REC-35"), resumed[0])
+            )
+
+            # A forged legacy (digest-only) record is rejected too: neither its declared
+            # changed fields nor its declared added paths may be rewritten after approval.
+            forged_fields = Run.load(run.run_dir, root)
+            forged_fields.task("REC-35").amendment_revisions[-1].pop("new_contract")
+            forged_fields.task("REC-35").amendment_revisions[-1]["changed_fields"] = ["forged"]
+            with self.assertRaises(ExecutionError) as denied:
+                _apply_approved_amendments(forged_fields, resumed)
+            self.assertEqual(denied.exception.code, "task-contract-mismatch")
+
+            forged_paths = Run.load(run.run_dir, root)
+            forged_paths.task("REC-35").amendment_revisions[-1].pop("new_contract")
+            forged_paths.task("REC-35").amendment_revisions[-1]["added_paths"] = [".pipeline/forged"]
+            with self.assertRaises(ExecutionError) as denied:
+                _apply_approved_amendments(forged_paths, resumed)
+            self.assertEqual(denied.exception.code, "task-contract-mismatch")
+
+            # Resume never repairs a forged durable record by re-canonicalizing it.
+            resumed_run.task("REC-35").amendment_revisions[-1]["new_contract"][
+                "allowed_scope"
+            ].append("forged/**")
+            with self.assertRaises(ExecutionError) as denied:
+                _apply_approved_amendments(resumed_run, (original,))
+            self.assertEqual(denied.exception.code, "task-contract-mismatch")
+
     def test_resume_tolerates_rec_11_outside_recorded_execution_scope(self) -> None:
         """An independent newly planned task must not invalidate TC-05's recorded scope."""
         profile = compiled_profile_from_core(Profile.from_data(_native_profile()))
@@ -360,6 +458,49 @@ class ResumeCompatibilityTests(unittest.TestCase):
                 "plan_fingerprint", _plan_fingerprint(recorded), sourced="explicit")
             run.save()
             _ensure_plan_compatible(run, resumed)
+
+    def test_resume_plan_fingerprint_ignores_historical_card_outside_scope(self) -> None:
+        """TC-11 resume never reads state for a historical TC-01 board card.
+
+        The freshly compiled plan still contains TC-01, while the durable focused run owns
+        only TC-10 and TC-11.  This mirrors ``execute --resume --task TC-11`` after the
+        board retained an unrelated historical TC-01 card.
+        """
+        profile = compiled_profile_from_core(Profile.from_data(_native_profile()))
+        definitions = [
+            ShallowTaskInput("TC-01", "docs"),
+            ShallowTaskInput("TC-10", "docs"),
+            ShallowTaskInput("TC-11", "docs", ("TC-10",)),
+        ]
+        plan = compile_run_plan(
+            feature="tc11-focused-resume", definitions=definitions, profile=profile,
+            task="TC-11",
+        )
+        specs = [
+            TaskSpec.build(
+                id=definition.id, task_type=definition.task_type,
+                executor="docs-executor", allowed_scope=["content/**"],
+                depends_on=list(definition.depends_on), acceptance_criteria=["done"],
+            )
+            for definition in definitions
+        ]
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            board = root / "docs" / "kanban.md"
+            board.parent.mkdir(parents=True)
+            board.write_text("## To Do\n\n- [ ] TC-01 - historical card\n", encoding="utf-8")
+            run = Run.create(
+                "tc11-focused-resume", root / "prompt.md", root / "plan.json",
+                root / "runs" / "tc11-focused-resume", root,
+            )
+            RunLifecycle.initialize(
+                run,
+                tasks=[("TC-10", []), ("TC-11", ["TC-10"])],
+                controls={"plan_fingerprint": (_plan_fingerprint(plan), "explicit")},
+            )
+
+            _ensure_plan_compatible(run, plan, specs)
 
 
 if __name__ == "__main__":

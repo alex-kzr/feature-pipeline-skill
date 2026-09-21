@@ -8,11 +8,12 @@ implementation manifest/diff/report references into one immutable :class:`Verifi
 test-verifier request builders are handed byte-identical facts.
 
 :func:`orchestrate_verification` completes stage 8: it builds two separate, fresh, read-only
-verifier contexts over that one evidence payload, settles each verifier's strict JSON verdict
-envelope against its prose report, and lets *only* the parsed ``PASS``/``FAIL``/``BLOCKED``
-combination move task state (via :meth:`pipeline_core.state.Run.record_verdicts`). A launch
-that fails, a malformed envelope, or a prose/envelope disagreement is written to a diagnostic
-and blocks the task — it can never produce ``verified``.
+    verifier contexts over that one evidence payload, settles each verifier's strict JSON verdict
+    envelope against its prose report, and lets *only* the parsed ``PASS``/``FAIL``/``BLOCKED``
+    combination move task state (via :meth:`pipeline_core.state.Run.record_verdicts`). A launch
+    that fails, a malformed envelope, or a prose/envelope disagreement is written to a diagnostic
+    and blocks the task — including a strict-isolation rejection. A containment proof cannot replace
+    independent task and test verdicts.
 
 Command *execution* lives in :mod:`pipeline_core.commands`; this module only packages the
 result and interprets verdicts — it never launches a command itself.
@@ -21,18 +22,22 @@ result and interprets verdicts — it never launches a command itself.
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence
+from typing import Iterable, Mapping, Protocol, Sequence
 
 from feature_pipeline.application.diagnostic_service import DiagnosticService
+from feature_pipeline.application.skill_bundles import SkillBundleError, load_project_skill_bundle
 from feature_pipeline.application.work_items import WorkItemError, require_active_work_item
 
 from .adapters import (
     Adapter,
     AdapterError,
     LaunchRequest,
+    LaunchComposition,
+    bind_launch_request,
     LaunchResult,
     grant_tool_names,
     normalize_role,
@@ -57,11 +62,11 @@ VERDICTS = frozenset({"PASS", "FAIL", "BLOCKED"})
 _DIAGNOSTICS = DiagnosticService()
 
 #: The command-record keys carried into the evidence payload. Redacted, budgeted stdout/stderr
-#: text stays in the persisted log files; the payload references those logs, it never inlines
-#: their content (Implementation Notes).
+#: is embedded so a tool-free verifier receives the complete immutable command evidence rather
+#: than an inaccessible log-path promise.
 _COMMAND_REFERENCE_KEYS = (
     "id", "stage", "cwd", "argv", "exit_code", "disposition", "duration",
-    "stdout_log", "stderr_log", "reason", "command_index", "task_id", "attempt",
+    "stdout_log", "stderr_log", "stdout", "stderr", "reason", "command_index", "task_id", "attempt",
     "snapshot", "revision",
 )
 
@@ -535,6 +540,48 @@ class VerifierAnchors:
     kanban_path: str = "docs/kanban.md"
 
 
+class DeterministicIsolationVerifier(Protocol):
+    """Read-only TC-11 fallback; it is never an adapter or executor."""
+
+    def verify(self, *, task_id: str, role: str) -> object: ...
+
+
+@dataclass(frozen=True)
+class RunnerOwnedIsolationProofVerifier:
+    """Validate a completed, digest-bound Docker proof; never assess launch configuration."""
+
+    run: Run
+
+    def verify(self, *, task_id: str, role: str) -> object:
+        rows = [row for row in self.run.live_probe_evidence if row.get("task_id") == task_id]
+        if not rows:
+            return type("Verdict", (), {"token": "FAIL", "report": {"reason": "missing-concrete-proof"}})()
+        row = rows[-1]
+        if row.get("disposition") != "CONTAINMENT_PROVEN":
+            return type("Verdict", (), {"token": "FAIL", "report": {"reason": "incomplete-concrete-proof"}})()
+        path = Path(self.run.run_dir) / str(row.get("proof_path", ""))
+        try:
+            content = path.read_bytes()
+            proof = json.loads(content)
+        except (OSError, json.JSONDecodeError):
+            return type("Verdict", (), {"token": "FAIL", "report": {"reason": "proof-artifact-unavailable"}})()
+        observations = proof.get("observations") if isinstance(proof, dict) else None
+        binding = proof.get("binding") if isinstance(proof, dict) else None
+        valid = (
+            hashlib.sha256(content).hexdigest() == row.get("proof_digest")
+            and isinstance(proof, dict) and proof.get("disposition") == "CONTAINMENT_PROVEN"
+            and isinstance(observations, dict) and bool(observations) and all(value is True for value in observations.values())
+            and isinstance(binding, dict)
+            and all(isinstance(binding.get(key), str) and binding[key] for key in
+                    ("image", "package", "observed_version", "argv_digest", "contract_revision"))
+        )
+        return type("Verdict", (), {
+            "token": "PASS" if valid else "FAIL",
+            "report": {"task_id": task_id, "role": role,
+                       "reason": "completed-concrete-runner-evidence" if valid else "invalid-concrete-proof"},
+        })()
+
+
 @dataclass(frozen=True)
 class VerifierLaunchers:
     """The injectable independent launcher pair.
@@ -547,6 +594,7 @@ class VerifierLaunchers:
 
     task: Adapter
     test: Adapter
+    deterministic_isolation: DeterministicIsolationVerifier | None = None
 
 
 _VERIFIER_RULES: dict[str, tuple[str, ...]] = {
@@ -645,6 +693,7 @@ def build_verifier_prompt(
     evidence_payload: str,
     attempt: int,
     plan_path: str | None = None,
+    skill_content: str = "",
 ) -> str:
     """Render one fresh, read-only verifier context.
 
@@ -685,6 +734,7 @@ def build_verifier_prompt(
         "```json",
         evidence_payload,
         "```",
+        *( ["", skill_content.rstrip("\n")] if skill_content else [] ),
         "",
         "Final report:",
         "- Verdict: PASS | FAIL | BLOCKED",
@@ -738,9 +788,8 @@ def _amendment_assessment_failure(
     # the exact governing pair; otherwise a PASS could settle a different amendment epoch.
     revision = amendment.get("revision")
     epoch = amendment.get("epoch")
-    markup = r"[\s*_`]*"
     identity = re.compile(
-        rf"revision{markup}{re.escape(str(revision))}{markup},{markup}epoch{markup}{re.escape(str(epoch))}\b",
+        rf"revision\D*{re.escape(str(revision))}\D{{0,120}}?epoch\D*{re.escape(str(epoch))}\b",
         re.IGNORECASE,
     )
     if not identity.search(report_text):
@@ -799,12 +848,26 @@ def _run_one_verifier(
     # The task verifier's prompt says "You may read the worktree"; grant exactly that and
     # nothing that writes. The test verifier stays deliberately tool-free (`no_tools=True`).
     verifier_grant: tuple[str, ...] = () if tool_less else ("read",)
+    try:
+        bundle = load_project_skill_bundle(
+            run.repo_root, task_type=spec.task_type, recipient_role=normalized)
+    except (SkillBundleError, ValueError) as exc:
+        return _diagnose(
+            run, spec, artifacts, role=normalized, attempt=attempt,
+            reason=f"skill-bundle-invalid: {exc}")
     prompt = build_verifier_prompt(
         normalized, spec, anchors=anchors, feature_prompt=run.prompt_path,
         evidence_payload=evidence_payload, attempt=attempt, plan_path=plan_path,
+        skill_content="" if bundle is None else bundle.render(),
     )
     write_text_atomic(artifacts.prompt(normalized), prompt, repo_root=run.repo_root)
 
+    composition = LaunchComposition(
+        recipient_role=normalized,
+        bundle_digest=None if bundle is None else bundle.digest,
+        allowed_scope=tuple(getattr(spec, "allowed_scope", ()) or ()),
+        role_grant=verifier_grant,
+    )
     request = LaunchRequest(
         role=normalized,
         task_id=spec.id,
@@ -820,9 +883,16 @@ def _run_one_verifier(
         no_tools=tool_less,
         model=model,
         effort=effort,
+        # Bind this launch to the exact role and skill-bundle digest it was composed for
+        # (TC-11 AC-1); an adapter rejects a request whose recipient role disagrees with the
+        # role actually being launched, so later adapter code can never widen or substitute
+        # either — and neither verifier's bundle can leak into the other's launch.
+        recipient_role=normalized,
+        bundle_digest=None if bundle is None else bundle.digest,
+        composition=composition,
     )
     try:
-        result = adapter.launch(request)
+        result = adapter.launch(bind_launch_request(request))
     except AdapterError as exc:
         return _diagnose(
             run, spec, artifacts, role=normalized, attempt=attempt,
@@ -858,13 +928,17 @@ def _run_one_verifier(
         report_path=artifacts.envelope(normalized),
         read_only=True,
         working_root=".",
+        allowed_scope=tuple(getattr(spec, "allowed_scope", ()) or ()),
         resume_session_id=result.session_id,
         no_tools=True,
         model=model,
         effort=effort,
+        recipient_role=normalized,
+        bundle_digest=None if bundle is None else bundle.digest,
+        composition=composition,
     )
     try:
-        envelope_result = adapter.launch(envelope_request)
+        envelope_result = adapter.launch(bind_launch_request(envelope_request))
     except AdapterError as exc:
         return _diagnose(
             run, spec, artifacts, role=normalized, attempt=attempt,
@@ -912,6 +986,28 @@ def _run_one_verifier(
     )
 
 
+def _deterministic_isolation_fallback(
+    run: Run, spec: object, role: str, artifacts: object, attempt: int,
+    verifier: DeterministicIsolationVerifier | None,
+) -> _SettledVerifier | None:
+    """Keep structural rejection blocked even when a containment proof is available."""
+    if verifier is None or spec.id != "TC-11":
+        return None
+    if not isinstance(verifier, RunnerOwnedIsolationProofVerifier):
+        return _diagnose(
+            run, spec, artifacts, role=role, attempt=attempt,
+            reason="deterministic-isolation-verifier-must-validate-concrete-runner-evidence",
+        )
+    # A containment observation certifies only a launch boundary. It cannot assess the
+    # task's acceptance criteria or its command evidence, and reusing it for both roles
+    # would manufacture independent verdicts after their actual launches were rejected.
+    return _diagnose(
+        run, spec, artifacts, role=role, attempt=attempt,
+        reason="stack-isolation-unsupported: containment proof cannot replace "
+               "independent task and test verification",
+    )
+
+
 def _block(run: Run, task_id: str, reason: str) -> str:
     """Record an unavailable verifier as an operation, leaving the task resumable."""
     record = run.task(task_id)
@@ -941,8 +1037,8 @@ def orchestrate_verification(
     The task must be ``implemented`` and ``evidence`` must be this exact task/attempt. Both
     verifiers receive :func:`verifier_evidence_payload` verbatim. Every failure mode — a launch
     that will not start or exits non-zero, a missing session id, a malformed verdict envelope,
-    or a prose/envelope disagreement — writes a diagnostic and blocks the task; none can reach
-    ``verified``. An unbacked executor check (:func:`evidence_forces_fail`) forces the test
+    or a prose/envelope disagreement — writes a diagnostic and blocks the task. A ``stack-isolation-unsupported`` result also stays blocked: a runner-owned
+    containment proof cannot substitute for either independent verifier. An unbacked executor check (:func:`evidence_forces_fail`) forces the test
     verdict to ``FAIL`` regardless of what the tool-less test verifier returned (AC-4).
     """
     task_id = spec.id
@@ -968,6 +1064,10 @@ def orchestrate_verification(
     task_settled = _run_one_verifier(
         run, spec, "task_verifier", launchers.task, artifacts, anchors, payload, attempt,
         plan_path, model, effort, evidence.amendment, evidence.scope_observation)
+    if task_settled.failure and "(stack-isolation-unsupported)" in task_settled.failure:
+        task_settled = _deterministic_isolation_fallback(
+            run, spec, "task_verifier", artifacts, attempt,
+            launchers.deterministic_isolation) or task_settled
     if task_settled.failure:
         status = _block(run, task_id, f"task_verifier: {task_settled.failure}")
         return VerificationOutcome(
@@ -978,6 +1078,10 @@ def orchestrate_verification(
     test_settled = _run_one_verifier(
         run, spec, "test_verifier", launchers.test, artifacts, anchors, payload, attempt,
         plan_path, model, effort, evidence.amendment, evidence.scope_observation)
+    if test_settled.failure and "(stack-isolation-unsupported)" in test_settled.failure:
+        test_settled = _deterministic_isolation_fallback(
+            run, spec, "test_verifier", artifacts, attempt,
+            launchers.deterministic_isolation) or test_settled
     if test_settled.failure:
         status = _block(run, task_id, f"test_verifier: {test_settled.failure}")
         return VerificationOutcome(

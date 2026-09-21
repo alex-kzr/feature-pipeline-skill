@@ -482,6 +482,99 @@ class AmendmentRequestValidationTests(unittest.TestCase):
         self.assertEqual(revision.approved_by, "a-human")
         self.assertTrue(revision.rationale)
 
+    def test_retained_legacy_agents_scope_path_is_not_revalidated(self) -> None:
+        """A `.agents` path already present in the prior contract is historical context,
+        not a newly amended path, so it must not trip the forbidden-scope-path check when
+        it is carried over unchanged into the new contract."""
+        request = self._request(
+            prior_contract={
+                "allowed_scope": ["a.py", ".agents/legacy-exception.md"],
+                "max_repair_attempts": 2,
+            },
+            new_contract={
+                "allowed_scope": ["a.py", ".agents/legacy-exception.md"],
+                "max_repair_attempts": 3,
+            },
+        )
+        revision = build_amendment_revision(request, next_revision=1, next_epoch=1)
+        self.assertIn("max_repair_attempts", revision.changed_fields)
+
+    def test_rejects_a_newly_introduced_agents_scope_path(self) -> None:
+        """A `.agents` path that is genuinely new (absent from the prior contract) must
+        still be rejected, even when other legacy `.agents` paths are retained unchanged."""
+        request = self._request(
+            prior_contract={
+                "allowed_scope": ["a.py", ".agents/legacy-exception.md"],
+                "max_repair_attempts": 2,
+            },
+            new_contract={
+                "allowed_scope": ["a.py", ".agents/legacy-exception.md", ".agents/new-one.md"],
+                "max_repair_attempts": 2,
+            },
+        )
+        with self.assertRaises(AmendmentError) as ctx:
+            validate_amendment_request(request, expected_task_id="TAM-EX")
+        self.assertEqual(ctx.exception.code, "forbidden-scope-path")
+
+
+class AmendmentAwareResumeTests(unittest.TestCase):
+    """REC-35: an approved TAM-01 revision must survive the lifecycle resume boundary.
+
+    ``RunLifecycle.resume`` itself never rejects on task-contract identity (that gate lives
+    at the execution boundary, see ``pipeline_core.execution._matches_approved_amendment``),
+    but it must not lose or roll back the approved revision, its reset repair budget, or its
+    cleared verifier evidence while reconciling an interrupted run.
+    """
+
+    def test_resume_preserves_the_approved_amendment_epoch_and_reset_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = _run(root, plan="plan.md")
+            life = RunLifecycle.initialize(run, tasks=[("REC-35", [])])
+            life.transition("REC-35", "running", actor=ACTOR_RUNNER)
+            life.run.task("REC-35").attempts = 2
+            life.run.record_verdicts("REC-35", "FAIL", "PASS")
+            life.run.set_task_contract(
+                "REC-35", "tasks/REC-35.md", "sha256:" + "0" * 64, version="rec09-v1")
+            life.run.save()
+
+            request = AmendmentRequest(
+                task_id="REC-35", task_status="in_progress",
+                prior_contract={"allowed_scope": ["a.py"], "max_repair_attempts": 2},
+                new_contract={"allowed_scope": ["a.py", "b.py"], "max_repair_attempts": 3},
+                rationale="baseline exposed b.py failures out of scope",
+                approved_by="a-human", source_evidence="report:launch-3",
+            )
+            validate_amendment_request(request, expected_task_id="REC-35")
+            revision = build_amendment_revision(request, next_revision=1, next_epoch=1)
+            life.run.apply_amendment(
+                revision, new_digest=revision.new_digest, new_digest_version="tam01-amendment-v1")
+            life.run.current_task = "REC-35"
+            life.run.save()
+
+            resumed = RunLifecycle.resume(
+                run.run_dir, root, feature="durable",
+                prompt_path=root / "prompts" / "feature.md", plan_path=root / "plan.md")
+
+            record = resumed.run.task("REC-35")
+            # The approved revision, its digest, and the pre-amendment history snapshot all
+            # survive resume reconciliation untouched (AC-4).
+            self.assertEqual(record.current_revision, 1)
+            self.assertEqual(record.task_contract_digest, revision.new_digest)
+            self.assertEqual(record.task_contract_version, "tam01-amendment-v1")
+            self.assertEqual(record.amendment_revisions[-1]["revision"], 1)
+            self.assertEqual(record.revision_history[-1]["attempts"], 2)
+            self.assertEqual(
+                record.revision_history[-1]["verification"]["task_verdict"], "FAIL")
+            # The fresh epoch's repair budget and verifier evidence remain reset, not
+            # inherited from the pre-amendment epoch (AC-2).
+            self.assertEqual(record.attempts, 0)
+            self.assertEqual(record.verification["task_verdict"], None)
+            self.assertEqual(record.verification["test_verdict"], None)
+            # An in-flight interrupted operation still normalizes as an ordinary resume.
+            self.assertEqual(record.status, "in_progress")
+            self.assertIsNone(resumed.run.current_task)
+
 
 def _git(root: Path, *argv: str) -> None:
     import subprocess

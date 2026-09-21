@@ -16,6 +16,12 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from pipeline_core.adapters import LiveProbeRequest
+    from pipeline_core.state import Run
 
 
 @dataclass
@@ -69,6 +75,13 @@ class RunCommand:
     status: bool = False
     unattended: bool = False
     adapter: str | None = None
+    # ``None`` means the switch was omitted. A resume then inherits the persisted runtime
+    # identity instead of silently replacing Docker with the parser's host default.
+    codex_runtime: str | None = None
+    docker_codex_image: str | None = None
+    docker_proxy_image: str | None = None
+    docker_codex_version: str | None = None
+    docker_codex_auth_file: str | None = None
     model: str | None = None
     effort: str | None = None
     max_repair_attempts: int | None = None
@@ -76,6 +89,12 @@ class RunCommand:
     diagnostic_output_byte_budget: int | None = None
     verbose: bool = False
     quiet: bool = False
+    # Runner-owned containment experiment. This is deliberately separate from execute mode.
+    live_isolation_probe: bool = False
+    live_probe_opt_in: bool = False
+    live_probe_timeout: float | None = None
+    live_probe_max_attempts: int | None = None
+    live_probe_request_count: int = 0
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> "RunCommand":
@@ -117,6 +136,11 @@ class RunCommand:
             status=args.status,
             unattended=args.unattended,
             adapter=args.adapter,
+            codex_runtime=args.codex_runtime,
+            docker_codex_image=args.docker_codex_image,
+            docker_proxy_image=args.docker_proxy_image,
+            docker_codex_version=args.docker_codex_version,
+            docker_codex_auth_file=args.docker_codex_auth_file,
             model=args.model,
             effort=args.effort,
             max_repair_attempts=args.max_repair_attempts,
@@ -124,7 +148,65 @@ class RunCommand:
             diagnostic_output_byte_budget=args.diagnostic_output_byte_budget,
             verbose=args.verbose,
             quiet=args.quiet,
+            live_isolation_probe=bool(args.live_isolation_probe_count),
+            live_probe_opt_in=args.live_probe_opt_in,
+            live_probe_timeout=args.live_probe_timeout,
+            live_probe_max_attempts=args.live_probe_max_attempts,
+            live_probe_request_count=args.live_isolation_probe_count or 0,
         )
 
 
-__all__ = ["RunCommand"]
+def build_live_probe_request(
+    *,
+    task_id: str,
+    report_path: Path,
+    allowed_scope: tuple[str, ...],
+    timeout: float,
+) -> object:
+    """Create a probe-only request that cannot name an executor or verifier role."""
+    from pipeline_core.adapters import LiveProbeRequest
+
+    return LiveProbeRequest(
+        task_id=task_id,
+        prompt="runner-owned live isolation observation",
+        report_path=report_path,
+        allowed_scope=allowed_scope,
+        timeout=timeout,
+    )
+
+
+def execute_live_probe(
+    run: Run,
+    *,
+    task_id: str,
+    adapter: object,
+    request: LiveProbeRequest,
+    cli_version: str,
+    task_contract_digest: str,
+    bundle_digest: str,
+    timeout_s: float,
+    max_attempts: int,
+    attempt_id: str,
+) -> dict[str, Any]:
+    """Delegate the opaque, runner-owned observation to the core boundary."""
+    from pipeline_core.commands import run_live_isolation_probe
+
+    return run_live_isolation_probe(
+        run,
+        task_id=task_id,
+        adapter=adapter,
+        request=request,
+        cli_version=cli_version,
+        task_contract_digest=task_contract_digest,
+        bundle_digest=bundle_digest,
+        timeout_s=timeout_s,
+        max_attempts=max_attempts,
+        attempt_id=attempt_id,
+    )
+
+
+__all__ = [
+    "RunCommand",
+    "build_live_probe_request",
+    "execute_live_probe",
+]

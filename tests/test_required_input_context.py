@@ -28,6 +28,7 @@ from pipeline_core.adapters import (
     derive_required_input_dirs,
     effective_grant,
 )
+from tests.support.isolation import proven_isolation_capabilities
 
 
 def _request(role: str = "python-executor", **overrides: object) -> LaunchRequest:
@@ -153,6 +154,7 @@ class AdapterInjectionTests(unittest.TestCase):
             executable="claude",
             runner=runner,
             required_input_dirs={"REC-05": ("/proj/docs/plans", "/agents/skills/tdd")},
+            isolation_capabilities=proven_isolation_capabilities("claude"),
         )
         adapter.launch(_request(required_input_dirs=()))
         assert runner.argv is not None
@@ -166,6 +168,7 @@ class AdapterInjectionTests(unittest.TestCase):
             executable="claude",
             runner=runner,
             required_input_dirs={"REC-05": ("/proj/docs/plans",)},
+            isolation_capabilities=proven_isolation_capabilities("claude"),
         )
 
         adapter.launch(_request(required_input_dirs=("/workspace/.pipeline/reports/REC-05",)))
@@ -182,6 +185,7 @@ class AdapterInjectionTests(unittest.TestCase):
             executable="claude",
             runner=runner,
             required_input_dirs={"OTHER": ("/proj/docs/plans",)},
+            isolation_capabilities=proven_isolation_capabilities("claude"),
         )
         adapter.launch(_request(task_id="REC-05", required_input_dirs=()))
         assert runner.argv is not None
@@ -193,6 +197,7 @@ class AdapterInjectionTests(unittest.TestCase):
             executable="claude",
             runner=runner,
             required_input_dirs={"REC-05": ("/proj/docs/plans",)},
+            isolation_capabilities=proven_isolation_capabilities("claude"),
         )
         adapter.launch(
             _request(required_input_dirs=(), resume_session_id="s-1", fresh_session=False)

@@ -72,6 +72,18 @@ class DiagnosticReportTests(unittest.TestCase):
             self.assertNotIn(str(root), text)
             self.assertIn("<redacted>", text)
 
+    def test_recent_command_argv_redacts_temporary_worktree_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = _run(root)
+            interpreter = root.parent / "recovery-worktree" / "Scripts" / "python.exe"
+            run.record_command("task:T-1", ".", [str(interpreter), "-c", "pass"], 0, 0.0, "", "")
+
+            text = write_diagnostic_report(run, task_id="T-1", attempt=1).read_text(encoding="utf-8")
+
+            self.assertNotIn(str(interpreter), text)
+            self.assertIn("<tmp>", text)
+
     def test_report_is_standalone_and_referenced_without_saving_the_run(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

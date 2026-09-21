@@ -19,6 +19,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from pipeline_core.concurrency import pipeline_lock_path, task_lock_path
 from pipeline_core.execution import (
@@ -27,12 +28,15 @@ from pipeline_core.execution import (
     EXIT_OK,
     ExecuteControls,
     ExecuteRequest,
+    ExecutionError,
+    _ensure_execution_controls_match,
     execute_run,
     persist_task_contracts,
 )
 import pipeline_core.execution as execution_module
 from pipeline_core.adapters import LaunchResult
 from pipeline_core.lifecycle import RunLifecycle
+from pipeline_core.plan import AmendmentRequest, build_amendment_revision, canonical_amendment_fields
 from pipeline_core.prompt_envelope import EnvelopeAnchors
 from pipeline_core.state import ACTOR_RUNNER, Run, pid_alive
 from pipeline_core.task_files import load_task_spec
@@ -1125,6 +1129,155 @@ class ResumeAndSafetyTests(unittest.TestCase):
                 controls=ExecuteControls(unattended=True),
             )
             self.assertTrue(result.ok)
+
+
+class _AmendmentAwareVerifier(sa.ScriptedVerifier):
+    """A verifier that also reviews and confirms the accepted amendment, exactly the
+    independent finding a real amended-revision verification gate requires."""
+
+    def launch(self, request):  # noqa: ANN001 - test adapter protocol
+        result = super().launch(request)
+        if not request.resume_session_id:
+            path = Path(request.report_path)
+            path.write_text(
+                path.read_text(encoding="utf-8")
+                + "\n- Amendment-justification finding: revision 1, epoch 1: approved\n",
+                encoding="utf-8",
+            )
+        return result
+
+
+class AmendmentAwareResumeTests(unittest.TestCase):
+    """REC-35: ``--resume`` compares against the approved TAM-01 revision, not the
+    pre-amendment contract, and dispatches in that revision's fresh execution epoch."""
+
+    def _seed_verified_run(self, root: Path, original: TaskSpec) -> Path:
+        """A real, once-verified run (through ``execute_run`` itself, so every runner
+        control -- including the recorded execution scope -- is exactly what production
+        writes), then reopened as if a crash happened just before the final projection.
+        Its PASS/PASS evidence must not by itself complete an amended revision (AC-2)."""
+        request = _request(
+            root, (original,),
+            executor=sa.ScriptedExecutor(("implemented",)),
+            launchers=VerifierLaunchers(
+                task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))),
+            controls=ExecuteControls(plan_approved=True),
+            environment={"claude": True},
+        )
+        first = execute_run(request)
+        self.assertEqual(first.exit_code, EXIT_OK, first.message)
+        reloaded = Run.load(request.run_dir, root)
+        reloaded.task(original.id).status = "in_progress"
+        reloaded.save()
+        return request.run_dir
+
+    def test_resume_accepts_the_approved_amendment_and_uses_its_fresh_epoch(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            original = _specs(("EX-01",))[0]
+            path = root / original.path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"# {original.id}\n", encoding="utf-8")
+
+            run_dir = self._seed_verified_run(root, original)
+
+            recorded = Run.load(run_dir, root)
+            new_contract = {
+                "allowed_scope": sorted(
+                    set(original.allowed_scope) | {"fixtures/execution/work/ex-01-review.txt"}
+                ),
+                "out_of_scope": list(original.out_of_scope),
+                "verification_commands": [],
+                "max_repair_attempts": original.max_repair_attempts + 1,
+                "documentation_impact": [],
+            }
+            revision = build_amendment_revision(
+                AmendmentRequest(
+                    task_id=original.id, task_status="in_progress",
+                    prior_contract=canonical_amendment_fields(original),
+                    new_contract=new_contract,
+                    rationale="EX-01 needs a review artifact outside its original estimate",
+                    approved_by="reviewer", source_evidence="baseline:EX-01",
+                ),
+                next_revision=1, next_epoch=1,
+            )
+            recorded.apply_amendment(
+                revision, new_digest=revision.new_digest,
+                new_digest_version="tam01-amendment-v1")
+            recorded.save()
+
+            # The pre-amendment epoch's PASS/PASS evidence is preserved, not erased.
+            history_entry = recorded.task(original.id).revision_history[-1]
+            self.assertEqual(history_entry["verification"]["task_verdict"], "PASS")
+            self.assertEqual(history_entry["verification"]["test_verdict"], "PASS")
+            # And the fresh epoch starts clean: it cannot be marked complete without new
+            # verifier evidence of its own.
+            self.assertEqual(recorded.task(original.id).attempts, 0)
+            self.assertIsNone(recorded.task(original.id).verification["task_verdict"])
+
+            amended = replace(
+                original,
+                allowed_scope=tuple(new_contract["allowed_scope"]),
+                max_repair_attempts=new_contract["max_repair_attempts"],
+            )
+            executor = sa.ScriptedExecutor(("implemented",))
+            resume_request = _request(
+                root, (amended,),
+                executor=executor,
+                launchers=VerifierLaunchers(
+                    task=_AmendmentAwareVerifier(("PASS",)),
+                    test=_AmendmentAwareVerifier(("PASS",))),
+                controls=ExecuteControls(plan_approved=True, resume=True),
+                environment={"claude": True},
+            )
+
+            result = execute_run(resume_request)
+
+            self.assertTrue(result.ok, result.message)
+            self.assertEqual(result.exit_code, EXIT_OK)
+            # The amended revision only reached 'done' through a fresh executor dispatch,
+            # never by reusing the stale pre-amendment evidence.
+            self.assertEqual(executor.launches, 1)
+            final = Run.load(resume_request.run_dir, root)
+            record = final.task(original.id)
+            self.assertEqual(record.status, "done")
+            self.assertEqual(record.current_revision, 1)
+            self.assertEqual(record.verification["task_verdict"], "PASS")
+            self.assertEqual(record.attempts, 0)
+
+    def test_unapproved_contract_drift_still_fails_closed_on_resume(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            original = _specs(("EX-01",))[0]
+            path = root / original.path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"# {original.id}\n", encoding="utf-8")
+
+            run_dir = self._seed_verified_run(root, original)
+            before = (run_dir / "run.json").read_bytes()
+
+            # No amendment was ever approved: this is a hand-edited task definition
+            # arriving at resume, the exact drift this recovery must keep rejecting.
+            drifted = replace(
+                original, allowed_scope=original.allowed_scope + ("unreviewed/new-path.py",))
+            resume_request = _request(
+                root, (drifted,),
+                executor=sa.ScriptedExecutor(("implemented",)),
+                launchers=VerifierLaunchers(
+                    task=sa.ScriptedVerifier(("PASS",)), test=sa.ScriptedVerifier(("PASS",))),
+                controls=ExecuteControls(plan_approved=True, resume=True),
+                environment={"claude": True},
+            )
+
+            with patch.object(resume_request.adapter, "launch",
+                               side_effect=AssertionError("must not dispatch")):
+                result = execute_run(resume_request)
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.exit_code, EXIT_ERROR)
+            self.assertIn("task-contract-mismatch", result.message)
+            after = (run_dir / "run.json").read_bytes()
+            self.assertEqual(after, before)
 
 
 class AttestDependencyTests(unittest.TestCase):
@@ -2410,6 +2563,62 @@ class BoardProjectionWiringTests(unittest.TestCase):
             )
             self.assertTrue(result.ok, result.message)
             self.assertFalse((root / "docs" / "kanban.md").exists())
+
+
+class ResumeControlValidationTests(unittest.TestCase):
+    def _run(
+        self, root: Path, controls: dict[str, tuple[object, str]],
+        tasks: list[tuple[str, list[str]]] | None = None,
+    ) -> Run:
+        prompt = root / "prompt.md"
+        prompt.write_text("feature prompt", encoding="utf-8")
+        run = Run.create("resume-controls", prompt, None, root / "runs" / "resume-controls", root)
+        return RunLifecycle.initialize(
+            run, tasks=tasks or [("TC-11", [])], controls=controls
+        ).run
+
+    def test_resume_allows_only_done_or_unrecorded_scope_items_to_be_reused(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = self._run(root, {
+                "execution_scope": (["TC-10", "TC-11"], "explicit"),
+                "verify_dependency_chain": (False, "default"),
+            })
+            run.task("TC-11").status = "done"
+
+            _ensure_execution_controls_match(run, ["TC-11"], False)
+
+    def test_resume_rejects_scope_shrink_that_discards_unfinished_recorded_task(self) -> None:
+        with TemporaryDirectory() as directory:
+            run = self._run(Path(directory), {
+                "execution_scope": (["TC-10", "TC-11"], "explicit"),
+                "verify_dependency_chain": (False, "default"),
+            }, tasks=[("TC-10", []), ("TC-11", [])])
+            with self.assertRaisesRegex(ExecutionError, "recorded=.*current") as raised:
+                _ensure_execution_controls_match(run, ["TC-11"], False)
+            self.assertEqual(raised.exception.code, "execution-scope-mismatch")
+
+    def test_resume_rejects_explicit_docker_runtime_control_substitution(self) -> None:
+        with TemporaryDirectory() as directory:
+            run = self._run(Path(directory), {
+                "execution_scope": (["TC-11"], "explicit"),
+                "verify_dependency_chain": (False, "default"),
+                "model": ("gpt-5.6-terra", "explicit"),
+                "effort": ("medium", "explicit"),
+                "codex_runtime": ("docker", "explicit"),
+                "docker_codex_image": ("registry.invalid/codex@sha256:" + "a" * 64, "explicit"),
+                "docker_proxy_image": ("registry.invalid/python@sha256:" + "b" * 64, "explicit"),
+                "docker_codex_version": ("0.154.0", "explicit"),
+                "docker_codex_auth_file": ("codex-auth.json", "explicit"),
+            })
+            with self.assertRaisesRegex(ExecutionError, "docker_codex_version") as raised:
+                _ensure_execution_controls_match(
+                    run, ["TC-11"], False, model="gpt-5.6-terra", effort="medium",
+                    codex_runtime="docker", docker_codex_image="registry.invalid/codex@sha256:" + "a" * 64,
+                    docker_proxy_image="registry.invalid/python@sha256:" + "b" * 64,
+                    docker_codex_version="0.155.0", docker_codex_auth_file="codex-auth.json",
+                )
+            self.assertEqual(raised.exception.code, "runtime-control-mismatch")
 
 
 if __name__ == "__main__":

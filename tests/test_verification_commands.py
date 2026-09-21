@@ -172,9 +172,9 @@ class ExternalBlockerTests(unittest.TestCase):
 
             reference = evidence.commands[0]
             self.assertIn("stdout_log", reference)
-            self.assertNotIn("stdout", reference)
-            self.assertNotIn("stderr", reference)
-            self.assertNotIn("Z" * 64, evidence.serialized())
+            self.assertIn("stdout", reference)
+            self.assertIn("stderr", reference)
+            self.assertIn("Z" * 64, evidence.serialized())
 
 
 class MissingClaimTests(unittest.TestCase):

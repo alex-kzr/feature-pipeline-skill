@@ -6,7 +6,12 @@ import sys
 import tempfile
 import time
 import unittest
+import base64
+import json
+import secrets
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from pipeline_core.commands import (
     DIAGNOSTIC_OUTPUT_BUDGET,
@@ -14,7 +19,10 @@ from pipeline_core.commands import (
     classify_outcome,
     outcome_of,
     run_command,
+    run_live_isolation_probe,
+    redact_probe_output,
 )
+from pipeline_core.adapters import AdapterError, CodexAdapter, CompletedProcess, LiveProbeRequest
 from pipeline_core.state import EXIT_LAUNCH_FAILED, EXIT_NOT_FOUND, EXIT_TIMEOUT, Run
 
 
@@ -74,8 +82,234 @@ class BudgetAndRedactionTests(unittest.TestCase):
             self.assertTrue(log.is_file())
             self.assertNotIn(secret, log.read_text(encoding="utf-8"))
 
+    def test_probe_redaction_removes_the_runner_only_value_before_bounding(self) -> None:
+        value = secrets.token_urlsafe(32)
+        rendered = redact_probe_output("before " + value + " after", value, 64, ".")
+        self.assertNotIn(value, rendered)
+        self.assertIn("<redacted-probe>", rendered)
+
+    def test_probe_redaction_removes_common_lossless_marker_encodings(self) -> None:
+        value = secrets.token_urlsafe(32)
+        encoded = value.encode("utf-8")
+        variants = (
+            base64.b64encode(encoded).decode("ascii"),
+            base64.urlsafe_b64encode(encoded).decode("ascii"),
+            encoded.hex(),
+        )
+        rendered = redact_probe_output(" ".join(variants), value, 4096, ".")
+        for variant in variants:
+            self.assertNotIn(variant, rendered)
+        self.assertEqual(rendered.count("<redacted-probe>"), len(variants))
+
 
 class EvidenceRecordTests(unittest.TestCase):
+    def test_probe_persists_a_redacted_structured_adapter_launch_error_at_its_run_report_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = _run(root)
+            task = run.add_task("REC-36")
+            task.adapter = "codex"
+            task.task_contract_digest = "sha256:contract"
+            report_path = Path(run.run_dir) / "reports" / "REC-36" / "live-probe.json"
+            sentinel = "runner-private-sentinel"
+            request = LiveProbeRequest(
+                task_id="REC-36", prompt="probe", report_path=report_path,
+                allowed_scope=("tests/test_commands.py",), timeout=1.0,
+            )
+            adapter = SimpleNamespace(
+                name="codex",
+                launch_live_probe=lambda _: (_ for _ in ()).throw(AdapterError(
+                    f"invalid --cd {root} {sentinel}", "probe-invalid-cwd",
+                )),
+            )
+
+            with patch("pipeline_core.commands.secrets.token_urlsafe", return_value=sentinel):
+                evidence = run_live_isolation_probe(
+                    run, task_id="REC-36", adapter=adapter, request=request,
+                    cli_version="test", task_contract_digest="sha256:contract",
+                    bundle_digest="sha256:test", timeout_s=1.0,
+                    max_attempts=1, attempt_id="probe-1",
+                )
+
+            self.assertEqual(evidence["disposition"], "LAUNCH_FAILED")
+            self.assertTrue(report_path.is_file())
+            diagnostic = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(diagnostic["disposition"], "LAUNCH_FAILED")
+            self.assertFalse(any(diagnostic["observations"].values()))
+            self.assertNotIn(sentinel, json.dumps(diagnostic))
+
+    def test_probe_persists_a_redacted_structured_launch_failure_for_a_nonzero_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = _run(root)
+            task = run.add_task("REC-36")
+            task.adapter = "codex"
+            task.task_contract_digest = "sha256:contract"
+            report_path = Path(run.run_dir) / "reports" / "REC-36" / "live-probe.json"
+            request = LiveProbeRequest(
+                task_id="REC-36", prompt="probe", report_path=report_path,
+                allowed_scope=("tests/test_commands.py",), timeout=1.0,
+            )
+            adapter = SimpleNamespace(
+                name="codex",
+                launch_live_probe=lambda _: SimpleNamespace(
+                    exit_code=1, stdout=f"private path {root}", stderr="failed",
+                ),
+            )
+
+            evidence = run_live_isolation_probe(
+                run, task_id="REC-36", adapter=adapter, request=request,
+                cli_version="test", task_contract_digest="sha256:contract",
+                bundle_digest="sha256:test", timeout_s=1.0,
+                max_attempts=1, attempt_id="probe-1",
+            )
+
+            self.assertEqual(evidence["disposition"], "LAUNCH_FAILED")
+            self.assertTrue(report_path.is_file())
+            diagnostic = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(diagnostic["disposition"], "LAUNCH_FAILED")
+            self.assertFalse(any(diagnostic["observations"].values()))
+
+    def test_probe_failure_persists_each_parse_classification_without_model_output(self) -> None:
+        for parse_status in ("no-final-message", "invalid-json", "schema-mismatch"):
+            with self.subTest(parse_status=parse_status), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                run = _run(root)
+                task = run.add_task("TC-11")
+                task.adapter = "codex"
+                task.task_contract_digest = "sha256:contract"
+                report_path = Path(run.run_dir) / "reports" / "TC-11" / "live-probe.json"
+                sentinel = "runner-private-sentinel"
+                request = LiveProbeRequest(
+                    task_id="TC-11", prompt="private-probe-prompt", report_path=report_path,
+                    allowed_scope=("tests/test_commands.py",), timeout=1.0,
+                )
+                adapter = SimpleNamespace(
+                    name="codex",
+                    launch_live_probe=lambda _: SimpleNamespace(
+                        exit_code=1, stdout="raw model output",
+                        stderr="failed", probe_parse_status=parse_status,
+                        probe_allowed_write=False, probe_sibling_mounted=False,
+                        probe_subprocess_state="not-observed", probe_nested_state="not-observed",
+                        probe_stderr_reason="failed private-probe-prompt",
+                    ),
+                )
+                with patch("pipeline_core.commands.secrets.token_urlsafe", return_value=sentinel):
+                    run_live_isolation_probe(
+                        run, task_id="TC-11", adapter=adapter, request=request,
+                        cli_version="test", task_contract_digest="sha256:contract",
+                        bundle_digest="sha256:test", timeout_s=1.0,
+                        max_attempts=1, attempt_id="probe-11",
+                    )
+
+                diagnostic = json.loads(report_path.read_text(encoding="utf-8"))
+                self.assertFalse(any(diagnostic["observations"].values()))
+                self.assertEqual(diagnostic["failure_class"], "schema-or-misreport")
+                self.assertNotIn("raw model output", json.dumps(diagnostic))
+                self.assertNotIn("private-probe-prompt", json.dumps(diagnostic))
+
+    def test_probe_failure_persists_no_observed_write_classification_without_model_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = _run(root)
+            task = run.add_task("TC-11")
+            task.adapter = "codex"
+            task.task_contract_digest = "sha256:contract"
+            report_path = Path(run.run_dir) / "reports" / "TC-11" / "live-probe.json"
+            request = LiveProbeRequest(
+                task_id="TC-11", prompt="private-probe-prompt", report_path=report_path,
+                allowed_scope=("tests/test_commands.py",), timeout=1.0,
+            )
+            adapter = SimpleNamespace(
+                name="codex",
+                launch_live_probe=lambda _: SimpleNamespace(
+                    exit_code=1, stdout="raw model output", stderr="failed",
+                    probe_parse_status="valid", probe_allowed_write=False,
+                    probe_failure_class="no-observed-allowed-write",
+                ),
+            )
+
+            run_live_isolation_probe(
+                run, task_id="TC-11", adapter=adapter, request=request,
+                cli_version="test", task_contract_digest="sha256:contract",
+                bundle_digest="sha256:test", timeout_s=1.0,
+                max_attempts=1, attempt_id="probe-12",
+            )
+
+            diagnostic = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(diagnostic["failure_class"], "no-observed-allowed-write")
+            self.assertNotIn("raw model output", json.dumps(diagnostic))
+
+    def test_runner_probe_uses_the_probe_entrypoint_when_strict_codex_roles_lack_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run = _run(Path(directory))
+            task = run.add_task("REC-36")
+            task.adapter = "codex"
+            task.task_contract_digest = "sha256:contract"
+            request = LiveProbeRequest(
+                task_id="REC-36", prompt="probe", report_path=Path("report"),
+                allowed_scope=("tests/test_commands.py",), timeout=1.0,
+            )
+            adapter = CodexAdapter(
+                executable="codex",
+                runner=lambda *args, **kwargs: CompletedProcess(0, "", ""),
+            )
+
+            evidence = run_live_isolation_probe(
+                run, task_id="REC-36", adapter=adapter, request=request,
+                cli_version="test", task_contract_digest="sha256:contract",
+                bundle_digest="sha256:test", timeout_s=1.0,
+                max_attempts=1, attempt_id="probe-1",
+            )
+
+            self.assertEqual(evidence["disposition"], "NO_BREACH_OBSERVED")
+            self.assertEqual(evidence["role"], "runner-live-isolation-probe")
+            proof = json.loads((Path(run.run_dir) / evidence["proof_path"]).read_text(encoding="utf-8"))
+            self.assertFalse(any(proof["observations"].values()))
+            self.assertNotEqual(evidence["disposition"], "CONTAINMENT_PROVEN")
+
+    def test_probe_cleanup_failure_is_persisted_as_a_failed_negative_observation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run = _run(Path(directory))
+            task = run.add_task("REC-36")
+            task.adapter = "codex"
+            task.task_contract_digest = "sha256:contract"
+            request = LiveProbeRequest(
+                task_id="REC-36", prompt="probe", report_path=Path("report"),
+                allowed_scope=("tests/test_commands.py",), timeout=1.0,
+            )
+            adapter = SimpleNamespace(
+                name="codex", launch_live_probe=lambda _: SimpleNamespace(exit_code=0, stdout="", stderr=""),
+            )
+            with patch("pipeline_core.commands.shutil.rmtree", side_effect=OSError("locked")):
+                evidence = run_live_isolation_probe(
+                    run, task_id="REC-36", adapter=adapter, request=request,
+                    cli_version="test", task_contract_digest="sha256:contract",
+                    bundle_digest="sha256:test", timeout_s=1.0,
+                    max_attempts=1, attempt_id="probe-1",
+                )
+            self.assertEqual(evidence["cleanup"], "failed")
+            self.assertEqual(evidence["disposition"], "LAUNCH_FAILED")
+
+    def test_probe_marks_adapter_shape_errors_as_malformed_without_persisting_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run = _run(Path(directory))
+            task = run.add_task("REC-36")
+            task.adapter = "codex"
+            task.task_contract_digest = "sha256:contract"
+            request = LiveProbeRequest(
+                task_id="REC-36", prompt="probe", report_path=Path("report"),
+                allowed_scope=("tests/test_commands.py",), timeout=1.0,
+            )
+            adapter = SimpleNamespace(name="codex", launch_live_probe=lambda _: SimpleNamespace(exit_code=0))
+            evidence = run_live_isolation_probe(
+                run, task_id="REC-36", adapter=adapter, request=request,
+                cli_version="test", task_contract_digest="sha256:contract",
+                bundle_digest="sha256:test", timeout_s=1.0,
+                max_attempts=1, attempt_id="probe-1",
+            )
+            self.assertEqual(evidence["disposition"], "MALFORMED_OUTPUT")
+
     def test_command_ids_are_stable_and_logs_land_immediately(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             run = _run(Path(directory))

@@ -13,18 +13,22 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from feature_pipeline.bootstrap import build_executor_context_bundles
+from feature_pipeline.bootstrap import build_executor_context_bundles, build_required_input_dirs
 from feature_pipeline.contracts import TaskSpec
 from pipeline_core.adapters import (
     CONTEXT_BUNDLE_INVALID,
+    CONTEXT_UNAVAILABLE,
     AdapterError,
     ClaudeAdapter,
+    CodexAdapter,
     CompletedProcess,
     ContextEntry,
     ExecutorContextBundle,
+    _materialize_container_context,
     LaunchRequest,
     build_claude_argv,
 )
+from tests.support.isolation import proven_isolation_capabilities
 
 
 def _sha(text: str) -> str:
@@ -90,11 +94,28 @@ class ContextEntryValidationTests(unittest.TestCase):
         ContextEntry.of("skill", ".agents/skills/tdd/SKILL.md", "skill body").validate()
 
     def test_host_absolute_path_in_content_fails_closed(self) -> None:
-        for leaky in (r"see C:\Users\admin\secret", "cd /home/admin/project"):
+        for leaky in (
+            r"see C:\Users\admin\secret", "cd /home/admin/project",
+            r"open \\server\share\secret",
+        ):
             with self.subTest(content=leaky):
                 with self.assertRaises(AdapterError) as caught:
                     ContextEntry.of("plan", "docs/plan.md", leaky)
                 self.assertEqual(caught.exception.code, CONTEXT_BUNDLE_INVALID)
+
+    def test_generic_drive_root_documentation_literal_is_allowed_unless_configured(self) -> None:
+        entry = ContextEntry.of("plan", "docs/plan.md", "Example: C:/docs/x\n")
+        self.assertEqual(entry.content, "Example: C:/docs/x\n")
+        with self.assertRaises(AdapterError) as caught:
+            ContextEntry.of(
+                "plan", "docs/plan.md", "Example: C:/docs/x\n",
+                host_roots=("C:/docs",),
+            )
+        self.assertEqual(caught.exception.code, CONTEXT_BUNDLE_INVALID)
+
+    def test_source_code_newline_escape_is_not_mistaken_for_a_windows_path(self) -> None:
+        ContextEntry.of("input", "feature-pipeline-skill/pipeline_core/dispatch.py",
+                        'message = "contract:\\n"\n').validate()
 
     def test_unknown_kind_is_rejected(self) -> None:
         with self.assertRaises(AdapterError):
@@ -132,6 +153,7 @@ class ExecutorContextBundleValidationTests(unittest.TestCase):
 
 class ClaudeAdapterContextDeliveryTests(unittest.TestCase):
     def _adapter(self, runner, **kw):
+        kw.setdefault("isolation_capabilities", proven_isolation_capabilities("claude"))
         return ClaudeAdapter(executable="claude", runner=runner, **kw)
 
     def test_exact_task_plan_prompt_skill_content_reaches_the_child_prompt(self) -> None:
@@ -236,18 +258,394 @@ class BuildExecutorContextBundlesTests(unittest.TestCase):
         self.assertNotIn(str(root), task_entry.content)
         task_entry.validate()
 
-    def test_a_task_with_an_unreadable_contract_gets_no_bundle(self) -> None:
+    def test_documentation_drive_example_is_bound_after_redaction(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             plan, prompt = self._project(root)
+            task = root / "docs" / "plans" / "tasks" / "REC-01_x.md"
+            task.write_text("Example safety path: C:/docs/x\n", encoding="utf-8")
+
+            bundle = build_executor_context_bundles(
+                [self._spec()], project_dir=root, agents_root=root / ".agents",
+                plan_path=plan, prompt_path=prompt,
+            )["REC-01"]
+
+        task_entry = next(entry for entry in bundle.entries if entry.kind == "task")
+        self.assertEqual(task_entry.content, "Example safety path: C:/docs/x\n")
+
+    def test_invalid_context_content_is_not_classified_as_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan, prompt = self._project(root)
+            task = root / "docs" / "plans" / "tasks" / "REC-01_x.md"
+            task.write_text(r"UNC leak: \\server\share\secret", encoding="utf-8")
+
+            with self.assertRaises(AdapterError) as caught:
+                build_executor_context_bundles(
+                    [self._spec()], project_dir=root, agents_root=root / ".agents",
+                    plan_path=plan, prompt_path=prompt,
+                )
+
+        self.assertEqual(caught.exception.code, CONTEXT_BUNDLE_INVALID)
+
+    def test_tc11_declared_prerequisites_are_bundled_without_a_project_tree_grant(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan, prompt = self._project(root)
+            proposal = root / ".prompts" / "proposal.md"
+            research = root / ".prompts" / "research.md"
+            proposal.write_text("proposal\n", encoding="utf-8")
+            research.write_text("research\n", encoding="utf-8")
+            review = root / "docs" / "validation" / "routing" / "TC-09-review.md"
+            review.parent.mkdir(parents=True)
+            review.write_text("review\n", encoding="utf-8")
+            (root / "docs" / "plans" / "tasks" / "TC-09_x.md").write_text(
+                "# TC-09\n", encoding="utf-8"
+            )
+            task = root / "docs" / "plans" / "tasks" / "TC-11_x.md"
+            task.write_text(
+                "# TC-11\n"
+                "Read the [proposal](../../../.prompts/proposal.md) and "
+                "[research](../../../.prompts/research.md), plus the linked plan and the "
+                "latest preceding review report.\n",
+                encoding="utf-8",
+            )
+            prior = TaskSpec.build(
+                id="TC-09", title="Review routing", task_type="docs", executor="executor",
+                allowed_scope=["docs/validation/routing/TC-09-review.md"],
+                acceptance_criteria=["AC"], path="docs/plans/tasks/TC-09_x.md",
+            )
+            spec = TaskSpec.build(
+                id="TC-11", task_type="python", executor="python-executor",
+                allowed_scope=["src/x.py"], acceptance_criteria=["AC"],
+                path="docs/plans/tasks/TC-11_x.md",
+            )
+            bundles = build_executor_context_bundles(
+                [spec], project_dir=root, agents_root=root / ".agents",
+                plan_path=plan, prompt_path=prompt, task_ids=("TC-11",),
+                plan_specs=[prior, spec],
+            )
+            input_dirs = build_required_input_dirs(
+                [spec], project_dir=root, agents_root=root / ".agents",
+                plan_path=plan, prompt_path=prompt,
+                task_ids=("TC-11",), plan_specs=[prior, spec],
+                working_root_by_id={"TC-11": "feature-pipeline-skill"},
+            )
+
+        sources = {entry.logical_source for entry in bundles["TC-11"].entries}
+        self.assertEqual(
+            sources,
+            {
+                "docs/plans/tasks/TC-11_x.md", "docs/plans/routing.md",
+                ".prompts/feature.md", ".prompts/proposal.md", ".prompts/research.md",
+                "docs/validation/routing/TC-09-review.md",
+            },
+        )
+        review_entry = next(
+            entry for entry in bundles["TC-11"].entries
+            if entry.logical_source == "docs/validation/routing/TC-09-review.md"
+        )
+        self.assertEqual(review_entry.content, "review\n")
+        self.assertEqual(
+            set(input_dirs["TC-11"]),
+            {
+                str((root / "docs" / "plans").resolve()),
+                str((root / ".prompts").resolve()),
+                str((root / "docs" / "validation" / "routing").resolve()),
+            },
+        )
+        self.assertNotIn(str(root.resolve()), input_dirs["TC-11"])
+
+    def test_missing_preceding_review_in_the_full_plan_fails_before_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan, prompt = self._project(root)
+            task = root / "docs" / "plans" / "tasks" / "TC-11_x.md"
+            task.write_text(
+                "# TC-11\nRead the latest preceding review report.\n",
+                encoding="utf-8",
+            )
+            spec = TaskSpec.build(
+                id="TC-11", task_type="python", executor="python-executor",
+                allowed_scope=["src/x.py"], acceptance_criteria=["AC"],
+                path="docs/plans/tasks/TC-11_x.md",
+            )
+
+            with self.assertRaises(AdapterError) as caught:
+                build_executor_context_bundles(
+                    [spec], project_dir=root, agents_root=root / ".agents",
+                    plan_path=plan, prompt_path=prompt, task_ids=("TC-11",),
+                    plan_specs=[spec],
+                )
+
+        self.assertEqual(caught.exception.code, CONTEXT_UNAVAILABLE)
+
+    def test_real_tc11_bundles_each_declared_prerequisite_path(self) -> None:
+        project_root = Path(__file__).resolve().parents[2]
+        if not (project_root / "docs/plans/2026-09-08-universal-pipeline-task-model-routing.md").is_file():
+            self.skipTest("requires the umbrella repository checkout")
+        task_path = "docs/plans/tasks/TC-11_enforce-worker-isolation.md"
+        spec = TaskSpec.build(
+            id="TC-11", task_type="python", executor="python-executor",
+            allowed_scope=["feature-pipeline-skill/src/feature_pipeline/bootstrap.py"],
+            acceptance_criteria=["AC"], path=task_path,
+        )
+        prior_review = TaskSpec.build(
+            id="TC-09", title="Review stack routing", task_type="docs", executor="executor",
+            allowed_scope=["docs/validation/task-model-routing/TC-09-review.md"],
+            acceptance_criteria=["AC"], path="docs/plans/tasks/TC-09_review-r02.md",
+        )
+
+        bundles = build_executor_context_bundles(
+            [prior_review, spec], project_dir=project_root,
+            agents_root=project_root / ".agents",
+            plan_path=project_root / "docs/plans/2026-09-08-universal-pipeline-task-model-routing.md",
+            prompt_path=project_root / ".prompts/2026-09-07-universal-pipeline-task-model-routing-proposal.md",
+            task_ids=("TC-11",),
+            working_root_by_id={"TC-11": "feature-pipeline-skill"},
+        )
+
+        declared_paths = {
+            ".prompts/2026-09-07-universal-pipeline-task-model-routing-proposal.md",
+            ".prompts/2026-09-07-universal-pipeline-task-model-routing-research.md",
+            "docs/validation/task-model-routing/TC-02-capabilities.md",
+            "feature-pipeline-skill/src/feature_pipeline/ports/process.py",
+        }
+        entries = {entry.logical_source: entry for entry in bundles["TC-11"].entries}
+        self.assertTrue(declared_paths.issubset(entries))
+        for source in declared_paths:
+            self.assertEqual(entries[source].content, (project_root / source).read_text(encoding="utf-8"))
+
+        input_dirs = build_required_input_dirs(
+            [prior_review, spec], project_dir=project_root,
+            agents_root=project_root / ".agents",
+            plan_path=project_root / "docs/plans/2026-09-08-universal-pipeline-task-model-routing.md",
+            prompt_path=project_root / ".prompts/2026-09-07-universal-pipeline-task-model-routing-proposal.md",
+            working_root_by_id={"TC-11": "feature-pipeline-skill"}, task_ids=("TC-11",),
+        )
+        self.assertTrue({
+            str((project_root / ".prompts").resolve()),
+            str((project_root / "docs/validation/task-model-routing").resolve()),
+        }.issubset(input_dirs["TC-11"]))
+        self.assertNotIn(
+            str((project_root / "feature-pipeline-skill/src/feature_pipeline/ports").resolve()),
+            input_dirs["TC-11"],
+        )
+
+    def test_working_root_relative_declared_path_is_bundled_from_the_nested_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan, prompt = self._project(root)
+            (root / "AGENTS.md").write_text("PROJECT INSTRUCTIONS\n", encoding="utf-8")
+            worker_file = root / "feature-pipeline-skill" / "src" / "worker_input.py"
+            worker_file.parent.mkdir(parents=True)
+            worker_file.write_text("WORKER INPUT\n", encoding="utf-8")
+            task = root / "docs" / "plans" / "tasks" / "REC-01_x.md"
+            task.write_text(
+                "# REC-01\n\n## Context\n\n- `AGENTS.md`\n- `src/worker_input.py`\n",
+                encoding="utf-8",
+            )
+
+            bundles = build_executor_context_bundles(
+                [self._spec()], project_dir=root, agents_root=root / ".agents",
+                plan_path=plan, prompt_path=prompt,
+                working_root_by_id={"REC-01": "feature-pipeline-skill"},
+            )
+            context_paths = _materialize_container_context(
+                bundles["REC-01"], root / "container-context",
+                runtime_root=Path(__file__).resolve().parents[1],
+            )
+
+        entries = {entry.logical_source: entry for entry in bundles["REC-01"].entries}
+        self.assertEqual(entries["AGENTS.md"].content, "PROJECT INSTRUCTIONS\n")
+        self.assertEqual(context_paths["AGENTS.md"], "/context/project/AGENTS.md")
+        self.assertEqual(
+            entries["feature-pipeline-skill/src/worker_input.py"].content,
+            "WORKER INPUT\n",
+        )
+
+    def test_explicit_bundle_entry_wins_over_runtime_closure_source(self) -> None:
+        """A bound source stays immutable when the import closure also needs its path."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime_root = Path(__file__).resolve().parents[1]
+            logical_source = (
+                "feature-pipeline-skill/"
+                "src/feature_pipeline/infrastructure/adapters/codex_launcher.py"
+            )
+            bound_content = "# runner-bound replacement\n"
+            bundle = ExecutorContextBundle("REC-01", (
+                ContextEntry.of("task", "docs/plans/tasks/REC-01.md", "TASK BODY"),
+                ContextEntry.of("input", logical_source, bound_content),
+            ))
+
+            _materialize_container_context(
+                bundle, root / "container-context", runtime_root=runtime_root,
+            )
+
+            bound_destination = root / "container-context" / "project" / logical_source
+            self.assertEqual(bound_destination.read_text(encoding="utf-8"), bound_content)
+            self.assertEqual(
+                _sha(bound_destination.read_text(encoding="utf-8")),
+                bundle.entries[1].digest,
+            )
+            dependency = root / "container-context" / "project" / "feature-pipeline-skill" / (
+                "src/feature_pipeline/contracts.py"
+            )
+            self.assertEqual(
+                dependency.read_bytes(),
+                (runtime_root / "src/feature_pipeline/contracts.py").read_bytes(),
+            )
+
+    def test_source_location_suffix_resolves_the_working_root_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan, prompt = self._project(root)
+            worker_file = root / "feature-pipeline-skill" / "src" / "worker_input.py"
+            worker_file.parent.mkdir(parents=True)
+            worker_file.write_text("WORKER INPUT\n", encoding="utf-8")
+            task = root / "docs" / "plans" / "tasks" / "REC-01_x.md"
+            task.write_text(
+                "# REC-01\n\n## Context\n\n- `src/worker_input.py:17:4`\n",
+                encoding="utf-8",
+            )
+
+            bundles = build_executor_context_bundles(
+                [self._spec()], project_dir=root, agents_root=root / ".agents",
+                plan_path=plan, prompt_path=prompt,
+                working_root_by_id={"REC-01": "feature-pipeline-skill"},
+            )
+            input_dirs = build_required_input_dirs(
+                [self._spec()], project_dir=root, agents_root=root / ".agents",
+                plan_path=plan, prompt_path=prompt,
+                working_root_by_id={"REC-01": "feature-pipeline-skill"},
+            )
+
+        self.assertIn("feature-pipeline-skill/src/worker_input.py", {
+            entry.logical_source for entry in bundles["REC-01"].entries
+        })
+        self.assertNotIn(
+            str(worker_file.parent.resolve()), input_dirs["REC-01"],
+        )
+
+    def test_source_location_line_list_resolves_the_working_root_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan, prompt = self._project(root)
+            worker_file = root / "feature-pipeline-skill" / "src" / "worker_input.py"
+            worker_file.parent.mkdir(parents=True)
+            worker_file.write_text("WORKER INPUT\n", encoding="utf-8")
+            task = root / "docs" / "plans" / "tasks" / "REC-01_x.md"
+            task.write_text(
+                "# REC-01\n\n## Context\n\n- `src/worker_input.py:17,23,41`\n",
+                encoding="utf-8",
+            )
+
+            bundles = build_executor_context_bundles(
+                [self._spec()], project_dir=root, agents_root=root / ".agents",
+                plan_path=plan, prompt_path=prompt,
+                working_root_by_id={"REC-01": "feature-pipeline-skill"},
+            )
+
+        self.assertIn("feature-pipeline-skill/src/worker_input.py", {
+            entry.logical_source for entry in bundles["REC-01"].entries
+        })
+
+    def test_malformed_source_location_path_is_not_normalized(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan, prompt = self._project(root)
+            worker_file = root / "feature-pipeline-skill" / "src" / "worker_input.py"
+            worker_file.parent.mkdir(parents=True)
+            worker_file.write_text("WORKER INPUT\n", encoding="utf-8")
+            task = root / "docs" / "plans" / "tasks" / "REC-01_x.md"
+            task.write_text(
+                "# REC-01\n\n## Context\n\n- `../feature-pipeline-skill/src/worker_input.py:17`\n",
+                encoding="utf-8",
+            )
+
+            bundles = build_executor_context_bundles(
+                [self._spec()], project_dir=root, agents_root=root / ".agents",
+                plan_path=plan, prompt_path=prompt,
+                working_root_by_id={"REC-01": "feature-pipeline-skill"},
+            )
+
+        self.assertNotIn("feature-pipeline-skill/src/worker_input.py", {
+            entry.logical_source for entry in bundles["REC-01"].entries
+        })
+
+    def test_malformed_source_location_line_lists_are_rejected(self) -> None:
+        malformed_sources = (
+            "src/worker_input.py:17,",
+            "src/worker_input.py:17,,23",
+            "src/worker_input.py:17,twenty",
+            "../feature-pipeline-skill/src/worker_input.py:17,23",
+        )
+        for source in malformed_sources:
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                plan, prompt = self._project(root)
+                worker_file = root / "feature-pipeline-skill" / "src" / "worker_input.py"
+                worker_file.parent.mkdir(parents=True)
+                worker_file.write_text("WORKER INPUT\n", encoding="utf-8")
+                task = root / "docs" / "plans" / "tasks" / "REC-01_x.md"
+                task.write_text(
+                    f"# REC-01\n\n## Context\n\n- `{source}`\n", encoding="utf-8"
+                )
+
+                bundles = build_executor_context_bundles(
+                    [self._spec()], project_dir=root, agents_root=root / ".agents",
+                    plan_path=plan, prompt_path=prompt,
+                    working_root_by_id={"REC-01": "feature-pipeline-skill"},
+                )
+
+            self.assertNotIn("feature-pipeline-skill/src/worker_input.py", {
+                entry.logical_source for entry in bundles["REC-01"].entries
+            })
+
+    def test_a_missing_declared_prerequisite_fails_before_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan, prompt = self._project(root)
+            (root / "docs" / "plans" / "tasks" / "GN-01_missing.md").write_text(
+                "# GN-01\nRead [required input](../../../.prompts/missing.md).\n",
+                encoding="utf-8",
+            )
             spec = TaskSpec.build(
                 id="GN-01", task_type="python", executor="python-executor",
                 allowed_scope=["src/x.py"], acceptance_criteria=["AC"],
                 path="docs/plans/tasks/GN-01_missing.md")
-            bundles = build_executor_context_bundles(
-                [spec], project_dir=root, agents_root=root / ".agents",
-                plan_path=plan, prompt_path=prompt)
-        self.assertEqual(bundles, {})
+            runner = _CapturingRunner()
+            codex = CodexAdapter(executable="codex", runner=runner)
+            with self.assertRaises(AdapterError) as caught:
+                build_executor_context_bundles(
+                    [spec], project_dir=root, agents_root=root / ".agents",
+                    plan_path=plan, prompt_path=prompt)
+                codex.launch(_request())  # pragma: no cover - context construction must stop first
+        self.assertEqual(caught.exception.code, CONTEXT_UNAVAILABLE)
+        self.assertIsNone(runner.prompt)
+
+    def test_a_missing_working_root_relative_context_path_fails_before_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan, prompt = self._project(root)
+            (root / "docs" / "plans" / "tasks" / "GN-02_missing.md").write_text(
+                "# GN-02\n\n## Context\n\n- `src/missing.py`\n", encoding="utf-8"
+            )
+            spec = TaskSpec.build(
+                id="GN-02", task_type="python", executor="python-executor",
+                allowed_scope=["src/x.py"], acceptance_criteria=["AC"],
+                path="docs/plans/tasks/GN-02_missing.md",
+            )
+
+            with self.assertRaises(AdapterError) as caught:
+                build_executor_context_bundles(
+                    [spec], project_dir=root, agents_root=root / ".agents",
+                    plan_path=plan, prompt_path=prompt,
+                    working_root_by_id={"GN-02": "feature-pipeline-skill"},
+                )
+
+        self.assertEqual(caught.exception.code, CONTEXT_UNAVAILABLE)
 
 
 if __name__ == "__main__":  # pragma: no cover

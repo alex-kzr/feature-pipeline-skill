@@ -15,6 +15,7 @@ The tests cover the four properties the contract names:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -62,10 +63,12 @@ from pipeline_core.verification import (
     orchestrate_verification,
     remote_evidence_failure,
     remote_evidence_required,
+    RunnerOwnedIsolationProofVerifier,
 )
 from feature_pipeline.contracts import CommandSpec, TaskSpec
 from feature_pipeline.application.verification_service import VerificationRequest, VerificationService
 from feature_pipeline.application.work_items import activate_work_item, register_work_items
+from tests.support.isolation import proven_isolation_capabilities
 
 ANCHORS = VerifierAnchors(project_root="/repo", agents_root="/repo/.agents")
 
@@ -258,7 +261,7 @@ def _orchestrate(run: Run, spec: TaskSpec, task: FakeVerifier, test: FakeVerifie
     register_work_items(run, (spec,))
     with activate_work_item(run, spec.id):
         return orchestrate_verification(
-            run, spec, _evidence(**kw.pop("evidence_kw", {})),
+            run, spec, _evidence(task_id=spec.id, **kw.pop("evidence_kw", {})),
             launchers=VerifierLaunchers(task=task, test=test),
             anchors=ANCHORS, attempt=1,
         )
@@ -420,10 +423,11 @@ class VerifierResultTextExtractionTests(unittest.TestCase):
             executable = [sys.executable, str(script)]
 
             run = _implemented_run(root)
+            proven = proven_isolation_capabilities("claude", runtime="\0".join(executable))
             outcome = _orchestrate(
                 run, _spec(),
-                ClaudeAdapter(executable=executable),
-                ClaudeAdapter(executable=executable),
+                ClaudeAdapter(executable=executable, isolation_capabilities=proven),
+                ClaudeAdapter(executable=executable, isolation_capabilities=proven),
             )
 
             self.assertEqual(outcome.status, "done")
@@ -483,6 +487,20 @@ class FreshReadOnlyToollessTests(unittest.TestCase):
         self.assertIn("Do not require a PASS from either verifier", prompt)
         self.assertIn("limited to runner-recorded verification-command evidence", prompt)
         self.assertIn("functional failure/resume scenarios", prompt)
+
+    def test_tool_free_verifier_evidence_includes_command_output_not_only_log_paths(self) -> None:
+        evidence = VerificationEvidence(
+            "VR-02", 1,
+            commands=({"id": "command-1", "stdout_log": "logs/out.txt",
+                       "stdout": "complete immutable command output", "stderr": ""},),
+        )
+
+        prompt = build_verifier_prompt(
+            "test_verifier", _spec(), anchors=ANCHORS, feature_prompt="prompt.md",
+            evidence_payload=evidence.serialized(), attempt=1,
+        )
+
+        self.assertIn("complete immutable command output", prompt)
 
 
 class CurrentRunMutationEvidenceTests(unittest.TestCase):
@@ -816,6 +834,20 @@ class ProseEnvelopeSettlementTests(unittest.TestCase):
             )
         self.assertIn("amendment-justification-missing-revision-identity", outcome.failure or "")
 
+    def test_amended_revision_accepts_separately_stated_prompted_identity(self) -> None:
+        prose = (
+            "# verifier\n\n- Verdict: PASS\n\n- Findings: none\n"
+            "- Amendment-justification finding: scope amendment shows \"revision 1\" "
+            "and \"epoch 1\"; rationale is supported.\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            run = _implemented_run(Path(directory))
+            outcome = _orchestrate(
+                run, _spec(), FakeVerifier(prose=prose), FakeVerifier(prose=prose),
+                evidence_kw={"amendment": {"revision": 1, "epoch": 1, "rationale": "scope"}},
+            )
+        self.assertEqual(outcome.status, "done")
+
     def test_agreeing_prose_and_envelope_leave_no_drift(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             run = _implemented_run(Path(directory))
@@ -914,6 +946,75 @@ class LaunchFailureTests(unittest.TestCase):
             self.assertEqual(outcome.status, "in_progress")
             self.assertIn("adapter-unavailable", outcome.failure)
 
+    def test_tc11_uses_two_runner_owned_fallback_verdicts_only_after_structural_rejection(self) -> None:
+        class IsolationVerifier:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+
+            def verify(self, *, task_id: str, role: str):  # noqa: ANN001
+                self.calls.append(role)
+                return type("Verdict", (), {
+                    "token": "PASS",
+                    "report": {"task_id": task_id, "role": role, "source": "live-probe"},
+                })()
+
+        with tempfile.TemporaryDirectory() as directory:
+            run = _implemented_run(Path(directory), task_id="TC-11")
+            spec = _spec(id="TC-11")
+            fallback = IsolationVerifier()
+            register_work_items(run, (spec,))
+            with activate_work_item(run, spec.id):
+                outcome = orchestrate_verification(
+                    run, spec, _evidence(task_id="TC-11"),
+                    launchers=VerifierLaunchers(
+                        task=FakeVerifier(raise_code="stack-isolation-unsupported"),
+                        test=FakeVerifier(raise_code="stack-isolation-unsupported"),
+                        deterministic_isolation=fallback,
+                    ), anchors=ANCHORS, attempt=1,
+                )
+
+            self.assertEqual(outcome.status, "in_progress")
+            self.assertIn("must-validate-concrete-runner-evidence", outcome.failure or "")
+            self.assertEqual(fallback.calls, [])
+
+    def test_containment_proof_cannot_replace_independent_verifier_verdicts(self) -> None:
+        from unittest.mock import patch
+        from pipeline_core.verification import RunnerOwnedIsolationProofVerifier
+
+        with tempfile.TemporaryDirectory() as directory:
+            run = _implemented_run(Path(directory), task_id="TC-11")
+            spec = _spec(id="TC-11")
+            register_work_items(run, (spec,))
+            fallback = RunnerOwnedIsolationProofVerifier(run)
+            with activate_work_item(run, spec.id), patch.object(
+                RunnerOwnedIsolationProofVerifier, "verify",
+                return_value=type("Proof", (), {"token": "PASS", "report": {"containment": True}})(),
+            ) as proof_check:
+                outcome = orchestrate_verification(
+                    run, spec, _evidence(task_id="TC-11"),
+                    launchers=VerifierLaunchers(
+                        task=FakeVerifier(raise_code="stack-isolation-unsupported"),
+                        test=FakeVerifier(raise_code="stack-isolation-unsupported"),
+                        deterministic_isolation=fallback,
+                    ), anchors=ANCHORS, attempt=1,
+                )
+            self.assertEqual(outcome.status, "in_progress")
+            self.assertIn("stack-isolation-unsupported", outcome.failure or "")
+            self.assertIsNone(outcome.task_verdict)
+            self.assertIsNone(outcome.test_verdict)
+            proof_check.assert_not_called()
+
+    def test_structural_rejection_without_the_runner_owned_fallback_stays_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run = _implemented_run(Path(directory), task_id="TC-11")
+            spec = _spec(id="TC-11")
+            outcome = _orchestrate(
+                run, spec, FakeVerifier(raise_code="stack-isolation-unsupported"), FakeVerifier(),
+            )
+
+        self.assertEqual(outcome.status, "in_progress")
+        self.assertIn("stack-isolation-unsupported", outcome.failure or "")
+
     def test_a_missing_session_id_blocks_before_the_envelope_request(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             run = _implemented_run(Path(directory))
@@ -930,6 +1031,58 @@ class LaunchFailureTests(unittest.TestCase):
             outcome = _orchestrate(run, _spec(), task, FakeVerifier())
             self.assertEqual(outcome.status, "in_progress")
             self.assertIn("envelope request exited with 1", outcome.failure)
+
+
+class RunnerOwnedIsolationProofVerifierTests(unittest.TestCase):
+    def test_missing_incomplete_and_invalid_proofs_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run = _implemented_run(Path(directory), task_id="TC-11")
+            verifier = RunnerOwnedIsolationProofVerifier(run)
+            self.assertEqual(verifier.verify(task_id="TC-11", role="task_verifier").report["reason"], "missing-concrete-proof")
+
+            run.live_probe_evidence.append({"task_id": "TC-11", "disposition": "FAILED"})
+            self.assertEqual(verifier.verify(task_id="TC-11", role="task_verifier").report["reason"], "incomplete-concrete-proof")
+
+            path = run.run_dir / "reports" / "TC-11" / "live-probe.json"
+            path.parent.mkdir(parents=True)
+            path.write_text("not json", encoding="utf-8")
+            run.live_probe_evidence.append({
+                "task_id": "TC-11", "disposition": "CONTAINMENT_PROVEN",
+                "proof_path": "reports/TC-11/live-probe.json", "proof_digest": "0" * 64,
+            })
+            self.assertEqual(verifier.verify(task_id="TC-11", role="task_verifier").report["reason"], "proof-artifact-unavailable")
+
+    def test_matching_durable_containment_proof_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run = _implemented_run(Path(directory), task_id="TC-11")
+            proof = {
+                "disposition": "CONTAINMENT_PROVEN",
+                "observations": {"allowed_write": True, "network_contained": True},
+                "binding": {
+                    "image": "image@sha256:abc",
+                    "package": "@openai/codex@0.154.0",
+                    "observed_version": "codex-cli 0.154.0",
+                    "argv_digest": "abc",
+                    "contract_revision": "26",
+                },
+            }
+            path = run.run_dir / "reports" / "TC-11" / "live-probe.json"
+            path.parent.mkdir(parents=True)
+            content = json.dumps(proof, sort_keys=True).encode("utf-8")
+            path.write_bytes(content)
+            run.live_probe_evidence.append({
+                "task_id": "TC-11",
+                "disposition": "CONTAINMENT_PROVEN",
+                "proof_path": "reports/TC-11/live-probe.json",
+                "proof_digest": hashlib.sha256(content).hexdigest(),
+            })
+
+            verdict = RunnerOwnedIsolationProofVerifier(run).verify(
+                task_id="TC-11", role="task_verifier",
+            )
+
+        self.assertEqual(verdict.token, "PASS")
+        self.assertEqual(verdict.report["reason"], "completed-concrete-runner-evidence")
 
 
 class NoFalseVerifiedTests(unittest.TestCase):

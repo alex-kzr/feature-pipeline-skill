@@ -564,6 +564,51 @@ def _bullet_list(items: Sequence[str], empty: str) -> list[str]:
     return [f"- {row}" for row in rows] if rows else [f"- {empty}"]
 
 
+def _runner_command_evidence(
+    run: object, spec: object, source_attempt: int, revision: int | None,
+) -> list[str]:
+    """Render the exact command records for one repair's failed verification gate.
+
+    Repair executors run in isolated workspaces and cannot read the runner control plane.  The
+    immutable repair report is therefore the only safe handoff for complete stdout/stderr that a
+    documentation repair must transcribe.  Select only the current task's exact revision-scoped
+    gate; prior revisions and unrelated commands must never enter the executor context.
+    """
+    task_id = str(getattr(spec, "id", ""))
+    stage = f"task:{task_id}:verify:{source_attempt}"
+    if revision:
+        stage += f":revision:{revision}"
+    records = [
+        item for item in getattr(run, "commands", ())
+        if isinstance(item, dict) and item.get("stage") == stage
+    ]
+    if not records:
+        return ["- No command record exists for this exact verification gate."]
+
+    lines = ["- The following is runner-owned evidence; transcribe it accurately and do not rerun it.", ""]
+    for index, item in enumerate(records, start=1):
+        argv = item.get("argv", [])
+        rendered_argv = " ".join(str(token) for token in argv) if isinstance(argv, list) else repr(argv)
+        lines += [
+            f"### Command {index}: {item.get('id', 'unknown')}",
+            "",
+            f"- Stage: {stage}",
+            f"- CWD: {item.get('cwd', '')}",
+            f"- argv: {rendered_argv}",
+            f"- Exit code: {item.get('exit_code', '')}",
+            "- stdout:",
+            "````text",
+            str(item.get("stdout", "")),
+            "````",
+            "- stderr:",
+            "````text",
+            str(item.get("stderr", "")),
+            "````",
+            "",
+        ]
+    return lines
+
+
 def write_repair_report(
     run: object,
     spec: object,
@@ -639,6 +684,10 @@ def write_repair_report(
         "- Treat the declared scope as the original estimate. If functionality needs another "
         "safe path, preserve its attribution and provide a rationale and amended acceptance "
         "criteria for independent review; never use an amendment to authorize a safety boundary.",
+        "",
+        "## Runner-owned command evidence (immutable)",
+        "",
+        *_runner_command_evidence(run, spec, source_attempt, revision),
         "",
         "## Task-verifier report (verbatim)",
         "",

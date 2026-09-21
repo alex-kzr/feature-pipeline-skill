@@ -34,9 +34,17 @@ from pipeline_core.reports import (
 from pipeline_core.state import ACTOR_EXECUTOR, ACTOR_RUNNER, Run, TransitionError
 from feature_pipeline.contracts import TaskSpec
 from feature_pipeline.application.work_items import activate_work_item, register_work_items
+from feature_pipeline.ports.adapters import AdapterCapabilities
+from tests.support.isolation import proven_isolation_capabilities
 
 
 # --- fixtures --------------------------------------------------------------------------------
+
+
+def _codex_isolation_capabilities_proven() -> AdapterCapabilities:
+    """An explicit all-tokens-True grant standing in for a separately budgeted R03 live-probe
+    measurement, used only where a test's own purpose is unrelated to the isolation gate."""
+    return proven_isolation_capabilities("codex")
 
 
 def _spec(**overrides: object) -> TaskSpec:
@@ -466,7 +474,12 @@ class ResultTextExtractionTests(unittest.TestCase):
             root = Path(directory)
             script = root / "wrapped_claude.py"
             script.write_text(_WRAPPED_CLAUDE_FAKE, encoding="utf-8")
-            adapter = ClaudeAdapter(executable=[sys.executable, str(script)])
+            adapter = ClaudeAdapter(
+                executable=[sys.executable, str(script)],
+                isolation_capabilities=proven_isolation_capabilities(
+                    "claude", runtime="\0".join((sys.executable, str(script)))
+                ),
+            )
 
             spec = _spec()
             life = _running_life(root, spec)
@@ -959,6 +972,26 @@ def _init_repo(root: Path) -> None:
 
 
 class DispatchAttributionTests(unittest.TestCase):
+    def test_isolated_executor_promotes_a_preexisting_task_owned_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _init_repo(root)
+            target = root / "docs" / "validation.md"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("runner baseline\n", encoding="utf-8")
+            spec = _spec(allowed_scope=("docs/validation.md",))
+            life = _running_life(root, spec)
+
+            def mutate(request) -> None:  # noqa: ANN001
+                (Path(request.working_root) / "docs" / "validation.md").write_text(
+                    "executor evidence\n", encoding="utf-8"
+                )
+
+            outcome = dispatch_executor(life, _request(spec), ScriptedAdapter(on_launch=mutate))
+
+            self.assertEqual(outcome.status, "implemented")
+            self.assertEqual(target.read_text(encoding="utf-8"), "executor evidence\n")
+
     def test_tc03_runner_projection_is_durable_and_not_charged_to_allowed_review(self) -> None:
         """TC-03: prior runner projections are protected context, not executor work.
 
@@ -1260,7 +1293,14 @@ class CodexIsolatedWorkspaceCompositionTests(unittest.TestCase):
                 ]
                 return CompletedProcess(0, "\n".join(events), "")
 
-            adapter = CodexAdapter(executable="codex", runner=fake_runner)
+            # This regression targets the Windows workspace-write handoff, not R03 isolation
+            # policy; codex exec structurally cannot back the strict-isolation tokens (it
+            # exposes no agent/role/bundle, no-tools, or discovery-scoping flag), so exercise
+            # it here as an explicit, separately budgeted live-probe grant would.
+            adapter = CodexAdapter(
+                executable="codex", runner=fake_runner,
+                isolation_capabilities=_codex_isolation_capabilities_proven(),
+            )
             outcome = dispatch_executor(life, _request(spec), adapter)
 
             self.assertEqual(outcome.status, "implemented")

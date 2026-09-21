@@ -17,7 +17,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from pipeline_core.adapters import WRITING_TOOLS, build_claude_argv
+from pipeline_core.adapters import AdapterError, WRITING_TOOLS, build_claude_argv, build_codex_argv
 from pipeline_core.execution import run_task
 
 from tests.test_execution import _execution, _run, _spec
@@ -97,6 +97,15 @@ class ConcreteToolGrantRegressionTests(unittest.TestCase):
             request = test.main_request()
             self.assertTrue(request.no_tools)
             self.assertEqual(_tools_arg(request), [])
+
+    def test_codex_rejects_the_captured_test_verifier_request_without_a_tool_free_flag(self) -> None:
+        """The real test-verifier request cannot become an unrestricted Codex argv."""
+        with tempfile.TemporaryDirectory() as directory:
+            _executor, _task, test = self._drive(Path(directory))
+            request = test.main_request()
+            with self.assertRaises(AdapterError) as raised:
+                build_codex_argv(request, executable="codex")
+        self.assertEqual(raised.exception.code, "no-tools-unsupported")
 
 
 if __name__ == "__main__":

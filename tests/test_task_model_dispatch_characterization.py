@@ -105,7 +105,9 @@ class AdapterSelectionCharacterizationTests(unittest.TestCase):
         self.assertEqual(claude[claude.index("--resume") + 1], "previous-session")
         self.assertEqual(claude[claude.index("--tools") + 1], "")
 
-        codex_request = replace(request, model="gpt-5.6-terra")
+        # Codex has no tool-free argv switch.  Keep this characterization focused on its
+        # model/effort lowering and fresh-session behaviour, not an impossible no-tools claim.
+        codex_request = replace(request, model="gpt-5.6-terra", no_tools=False)
         codex = build_codex_argv(codex_request)
         self.assertEqual(codex[:2], ["codex", "exec"])
         self.assertEqual(codex[codex.index("--model") + 1], "gpt-5.6-terra")

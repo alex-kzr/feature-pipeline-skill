@@ -16,6 +16,7 @@ from pipeline_core.state import (
     Run,
     StateError,
     migrate_run_state,
+    LiveProbeEvidence,
 )
 
 _V1_RUN = {
@@ -57,6 +58,302 @@ class SchemaVersionTests(unittest.TestCase):
             path = run.save()
             stored = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(stored["schema_version"], 2)
+
+
+class LiveProbeEvidenceTests(unittest.TestCase):
+    def test_load_migrates_legacy_probe_revision_from_unique_historical_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = _run(root)
+            task = run.add_task("TC-11")
+            task.adapter = "codex"
+            task.task_contract_digest = "sha256:before"
+            evidence = LiveProbeEvidence(
+                schema_version=1, task_id="TC-11", run_id=run.run_id,
+                task_contract_digest="sha256:before", attempt_id="probe-1",
+                adapter="codex", cli_version="codex-v1", role="python-executor",
+                bundle_digest="sha256:bundle", allowed_scope=("pipeline_core",),
+                grants=("read",), timeout_s=1.0, max_attempts=1,
+                started_at="2026-09-19T00:00:00Z", ended_at="2026-09-19T00:00:01Z",
+                disposition="INCONCLUSIVE", reason="not proof", cleanup="removed",
+            )
+            run.record_live_probe_evidence(evidence)
+            run.apply_amendment(
+                AmendmentRevision(
+                    task_id="TC-11", revision=1, prior_digest="sha256:before",
+                    new_digest="sha256:after", changed_fields=("allowed_scope",),
+                    added_paths=("tests/test_state_v2.py",), rationale="scope gap",
+                    approved_by="reviewer", source_evidence="baseline:TC-11",
+                    created_at="2026-09-19T00:00:02Z", epoch=1,
+                ),
+                new_digest="sha256:after", new_digest_version="tam01-amendment-v1",
+            )
+            run.save()
+            state_path = run.run_dir / "run.json"
+            legacy = json.loads(state_path.read_text(encoding="utf-8"))
+            legacy_row = legacy["live_probe_evidence"][0]
+            legacy_row.pop("task_contract_revision")
+            legacy["tasks"][0]["revision_history"] = []
+            source_bytes = json.dumps(legacy, indent=2).encode("utf-8")
+            state_path.write_bytes(source_bytes)
+
+            loaded = Run.load(run.run_dir, root)
+
+            self.assertEqual(loaded.live_probe_evidence[0], {
+                **legacy_row, "task_contract_revision": 0,
+            })
+            self.assertEqual(state_path.read_bytes(), source_bytes)
+
+    def test_load_rejects_legacy_probe_revision_without_unique_digest_match(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = _run(root)
+            task = run.add_task("TC-11")
+            task.adapter = "codex"
+            task.task_contract_digest = "sha256:same"
+            task.revision_history = [{"revision": 0, "contract_digest": "sha256:same"}]
+            task.current_revision = 1
+            evidence = LiveProbeEvidence(
+                schema_version=1, task_id="TC-11", run_id=run.run_id,
+                task_contract_digest="sha256:same", attempt_id="probe-1",
+                adapter="codex", cli_version="codex-v1", role="python-executor",
+                bundle_digest="sha256:bundle", allowed_scope=("pipeline_core",),
+                grants=("read",), timeout_s=1.0, max_attempts=1,
+                started_at="2026-09-19T00:00:00Z", ended_at="2026-09-19T00:00:01Z",
+                disposition="INCONCLUSIVE", reason="not proof", cleanup="removed",
+                task_contract_revision=1,
+            )
+            run.record_live_probe_evidence(evidence)
+            run.save()
+            state_path = run.run_dir / "run.json"
+            legacy = json.loads(state_path.read_text(encoding="utf-8"))
+            legacy["live_probe_evidence"][0].pop("task_contract_revision")
+            state_path.write_text(json.dumps(legacy), encoding="utf-8")
+
+            with self.assertRaises(StateError) as raised:
+                Run.load(run.run_dir, root)
+
+            self.assertEqual(raised.exception.code, "live-probe-contract-mismatch")
+
+    def test_load_rejects_legacy_probe_revision_without_a_digest_match(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = _run(root)
+            task = run.add_task("TC-11")
+            task.adapter = "codex"
+            task.task_contract_digest = "sha256:expected"
+            evidence = LiveProbeEvidence(
+                schema_version=1, task_id="TC-11", run_id=run.run_id,
+                task_contract_digest="sha256:expected", attempt_id="probe-1",
+                adapter="codex", cli_version="codex-v1", role="python-executor",
+                bundle_digest="sha256:bundle", allowed_scope=("pipeline_core",),
+                grants=("read",), timeout_s=1.0, max_attempts=1,
+                started_at="2026-09-19T00:00:00Z", ended_at="2026-09-19T00:00:01Z",
+                disposition="INCONCLUSIVE", reason="not proof", cleanup="removed",
+            )
+            run.record_live_probe_evidence(evidence)
+            run.save()
+            state_path = run.run_dir / "run.json"
+            legacy = json.loads(state_path.read_text(encoding="utf-8"))
+            legacy["live_probe_evidence"][0].pop("task_contract_revision")
+            legacy["live_probe_evidence"][0]["task_contract_digest"] = "sha256:missing"
+            state_path.write_text(json.dumps(legacy), encoding="utf-8")
+
+            with self.assertRaises(StateError) as raised:
+                Run.load(run.run_dir, root)
+
+            self.assertEqual(raised.exception.code, "live-probe-contract-mismatch")
+
+    def test_negative_probe_evidence_round_trips_and_rejects_positive_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = _run(root)
+            task = run.add_task("REC-36")
+            task.adapter = "codex"
+            task.task_contract_digest = "sha256:contract"
+            evidence = LiveProbeEvidence(
+                schema_version=1, task_id="REC-36", run_id=run.run_id,
+                task_contract_digest="sha256:contract",
+                attempt_id="probe-1", adapter="codex", cli_version="codex-v1",
+                role="python-executor", bundle_digest="sha256:bundle",
+                allowed_scope=("pipeline_core",), grants=("read",), timeout_s=1.0,
+                max_attempts=1, started_at="2026-09-19T00:00:00Z",
+                ended_at="2026-09-19T00:00:01Z", disposition="NO_BREACH_OBSERVED",
+                reason="clean observation is non-positive", cleanup="removed",
+            )
+            run.record_live_probe_evidence(evidence)
+            run.save()
+            self.assertEqual(Run.load(run.run_dir, root).live_probe_evidence[0]["disposition"],
+                             "NO_BREACH_OBSERVED")
+            with self.assertRaises(StateError):
+                LiveProbeEvidence(**{**evidence.as_dict(), "disposition": "SUPPORTED"}).validate()
+
+    def test_probe_evidence_rejects_duplicate_scope_and_nonfinite_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run = _run(Path(directory))
+            run.add_task("REC-36").adapter = "codex"
+            valid = LiveProbeEvidence(
+                schema_version=1, task_id="REC-36", run_id=run.run_id,
+                task_contract_digest="sha256:contract",
+                attempt_id="probe-1", adapter="codex", cli_version="codex-v1",
+                role="python-executor", bundle_digest="sha256:bundle",
+                allowed_scope=("pipeline_core",), grants=("read",), timeout_s=1.0,
+                max_attempts=1, started_at="2026-09-19T00:00:00Z",
+                ended_at="2026-09-19T00:00:01Z", disposition="INCONCLUSIVE",
+                reason="not proof", cleanup="removed",
+            )
+            with self.assertRaises(StateError):
+                LiveProbeEvidence(**{**valid.as_dict(), "allowed_scope": ("a", "a")}).validate()
+            with self.assertRaises(StateError):
+                LiveProbeEvidence(**{**valid.as_dict(), "timeout_s": float("inf")}).validate()
+            with self.assertRaises(StateError):
+                LiveProbeEvidence(**{**valid.as_dict(), "cli_version": "unknown"}).validate()
+
+    def test_probe_evidence_must_match_the_task_contract_before_append(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run = _run(Path(directory))
+            task = run.add_task("REC-36")
+            task.adapter = "codex"
+            task.task_contract_digest = "sha256:expected"
+            evidence = LiveProbeEvidence(
+                schema_version=1, task_id="REC-36", run_id=run.run_id,
+                task_contract_digest="sha256:other", attempt_id="probe-1",
+                adapter="codex", cli_version="codex-v1", role="python-executor",
+                bundle_digest="sha256:bundle", allowed_scope=("pipeline_core",),
+                grants=("read",), timeout_s=1.0, max_attempts=1,
+                started_at="2026-09-19T00:00:00Z", ended_at="2026-09-19T00:00:01Z",
+                disposition="INCONCLUSIVE", reason="not proof", cleanup="removed",
+                task_contract_revision=0,
+            )
+            with self.assertRaises(StateError) as raised:
+                run.record_live_probe_evidence(evidence)
+            self.assertEqual(raised.exception.code, "live-probe-contract-mismatch")
+
+    def test_probe_evidence_rejects_persisted_contract_mismatch_and_budget_widening(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = _run(root)
+            task = run.add_task("REC-36")
+            task.adapter = "codex"
+            task.task_contract_digest = "sha256:expected"
+            evidence = LiveProbeEvidence(
+                schema_version=1, task_id="REC-36", run_id=run.run_id,
+                task_contract_digest="sha256:expected", attempt_id="probe-1",
+                adapter="codex", cli_version="codex-v1", role="python-executor",
+                bundle_digest="sha256:bundle", allowed_scope=("pipeline_core",),
+                grants=("read",), timeout_s=1.0, max_attempts=1,
+                started_at="2026-09-19T00:00:00Z", ended_at="2026-09-19T00:00:01Z",
+                disposition="INCONCLUSIVE", reason="not proof", cleanup="removed",
+            )
+            run.record_live_probe_evidence(evidence)
+            run.live_probe_evidence[0]["task_contract_digest"] = "sha256:tampered"
+            with self.assertRaises(StateError) as raised:
+                run.save()
+            self.assertEqual(raised.exception.code, "live-probe-contract-mismatch")
+
+            run.live_probe_evidence[0] = evidence.as_dict()
+            run.live_probe_evidence[0]["allowed_scope"] = ["pipeline_core"]
+            widened = dict(run.live_probe_evidence[0], attempt_id="probe-2", max_attempts=2)
+            run.live_probe_evidence.append(widened)
+            with self.assertRaises(StateError) as raised:
+                run.save()
+            self.assertEqual(raised.exception.code, "live-probe-budget-mismatch")
+
+    def test_probe_evidence_cannot_be_removed_after_it_is_durably_saved(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = _run(root)
+            task = run.add_task("REC-36")
+            task.adapter = "codex"
+            task.task_contract_digest = "sha256:contract"
+            evidence = LiveProbeEvidence(
+                schema_version=1, task_id="REC-36", run_id=run.run_id,
+                task_contract_digest="sha256:contract", attempt_id="probe-1",
+                adapter="codex", cli_version="codex-v1", role="python-executor",
+                bundle_digest="sha256:bundle", allowed_scope=("pipeline_core",),
+                grants=("read",), timeout_s=1.0, max_attempts=2,
+                started_at="2026-09-19T00:00:00Z", ended_at="2026-09-19T00:00:01Z",
+                disposition="INCONCLUSIVE", reason="not proof", cleanup="removed",
+            )
+            run.record_live_probe_evidence(evidence)
+            run.save()
+            run = Run.load(run.run_dir, root)
+            run.live_probe_evidence.clear()
+            with self.assertRaises(StateError) as raised:
+                run.save()
+            self.assertEqual(raised.exception.code, "live-probe-history-rewritten")
+
+    def test_probe_evidence_cannot_be_replaced_after_it_is_durably_saved(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = _run(root)
+            task = run.add_task("REC-36")
+            task.adapter = "codex"
+            task.task_contract_digest = "sha256:contract"
+            evidence = LiveProbeEvidence(
+                schema_version=1, task_id="REC-36", run_id=run.run_id,
+                task_contract_digest="sha256:contract", attempt_id="probe-1",
+                adapter="codex", cli_version="codex-v1", role="python-executor",
+                bundle_digest="sha256:bundle", allowed_scope=("pipeline_core",),
+                grants=("read",), timeout_s=1.0, max_attempts=1,
+                started_at="2026-09-19T00:00:00Z", ended_at="2026-09-19T00:00:01Z",
+                disposition="INCONCLUSIVE", reason="not proof", cleanup="removed",
+            )
+            run.record_live_probe_evidence(evidence)
+            run.save()
+            run = Run.load(run.run_dir, root)
+            run.live_probe_evidence[0]["reason"] = "replacement"
+            with self.assertRaises(StateError) as raised:
+                run.save()
+            self.assertEqual(raised.exception.code, "live-probe-history-rewritten")
+
+    def test_historical_probe_evidence_survives_an_amendment_but_forgery_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = _run(root)
+            task = run.add_task("TC-11")
+            task.adapter = "codex"
+            task.task_contract_digest = "sha256:before"
+            evidence = LiveProbeEvidence(
+                schema_version=1, task_id="TC-11", run_id=run.run_id,
+                task_contract_digest="sha256:before", attempt_id="probe-1",
+                adapter="codex", cli_version="codex-v1", role="python-executor",
+                bundle_digest="sha256:bundle", allowed_scope=("pipeline_core",),
+                grants=("read",), timeout_s=1.0, max_attempts=1,
+                started_at="2026-09-19T00:00:00Z", ended_at="2026-09-19T00:00:01Z",
+                disposition="INCONCLUSIVE", reason="not proof", cleanup="removed",
+            )
+            run.record_live_probe_evidence(evidence)
+            run.apply_amendment(
+                AmendmentRevision(
+                    task_id="TC-11", revision=1, prior_digest="sha256:before",
+                    new_digest="sha256:after", changed_fields=("allowed_scope",),
+                    added_paths=("tests/test_state_v2.py",), rationale="scope gap",
+                    approved_by="reviewer", source_evidence="baseline:TC-11",
+                    created_at="2026-09-19T00:00:02Z", epoch=1,
+                ),
+                new_digest="sha256:after", new_digest_version="tam01-amendment-v1",
+            )
+            run.record_live_probe_evidence(LiveProbeEvidence(
+                schema_version=1, task_id="TC-11", run_id=run.run_id,
+                task_contract_digest="sha256:after", attempt_id="probe-1",
+                adapter="codex", cli_version="codex-v1", role="python-executor",
+                bundle_digest="sha256:bundle", allowed_scope=("pipeline_core",),
+                grants=("read",), timeout_s=1.0, max_attempts=2,
+                started_at="2026-09-19T00:00:03Z", ended_at="2026-09-19T00:00:04Z",
+                disposition="INCONCLUSIVE", reason="not proof", cleanup="removed",
+                task_contract_revision=1,
+            ))
+
+            run.save()
+            reloaded = Run.load(run.run_dir, root)
+            self.assertEqual(reloaded.live_probe_evidence[0], evidence.as_dict())
+            self.assertEqual(reloaded.live_probe_evidence[1]["task_contract_revision"], 1)
+
+            reloaded.live_probe_evidence[0]["task_contract_digest"] = "sha256:forged"
+            with self.assertRaises(StateError) as raised:
+                reloaded.save()
+            self.assertEqual(raised.exception.code, "live-probe-contract-mismatch")
 
 
 class MigrationTests(unittest.TestCase):

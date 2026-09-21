@@ -35,12 +35,15 @@ from pathlib import Path
 from typing import Sequence
 
 from feature_pipeline.contracts import TaskSpec
+from feature_pipeline.application.skill_bundles import SkillBundleError, load_project_skill_bundle
 from feature_pipeline.application.work_items import WorkItemError, require_active_work_item
 
 from .adapters import (
     Adapter,
     AdapterError,
     LaunchRequest,
+    LaunchComposition,
+    bind_launch_request,
     LaunchResult,
     check_command_allowances,
     parse_codex_final_result,
@@ -49,6 +52,7 @@ from .adapters import (
 from .artifacts import write_json_atomic, write_text_atomic
 from .commands import active_revision
 from .lifecycle import RunLifecycle
+from .plan import render_effective_task_contract
 from .prompt_envelope import EnvelopeAnchors, build_executor_envelope
 from .reports import (
     LaunchArtifacts,
@@ -402,6 +406,8 @@ def _promote_reviewable_paths(
     workspace: Path,
     attribution: AttributionResult,
     before_snapshot,
+    protected_paths: Sequence[str] = (),
+    promotable_preexisting_paths: Sequence[str] = (),
 ) -> list[str]:
     """Apply every non-safety executor delta so independent verification sees the work.
 
@@ -413,7 +419,13 @@ def _promote_reviewable_paths(
         relative = Path(str(row["path"]))
         # The disposable workspace starts as a copy of the primary worktree. A path in the
         # opening snapshot was already dirty or untracked, so promotion must preserve it.
-        if relative.as_posix() in before_snapshot.files:
+        if (
+            relative.as_posix() in before_snapshot.files
+            and (
+                row.get("classification") != "in_allowed_scope"
+                or relative.as_posix() not in promotable_preexisting_paths
+            )
+        ):
             continue
         source, destination = workspace / relative, primary / relative
         if row.get("status") == "deleted":
@@ -497,6 +509,15 @@ def dispatch_executor(
     if repair_report_path is not None:
         repair_report_path = _validated_repair_report_path(run, task_id, repair_report_path)
 
+    # Resolve before consuming a generation or writing launch artifacts. A configured project's
+    # missing route/binding or an incompatible manifest is a dispatch preflight failure, not a
+    # partially launched executor attempt.
+    try:
+        bundle = load_project_skill_bundle(
+            run.repo_root, task_type=spec.task_type, recipient_role=EXECUTOR_ROLE)
+    except (SkillBundleError, ValueError) as exc:
+        raise DispatchError(f"skill-bundle-invalid: {exc}", "skill-bundle-invalid") from None
+
     # Consume the generation *before* the launch: a failed attempt still owns its number.
     generation = life.consume_launch_generation(task_id, EXECUTOR_ROLE)
     life.record_operation(task_id, "executor", "started", "executor window opened",
@@ -523,6 +544,13 @@ def dispatch_executor(
         plan_path=request.plan_path,
         repair_report_path=repair_report_path,
         runner_evidence_satisfied=runner_evidence_satisfied,
+        skill_content="" if bundle is None else bundle.render(),
+    )
+    envelope += (
+        "\nRunner-authoritative effective task contract:\n"
+        + render_effective_task_contract(spec)
+        + "\n- This briefing overrides conflicting scope, verification-command, and repair-budget "
+        "text in the historical task Markdown.\n"
     )
     write_text_atomic(artifacts.prompt_envelope, envelope, repo_root=run.repo_root)
 
@@ -537,6 +565,13 @@ def dispatch_executor(
         repair_input_dirs = (str((workspace / repo_relative(repair_report_path, primary_root)).parent),)
     launch_working_root = str(workspace / request.working_root)
 
+    composition = LaunchComposition(
+        recipient_role=EXECUTOR_ROLE,
+        bundle_digest=None if bundle is None else bundle.digest,
+        allowed_scope=tuple(spec.allowed_scope),
+        role_grant=tuple(request.role_grant),
+        executor_identity=spec.executor,
+    )
     launch_request = LaunchRequest(
         role=spec.executor,
         task_id=task_id,
@@ -567,6 +602,12 @@ def dispatch_executor(
         # Its prompt path remains .pipeline/...; grant only its copied parent so Claude can
         # read the diagnosis without access to the primary runner control plane.
         required_input_dirs=repair_input_dirs,
+        # Bind this launch to the exact role and skill-bundle digest it was composed for
+        # (TC-11 AC-1); an adapter rejects a request whose recipient role disagrees with the
+        # role actually being launched, so later adapter code can never substitute either.
+        recipient_role=EXECUTOR_ROLE,
+        bundle_digest=None if bundle is None else bundle.digest,
+        composition=composition,
     )
     # Runner-owned evidence: content snapshot of the whole worktree immediately before the
     # launch, with the runner's own run/lock/report directory excluded. Subtracting this
@@ -577,7 +618,7 @@ def dispatch_executor(
     git_boundary = _capture_git_mutation_boundary(workspace)
 
     try:
-        result = adapter.launch(launch_request)
+        result = adapter.launch(bind_launch_request(launch_request))
     except AdapterError as exc:
         return _retryable_failure(
             life, request, artifacts, generation,
@@ -629,15 +670,19 @@ def dispatch_executor(
         report_path=artifacts.status_envelope,
         working_root=launch_working_root,
         role_grant=tuple(request.role_grant),
+        allowed_scope=tuple(spec.allowed_scope),
         resume_session_id=result.session_id,
         no_tools=True,
         read_only=True,
         timeout=request.timeout,
         model=request.model,
         effort=request.effort,
+        recipient_role=EXECUTOR_ROLE,
+        bundle_digest=None if bundle is None else bundle.digest,
+        composition=composition,
     )
     try:
-        envelope_result = adapter.launch(envelope_request)
+        envelope_result = adapter.launch(bind_launch_request(envelope_request))
     except AdapterError as exc:
         return _retryable_failure(
             life, request, artifacts, generation, result, None,
@@ -724,7 +769,11 @@ def dispatch_executor(
             report_text, resolution.drift, scope_block, attribution,
         )
     if workspace != primary_root:
-        _promote_reviewable_paths(primary_root, workspace, attribution, before_snapshot)
+        _promote_reviewable_paths(
+            primary_root, workspace, attribution, before_snapshot,
+            tuple(str(row["path"]) for row in run.task(task_id).runner_owned_writes),
+            tuple(run.task(task_id).changed_files),
+        )
     if resolution.drift:
         run.record_event(
             f"executor:{task_id}", to=str(generation), note=resolution.drift)
@@ -823,7 +872,11 @@ def _settle_codex_final_result(
                                result, None, report_text, failure=scope_block,
                                attribution=attribution)
     if workspace != primary_root:
-        _promote_reviewable_paths(primary_root, workspace, attribution, before_snapshot)
+        _promote_reviewable_paths(
+            primary_root, workspace, attribution, before_snapshot,
+            tuple(str(row["path"]) for row in run.task(request.spec.id).runner_owned_writes),
+            tuple(run.task(request.spec.id).changed_files),
+        )
     life.record_operation(request.spec.id, "executor", "succeeded",
                           f"executor launch-{generation} reported implemented",
                           generation=generation)

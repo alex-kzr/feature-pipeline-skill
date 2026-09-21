@@ -24,6 +24,7 @@ from typing import Any
 
 from .artifacts import write_text_atomic
 from .commands import DIAGNOSTIC_OUTPUT_BUDGET, redact_then_truncate
+from .redaction import output_rules, redact_text
 from .reporting import Section, fenced, render_report
 from .state import Run
 
@@ -89,7 +90,8 @@ def write_diagnostic_report(
 
     if recent:
         command_lines = "\n".join(
-            f"- `{' '.join(c.get('argv', []))}` in `{c.get('cwd', '.')}` -> exit "
+            f"- `{redact_text(' '.join(c.get('argv', [])), output_rules(run.repo_root))}` "
+            f"in `{c.get('cwd', '.')}` -> exit "
             f"`{c.get('exit_code')}` ({round(float(c.get('duration', 0.0)), 3)}s)"
             for c in recent)
     else:
