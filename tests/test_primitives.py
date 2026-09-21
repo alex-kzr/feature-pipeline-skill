@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from pipeline_core.artifacts import (
@@ -120,6 +121,20 @@ class ArtifactCharacterizationTests(unittest.TestCase):
             write_text_atomic(text_target, f"path={root / 'secret'}", repo_root=root)
             self.assertEqual(text_target.read_text(encoding="utf-8"), f"path=<repo>{os.sep}secret")
             self.assertFalse(text_target.with_name("command.log.tmp").exists())
+
+    def test_atomic_writes_remove_temporary_files_when_replace_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for writer, target, payload in (
+                (write_json_atomic, root / "result.json", {"ok": True}),
+                (write_text_atomic, root / "command.log", "output"),
+            ):
+                with self.subTest(writer=writer.__name__), patch(
+                    "pipeline_core.artifacts.os.replace", side_effect=OSError("replace failed")
+                ):
+                    with self.assertRaisesRegex(OSError, "replace failed"):
+                        writer(target, payload)
+                    self.assertFalse(target.with_name(f"{target.name}.tmp").exists())
 
 
 class StateCharacterizationTests(unittest.TestCase):
