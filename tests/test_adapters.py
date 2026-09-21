@@ -1034,6 +1034,67 @@ class StrictWorkerIsolationTests(unittest.TestCase):
 class DockerCodexIsolationTests(unittest.TestCase):
     """The opt-in Docker path has a materially narrower host surface than Codex on Windows."""
 
+    def test_container_runtime_closure_resolves_only_explicit_feature_modules(self) -> None:
+        """The runtime closure follows local imports without broadening to the project tree."""
+        from pipeline_core.adapters import _container_runtime_sources
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "pipeline_core").mkdir()
+            (root / "src" / "feature_pipeline" / "application").mkdir(parents=True)
+            (root / "src" / "feature_pipeline" / "infrastructure" / "adapters").mkdir(parents=True)
+            (root / "pipeline_core" / "adapters.py").write_text(
+                "import feature_pipeline.application.identity\n", encoding="utf-8"
+            )
+            (root / "src" / "feature_pipeline" / "__init__.py").write_text("", encoding="utf-8")
+            (root / "src" / "feature_pipeline" / "application" / "__init__.py").write_text(
+                "", encoding="utf-8"
+            )
+            (root / "src" / "feature_pipeline" / "application" / "identity.py").write_text(
+                "from ..infrastructure.adapters import codex_launcher\n", encoding="utf-8"
+            )
+            (root / "src" / "feature_pipeline" / "infrastructure" / "__init__.py").write_text(
+                "", encoding="utf-8"
+            )
+            (root / "src" / "feature_pipeline" / "infrastructure" / "adapters" / "__init__.py").write_text(
+                "", encoding="utf-8"
+            )
+            (root / "src" / "feature_pipeline" / "infrastructure" / "adapters" / "codex_launcher.py").write_text(
+                "VALUE = 1\n", encoding="utf-8"
+            )
+
+            sources = _container_runtime_sources(root)
+
+            self.assertEqual(
+                {path.relative_to(root / "src").as_posix() for path in sources},
+                {
+                    "feature_pipeline/__init__.py",
+                    "feature_pipeline/application/__init__.py",
+                    "feature_pipeline/application/identity.py",
+                    "feature_pipeline/infrastructure/__init__.py",
+                    "feature_pipeline/infrastructure/adapters/__init__.py",
+                },
+            )
+
+    def test_container_runtime_closure_fails_closed_for_missing_or_invalid_sources(self) -> None:
+        from pipeline_core.adapters import (
+            CONTEXT_UNAVAILABLE,
+            _container_runtime_sources,
+            _feature_pipeline_imports,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaisesRegex(AdapterError, "runtime source is unavailable") as raised:
+                _container_runtime_sources(root)
+            self.assertEqual(raised.exception.code, CONTEXT_UNAVAILABLE)
+
+            malformed = root / "malformed.py"
+            malformed.write_text("from feature_pipeline import (\n", encoding="utf-8")
+            with self.assertRaisesRegex(AdapterError, "runtime source is unavailable") as raised:
+                _feature_pipeline_imports(malformed, "feature_pipeline")
+            self.assertEqual(raised.exception.code, CONTEXT_UNAVAILABLE)
+
     def test_container_context_has_the_minimal_runtime_import_closure(self) -> None:
         """A scoped ``pipeline_core.adapters`` import resolves without mounting the project."""
         from pipeline_core.adapters import _materialize_container_context

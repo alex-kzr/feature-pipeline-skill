@@ -14,6 +14,7 @@ from feature_pipeline.infrastructure.isolation_probes import (
     DeterministicIsolationVerifier,
     IsolationProbeRecordError,
     ProductionIsolationProbe,
+    _observed_version,
     load_isolation_capabilities,
 )
 from feature_pipeline.ports.adapters import STRICT_ISOLATION_CAPABILITIES
@@ -134,6 +135,36 @@ class ProductionIsolationProbeTests(unittest.TestCase):
                 supports_read_only=True, supports_write=True,
             )
         self.assertEqual(verdict.token, "FAIL")
+
+    def test_missing_and_malformed_records_fail_closed(self) -> None:
+        path = self.root / ".pipeline" / "isolation-probes" / "codex.json"
+        baseline = load_isolation_capabilities(
+            path, name="codex", available=True, supports_resume=False,
+            supports_read_only=True, supports_write=True,
+        )
+        self.assertFalse(any(baseline.has(token) for token in STRICT_ISOLATION_CAPABILITIES))
+
+        path.parent.mkdir(parents=True)
+        for payload, message in (("{", "unreadable"), ("[]", "must be an object"),
+                                 (json.dumps({"schema_version": 1}), "incomplete")):
+            with self.subTest(payload=payload):
+                path.write_text(payload, encoding="utf-8")
+                with self.assertRaisesRegex(IsolationProbeRecordError, message):
+                    load_isolation_capabilities(
+                        path, name="codex", available=True, supports_resume=False,
+                        supports_read_only=True, supports_write=True,
+                    )
+
+    def test_version_observation_validates_executable_and_non_tc11_verdict(self) -> None:
+        self.assertEqual(_observed_version(self.executable), self.version)
+        with self.assertRaisesRegex(IsolationProbeRecordError, "executable is unavailable"):
+            _observed_version([])
+
+        verdict = DeterministicIsolationVerifier(self.root, "codex").verify(
+            task_id="TC-10", role="task_verifier",
+        )
+        self.assertEqual(verdict.token, "FAIL")
+        self.assertEqual(verdict.report["reason"], "deterministic-isolation-verifier-not-applicable")
 
 
 if __name__ == "__main__":
