@@ -88,6 +88,10 @@ class SkillBundleTests(unittest.TestCase):
         with self.assertRaisesRegex(SkillBundleError, "does not match sha256"):
             load_manifests([raw])
 
+    def test_rejects_a_non_object_manifest_document(self) -> None:
+        with self.assertRaisesRegex(SkillBundleError, "must be an object"):
+            load_manifests(["[]"])
+
     def test_project_bundle_uses_canonical_route_and_recipient_role(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
