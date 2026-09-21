@@ -10,7 +10,9 @@ from pathlib import Path
 from feature_pipeline.application.skill_bundles import (
     SkillBundleError, load_manifests, load_project_skill_bundle, resolve_skill_bundle,
 )
+from feature_pipeline.contracts import SchemaError
 from feature_pipeline.inputs.profile import CompiledProfile
+from pipeline_core.roles import canonical_stack_role
 
 
 def _manifest(skill_id: str, classification: str, *, content: str = "reviewed text",
@@ -64,6 +66,21 @@ class SkillBundleTests(unittest.TestCase):
         with self.assertRaisesRegex(SkillBundleError, "cycle"):
             resolve_skill_bundle(_profile(), stack="python", requested_role="executor",
                                  requested_ids=["one"], manifests=manifests)
+
+    def test_rejects_unknown_bundle_recipient_and_missing_canonical_role_grant(self) -> None:
+        manifests = load_manifests([_manifest("python", "stack:python")])
+        with self.assertRaisesRegex(SkillBundleError, "recipient role is unknown"):
+            resolve_skill_bundle(_profile(), stack="python", requested_role="executor",
+                                 requested_ids=["python"], manifests=manifests,
+                                 recipient_role="missing")
+        profile = _profile()
+        profile.role_grants.pop("executor")
+        with self.assertRaisesRegex(SchemaError, "canonical stack role is unknown"):
+            canonical_stack_role(profile, "python", "executor")
+
+    def test_canonical_stack_role_rejects_a_requested_role_mismatch(self) -> None:
+        with self.assertRaisesRegex(SchemaError, "canonically bound"):
+            canonical_stack_role(_profile(), "python", "test_verifier")
 
     def test_rejects_changed_content_with_a_stale_hash(self) -> None:
         raw = _manifest("python", "stack:python")

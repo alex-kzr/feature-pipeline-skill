@@ -17,7 +17,11 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from pipeline_core.adapters import LiveProbeRequest
+    from pipeline_core.state import Run
 
 
 @dataclass
@@ -172,11 +176,11 @@ def build_live_probe_request(
 
 
 def execute_live_probe(
-    run: object,
+    run: Run,
     *,
     task_id: str,
     adapter: object,
-    request: object,
+    request: LiveProbeRequest,
     cli_version: str,
     task_contract_digest: str,
     bundle_digest: str,

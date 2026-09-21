@@ -110,6 +110,14 @@ class RoleCompositionTests(unittest.TestCase):
         with self.assertRaisesRegex(SchemaError, "read-only"):
             Profile.from_data(data)
 
+    def test_unknown_role_and_mutated_verifier_grants_fail_closed(self) -> None:
+        profile = Profile.from_data(profile_data())
+        with self.assertRaisesRegex(SchemaError, "unknown role"):
+            compose_role(profile, "missing", [], [])
+        profile.role_grants["task_verifier"] = frozenset({"read", "write"})
+        with self.assertRaisesRegex(SchemaError, "must be read-only"):
+            compose_role(profile, "task_verifier", [], [])
+
 
 if __name__ == "__main__":
     unittest.main()

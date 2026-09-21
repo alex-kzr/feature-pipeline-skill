@@ -13,7 +13,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Iterable, Mapping
+from typing import Iterable, Mapping, cast
 
 from feature_pipeline.inputs.profile import CompiledProfile, UnknownStack
 
@@ -61,6 +61,11 @@ class SkillManifest:
         if not all(isinstance(value, str) and value for value in
                    (skill_id, classification, source, sha256, content)):
             raise SkillBundleError("skill manifest needs non-empty id, classification, source, sha256 and content")
+        skill_id = cast(str, skill_id)
+        classification = cast(str, classification)
+        source = cast(str, source)
+        sha256 = cast(str, sha256)
+        content = cast(str, content)
         if classification != "neutral" and not classification.startswith("stack:"):
             raise SkillBundleError(f"unknown skill classification: {classification!r}")
         if not _safe_source(source):
