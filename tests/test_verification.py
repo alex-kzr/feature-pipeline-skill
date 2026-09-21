@@ -15,6 +15,7 @@ The tests cover the four properties the contract names:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -62,6 +63,7 @@ from pipeline_core.verification import (
     orchestrate_verification,
     remote_evidence_failure,
     remote_evidence_required,
+    RunnerOwnedIsolationProofVerifier,
 )
 from feature_pipeline.contracts import CommandSpec, TaskSpec
 from feature_pipeline.application.verification_service import VerificationRequest, VerificationService
@@ -1029,6 +1031,58 @@ class LaunchFailureTests(unittest.TestCase):
             outcome = _orchestrate(run, _spec(), task, FakeVerifier())
             self.assertEqual(outcome.status, "in_progress")
             self.assertIn("envelope request exited with 1", outcome.failure)
+
+
+class RunnerOwnedIsolationProofVerifierTests(unittest.TestCase):
+    def test_missing_incomplete_and_invalid_proofs_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run = _implemented_run(Path(directory), task_id="TC-11")
+            verifier = RunnerOwnedIsolationProofVerifier(run)
+            self.assertEqual(verifier.verify(task_id="TC-11", role="task_verifier").report["reason"], "missing-concrete-proof")
+
+            run.live_probe_evidence.append({"task_id": "TC-11", "disposition": "FAILED"})
+            self.assertEqual(verifier.verify(task_id="TC-11", role="task_verifier").report["reason"], "incomplete-concrete-proof")
+
+            path = run.run_dir / "reports" / "TC-11" / "live-probe.json"
+            path.parent.mkdir(parents=True)
+            path.write_text("not json", encoding="utf-8")
+            run.live_probe_evidence.append({
+                "task_id": "TC-11", "disposition": "CONTAINMENT_PROVEN",
+                "proof_path": "reports/TC-11/live-probe.json", "proof_digest": "0" * 64,
+            })
+            self.assertEqual(verifier.verify(task_id="TC-11", role="task_verifier").report["reason"], "proof-artifact-unavailable")
+
+    def test_matching_durable_containment_proof_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run = _implemented_run(Path(directory), task_id="TC-11")
+            proof = {
+                "disposition": "CONTAINMENT_PROVEN",
+                "observations": {"allowed_write": True, "network_contained": True},
+                "binding": {
+                    "image": "image@sha256:abc",
+                    "package": "@openai/codex@0.154.0",
+                    "observed_version": "codex-cli 0.154.0",
+                    "argv_digest": "abc",
+                    "contract_revision": "26",
+                },
+            }
+            path = run.run_dir / "reports" / "TC-11" / "live-probe.json"
+            path.parent.mkdir(parents=True)
+            content = json.dumps(proof, sort_keys=True).encode("utf-8")
+            path.write_bytes(content)
+            run.live_probe_evidence.append({
+                "task_id": "TC-11",
+                "disposition": "CONTAINMENT_PROVEN",
+                "proof_path": "reports/TC-11/live-probe.json",
+                "proof_digest": hashlib.sha256(content).hexdigest(),
+            })
+
+            verdict = RunnerOwnedIsolationProofVerifier(run).verify(
+                task_id="TC-11", role="task_verifier",
+            )
+
+        self.assertEqual(verdict.token, "PASS")
+        self.assertEqual(verdict.report["reason"], "completed-concrete-runner-evidence")
 
 
 class NoFalseVerifiedTests(unittest.TestCase):

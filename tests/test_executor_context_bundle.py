@@ -382,6 +382,8 @@ class BuildExecutorContextBundlesTests(unittest.TestCase):
 
     def test_real_tc11_bundles_each_declared_prerequisite_path(self) -> None:
         project_root = Path(__file__).resolve().parents[2]
+        if not (project_root / "docs/plans/2026-09-08-universal-pipeline-task-model-routing.md").is_file():
+            self.skipTest("requires the umbrella repository checkout")
         task_path = "docs/plans/tasks/TC-11_enforce-worker-isolation.md"
         spec = TaskSpec.build(
             id="TC-11", task_type="python", executor="python-executor",
@@ -616,7 +618,7 @@ class BuildExecutorContextBundlesTests(unittest.TestCase):
             runner = _CapturingRunner()
             codex = CodexAdapter(executable="codex", runner=runner)
             with self.assertRaises(AdapterError) as caught:
-                contexts = build_executor_context_bundles(
+                build_executor_context_bundles(
                     [spec], project_dir=root, agents_root=root / ".agents",
                     plan_path=plan, prompt_path=prompt)
                 codex.launch(_request())  # pragma: no cover - context construction must stop first

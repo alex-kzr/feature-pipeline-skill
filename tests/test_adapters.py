@@ -435,7 +435,10 @@ class CodexArgvTests(unittest.TestCase):
 
         argv = adapter.plan(_request("executor", role_grant=("read", "write")))
 
-        self.assertEqual(argv[argv.index("--sandbox") + 1], "danger-full-access")
+        self.assertEqual(
+            argv[argv.index("--sandbox") + 1],
+            "danger-full-access" if os.name == "nt" else "workspace-write",
+        )
         self.assertEqual(
             [argv[index + 1] for index, value in enumerate(argv) if value == "--add-dir"],
             [
@@ -1140,6 +1143,71 @@ class DockerCodexIsolationTests(unittest.TestCase):
         self.assertIn("do not edit outside the allowed scope", str(observed["prompt"]))
         self.assertIn("PYTHONPATH=/workspace/src:/context/project/feature-pipeline-skill/src",
                       observed["argv"])
+
+    def test_observe_cli_version_uses_the_contained_pinned_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            auth = root / "auth.json"
+            auth.write_text("test-only", encoding="utf-8")
+            image = "example.invalid/codex@sha256:" + "a" * 64
+            controls: list[list[str]] = []
+
+            def docker_runner(argv: list[str]) -> CompletedProcess:
+                controls.append(argv)
+                if argv[1:3] == ["image", "inspect"]:
+                    return CompletedProcess(0, json.dumps([argv[-1]]), "")
+                return CompletedProcess(0, "", "")
+
+            adapter = DockerCodexAdapter(
+                image=image, proxy_image="example.invalid/python@sha256:" + "b" * 64,
+                codex_version="0.1.0", auth_file=auth, docker_executable=sys.executable,
+                docker_runner=docker_runner,
+                runner=lambda *_args, **_kwargs: CompletedProcess(0, "codex-cli 0.1.0\n", ""),
+                image_validator=lambda *_: True,
+            )
+
+            observed = adapter.observe_cli_version(5.0)
+
+        self.assertEqual(observed, "codex-cli 0.1.0")
+        self.assertTrue(any(argv[1:3] == ["network", "create"] for argv in controls))
+        self.assertTrue(any(argv[1:3] == ["network", "rm"] for argv in controls))
+
+    def test_image_validation_accepts_the_exact_digest_from_docker(self) -> None:
+        image = "example.invalid/codex@sha256:" + "a" * 64
+        with unittest.mock.patch(
+            "pipeline_core.adapters.subprocess.run",
+            return_value=subprocess.CompletedProcess([], 0, stdout=json.dumps([image]), stderr=""),
+        ):
+            valid = DockerCodexAdapter._validate_image("docker", image)
+
+        self.assertTrue(valid)
+
+    def test_image_validation_rejects_malformed_docker_output(self) -> None:
+        with unittest.mock.patch(
+            "pipeline_core.adapters.subprocess.run",
+            return_value=subprocess.CompletedProcess([], 0, stdout="not-json", stderr=""),
+        ):
+            valid = DockerCodexAdapter._validate_image("docker", "example.invalid/codex@sha256:" + "a" * 64)
+
+        self.assertFalse(valid)
+
+    def test_image_validation_rejects_a_docker_inspect_failure(self) -> None:
+        with unittest.mock.patch(
+            "pipeline_core.adapters.subprocess.run",
+            return_value=subprocess.CompletedProcess([], 1, stdout="", stderr="not found"),
+        ):
+            valid = DockerCodexAdapter._validate_image("docker", "example.invalid/codex@sha256:" + "a" * 64)
+
+        self.assertFalse(valid)
+
+    def test_image_validation_fails_closed_when_docker_cannot_start(self) -> None:
+        with unittest.mock.patch(
+            "pipeline_core.adapters.subprocess.run",
+            side_effect=OSError("docker unavailable"),
+        ):
+            valid = DockerCodexAdapter._validate_image("docker", "example.invalid/codex@sha256:" + "a" * 64)
+
+        self.assertFalse(valid)
 
     def test_workspace_write_probe_is_unprivileged_and_exposes_no_runtime_inputs(self) -> None:
         """The preflight proves only the disposable bind mount is writable."""
