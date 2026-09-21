@@ -28,6 +28,8 @@ from pipeline_core.execution import (
     EXIT_OK,
     ExecuteControls,
     ExecuteRequest,
+    ExecutionError,
+    _ensure_execution_controls_match,
     execute_run,
     persist_task_contracts,
 )
@@ -2561,6 +2563,62 @@ class BoardProjectionWiringTests(unittest.TestCase):
             )
             self.assertTrue(result.ok, result.message)
             self.assertFalse((root / "docs" / "kanban.md").exists())
+
+
+class ResumeControlValidationTests(unittest.TestCase):
+    def _run(
+        self, root: Path, controls: dict[str, tuple[object, str]],
+        tasks: list[tuple[str, list[str]]] | None = None,
+    ) -> Run:
+        prompt = root / "prompt.md"
+        prompt.write_text("feature prompt", encoding="utf-8")
+        run = Run.create("resume-controls", prompt, None, root / "runs" / "resume-controls", root)
+        return RunLifecycle.initialize(
+            run, tasks=tasks or [("TC-11", [])], controls=controls
+        ).run
+
+    def test_resume_allows_only_done_or_unrecorded_scope_items_to_be_reused(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            run = self._run(root, {
+                "execution_scope": (["TC-10", "TC-11"], "explicit"),
+                "verify_dependency_chain": (False, "default"),
+            })
+            run.task("TC-11").status = "done"
+
+            _ensure_execution_controls_match(run, ["TC-11"], False)
+
+    def test_resume_rejects_scope_shrink_that_discards_unfinished_recorded_task(self) -> None:
+        with TemporaryDirectory() as directory:
+            run = self._run(Path(directory), {
+                "execution_scope": (["TC-10", "TC-11"], "explicit"),
+                "verify_dependency_chain": (False, "default"),
+            }, tasks=[("TC-10", []), ("TC-11", [])])
+            with self.assertRaisesRegex(ExecutionError, "recorded=.*current") as raised:
+                _ensure_execution_controls_match(run, ["TC-11"], False)
+            self.assertEqual(raised.exception.code, "execution-scope-mismatch")
+
+    def test_resume_rejects_explicit_docker_runtime_control_substitution(self) -> None:
+        with TemporaryDirectory() as directory:
+            run = self._run(Path(directory), {
+                "execution_scope": (["TC-11"], "explicit"),
+                "verify_dependency_chain": (False, "default"),
+                "model": ("gpt-5.6-terra", "explicit"),
+                "effort": ("medium", "explicit"),
+                "codex_runtime": ("docker", "explicit"),
+                "docker_codex_image": ("registry.invalid/codex@sha256:" + "a" * 64, "explicit"),
+                "docker_proxy_image": ("registry.invalid/python@sha256:" + "b" * 64, "explicit"),
+                "docker_codex_version": ("0.154.0", "explicit"),
+                "docker_codex_auth_file": ("codex-auth.json", "explicit"),
+            })
+            with self.assertRaisesRegex(ExecutionError, "docker_codex_version") as raised:
+                _ensure_execution_controls_match(
+                    run, ["TC-11"], False, model="gpt-5.6-terra", effort="medium",
+                    codex_runtime="docker", docker_codex_image="registry.invalid/codex@sha256:" + "a" * 64,
+                    docker_proxy_image="registry.invalid/python@sha256:" + "b" * 64,
+                    docker_codex_version="0.155.0", docker_codex_auth_file="codex-auth.json",
+                )
+            self.assertEqual(raised.exception.code, "runtime-control-mismatch")
 
 
 if __name__ == "__main__":
